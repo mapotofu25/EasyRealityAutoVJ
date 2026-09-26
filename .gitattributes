@@ -1,0 +1,11 @@
+# Normalize line endings: store LF in the repository, check out native.
+* text=auto
+
+# Batch files must keep CRLF, otherwise cmd.exe mis-parses them.
+*.bat text eol=crlf
+
+# Binary assets must never be touched.
+*.dll binary
+*.png binary
+*.ico binary
+*.zip binary

@@ -1,0 +1,179 @@
+# ============================================================
+#  Easy Reality AutoVJ —— .gitignore
+#  原则：仓库只放「源码 + 文档 + 构建脚本」。
+#  凡是体积大、可重建、含个人环境/路径、或有第三方版权风险的，一律不进仓库。
+# ============================================================
+
+# ---------- Python / 虚拟环境 ----------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---------- 构建产物 / 发行包（体积大 ⇒ 走 GitHub Releases）----------
+build/
+build_*/
+dist/
+dist_*/
+*.spec
+*.exe
+*.dll.tmp
+EasyRealityAutoVJ_测试版*.zip
+EasyRealityAutoVJ*.zip
+*.7z
+*.rar
+
+# ---------- 虚拟环境 / 下载的安装包 ----------
+_glenv/
+_pkgsize/
+wheels/
+
+# ---------- 运行期缓存 ----------
+thumbs/
+cache/
+Cache/
+
+# ---------- 附带的诊断小工具（含 exe，另行发布）----------
+音源排查/
+NDI局域网测试/
+dist_audio_probe/
+dist_ndi_probe/
+
+# ---------- 模型权重（体积大；见 NOTICE.md，Discogs-EffNet 另有非商业限制）----------
+assets/models/
+assets/thumbs/
+*.onnx
+*.npy
+
+# ---------- 内部工作目录 / 备份 ----------
+.workbuddy/
+backups/
+_build_tools/
+*.bak
+*~
+
+# ---------- 运行期产物 / 调试输出 ----------
+*.log
+startup_error.log
+ui_stall.log
+scan_time.log
+_dump*.txt
+_*.txt
+_*.html
+_*.json
+_beat_audio/
+_bpm_*.txt
+
+# ---------- 开发期临时诊断脚本（含本机个人路径，不进公开仓库）----------
+tools/_*.py
+tools/audio_cost.py
+tools/bpm_check.py
+tools/bpm_live.py
+tools/cpu_profile.py
+tools/music_path_probe.py
+tools/perf_qa_probe.py
+tools/qt_pool_source.py
+tools/qt_threads_probe.py
+
+# ---------- 配置（含个人路径与偏好，绝不上传）----------
+config.json
+config.local.json
+*local*.json
+
+# ---------- 音频素材（第三方版权，且体积大）----------
+*.flac
+*.mp3
+*.wav
+*.m4a
+*.aiff
+*.ogg
+
+# ---------- 视频素材 ----------
+*.mov
+*.mp4
+*.mkv
+
+# ---------- 开发期调试产物 / 缓存（逐个点名，避免误伤正式文档）----------
+audio_probe.txt
+diag_energy.txt
+build_log.txt
+build_diag_log.txt
+build_seq.json
+genre_cache.json
+ndi_received.bmp
+问题.png
+能量检测工具.zip
+*.bmp
+
+# ---------- 开发过程截图（体积占仓库 2/3，且无任何文档引用）----------
+# 如需公开截图，新建 assets/screenshots/ 目录单独放，不要放在 assets 根下
+assets/*.png
+assets/*.txt
+
+# ---------- 开发期一次性诊断探针（含本机硬编码盘符路径，不可移植，不对外）----------
+tools/analyze_audio.py
+tools/audio_chain_probe.py
+tools/audio_chain_probe2.py
+tools/audio_chain_probe3.py
+tools/audio_chain_probe4.py
+tools/audio_chain_probe5.py
+tools/audio_probe.py
+tools/bass_probe.py
+tools/bpm_range_check.py
+tools/build_diag.py
+tools/build_probe.py
+tools/decode_attrib.py
+tools/decode_cost.py
+tools/decode_threads.py
+tools/device_check.py
+tools/diag_audio.py
+tools/dml_diag.py
+tools/dml_probe.py
+tools/dxv_gpu_bench.py
+tools/dxv_gpu_verify.py
+tools/eco_child.py
+tools/eco_diag.py
+tools/energy_probe.py
+tools/exe_startup_time.py
+tools/frame_cost.py
+tools/gl_dbg.py
+tools/gl_probe.py
+tools/low_energy_mode_check.py
+tools/ndi_probe.py
+tools/onnx_cost.py
+tools/precompute_tag_emb.py
+tools/qt_scale_probe.py
+tools/render_fps_ab.py
+tools/startup_profile.py
+tools/switch_align_report.py
+tools/switch_latency.py
+tools/thread_attrib.py
+
+# ---------- 面向群友的更新文案（随发行包单独发送，不进仓库）----------
+更新内容*.txt
+
+# ---------- 失效的本机便利脚本（仍指向改名前的 dist\AutoVJ\AutoVJ.exe）----------
+更新到新版.bat
+
+# ---------- 内部工程笔记（实现细节/调优过程，不对外公开）----------
+# 这些是开发过程中的技术分析记录，面向用户的使用文档见 使用说明.txt / 更新内容.txt
+CPU优化说明.txt
+GPU解码实现与实测.txt
+GPU解码验证与性能问答.txt
+硬解方案讨论.txt
+能量算法说明.txt
+能量检测工具_说明.txt
+更新内容_今日三版.txt
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+System Volume Information/

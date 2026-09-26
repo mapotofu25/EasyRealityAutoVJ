@@ -1,0 +1,504 @@
+Easy Reality AutoVJ — User Manual
+=================================
+Version 1.0.0 · 2026-09-23
+A real-time auto-VJ engine that turns music into visuals
+
+This manual follows the real order of use — from install to showtime.
+If it's your first time, just read it top to bottom.
+
+
+────────────────────────────────────────
+1. Install & Launch
+────────────────────────────────────────
+1. Extract the WHOLE folder (don't take only EasyRealityAutoVJ.exe).
+   The _internal folder next to the exe is part of the app; without it
+   it won't start.
+2. Double-click EasyRealityAutoVJ.exe.
+   On first launch Windows Defender scans it — this can take from a few
+   seconds up to a minute. That's normal.
+3. If "Scanning library…" appears in the bottom-right corner, the app is
+   re-computing clip tags. Let it finish (there's a progress display, it
+   never freezes silently).
+
+Tip: the folder can live on any drive or USB stick, and non-ASCII paths
+     are fine. Just avoid directories that need admin rights
+     (e.g. C:\Program Files).
+
+
+────────────────────────────────────────
+2. Getting Started
+────────────────────────────────────────
+Step 1 — Pick an audio source
+  Click "🎛 Audio" at the top and choose "System Sound" so the app can
+  hear whatever your computer is playing.
+  (Using an external sound card / DJ controller? Choose "Line-In / Sound Card".)
+
+Step 2 — Import clips
+  Click "Import Folder" or "Import Files" and load your video/image clips.
+  Supported: mp4 / mov / webm / avi / mkv / gif / png / jpg / webp, etc.
+
+Step 3 — Scan & Tag (important, don't skip)
+  After importing, click "Scan & Tag" above the library.
+  The app uses a local AI model to tag every clip with content tags
+  (blue / particles / ocean …) and motion tags
+  (Low Motion / Mid Motion / High Motion / Flicker).
+  Untagged clips are almost impossible to match automatically — this step
+  directly determines how well visuals fit the music.
+  Tagging runs in the background, you can keep using the app, and it
+  resumes if interrupted.
+
+Step 4 — Create layers and set their role
+  Click "+ Layer" at the top right of the layer area, choose
+  "Auto (match visuals by genre)" or "Manual", then pick a role:
+    · Background: a full-frame environment clip (the base layer)
+    · Foreground: dark or alpha overlay elements (light, effects)
+  The usual setup is two layers: one background for the base plus one
+  foreground overlay — that gives the best depth.
+
+Step 5 — Scan your music library first (strongly recommended, do it before the show)
+  Click "🎵 Music Library" at the top, import your music folder and click
+  "Scan & Analyze". The app fingerprints each track and detects its genre
+  (background, resumable — you only scan once).
+  Only after this can it recognize "what genre is playing" and pick
+  matching visuals. Without it, it falls back to estimating the genre in
+  real time, which is noticeably less accurate.
+
+Step 6 — Click "Start Auto VJ"
+  Visuals now switch automatically with the music.
+  For a full-screen show, click "Show Output Window" and drag it to your
+  second display, then go fullscreen.
+
+That's it. Everything below is fine-tuning.
+
+
+────────────────────────────────────────
+3. Audio Source
+────────────────────────────────────────
+· Source Type
+    System Sound (WASAPI Loopback): capture what the computer plays
+                                     (the usual choice for DJ/VJ work)
+    Microphone: capture a mic (good for miking a speaker)
+    Line-In / Sound Card: capture a sound card input
+                          (external interface, mixer out)
+
+· Device
+    Switching source type automatically re-scans the devices (so a device
+    you just plugged in shows up). The app remembers the device you used
+    **per source type** and selects it again when you switch back.
+
+· Sample Rate
+    Keep "Auto (follow system)". Auto follows the device's native rate,
+    avoiding resampling that smears drum transients — energy detection is
+    more accurate that way. Only override it if auto misdetects.
+
+· Mono analysis
+    Usually on. Mono is enough for analysis and halves CPU usage.
+
+· Gain
+    Raise it only if the incoming signal is too weak. If kicks are already
+    detected reliably, leave it alone.
+
+· Current device / Input level
+    The dialog has live meters (total, low, mid, high) so you can confirm
+    at a glance that the app really hears you and that bass is coming in.
+
+⚠ If the app seems "deaf", check here first: switch to System Sound and
+  see whether the meters move.
+⚠ If a device is unplugged, the dialog shows a hint — just pick another
+  device and click "Apply".
+
+
+────────────────────────────────────────
+4. Media Library
+────────────────────────────────────────
+[Import]
+The first import asks how to import, with a "remember my choice" option:
+  · Copy into library (keep originals) — recommended. Clips stay together,
+                                          so unplugging a drive is safe
+  · Move into library — deletes originals after copying
+  · Reference only — no copy, keeps the original path
+                      (breaks if you move/rename files)
+To change later: right-click the library → "Import Settings…".
+Importing runs **in the background**: bringing in thousands of clips / hundreds
+of GB no longer freezes the UI — clips appear in batches, the bottom bar shows
+progress, and a summary reports "N added, M skipped".
+(Click "Scan & Tag" afterwards so the new clips get tags.)
+
+[Scan & Tag]
+See step 3 above. You can run it again — it only fills in what's missing.
+
+[Edit tags manually]
+Right-click a clip → "Edit Tags…". Tick/untick any tag, or type your own.
+Auto-detected tags are shown in blue; manual choices win and re-scanning
+won't overwrite them.
+
+[Filter by tag]
+The "Tag" dropdown above the library filters clips by tag; click "Filter"
+to select several (a clip shows if it has ANY of the selected tags).
+
+[Exclude clips]
+For logos or subtitles, right-click and tick "Exclude from auto-tag /
+auto-match" so the app won't pick them as random switch candidates.
+
+[Cleanup]
+Right-click → "View usage…" shows how much the thumbnail cache takes and
+lets you clear it.
+
+
+────────────────────────────────────────
+5. Layers
+────────────────────────────────────────
+One layer = one visual stream. Multiple layers are stacked (the higher
+entry in the list is drawn on top).
+
+[New layer]
+Click "+ Layer" at the top of the layer area. Three types:
+  · Manual (drag clips yourself) — you drag clips in; the app only
+                                    switches them on the beat
+  · Auto (match visuals by genre) — the app detects the genre and picks
+                                    matching clips automatically
+  · Kv Main Visual — the idle layer, see section 9
+
+[Layer role (auto layers only)]
+  · Background: a full-frame environment to sit under everything
+  · Foreground: dark/alpha overlay elements (effects, light)
+  The app picks different kinds of clips per role. Click the small
+  "Foreground/Background" button on the layer header to toggle.
+
+[Header buttons]
+  👁  show / hide
+  S  Solo (show this layer only)
+  Name: click to select, double-click to rename
+  Slider: opacity
+  α  keep the clip's own alpha channel (only matters for alpha movs)
+  🔒 lock frame (for logos/subtitles: no music-pulse scaling)
+  Blend mode: Normal / Add / Screen / Lighten … ("Add" is common for
+              foreground overlays)
+
+[Right-click menu]
+Right-click a layer header or a clip cell to rename, loop a clip, pause
+when silent, copy the clip pool to a new layer, move up/down, reset this
+layer's settings, delete the layer, and more.
+
+[Drag & drop]
+Clips can be dragged between layers (drop onto the target layer's row).
+Thumbnails in the library can also be dragged straight into a layer.
+
+
+────────────────────────────────────────
+6. Clip Switch Tempo (the automation core)
+────────────────────────────────────────
+The "Clip Switch Tempo" dropdown on the right has four options:
+
+  · Auto (recommended)
+      The app chooses the tempo from music energy and genre.
+      This is what you'll normally use live.
+
+  · Normal
+      Switch every 16 beats (4 bars of 4/4).
+
+  · Fast
+      Switch every 8 beats (2 bars of 4/4).
+
+  · Beat Alternation
+      Takes a pair of clips A/B and alternates them quickly
+      (every beat by default — also 1/4, 1/2, 2, 4, 8 or 16 beats).
+      Selecting it reveals the "Beat Alternation" section:
+        Clip Picking: Sequential / Random
+        Alternation Interval: how often A↔B alternate
+        Bars per Pair: how many bars before a new pair is drawn
+        End Action: Loop / Reverse / Stop
+
+[When switching happens immediately]
+  · Energy tier change (a quiet section suddenly exploding):
+    deliberate — responsiveness wins.
+  · Sudden genre change: waits for the next switch point instead of
+    interrupting the visual.
+
+[Other controls]
+  · Sensitivity: Low / Medium / High (higher = reacts to smaller energy changes).
+  · Transition: Follow mode / Fade / Cut / Slide / Zoom / Glitch.
+    In Follow mode: Normal = Fade, Beat Alternation = Cut.
+  · Beat Amplitude: how strongly the frame pulses with the music.
+  · BPM Sync Video Speed: clip playback speed follows the BPM.
+  · Render FPS: how many times per second the engine composites. Footage is usually 25-30 fps,
+    so at 60 about half the work is re-compositing the same frame - pick 30 on a busy machine
+    (VDJ + streaming + recording) and render cost roughly halves while the picture still keeps up.
+    20 saves more but motion gets visibly choppy.
+  · GPU decoding: lets the GPU hardware-decompress DXV clips, cutting decoding CPU.
+    Off by default; if the GPU does not support it or a clip cannot be decoded, the app falls back
+    automatically - never a black screen.
+    **Affects normal layers only; the Kv standby layer is untouched.**
+    There is a matching switch on the main toolbar, to the right of "Next clip", synced with this
+    one - handy for toggling live.
+    Try a full round of clips outside of a show first; a clip already playing switches over on its
+    next switch.
+    FIXED: earlier builds could occasionally freeze and stay frozen, because the graphics driver
+    hangs when GPU workspaces are created and destroyed repeatedly while switching clips. The app
+    now creates exactly ONE workspace and never destroys it, so that path is gone. Even if the
+    driver still misbehaves, only that single clip briefly falls back to software decoding (the
+    picture keeps playing) and GPU use is retried 60 seconds later - the UI can no longer be
+    dragged down. It is safe to leave this switch on.
+
+
+────────────────────────────────────────
+7. Smart Matching (song ID)
+────────────────────────────────────────
+[Build the music library]
+See step 5 above: "🎵 Music Library" → "Import Music Folder" →
+"Scan & Analyze". Do this before the show; you only need to scan once.
+
+[What happens live]
+  · The app hears the music, identifies the track and knows its genre
+    (e.g. Techno)
+  · Auto layers map the genre to visual tags
+    (tech / machine / future / neon)
+  · Clips carrying those tags are picked from the library
+  · If the track isn't recognized, a local AI guesses the genre in
+    real time as a fallback
+
+[Genre Mapping]
+"Genre Mapping" lets you edit the genre → visual tag bindings:
+· The left side lists genres **grouped by family** (Hardcore / House / Trance …).
+  Expand a family, click a genre, then tick its visual tags on the right.
+· Each family ends with "+ New Genre" — a new genre remembers its family, so it
+  also shows up later in Music Library → "Fix Genre".
+· The **"Selected" row at the top** of the right side lists the tags currently
+  ticked; click one to remove it.
+· Use the defaults first and only adjust if a certain style keeps getting the
+  wrong visuals.
+
+
+────────────────────────────────────────
+8. Energy & Clip Selection (read-only knowledge)
+────────────────────────────────────────
+The app computes a live 0–1 "energy" value by fusing loudness, low-frequency
+punch and fluctuation.
+
+  Very low / zero energy: still switches, just at the slowest cadence and
+                          preferring low-motion clips
+  Low energy (below 0.50): switches more slowly, mid/low-motion clips
+  Mid energy (0.50 to 0.65): normal switching
+  High energy (above 0.65): faster switching, high-motion / flicker clips
+
+· Clips keep switching at ANY energy level — the picture never freezes on one
+  clip just because there is no sound.
+
+· A tier change (e.g. quiet section into a drop) immediately re-picks the
+  clip pool.
+· "Energy Correction" lives under Experimental; leave it at 1.0.
+  Only nudge it right if your on-site system has heavy bass boost that
+  inflates energy.
+
+
+────────────────────────────────────────
+9. Kv Main Visual Layer (idle layer)
+────────────────────────────────────────
+Purpose: bring an idle visual in when there's no sound, and take it out
+when audio returns (e.g. between tracks, while talking, during ads).
+
+· Choose "Kv Main Visual" when creating a layer.
+· Only one can exist; it's automatically placed on top.
+· It is fully independent: unaffected by switch tempo, energy, genre
+  matching, color rendering or post-FX.
+· Its settings sit at the very top of the right panel (visible only while
+  the layer exists; removed with the layer):
+    Silence Threshold: -60 to -20 dB; below this counts as silence
+    "Auto-detect Noise Floor": listens for 3 s, sets threshold 3 dB above
+                               the room noise
+    Silence Trigger Delay: 0 to 10 s. How long silence must last to fade in
+    Audio-Return Exit Delay: 0.1 to 5 s. How long audio must persist to exit
+    Enter transition / duration: Fade / Cut / Glitch, 0.1 to 5 s
+    Exit transition / duration: Fade / Cut / Zoom, 0.1 to 3 s
+    Clip Rotation Speed: 0 to 60 s; how often to rotate clips while the
+                         idle layer shows. 0 = never rotate
+
+Live tip: click "Auto-detect Noise Floor" first, then fine-tune to the venue.
+
+
+────────────────────────────────────────
+10. Color Rendering (one-click grading)
+────────────────────────────────────────
+Makes the same clips look different under a different color, reducing
+reliance on clip quantity.
+Location: "Color Rendering" on the right (between "Effects" and "Post-FX").
+
+· Enable Color Rendering: master switch
+· Auto mode: follow music energy (on by default)
+    low energy = no color → mid = light tint → peak = strong color
+    at high energy it smoothly rotates to a new color every N seconds
+· Swatches: click to lock a color temporarily (auto resumes after 10 s)
+    Original / Cyber Purple / Glitch Red / Amber Gold / Electric Pink /
+    Deep Sea Blue / Neon Cyan / Neon Green
+· Bypass: instantly toggle original ↔ graded (hotkey C)
+· Color Strength: overall intensity, so color doesn't wash out detail
+· Advanced:
+    Color Mode: LUT grade (keeps clip color) / Duotone (looks like a
+                different clip)
+    Hue Rotation Time: 1 to 60 s
+    Force refresh on energy burst
+    Flicker clips: Sleep / Active / Random (what to do with flicker clips)
+    Back to Auto: after locking a swatch, return to auto mode
+
+Note: a color locked by clicking a swatch ALWAYS wins, regardless of the
+      flicker setting. But while the Kv layer is active, no color at all
+      is applied (a hard rule).
+
+
+────────────────────────────────────────
+11. Post-FX
+────────────────────────────────────────
+"Post-FX" on the right. Effects: Chromatic Aberration, Bloom, Glitch
+Displace, Exposure Pulse, Saturation Pulse, Soft Focus, Trails, Grain,
+Pixelate, Radial Spectrum, Audio Deform. Hover any entry for a description.
+
+Two modes:
+· Auto: picks 2 to 3 suitable effects by genre and energy; strength follows
+        energy continuously:
+        strength = energy × 60% of global strength
+· Manual: you enable and tune each effect yourself. Manual mode is
+          independent — the strength you set is used as-is and is not
+          affected by global strength.
+
+When does auto mode change effects?
+· "Effect Hold" defaults to "Live (follow energy)" — effects follow energy
+  instantly. When energy hovers near a threshold, effects can flicker in
+  and out.
+· Set it to 8 / 16 / 32 / 64 beats and a chosen set of effects stays
+  **stable for that many beats** before a new set is picked. Use this if you
+  want the changes to feel rhythmic.
+· **Global strength only sets how strong effects are — it does NOT affect
+  how often they change.**
+
+· Enable Post-FX: master switch (off = no effects at all)
+· Global Strength: affects AUTO mode only; the master gain for auto effects
+· Auto link: when off, effects follow energy only (no genre/events)
+· Gear button: **switch "Mode" to "Manual"** and every effect gets a gear
+  button on its right, where you can set the trigger mode
+  (always / genre / event), genre binding, decay time and audio drive.
+  (The auto page has no effect list, so there's no gear there.)
+
+⚠ If you enabled an effect but nothing changes, check two things:
+   ① is "Enable Post-FX" on?  ② is "Global Strength" set very low?
+
+
+────────────────────────────────────────
+12. Output
+────────────────────────────────────────
+Click "Show Output Window" → drag to your second display → choose
+"Display N fullscreen".
+
+· Output Display: window mode (draggable) or fullscreen on a display
+· Resolution: 1280x720 / 1920x1080 / 1080x1920 (portrait) /
+              1080x1080 (square). You can also type e.g. 1600 900
+· Lock 16:9: keep aspect ratio
+· Borderless / Always on Top
+· Reset Window Size: rebuilds the output window at **exactly the resolution above**
+
+Notes: when you start the VJ the output window is created at your chosen
+resolution; in fullscreen it **fills the whole screen** (a 720p output is scaled
+up to fill a 1080p screen), and if the aspect ratio differs the picture is
+centred with black bars (never stuck in a corner). What gets remembered on close
+is the window **position** — your chosen resolution is never overwritten.
+
+· Spout Output: share frames with other local apps in real time
+                 (install the Spout plugin in OBS, then pick this Sender)
+· NDI Output: sends video + audio over the network
+               (receiver needs NDI Runtime) — note you must install
+               NDI Runtime on this machine first.
+
+⚠ Output buttons only become available after you click "Start Auto VJ",
+  which prevents accidentally changing the show output.
+
+
+────────────────────────────────────────
+13. Hotkeys
+────────────────────────────────────────
+Open "Hotkeys" at the top to view, rebind, enable/disable, and optionally
+make them global (they then work even when the window isn't focused).
+
+  Space          Start / Stop
+  B              Blackout
+  F              Freeze
+  P              Pause Auto
+  →              Next Clip
+  Ctrl+T         Beat Alternation on/off
+  Ctrl+R         Sequential / Random (Beat Alternation mode only)
+  Ctrl+↑ / ↓     Intensity up / down
+  Ctrl+Enter     Manual switch
+  Ctrl+L         Lock current clip
+  Ctrl+F         Output fullscreen
+  Ctrl+H         Show / hide UI
+  C              Color Bypass (original / graded)
+  Ctrl+Shift+R   Panic reset (resets all settings)
+
+
+────────────────────────────────────────
+14. Language & About
+────────────────────────────────────────
+· Language dropdown at the top: 中文 / English — takes effect IMMEDIATELY,
+  no restart needed.
+· "About" at the top: version info, highlights, author & feedback,
+  **open-source projects / AI models / credits** (every entry is a clickable
+  link that opens in your browser), third-party licenses, and the disclaimer.
+  It also has "Open Data Folder" and "User Manual" buttons.
+· Version = date + daily build number, e.g. 2026.09.23.07 means the 7th build
+  made on 23 Sep 2026. The zip you receive is named to match
+  (…_测试版092307.zip). Mention this number when reporting an issue and I will
+  know exactly which build you are running.
+
+⚠ This software displays rapidly flashing visuals. Not for people with
+  photosensitive epilepsy. Beta software — always test thoroughly before
+  a show.
+
+
+────────────────────────────────────────
+15. FAQ
+────────────────────────────────────────
+Q: The app seems deaf — clips don't switch.
+A: ① Check that the input meters in "🎛 Audio" move.
+   ② In System Sound mode make sure the computer is actually playing
+      audio (some cards use exclusive mode).
+   ③ Check whether "Energy" sits near 0.
+
+Q: Clips flicker / switch too fast.
+A: ① Check whether "Fast" or "Beat Alternation" is selected on the right.
+   ② If energy reacts too strongly, set Sensitivity to Low.
+   ③ Check for clips mis-tagged as High Motion / Flicker; fix via
+      right-click → "Edit Tags…".
+
+Q: The same few clips keep coming back.
+A: ① Add more clips to the auto layer.
+   ② Make sure "Scan & Tag" was run (untagged clips are hard to match).
+   ③ Low-energy sections only use low-motion clips, so the pool is smaller.
+
+Q: Post-FX is enabled but nothing changes.
+A: First check "Enable Post-FX" and "Global Strength". To tune a single
+   effect, switch "Mode" to "Manual" — every effect then has a gear button.
+
+Q: How do I factory-reset?
+A: Press Ctrl+Shift+R (panic reset), or delete the data folder (below).
+
+Q: Will my settings survive moving to another PC?
+A: Config and caches all live in the data folder — just copy it over.
+
+
+────────────────────────────────────────
+16. Data Location
+────────────────────────────────────────
+Config, thumbnail cache and the music fingerprint database live in:
+    %LOCALAPPDATA%\AutoVJ\
+(Paste that into a File Explorer address bar — or use the "Open Data
+Folder" button in the About dialog.)
+
+Deleting that folder resets everything (library list, tags, placement
+settings).
+
+
+────────────────────────────────────────
+Beta software — still evolving. Feedback is welcome.
+
+Author: 麻婆豆腐    QQ: 1793170435
+Test group: ERAVJ测试 (No. 543643838)
+Join: https://qm.qq.com/q/o5m9jjmkIC
+────────────────────────────────────────
