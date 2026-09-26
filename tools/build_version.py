@@ -106,7 +106,46 @@ def write_build_info(date_key, seq):
             'BUILD_VER = "%s"\n'
             'ZIP_NAME = "%s"\n' % (date_key, seq, ver, zip_name(date_key, seq))
         )
+    stamp_docs(ver)
     return ver
+
+
+# ---------------------------------------------------------------- 说明书版本号
+# 说明书随压缩包一起发，版本号必须和 exe 内显示的一致。
+# 手写必然过期（实际踩过：exe 已经是 2026.09.26.15，说明书还写着「版本 1.0.0 · 2026-09-23」）。
+# ⇒ 由打包流程在递增版本号时同步改写头部那一行，只认前 8 行里的「版本 …」「Version …」。
+DOC_HEAD = os.path.join(ROOT, "使用说明.txt")
+DOC_HEAD_EN = os.path.join(ROOT, "使用说明_EN.txt")
+
+
+def stamp_docs(ver):
+    """把 `ver` 写进两版说明书的头部版本行（正文一律不动）。"""
+    import re
+    pat = re.compile(r"^(版本|Version)\s+[0-9]")
+    for path, tmpl in ((DOC_HEAD, "版本 %s"), (DOC_HEAD_EN, "Version %s")):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                lines = f.read().splitlines(keepends=True)
+        except Exception as e:                                    # noqa: BLE001
+            print("!! 说明书读取失败 %s: %s" % (os.path.basename(path), e))
+            continue
+        hit = False
+        for i in range(min(8, len(lines))):
+            body = lines[i].rstrip("\r\n")
+            if pat.match(body.strip()):
+                lines[i] = (tmpl % ver) + lines[i][len(body):]
+                hit = True
+                break
+        if not hit:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("".join(lines))
+            print("   说明书版本号 → %s（%s）" % (ver, os.path.basename(path)))
+        except Exception as e:                                    # noqa: BLE001
+            print("!! 说明书写入失败 %s: %s" % (os.path.basename(path), e))
 
 
 def set_seq(n):
@@ -125,6 +164,10 @@ if __name__ == "__main__":
     elif arg == "set" and len(sys.argv) > 2:
         k, s, v = set_seq(int(sys.argv[2]))
         print("已设为 %s（%s 第 %d 次）" % (v, k, s))
+    elif arg == "stamp":
+        k, s, v = read_build_info()
+        print("把当前版本 %s 写进说明书…" % v)
+        stamp_docs(v)
     else:
         k, s, v = read_build_info()
         print("当前版本 %s（%s%s）" % (v, k, "" if s else " 未打包过"))
