@@ -10,7 +10,8 @@
 
 ## 下载 / Download
 
-到 **[Releases](../../releases)** 页面下载最新的 `EasyRealityAutoVJ_测试版*.zip`，
+到 **[Releases](../../releases/latest)** 页面下载最新发行包
+（GitHub 上的附件名会把中文去掉，形如 `EasyRealityAutoVJ_092615.zip`，就是它），
 解压后双击 `EasyRealityAutoVJ.exe` 即可，**无需安装 Python**。
 
 ⚠️ 发行包内包含第三方模型（详见 [NOTICE.md](NOTICE.md)），其中 **Discogs-EffNet 为
