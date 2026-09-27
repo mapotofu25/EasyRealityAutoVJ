@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QStatusBar, QDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QApplication, QProgressBar, QAbstractItemView, QInputDialog,
     QToolBox, QScrollArea, QMenu, QFrame, QSizePolicy, QLineEdit, QButtonGroup,
-    QRadioButton,
+    QRadioButton, QTabWidget,
 )
 
 import i18n
@@ -201,12 +201,15 @@ class SettingsPanel(QWidget):
         self.sens = QComboBox()
         self.sens.addItems(["低", "中", "高"])
         gm.addWidget(self.sens, 2, 1)
-        gm.setRowStretch(3, 1)
-        self._add_section(box, "视觉行为模式", p1)
+        gm.setRowStretch(6, 1)
+        # 页面已建好，注册在下面统一做（见「设置面板重组」）
 
         # ---- 效果 ----
         p2 = QWidget()
         ga = QGridLayout(p2)
+        # ★ 2026-09-27：「渲染帧率 / GPU 解码」原来混在「效果」里，其实是**性能**项 —— 单独成页。
+        p_perf = QWidget()
+        gp = QGridLayout(p_perf)
         ga.addWidget(QLabel("画面振幅强度"), 0, 0)
         self.intensity = QComboBox()
         self.intensity.addItems([tr("intensity_low"), tr("intensity_mid"),
@@ -221,16 +224,34 @@ class SettingsPanel(QWidget):
         self.bpm_sync = QCheckBox("BPM Sync 视频速度")
         ga.addWidget(self.energy_map, 2, 0, 1, 2)
         ga.addWidget(self.bpm_sync, 3, 0, 1, 2)
-        ga.addWidget(QLabel("渲染帧率"), 4, 0)
+        self.chk_beat_grid = QCheckBox("节拍网格（八拍乐句对齐）")
+        self.chk_beat_grid.setToolTip("认出曲库里的歌时，用离线算好的八拍网格驱动拍位：素材切换踩在八拍乐句头，变速播放也能对齐。关掉则完全回到原来的实时拍钟。")
+        gm.addWidget(self.chk_beat_grid, 3, 0, 1, 2)
+        # 八拍相位修正：离线算的 phrase 是 0/4 二选一，判错时听感上就是"差 4 拍"（差半个乐句）。
+        # 按钮只作用于**当前识别到的这首歌**，就地生效（不重建网格、不丢锁定），并写进配置。
+        self.btn_grid_flip = QPushButton("八拍相位翻转")
+        self.btn_grid_flip.setToolTip(
+            "离线网格把「两个小节里哪一个是乐句头」判反时（听感上差 4 拍）点这里。"
+            "只作用于当前正在放、且已被识别出来的那首歌，就地生效（不用重扫、不打断已对齐的拍位），"
+            "并记进配置，下次放同一首仍然生效。点一下翻转，再点一下翻回来。"
+            "怎么听：看预览里的节拍网格线，「◆」应该正好落在音乐换句的地方。")
+        self.btn_grid_flip.clicked.connect(self._flip_grid_phrase)
+        gm.addWidget(self.btn_grid_flip, 4, 0)
+        self.lbl_grid_flip = QLabel("")
+        self.lbl_grid_flip.setProperty("_i18nDynamic", True)
+        self.lbl_grid_flip.setStyleSheet("color:#7ab;")
+        gm.addWidget(self.lbl_grid_flip, 4, 1)
+        gp.addWidget(QLabel("渲染帧率"), 0, 0)
         self.render_fps = QComboBox()
         self.render_fps.addItems(["60", "30", "20"])
         self.render_fps.setToolTip("引擎每秒合成多少次画面；素材多为 25 到 30fps，选 60 时约有一半是把同一帧重复合成 —— 机器吃紧（同时开 VDJ、直播、录制）就选 30，能省约一半渲染 CPU，画面仍跟得上素材")
-        ga.addWidget(self.render_fps, 4, 1)
+        gp.addWidget(self.render_fps, 0, 1)
         self.chk_gpu = QCheckBox("GPU 解码（实验）")
         self.chk_gpu.setToolTip("让显卡硬件解压 DXV 素材（帧内 DXT 压缩块直传显存），降低解码 CPU 占用：DXT5 素材约省一半以上、超宽素材约省七成；解压失败或显卡不支持时自动回退软解，不影响播放。默认关闭，建议先试播一轮再上台")
-        ga.addWidget(self.chk_gpu, 5, 0, 1, 2)
-        ga.setRowStretch(6, 1)
-        self._add_section(box, "效果", p2)
+        gp.addWidget(self.chk_gpu, 1, 0, 1, 2)
+        ga.setRowStretch(4, 1)
+        gp.setRowStretch(2, 1)
+        # 同上：注册统一在下面做
 
         # ---- 颜色渲染（一键调色：让同一批素材看起来不一样）----
         pc = QWidget()
@@ -333,7 +354,7 @@ class SettingsPanel(QWidget):
         self.lbl_color_state.setStyleSheet("color:#7ab;font-size:11px;")
         gc.addWidget(self.lbl_color_state, 8, 0, 1, 3)
         gc.setRowStretch(9, 1)
-        self._add_section(box, "颜色渲染", pc)
+        # 同上
 
         # ---- 后处理 ----
         p4 = QWidget()
@@ -418,7 +439,7 @@ class SettingsPanel(QWidget):
         pm.addWidget(hint_m, len(POSTFX), 0, 1, 3)
         pf.addWidget(self.postfx_manual_page, 2, 0, 1, 3)
         pf.setRowStretch(3, 1)
-        self._add_section(box, "后处理", p4)
+        # 同上
 
         # ---- 逐拍交替参数 ----
         p3 = QWidget()
@@ -442,7 +463,7 @@ class SettingsPanel(QWidget):
         self.beat_end.addItems([tr("loop"), tr("reverse")])
         gb.addWidget(self.beat_end, 3, 1)
         gb.setRowStretch(4, 1)
-        self._add_section(box, "逐拍交替参数", p3)
+        # 同上
 
         # ---- 实验性（默认折叠）----
         p5 = QWidget()
@@ -460,7 +481,59 @@ class SettingsPanel(QWidget):
         ef.addWidget(self.energy_scale_lbl, 0, 2)
         ef.addWidget(QLabel("实验性：现场系统低频增强导致能量虚高时用。默认 1.0 不校正。"), 1, 0, 1, 3)
         ef.setRowStretch(2, 1)
-        self._add_section(box, "实验性", p5, default=False)
+        # ================= 设置面板重组（2026-09-27）=================
+        # 7 个折叠分区 → **4 个**，按"用途"归组、顺序按使用流程：
+        #   · 「渲染帧率 / GPU 解码」原本混在「效果」里 —— 它们是**性能**项，独立成「性能」；
+        #   · 「节拍网格 / 相位翻转」原本是效果的一部分 —— 它决定**切换怎么跟音乐走**，归「演出行为」；
+        #   · 「逐拍交替参数」是行为模式的子模式 ⇒ 并入「演出行为」；
+        #   · 「颜色渲染 / 后处理 / 能量校正(原「实验性」)」都是画面处理 ⇒ 并入「画面效果」；
+        #   · ⚠「输出」**刻意不并进来**（用户明确要求：输出很重要）—— 它保持右下角**独立常显**面板，
+        #     不塞进折叠区（否则要多滚动 + 展开一次，反而更难找）。
+        # 控件对象与信号连线一律没动，只是换了所在的布局 ⇒ 行为与原来一致。
+        def _wrap(*pages):
+            """把多个页面拼成一个折叠分区的内容。"""
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(6)
+            for pg in pages:
+                v.addWidget(pg)
+            v.addStretch(1)
+            return w
+        # ⚠ 用户指出（2026-09-27）：这几项（素材选取 / 交替间隔 / 每对小节数 / 末尾行为）
+        #   **只在「逐拍交替」模式下才生效** —— 常显会让人以为当前正起作用。
+        #   原来它们是**独立折叠区**、由 `sync_beat_section()` 按模式隐藏；重组并进「演出行为」后，
+        #   这里改成**可整段隐藏的子页**（连同上方的细分隔线），仍由 `sync_beat_section()` 控制。
+        self._beat_box = QWidget()
+        _bv = QVBoxLayout(self._beat_box)
+        _bv.setContentsMargins(0, 0, 0, 0)
+        _bv.setSpacing(4)
+        _ln = QFrame()
+        _ln.setFrameShape(QFrame.HLine)
+        _ln.setFrameShadow(QFrame.Plain)
+        _bv.addWidget(_ln)
+        _bv.addWidget(p3)
+        self._add_section(box, "演出行为", _wrap(p1, self._beat_box))
+        # ★ 2026-09-27 用户反馈：四组画面相关设置**堆在同一个折叠区里反而更乱**（一屏 20+ 项），
+        #   改成**子标签页**：基础（振幅/过渡/能量映射/BPM Sync）/ 颜色渲染 / 后处理 / 能量校正。
+        #   ⚠ 页面对象（p2/pc/p4/p5）**原样复用**，只是换了个容器 ⇒ 控件对象与信号连线一条都没动。
+        self._fx_tabs = QTabWidget()
+        self._fx_tabs.setDocumentMode(True)      # 扁平化，不再是「一坨嵌入式面板」
+        # ★ 用户反馈（2026-09-27）：标签上方多出一条横线 ⇒
+        #   ① `setDrawBase(False)` 去掉标签栏那条底线/基线；
+        #   ② 去掉 pane 边框（documentMode 下本来就不该有外框，否则在标签上下各画一道）。
+        #   只作用于这一个 QTabWidget，不影响素材库那几个标签页。
+        try:
+            self._fx_tabs.tabBar().setDrawBase(False)
+        except Exception:
+            pass
+        self._fx_tabs.setStyleSheet("QTabWidget::pane{border:none;}")
+        self._fx_tabs.addTab(p2, "基础")
+        self._fx_tabs.addTab(pc, "颜色渲染")
+        self._fx_tabs.addTab(p4, "后处理")
+        self._fx_tabs.addTab(p5, "能量校正")
+        self._add_section(box, "画面效果", self._fx_tabs)
+        self._add_section(box, "性能", p_perf)
 
         # 信号
         self.kv_db.valueChanged.connect(self._on_kv_db)
@@ -482,6 +555,7 @@ class SettingsPanel(QWidget):
         self.transition.currentIndexChanged.connect(main.set_transition)
         self.energy_map.stateChanged.connect(lambda s: main.engine_cfg("auto", "energy_map", bool(s)))
         self.bpm_sync.stateChanged.connect(lambda s: main.engine_cfg("auto", "bpm_speed_sync", bool(s)))
+        self.chk_beat_grid.stateChanged.connect(lambda s: main.engine_cfg("auto", "beat_grid", bool(s)))
         self.energy_scale.valueChanged.connect(self._on_energy_scale)
         # 注意：构造时绝不主动 emit（否则默认值 100 会把配置里存好的 energy_scale 覆盖成 1.0）；
         # 初始化由 _load_settings_to_ui 的 setValue 触发 valueChanged 完成置换。
@@ -618,10 +692,20 @@ class SettingsPanel(QWidget):
             sec.setVisible(self.main.engine.kv_layer() is not None)
 
     def sync_beat_section(self):
-        """逐拍交替参数仅在手动选择「逐拍交替」模式时显示（删掉慢切后索引为 3）"""
+        """逐拍交替参数仅在手动选择「逐拍交替」模式时显示（删掉慢切后索引为 3）。
+
+        ★ 2026-09-27：设置分区重组后它**不再是独立折叠区**，而是「演出行为」区里的一段
+          （用户指出：这几项只在逐拍模式下有用，常显会让人以为当前生效）。
+          所以这里改为隐藏/显示**那一段页面**（连同上方的分隔线），语义与原来完全一致；
+          兼容旧结构：万一还有同名折叠区，也一并按模式显隐。
+        """
+        show = self.mode_combo.currentIndex() == 3
         sec = self._sections.get("逐拍交替参数")
         if sec is not None:
-            sec.setVisible(self.mode_combo.currentIndex() == 3)
+            sec.setVisible(show)
+        box = getattr(self, "_beat_box", None)
+        if box is not None:
+            box.setVisible(show)
 
     def _add_section(self, box, title, page, default=True):
         """独立折叠分区：可同时展开多个，状态记忆在配置里"""
@@ -638,6 +722,32 @@ class SettingsPanel(QWidget):
         states[title] = bool(opened)
         self.main.cfg["ui"]["sections"] = states
         self.main.cfg.save()
+
+    def _flip_grid_phrase(self):
+        """把**当前识别到的这首歌**的八拍相位翻转半个乐句（用户听出"差 4 拍"时一键修正）。
+
+        离线算的 `phrase` 只有 0 / 4 两种可能（两个小节里哪一个是乐句头），判错时听感上就是
+        "整个偏了半个乐句"。这里只翻"哪条线算乐句头"——**拍位与锁定都不动**，所以现场点一下
+        立刻生效：不用重扫、不用重开、不打断已经对齐的拍位。结果写进配置，下次放同一首仍然生效。
+        立即反馈有两个：① 本行右侧的"相位 +4/0"；② 预览里的节拍网格线 ◆ 会整条挪 4 拍。
+        """
+        snap = self.main.audio.state.snapshot()
+        ok, val = self.main.engine.flip_phrase_now(snap)
+        if not ok:
+            self.lbl_grid_flip.setText(T("没有正在识别的歌"))
+            return
+        sid = snap.get("recognized_song_id", -1)
+        p = getattr(self.main, "_grid_path_by_sid", {}).get(sid)
+        if p:
+            m = self.main.cfg["music_meta"].get(p)
+            if isinstance(m, dict):
+                # 落盘键放在 grid **同级**（不在 grid 里面）：重扫会重建 grid，写进去会被覆盖。
+                m["grid_flip"] = 1 if float(val) >= 2.0 else 0
+                try:
+                    self.main.cfg.save()
+                except Exception:
+                    pass
+        self.lbl_grid_flip.setText(Tf("相位 {}", "+4" if float(val) >= 2.0 else "0"))
 
     def retranslate(self):
         pass
@@ -1396,8 +1506,6 @@ class MusicScanThread(QThread):
             pass
         meta = self.main.cfg["music_meta"]
         items = list(self.paths) if self.paths else list(self.main.cfg["music_library"])
-        todo = [p for p in items if self.force or p not in meta]
-        total = len(todo)
         gc = None
         try:
             from audio_genre import get_genre_classifier
@@ -1429,6 +1537,47 @@ class MusicScanThread(QThread):
         except Exception as _e:                                         # noqa: BLE001
             _bg, vdj_idx = None, None
             _log("节拍网格：VDJ 库不可用（%s），将全部自算" % _e)
+
+        # ★ 增量扫描也要能补网格（阻塞项 F-a，旧实现 `todo=[p for p in items if force or
+        #   p not in meta]` 让**存量歌永远不重算** ⇒ 老曲库永远拿不到网格）。现在把待办拆成两类：
+        #     · todo（= todo_full）：需要**完整分析**（解码 + 指纹 + 曲风）
+        #     · todo_grid：已有元数据、只缺网格 / grid_ver 过期 ⇒ **只算网格**，
+        #       跳过指纹 / 联网 / 本地 AI（用户点一次「扫描分析」即可把全库缺失网格补齐，
+        #       ~0.5s/首量级，不重跑指纹/联网）。
+        _GRID_VER = getattr(_bg, "GRID_VER", 1) if _bg is not None else 1
+
+        def _need_grid(p):
+            m = meta.get(p)
+            if not isinstance(m, dict):
+                return False
+            g = m.get("grid")
+            return not (isinstance(g, dict) and g.get("beat_len")
+                        and g.get("grid_ver") == _GRID_VER)
+
+        todo = [p for p in items if self.force or p not in meta]
+        todo_grid = [p for p in items
+                     if not (self.force or p not in meta) and _need_grid(p)]
+        total = len(todo) + len(todo_grid)
+        if todo_grid:
+            _log("网格增量补算：%d 首缺网格（已有元数据）只补网格，不重跑指纹/联网" % len(todo_grid))
+
+        def _grid_one(p):
+            """只算网格（已有元数据、缺网格）：解码一次 → grid_from_signal → 返回 grid。
+
+            ★ 不碰指纹 / 联网 / 本地 AI（只补缺失的部分）。读取按 200s 封顶并传入**真实时长**，
+              既省内存/时间，又保证 VDJ 按时长匹配用对 dur（网格来源 src 判定靠它）。"""
+            try:
+                import soundfile as sf
+                info = sf.info(p)
+                dur = float(info.duration)
+                n = min(int(info.frames), int(200.0 * info.samplerate))
+                data, sr = sf.read(p, dtype="float32", always_2d=True, frames=n)
+                sig = np.mean(data, axis=1)
+                if _bg is None:
+                    return p, None
+                return p, _bg.grid_from_signal(sig, sr, vdj_idx, path=p, dur=dur)
+            except Exception:
+                return p, None
 
         def _one(p):
             """单首：解码 → 指纹入库 → 曲风（本地）。返回 (path, r, 三段耗时)。
@@ -1528,8 +1677,37 @@ class MusicScanThread(QThread):
         _log("阶段1（并行本地）完成：成功 %d/%d 首，用时 %.1f 秒（%.2f 秒/首）"
              % (ok_n, done, el, el / max(1, done)))
 
+        # ---- 阶段 1b：**只补网格**（存量歌缺网格 / grid_ver 过期）----
+        # 已有元数据的歌：跳过指纹 / 联网 / 本地 AI，只解码一次算网格并入原记录（保留曲风等字段）。
+        if todo_grid:
+            tg0 = _tm.perf_counter()
+            okg = 0
+            try:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    for p, g in ex.map(_grid_one, todo_grid):
+                        if g:
+                            rec = dict(meta.get(p) or {})
+                            rec["grid"] = g
+                            meta[p] = rec
+                            okg += 1
+                        done += 1
+                        self.progress.emit(done, total, p)
+                        if done % 20 == 0:
+                            try:
+                                self.main.cfg.save()
+                            except Exception:
+                                pass
+            except Exception as e:                                       # noqa: BLE001
+                _log("阶段1b（补网格）异常终止：%s" % e)
+            try:
+                self.main.cfg.save()
+            except Exception:
+                pass
+            _log("阶段1b（补网格）完成：%d 首只补网格，成功 %d 首，用时 %.1f 秒"
+                 % (len(todo_grid), okg, _tm.perf_counter() - tg0))
+
         # ---- 阶段 2：**串行**补在线曲风（尊重限流；网络差就提前收手）----
-        if done and not gl.online_blocked():
+        if todo and not gl.online_blocked():
             # ★ 必须先清缓存：阶段 1 联网是关的，那些"查不到"会被缓存成 None，
             #   不清掉的话阶段 2 每首都命中失败缓存、根本不会发请求（实测 200 首只花 0.2 秒）。
             try:
@@ -1550,7 +1728,14 @@ class MusicScanThread(QThread):
                 try:
                     r2 = resolve_music_genre(p)
                     if r2 and (r2.get("level") or r2.get("source") in ("discogs", "itunes")):
-                        self.main.cfg["music_meta"][p] = r2
+                        # ★ 合并而非整条替换（阻塞项 F-b）：`resolve_music_genre()` 的返回值
+                        #   **不含 `grid`、也不含 `song_id`**（见 music_meta.py：只返回 artist/
+                        #   title/genre/genres/source/query）。旧实现 `= r2` 整条替换会把扫描
+                        #   阶段算好的离线节拍网格连同 song_id 一起抹掉 —— 实测真实曲库 57/66 首
+                        #   命中在线（source ∈ discogs/itunes），导致网格几乎全丢（连全量重扫都保不住）。
+                        r0 = self.main.cfg["music_meta"].get(p) or {}
+                        r0.update(r2)
+                        self.main.cfg["music_meta"][p] = r0
                         fixed += 1
                         if fixed % 5 == 0:
                             try:
@@ -1842,26 +2027,11 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.mini_level)
 
         tb.addStretch(1)
-        # 主题亮暗切换：palette + 全局 QSS 即时生效，注册过的 widget 级样式同步刷新
-        self.btn_theme = QPushButton(T("☀ 亮色") if theme.current() == "dark" else T("🌙 暗色"))
-        self.btn_theme.setProperty("_i18nDynamic", True)   # 随主题/语言变化，动态重建
-        self.btn_theme.setMinimumHeight(32)
-        self.btn_theme.setToolTip("切换亮色/暗色主题")
-        self.btn_theme.clicked.connect(self.toggle_theme)
-        tb.addWidget(self.btn_theme)
-        tb.addWidget(QLabel(tr("language")))
-        self.lang_combo = QComboBox()
-        self.lang_combo.addItems(["中文", "English"])
-        self.lang_combo.setCurrentIndex(0 if i18n.lang() == "zh" else 1)
-        self.lang_combo.currentIndexChanged.connect(self.switch_lang)
-        tb.addWidget(self.lang_combo)
-        self.btn_hotkey = QPushButton(tr("hotkeys"))
-        self.btn_hotkey.clicked.connect(self.open_hotkeys)
-        tb.addWidget(self.btn_hotkey)
-        self.btn_about = QPushButton(tr("about"))
-        self.btn_about.setToolTip(T("版本信息、第三方组件、反馈渠道"))
-        self.btn_about.clicked.connect(self.open_about)
-        tb.addWidget(self.btn_about)
+        # ---- 右端：工具入口 ----
+        # ★ 2026-09-27 工具条收纳（用户选）：**主题 / 语言 / 快捷键 / 关于** 收进「⋯」菜单
+        #   —— 这几个属于"设置时用一次"，不是现场操作；**音乐曲库 / 曲风映射** 留在工具条上。
+        #   工具条原本 17 个控件混在一起（演出控制 + 设备 + 工具入口 + 杂项），现在按用途分组：
+        #     [开始|黑场|冻结|暂停自动|下一素材] │ [音源 电平] │ [GPU 解码] │ [音乐曲库|曲风映射|⋯]
         self.btn_music = QPushButton("🎵 音乐曲库")
         self.btn_music.setMinimumHeight(32)
         self.btn_music.setToolTip("导入音乐、扫描分析曲风（演出前准备）")
@@ -1872,6 +2042,44 @@ class MainWindow(QMainWindow):
         self.btn_gvmap.setToolTip("编辑曲风→画面标签的绑定关系")
         self.btn_gvmap.clicked.connect(self.open_genre_visual_editor)
         tb.addWidget(self.btn_gvmap)
+
+        # 主题按钮保留为**隐藏控件**：`_sync_theme_btn()` 仍要靠它同步文案，
+        # ⋯ 菜单里的「主题」动作转发到它 ⇒ 行为与原来逐字一致（不是重写一遍逻辑）。
+        self.btn_theme = QPushButton(T("☀ 亮色") if theme.current() == "dark" else T("🌙 暗色"), self)
+        self.btn_theme.setProperty("_i18nDynamic", True)   # 随主题/语言变化，动态重建
+        self.btn_theme.setToolTip("切换亮色/暗色主题")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        self.btn_theme.hide()
+
+        # ★ 用户反馈（2026-09-27）：① 光一个「⋯」不知道是什么 ⇒ 写成「⋯ 更多」；
+        #   ② **不能**跟「音乐曲库 / 曲风映射」并排 —— 那两个是**曲库工具**，
+        #   这里是**主题 / 语言 / 快捷键 / 关于**这类设置项，放一起会被误当成同一组。
+        #   所以中间加一条竖分隔线，让它单独成组、落在最右。
+        more_sep = QFrame()
+        more_sep.setFrameShape(QFrame.VLine)
+        tb.addWidget(more_sep)
+        self.btn_more = QPushButton("⋯ 更多")
+        self.btn_more.setMinimumHeight(32)
+        self.btn_more.setToolTip("更多：主题 / 语言 / 快捷键 / 关于")
+        self._more_menu = QMenu(self)
+        self.act_theme = self._more_menu.addAction("")
+        self.act_theme.triggered.connect(lambda: self.btn_theme.click())
+        self._lang_menu = self._more_menu.addMenu(tr("language"))
+        self.act_lang_zh = self._lang_menu.addAction("中文")
+        self.act_lang_zh.setCheckable(True)
+        self.act_lang_zh.triggered.connect(lambda: self.switch_lang(0))
+        self.act_lang_en = self._lang_menu.addAction("English")
+        self.act_lang_en.setCheckable(True)
+        self.act_lang_en.triggered.connect(lambda: self.switch_lang(1))
+        self._more_menu.addSeparator()
+        self.act_hotkey = self._more_menu.addAction(tr("hotkeys"))
+        self.act_hotkey.triggered.connect(self.open_hotkeys)
+        self.act_about = self._more_menu.addAction(tr("about"))
+        self.act_about.setToolTip(T("版本信息、第三方组件、反馈渠道"))
+        self.act_about.triggered.connect(self.open_about)
+        self.btn_more.setMenu(self._more_menu)
+        tb.addWidget(self.btn_more)
+        self._sync_more_menu()
         mv.addLayout(tb)
 
         # ---- 主区 ----
@@ -2564,6 +2772,9 @@ class MainWindow(QMainWindow):
             self.settings.transition.setCurrentIndex(0)
         self.settings.energy_map.setChecked(a.get("energy_map", True))
         self.settings.bpm_sync.setChecked(a.get("bpm_speed_sync", True))
+        # 节拍网格（八拍乐句对齐）：默认开。setChecked 会触发 stateChanged → engine_cfg 再写一遍
+        # 配置（值相同无副作用）。
+        self.settings.chk_beat_grid.setChecked(a.get("beat_grid", True))
         # 渲染帧率：60 / 30 / 20（脏值一律回落到 60）
         try:
             _rf = int((self.cfg["perf"] or {}).get("render_fps", 60) or 60)
@@ -2712,9 +2923,68 @@ class MainWindow(QMainWindow):
         files, _ = QFileDialog.getOpenFileNames(self, tr("import_files"), "", MEDIA_FILTER)
         self._import_paths(files)
 
+    def _inject_song_grids(self):
+        """构建并注入 song_id → 离线节拍网格（八拍乐句）映射给引擎。
+
+        只保留**VDJ 真值来源 + 字段完整 + conf 足够高**的网格 —— 演出稳定性优先：
+        宁可退回现有实时拍钟，也不用不可信的网格去驱动切换。
+        网格结构见 beatgrid：统一约定 **八拍头 = anchor + 8n × beat_len**。
+
+        ★ 来源门槛 `src == "vdj"`（不可省略，也不能用 conf 替代）：
+          本地自算的相位不可信 —— 实测 21 首有 VDJ 真值的样例里，纯本地相位仅 1/21 与
+          VDJ 对齐；而这 15 首找不到 VDJ 的歌，本地 grid 的 conf 全是 0.95（对比度大就顶到
+          上限）⇒ 单靠 conf≥0.6 会**全部放进网格模式**，相位很可能整体偏拍。conf 反映的是
+          「相位对比度」，不是「锚点对不对」，所以来源必须单独判：**只对 VDJ 来源启用**，
+          本地一律退回现有拍钟。
+        """
+        meta = self.cfg["music_meta"] or {}
+        out = {}
+        # song_id → 曲目路径：手动「八拍相位翻转」要按路径持久化到 cfg["music_meta"][path]
+        self._grid_path_by_sid = {}
+        for p, m in meta.items():
+            if not isinstance(m, dict):
+                continue
+            sid = m.get("song_id")
+            g = m.get("grid")
+            if not sid or not isinstance(g, dict):
+                continue
+            # 只认 VDJ 真值来源的网格（本地来源相位不可信，见上方说明）
+            if g.get("src") != "vdj":
+                continue
+            try:
+                bl = float(g.get("beat_len") or 0.0)
+                anchor = float(g.get("anchor"))
+                conf = float(g.get("conf") or 0.0)
+            except Exception:
+                continue
+            # 阈值理由：
+            #   - conf ≥ 0.6：VDJ 正常路径 conf≥0.80（可信）；本地自算需有八拍相位对比度证据
+            #     （0.55 为无对比度地基线）；VDJ 分析失败回退项 conf=0.5 予以剔除。
+            #     （相位是否可信已由上面的 src=="vdj" 保证，conf 只做二次保险。）
+            #   - beat_len ∈ (0.2, 1.5)：对应 BPM 40~300，排除异常值。
+            if conf < 0.6 or not (0.2 < bl < 1.5):
+                continue
+            out[sid] = {"bpm": g.get("bpm"), "beat_len": bl, "anchor": anchor,
+                        "conf": conf, "src": g.get("src"), "dur": g.get("dur"),
+                        # 手动八拍相位翻转（见 engine.flip_phrase_now）：存的是开关标记，
+                        # 注入时换算成 4 拍偏移。落盘键故意放在 grid **外面**（同级的
+                        # `grid_flip`），否则重扫重建 grid 时会被覆盖掉。
+                        "flip": 4.0 if m.get("grid_flip") else 0.0}
+            self._grid_path_by_sid[sid] = p
+        try:
+            self.engine.set_song_grids(out)
+        except Exception:
+            pass
+        return len(out)
+
     def _init_recognizer(self):
         """曲库就绪后启用现场识别：建指纹库 + song_id→meta 映射（无库则跳过）"""
         from config import app_base_dir
+        # 离线节拍网格：与指纹库无关，先注入（曲库即算好，演出中只查表）
+        try:
+            self._inject_song_grids()
+        except Exception:
+            pass
         db_path = os.path.join(app_base_dir(), "fingerprints.db")
         if not os.path.exists(db_path):
             return
@@ -3715,6 +3985,7 @@ class MainWindow(QMainWindow):
             return
         lay = self.engine.layers[idx]
         m = QMenu(self)
+        m.setToolTipsVisible(True)      # ★ 长条目拆短后，括号里的说明挪进悬停提示
         a_ren = m.addAction("重命名…")
         a_fix = m.addAction("固定播放本层当前素材")
         a_fix.setCheckable(True)
@@ -3725,11 +3996,13 @@ class MainWindow(QMainWindow):
         a_pau = m.addAction("静音时暂停播放")
         a_pau.setCheckable(True)
         a_pau.setChecked(bool(getattr(lay, "pause_silent", False)))
-        a_solo = m.addAction("Solo（只显示本层）")
+        a_solo = m.addAction("Solo")
+        a_solo.setToolTip(T("只显示本层"))
         a_solo.setCheckable(True)
         a_solo.setChecked(bool(getattr(lay, "solo", False)))
         m.addSeparator()
-        a_auto = m.addAction("自动匹配模式（按曲风挑素材）")
+        a_auto = m.addAction("自动匹配模式")
+        a_auto.setToolTip(T("按曲风给本层自动挑素材"))
         a_auto.setCheckable(True)
         a_auto.setChecked(bool(getattr(lay, "auto_mode", False)))
         role_menu = m.addMenu("图层角色")
@@ -3747,19 +4020,23 @@ class MainWindow(QMainWindow):
             a.setCheckable(True)
             a.setChecked(abs(float(getattr(lay, "speed", 1.0) or 1.0) - v) < 1e-6)
             sp_acts.append((a, v))
-        a_lock = m.addAction("锁定画面（不随脉冲/漂移）")
+        a_lock = m.addAction("锁定画面")
+        a_lock.setToolTip(T("画面不随能量脉冲/漂移"))
         a_lock.setCheckable(True)
         a_lock.setChecked(bool(getattr(lay, "lock_motion", False)))
-        a_alpha = m.addAction("保留素材自带透明通道（alpha）")
+        a_alpha = m.addAction("保留透明通道")
+        a_alpha.setToolTip(T("保留素材自带的 alpha 通道（透明区域）"))
         a_alpha.setCheckable(True)
         a_alpha.setChecked(bool(getattr(lay, "use_alpha", True)))
         m.addSeparator()
-        a_up = m.addAction("上移（更靠上）")
-        a_dn = m.addAction("下移（更靠下）")
+        a_up = m.addAction("上移")
+        a_up.setToolTip(T("更靠上（合成顺序）"))
+        a_dn = m.addAction("下移")
+        a_dn.setToolTip(T("更靠下（合成顺序）"))
         a_copy = m.addAction("复制素材池到新图层")
         a_rst = m.addAction("重置本层设置")
         m.addSeparator()
-        a_del = m.addAction("删除图层")
+        a_del = m.addAction(theme.danger_icon(), "删除图层")   # ★ 红点标记危险项
         a_del.setEnabled(len(self.engine.layers) > 1)
         # Kv 主视觉图层：不参与自动匹配/角色，也不允许复制（全局唯一）
         if getattr(lay, "is_kv", False):
@@ -3900,7 +4177,8 @@ class MainWindow(QMainWindow):
         a_fix.setEnabled(not is_auto)
         a_fix.setChecked(media is not None and lay.fixed >= 0
                         and 0 <= lay.fixed < len(lay.clips) and lay.clips[lay.fixed] is media)
-        a_rm = m.addAction("从本层移除")
+        m.addSeparator()
+        a_rm = m.addAction(theme.danger_icon(), "从本层移除")
         a_rm.setEnabled(media is not None and not is_auto)
         mv = m.addMenu("移到其他图层")
         mv_acts = []
@@ -4123,6 +4401,23 @@ class MainWindow(QMainWindow):
         """主题按钮文本（随主题与语言变化，动态文本，不能靠 i18n 静态记录）"""
         self.btn_theme.setText(T("☀ 亮色") if theme.current() == "dark" else T("🌙 暗色"))
         self.btn_theme.setToolTip(T("切换亮色/暗色主题"))
+        self._sync_more_menu()
+
+    def _sync_more_menu(self):
+        """「⋯」收纳菜单的文案与勾选态（菜单项不参与控件树 retranslate，必须显式同步）。
+
+        由 `_sync_theme_btn()` 带出来 ⇒ 切主题、切语言、retranslate_ui 三条路径都会走到。
+        """
+        try:
+            self.act_theme.setText(T("☀ 亮色") if theme.current() == "dark" else T("🌙 暗色"))
+            self._lang_menu.setTitle(tr("language"))
+            self.act_lang_zh.setChecked(i18n.lang() == "zh")
+            self.act_lang_en.setChecked(i18n.lang() != "zh")
+            self.act_hotkey.setText(tr("hotkeys"))
+            self.act_about.setText(tr("about"))
+            self.btn_more.setToolTip(T("更多：主题 / 语言 / 快捷键 / 关于"))
+        except Exception:
+            pass
 
     # ================= 预览/状态 =================
     def moveEvent(self, e):
@@ -4215,6 +4510,14 @@ class MainWindow(QMainWindow):
             # 倒计时从「间隔-1」开始数（刚切完显示 15 / 快切 7），数到 0 就是下一个切换点；
             # 实际间隔仍是完整 16 / 8 拍并踩小节线（计算在 engine.switch_countdown 里）。
             hud += Tf("  |  还有 {} 拍切换", f"{remain_n}")
+        # 网格模式：附带「距下一个八拍头还有几拍（几秒）」——VJ 现场据此判断八拍对齐
+        # 跟音乐合不合。仅在全局开关「节拍网格」打开且认出的歌有网格时才有值
+        # （phrase_countdown 内部走同一个 _grid_state 门控，关闭/无网格/未识别返回 None）。
+        # 复用本 HUD 的刷新节奏，不新增定时器、不新增每帧重活。
+        pc = self.engine.phrase_countdown(snap)
+        if pc is not None:
+            pb, ps = pc
+            hud += Tf("  |  距八拍头 {} 拍（{} 秒）", "%.1f" % pb, "%.1f" % ps)
         hud += "  |  " + self._bpm_text(snap) + f"  {T('能量')} {snap['energy']:.2f}"
         sid_now = snap.get("recognized_song_id", -1)
         song_meta = self._song_meta_by_id.get(sid_now)
@@ -4232,6 +4535,11 @@ class MainWindow(QMainWindow):
         if song_line:
             hud += "\n" + song_line
         self.preview_panel.update_hud(hud)
+        # 「节拍网格线」浮层（贴在 HUD 下方）：与切换对齐共用同一相位，
+        # 所以看到的那条乐句头线就是切换实际踩的线。无拍位时自动隐藏。
+        bgv = self.engine.beat_grid_view(snap)
+        self.preview_panel.update_grid(bgv[0] if bgv else None,
+                                      bgv[1] if bgv else None)
 
         # 每图层的"下一个素材"缩略图（多图层多个；无素材/隐藏的图层不显示）
         self.preview_panel.update_layer_thumbs(self.engine.layers)

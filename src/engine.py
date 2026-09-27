@@ -23,6 +23,8 @@ from PySide6.QtGui import QImage, QPainter, QColor
 
 from media_manager import make_player
 from match_engine import match_clips
+from beatgrid import GridClock
+from fp import hint_window_frames
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER, DYNAMIC_TAGS)
 
@@ -124,6 +126,28 @@ def snap_energy(snap, default=0.5):
     """
     v = snap.get("energy", None)
     return float(default) if v is None else float(v)
+
+
+def _publish_grid_hint(obj, orig_sec, w_frames=None):
+    """把「预测的识别窗起点原曲秒数」发布给识别线程（作为 fp.match 的 hint_delta）。
+
+    模块级函数（**不是**方法）：老的测试 dummy 只 bind 指定的几个方法，若写成
+    `self._set_grid_hint(...)` 会让它们 AttributeError。这里用 getattr 容错：
+    · obj 无 `audio`（离线 dummy）⇒ 静默 no-op，行为与改动前逐值一致；
+    · <0 表示无提示（清除）。
+    `w_frames`：hint 窗口半宽（hop 帧）。None ⇒ 不更新（识别侧用缺省 HINT_W）。引擎按
+    当前歌 grid 的 beat_len 用 `fp.hint_window_frames()` 换算后传入，使窗口**按拍数**
+    定义、跨 BPM 一致（固定帧窗在 90~200BPM 间对应的拍数差 2 倍以上）。
+    **不**去持 audio 的锁（只写一个 float 属性，CPython 下原子）：本函数在引擎
+    每帧路径（`_tick_lock` 内）运行，绝不能与音频线程的锁互相牵扯。"""
+    aud = getattr(obj, "audio", None)
+    if aud is not None:
+        try:
+            aud.grid_pred_orig = float(orig_sec)
+            if w_frames is not None:
+                aud.grid_pred_w = float(w_frames)
+        except Exception:                                                 # noqa: BLE001
+            pass
 
 
 class Layer:
@@ -263,8 +287,36 @@ class AutoVJEngine(QObject):
         self.switch_pos = 0.0
         self._next_due = None   # 已安排的下一次切换目标拍位（缓存：模式切换不重置，倒计时连续）
         self._due_off = 0.0     # 排 _next_due 时用的小节头相位（相位变了要重新贴线）
-        self._bar_off_user = None   # 用户按「下一素材」手动重定义的小节头相位（None=用音频识别的）
+        # 排 _next_due 时用的**栅格宽度**（4=小节线 / 8=八拍乐句）。用于识别「栅格变粗」
+        # （4→8，未锁定→锁定交接）——此时必须把重贴限制在「绝不提前」，见 _next_switch_due。
+        self._due_w = None
+        # 用户按「下一素材」手动重定义的相位：存**绝对拍位**（_bar_off 再按当前栅格宽度取模）。
+        # 存绝对值而不是相位，是为了在「4 拍小节」与「8 拍乐句（网格模式）」之间切换宽度时不丢对齐。
+        self._bar_off_user = None
         self._pos_ref = None    # 上次切换时的连续拍位（非逐拍模式）
+        # ---- 离线节拍网格（八拍乐句）驱动 ----
+        self._song_grid_lookup = {}   # song_id -> grid（ui_main 在曲库就绪后注入）
+        self._grid_clock = GridClock()   # 网格拍位时钟（连续/单调/防抖）
+        # 上一帧处于网格模式的 song_id（None=当前不在网格模式）。
+        # 用于检测「网格 → 音频拍钟」的切换边沿，做坐标续接（见 _beat_pos）。
+        self._grid_active_sid = None
+        # 网格坐标 − 音频拍钟坐标 的一次性平移量：两种坐标原点/速率都可能不同，在**任一切换
+        # 边沿**（网格→音频 或 音频→网格）都重算一次，使返回的绝对拍位在开关切换处
+        # **连续**（避免坐标原点不同导致的 ±数百拍跳变）。关闭 / 从未用过网格时恒为 0.0
+        # → 原有逻辑逐值不变（零回归）。
+        self._grid_coord_delta = 0.0
+        self._grid_last_pos = 0.0      # 最近一次网格模式返回的**网格原始坐标**拍位
+        self._grid_last_out = None     # 最近一次 _beat_pos 返回的最终拍位（切换时算 delta 用）
+        # 首次锁定用的「多窗一致性」暂存：(sid, off, ref_t)，见 _grid_observe。
+        self._grid_pending = None
+        # 手动「八拍相位翻转」量（0 或 4 拍）：离线算的 phrase（0/4 二选一）判错时，用
+        # `flip_phrase_now()` 翻转半个乐句。只影响**对齐相位 / 预告**，**不影响拍位本身**
+        # （见 _bar_off / phrase_countdown）。0 = 与离线结果一致（默认，零回归）。
+        self._grid_flip = 0.0
+        # 最近一次**已处理**的识别窗 (sid, ref_t)：识别结果每 0.5s 才更新一次，但引擎每帧都会
+        # 调 _beat_pos_grid。用它保证「每个识别窗只处理一次」（否则同一窗每帧都覆盖
+        # _grid_pending，两窗 offset 增量被压成 ~0，一致性永不成立 → 永不上锁）。
+        self._grid_seen = None
         # 能量跨档即时切换：能量从高(>0.6)跌到低(<0.4)或反向时，不等拍位立即换素材动态档
         self._last_energy_tier = "mid"   # high / mid / low
         self._tier_since = None          # 新档位首次出现时刻（防抖）
@@ -401,6 +453,205 @@ class AutoVJEngine(QObject):
     def set_song_genres(self, lookup):
         """注入 song_id → {"genres":[...], ...} 映射（指纹识别到歌时取精确曲风）。ui_main 在曲库就绪后调用。"""
         self._song_genre_lookup = lookup or {}
+
+    @_locked
+    def set_song_grids(self, mapping):
+        """注入 song_id → grid 映射（离线八拍网格）。ui_main 在曲库就绪后 / 扫描后调用。
+
+        grid 结构：{bpm, beat_len, anchor, phrase, contrast, src, conf, dur, …}，
+        统一约定 **八拍头 = anchor + 8n × beat_len**（beat_len=60/bpm）。
+        只有「字段完整 + conf 足够高」的 grid 才会被 ui_main 注入（见 _inject_song_grids）。
+        mapping=None / {} 时等价于关闭网格模式（退回现有拍钟逻辑）。"""
+        self._song_grid_lookup = mapping or {}
+        # 换库 / 重扫：旧的网格时钟坐标系作废
+        self._reset_grid_clock()
+
+    def _reset_grid_clock(self):
+        """作废局部网格时钟（换库/重扫/关闭网格时调用）。"""
+        try:
+            self._grid_clock.reset()
+        except Exception:
+            pass
+        self._grid_active_sid = None
+        self._grid_coord_delta = 0.0
+        self._grid_last_pos = 0.0
+        self._grid_last_out = None
+        self._grid_pending = None
+        self._grid_seen = None
+        self._grid_flip = 0.0          # 手动八拍相位翻转量（0/4 拍），换库/重扫时清掉
+        _publish_grid_hint(self, -1.0)
+
+    # 指纹对齐票数门槛：低于此值视为「歧义 / 弱匹配」，offset 不可信 → 不做相位校正。
+    # 依据（tools/_qa_votes_dist.py 实测：10 首真 FLAC、159 个 4.5s 查询窗；QA 第二轮 21 首
+    #   × 前 200s、hop=1s、4116 个 4.5s 窗复测）：
+    #   正确命中票数 min=6 p25=27 中位=48~56 p75=113~189 max=423；
+    #   命错歌票数 = 0~3；命中同歌但**位置错**（重复段落歧义）票数最高达 172。
+    #   ★ 第二轮实测：votes ≥ 180 的窗仅 10.2%（p50=56 / p75=113 / p90=181），
+    #     最长连续低于 180 达 196s ⇒ 门槛 180 太严，重同步机会过少（时钟长期自由跑）。
+    #   现降到 **120**（≈p75 档）：把重同步覆盖率从 ~10% 提到明显更高，同时用
+    #   「多窗一致性 + 连续同向跳转判据」挡住坏样本（见 _beat_pos_grid 与 GridClock），
+    #   误接受率仍为 0。弱窗只做速率更新（见 update_rate），不校正相位，无损。
+    #   设计取舍：**宁可自由跑，也不让坏坐标把整条时钟拽飞**（重复段落会硬重锚到错坐标）。
+    GRID_MIN_VOTES = 120
+    # 强匹配（"确认"）门槛：**硬重锚**（坐标跳变）的默认要求。实测坏样本（重复段落歧义）
+    # 票数最高 172 < 180 ⇒ 用 180 可以把所有已知坏样本挡在「单次巨跳」之外；而弱窗
+    # （120~179）仍可做**有界相位微调**并计入「连续同向」计数，重同步覆盖率不受影响。
+    GRID_STRONG_VOTES = 180
+    # 首次锁定的「多窗一致性」容差：连续两个可信窗 offset 增量 / 挂钟增量 的比值需落在此区间
+    # （= 输入速率 r 的合理范围）。区间比真实 r[0.8,1.25] 略宽，兼顾 keylock + 识别误差。
+    GRID_CONSIST_LO = 0.6
+    GRID_CONSIST_HI = 1.45
+    # ★ 首次锁定「多窗一致性」判据允许的**最大窗间隔 dt**（秒）：仅当
+    #   「上个暂存可信锚」与「本窗」的挂钟间隔 ≤ 它时，才允许用两窗 offset 增量判一致并锁定。
+    #   超时（> 它）视为锚太旧/识别中断/seek ⇒ 丢弃旧锚、以本窗**重新暂存**，绝不用很旧的锚锁。
+    #
+    #   取值依据（本轮实测，220 例 = 20 首 × 11 个起点，口径见 tools/_gridfix5_accept.py）：
+    #     6.0（旧，本常量引入前的字面量）：总误锁 171s、最长误锁 54.0s、>5s 5 例。
+    #       唯一长误锁来自 `Can We Believe That`(t=0)=54.0s：t=0 暂存锚、t=6.0 因一个残差窗
+    #       “一致”（dt=6.0 正好卡在旧上限）而锁定，锁到偏 −1.82s 的坐标（锚太旧）。
+    #     4.0（现取值）：总误锁 48s、最长 32.0s、>5s 3 例、CWB/Lost 均 0、覆盖仍 220/220。
+    #     3.0 与 4.0 指标完全相同 ⇒ 3~4 是一块**平台**（非尖峰），取更保守的 4.0（离 2.5 的反弹更远）。
+    #   ⚠ 为什么不能太小（别顺手调小！）：
+    #     · 2.5 / 2.0：总误锁反弹到 208s、>5s 升到 8 例 —— 上限过紧会把“正常 0.5s 识别窗、
+    #       偶发一次 1~2s 抖动延迟”的合法暂存锚也判超时丢弃 ⇒ 反复重暂存 ⇒ 反而锁不住正确坐标。
+    #     · 1.5 / 1.0：**彻底不锁定**（覆盖 0/220）—— 功能直接失效（多数正常窗间隔都会超时）。
+    #   ⇒ 上限必须留出「正常识别窗（0.5s）+ 少量抖动/一两次丢窗」的余量，4.0 是实测的稳妥点。
+    GRID_CONSIST_MAX_DT = 4.0
+
+    def _grid_observe(self, snap):
+        """每帧观测识别结果并推进「网格锁定判定」。可用时返回
+        (grid, beat_len, anchor, off_orig, r, sid)，不可用（关闭 / 未识别 / 无网格 /
+        offset 缺失）时返回 None。
+
+        ★ 语义：只要返回非 None，本方法**已经把本帧的新识别窗喂进 `_grid_clock`**
+          （已锁定 → update / 低票 update_rate；未锁定 → 「连续两个可信窗一致」锁定判据
+          + 暂存 `_grid_pending`）。调用方据 `clock.sid == sid` 判是否**已锁定**
+          （见 `_grid_state`）。
+        ★ **未锁定阶段不发布 hint**（H2 保留）：本方法只喂时钟、**不写** `grid_pred_orig`；
+          未锁定帧由 `_beat_pos` 的非网格分支统一发布 -1（matcher 走全局众数、开环），
+          这样首个锚点的对错在单窗内无法判断时不会被自己的临时 hint 锁死
+          （在离线重放里实测：给临时 hint 会把错误锚点"自证"，Demon 78s→5s）。
+        ★ 关闭 / 没网格 / 没认出歌时**立即返回 None**（不碰时钟）——这就是「关闭 / 没网格 /
+          没认出歌 → 零回归」的保证。"""
+        try:
+            if not self.cfg["auto"].get("beat_grid", True):
+                return None
+        except Exception:
+            return None
+        sid = snap.get("recognized_song_id", -1)
+        if sid is None or sid < 0:
+            return None
+        grid = self._song_grid_lookup.get(sid)
+        if not grid:
+            return None
+        bl = grid.get("beat_len") or 0.0
+        if bl <= 0:
+            return None
+        anchor = grid.get("anchor")
+        if anchor is None:
+            return None
+        off = snap.get("recognized_offset", -1.0)
+        if off is None or off < 0:
+            return None
+        r = snap.get("recognized_rate", 1.0)
+        try:
+            r = float(r)
+        except Exception:
+            r = 1.0
+        if not (0.5 <= r <= 2.0):
+            r = 1.0
+        bl = float(bl)
+        anchor = float(anchor)
+        off = float(off)
+        # 手动八拍相位翻转（0/4 拍）：每帧从注入表读，所以 `flip_phrase_now()` 说改就改，
+        # **不用重建网格、不丢锁定**。未设置时恒为 0（零回归）。
+        try:
+            self._grid_flip = float(grid.get("flip") or 0.0) % 8.0
+        except Exception:
+            self._grid_flip = 0.0
+        # ---------------- 喂时钟 / 锁定判定 ----------------
+        ref_t = snap.get("recognized_t", 0.0)
+        try:
+            ref_t = float(ref_t)
+        except Exception:
+            ref_t = 0.0
+        if ref_t <= 0.0:
+            # 时间戳缺失的防御：沿用时钟已记录的参考时刻；**不要**用 perf_counter（会给
+            # 每一帧造出"新参考"，让同一窗被反复处理）。时钟尚未记录时用 0（只处理一次）。
+            rt = self._grid_clock.ref_time()
+            ref_t = rt if rt > 0.0 else 0.0
+        # 票数是否可信：缺失字段当可信（保持既有行为）；有字段则按门槛判。
+        votes = snap.get("recognized_votes", None)
+        if votes is None:
+            trusted = True
+            strong = True
+        else:
+            try:
+                _iv = int(votes)
+                trusted = _iv >= self.GRID_MIN_VOTES
+                strong = _iv >= getattr(self, "GRID_STRONG_VOTES", 180)
+            except Exception:
+                trusted = True
+                strong = True
+        clock = self._grid_clock
+        # ★ 每个识别窗**只处理一次**：识别结果每 0.5s 才更新（recognized_t 在这段时间内不变），
+        #   而引擎每帧都会走到这里。用显式「最近已处理窗」(sid, ref_t) 去重，只在真正的新窗
+        #   （换歌或 ref_t 前进）处理一次；否则同一窗每帧覆盖 `_grid_pending`，两窗 offset
+        #   增量被压成 ~0 ⇒ 一致性永不成立 ⇒ 永不上锁。
+        seen = getattr(self, "_grid_seen", None)
+        is_new_win = (seen is None) or (seen[0] != sid) or (ref_t > seen[1] + 1e-6)
+        if is_new_win:
+            self._grid_seen = (sid, ref_t)
+        if clock.sid == sid:
+            if is_new_win:
+                if trusted:
+                    clock.update(sid, bl, anchor, off, r, ref_t, strong=strong)
+                else:
+                    # 低票数窗：只刷新速率、不做相位校正（阻塞项 A）
+                    clock.update_rate(bl, r)
+        elif is_new_win and trusted:
+            # 尚未锁定坐标系：只有「本窗可信 + 与上个可信窗一致」才锁定（阻塞项 B）。
+            # 多窗一致性：本窗与上个暂存可信窗的 offset 增量，需与挂钟增量一致
+            # （= 原曲时间轴推进速率 ≈ r ∈ [LO,HI]），否则视为歧义/坏值暂不锁定。
+            p = getattr(self, "_grid_pending", None)
+            have = (p is not None and p[0] == sid)
+            dt = (ref_t - p[2]) if have else 0.0
+            consistent = False
+            max_dt = getattr(self, "GRID_CONSIST_MAX_DT", 4.0)
+            if have and 0.05 < dt <= max_dt:
+                d_off = off - p[1]
+                if d_off > 0.0:
+                    rate = d_off / dt
+                    consistent = (getattr(self, "GRID_CONSIST_LO", 0.6)
+                                  <= rate
+                                  <= getattr(self, "GRID_CONSIST_HI", 1.45))
+            if have and consistent:
+                clock.update(sid, bl, anchor, off, r, ref_t, strong=strong)  # 正式锁定
+            elif (not have) or dt > max_dt:
+                # 首个可信窗 / 距上个可信窗很久（识别超时、seek）→ 重新定位暂存锚
+                self._grid_pending = (sid, off, ref_t)
+        return grid, bl, anchor, off, r, sid
+
+    def _grid_state(self, snap):
+        """网格模式所需信息；**只有已锁定**且（开关开 + 认出的歌有网格）时返回
+        (grid, beat_len, anchor, off, r, sid)，否则 None。
+
+        ★ **未锁定阶段彻底不进入网格模式**（本轮定案）：本方法在未锁定时返回 None ⇒
+          `_beat_pos`/`_bar_off`/`_next_switch_due`/`phrase_countdown` 全走**原有拍钟**
+          （逐值等价）。理由是「未锁定期的绝对位置根本不需要准」—— 那段时间只是在等锁定，
+          用原有拍钟拿到的**正确的 4 拍节奏**比网格给出的**错误绝对位置**对现场更有价值。
+          这与产品既定目标一致：「前几秒只保证 4 拍；攒够几小节锁定八拍相位，锁定后才预告」。
+          锁定那一刻起，`_beat_pos` 从原拍钟切到网格，并由 `_grid_coord_delta`（坐标续接，
+          **任一边沿**都重算）保证返回拍位**连续不跳**（复用已有机制，未新造轮子）。
+        ★ 本方法每帧都经 `_grid_observe` 喂一次识别结果（推进锁定判定）；**未锁定不发布
+          hint**（H2，见 `_grid_observe`）。
+        ★ 关闭 / 没网格 / 没认出歌时立即返回 None（`_grid_observe` 早退，不碰时钟）——零回归。"""
+        info = self._grid_observe(snap)
+        if info is None:
+            return None
+        if self._grid_clock.sid != info[5]:
+            return None          # 尚未锁定坐标系：不进入网格模式（走原有拍钟）
+        return info
 
     def _current_genres(self, snap):
         """当前生效曲风（英文原词）：指纹识别歌的精确曲风优先，兜底实时本地AI曲风"""
@@ -651,6 +902,14 @@ class AutoVJEngine(QObject):
     def _spout_send(self):
         """Spout 输出：CPU 共享内存路径把画布帧发给本机其他程序（OBS/Resolume 等）。
         懒加载 + 失败静默禁用（未装 SpoutGL 时输出功能不受影响）。"""
+        # ★ 2026-09-27 修（用户报：**没开始 VJ 时 NDI 也在输出**；Spout 同理，同一个坑）：
+        #   没点「开始」一律**不喂帧** —— 与「输出设置」既有门控语义一致
+        #   （显示输出窗口 / 重置窗口大小 / 输出显示器本来就要先开始）。
+        #   为什么必须这样：演出前 OBS / 投影 / NDI 接收端很可能**已经在线**，
+        #   未就绪的画面一推出去就直接上屏（彩排还没开始就把画面送出去了）。
+        #   发送端本身**不拆**（接收端仍能发现这个源），只是不喂帧。
+        if not self.running:
+            return
         oc = self.cfg["output"]
         if not oc.get("spout_enabled"):
             return
@@ -676,6 +935,10 @@ class AutoVJEngine(QObject):
 
     def _ndi_send(self):
         """NDI 输出：把画布帧喂给 NDI 发送器（音频由采集线程另行喂）。缺 Runtime 静默禁用。"""
+        # ★ 2026-09-27 修（用户报 bug：没开始 VJ 时 NDI 也在输出）：
+        #   没点「开始」一律**不喂帧**（理由同 `_spout_send`：接收端可能已经在线，未就绪画面会直接上屏）。
+        if not self.running:
+            return
         oc = self.cfg["output"]
         if not oc.get("ndi_enabled"):
             return
@@ -776,22 +1039,157 @@ class AutoVJEngine(QObject):
     def _beat_pos(self, snap):
         """连续拍位（小数）：beat_count + 拍内相位。
         鼓点/BPM 检测不可用（bpm=0 或长时间无鼓点）时，按真实时间以 120BPM 推算拍位，
-        保证自动切换不会因为"拍钟不走"而永远不切换。"""
-        if snap.get("bpm", 0) > 0 and snap.get("beat_active"):
-            pos = snap["beat_count"] + snap.get("beat_phase", 0.0)
-            self._pos_ref = (time.perf_counter(), pos)
-            return pos
+        保证自动切换不会因为"拍钟不走"而永远不切换。
+
+        ★ 网格模式（全局开关开 + 认出的歌有网格 + 识别已确认）优先：拍位改由离线八拍网格
+          推算（连续/单调/防抖，见 `_beat_pos_grid`）。**否则完全走下面的原有逻辑（零回归）**。
+
+        ★ 播出中途开关「节拍网格」：网格坐标与音频拍钟坐标**原点/速率都可能不同**，直接切会让
+          返回拍位整体跳变。这里在**任一切换边沿**（网格→音频 或 音频→网格）都重算一次
+          `_grid_coord_delta`（= 上一帧返回拍位 − 本帧原生坐标），叠加后返回拍位在切换处
+          **连续、不跳拍**（旧实现只在【网格→音频】记 delta，【音频→网格】重入会跳 ~2 拍
+          且随切换次数线性累积）。从未开过网格时 delta 恒为 0 → 原有逻辑逐值不变（零回归）。"""
+        gs = self._grid_state(snap)
+        in_grid = gs is not None
+        was_grid = getattr(self, "_grid_active_sid", None) is not None
+        if in_grid:
+            raw = self._beat_pos_grid(snap, gs)
+            self._grid_active_sid = gs[5]     # 记录本帧处于网格模式（song_id）
+        else:
+            # ---- 非网格模式：原有拍钟逻辑（零回归）。先在**原生坐标**算 raw ----
+            if snap.get("bpm", 0) > 0 and snap.get("beat_active"):
+                raw = snap["beat_count"] + snap.get("beat_phase", 0.0)
+                self._pos_ref = (time.perf_counter(), raw)
+            else:
+                now = time.perf_counter()
+                ref = getattr(self, "_pos_ref", None)
+                if ref is None or now - ref[0] > 8.0:
+                    # 长时间无鼓点：*必须*以「当前推算拍位」为新基准继续走（保持连续），
+                    # 而不是沿用旧基准 ref[1]：否则每 8 秒拍位会突然跳回旧值，触发
+                    # _auto_switch_tick 的 pos<switch_pos 重置 → 切换间隔翻倍甚至切不动
+                    # （BPM 未锁定、走这条 120BPM 回退时钟时最明显：快切 8 拍实际变成 16 拍）。
+                    cur = (ref[1] + (now - ref[0]) * (120.0 / 60.0)) if ref else 0.0
+                    self._pos_ref = (now, cur)
+                    ref = self._pos_ref
+                raw = ref[1] + (now - ref[0]) * (120.0 / 60.0)   # 回退时钟：120 BPM
+            self._grid_active_sid = None
+            # 退出网格模式 ⇒ 清除匹配 hint（识别退回全局众数，与旧行为一致）
+            _publish_grid_hint(self, -1.0)
+        # 坐标续接：仅在**切换边沿**（网格↔音频）重算平移量，使返回拍位连续（不跳拍）。
+        if in_grid != was_grid:
+            prev_out = getattr(self, "_grid_last_out", None)
+            if prev_out is not None:
+                self._grid_coord_delta = prev_out - raw
+        delta = getattr(self, "_grid_coord_delta", 0.0)
+        out = raw + delta if delta else raw
+        self._grid_last_out = out
+        return out
+
+    def _beat_pos_grid(self, snap, gs):
+        """网格模式的连续拍位（**仅在已锁定时由 `_beat_pos` 调用**；见 `_grid_state`）。
+
+        网格坐标 = (原曲位置 - anchor) / beat_len ⇒ 八拍头落在 8 的整数倍。
+        GridClock 内部保证**单调不减**（一次识别抖动绝不跳拍）。
+
+        ★ 喂时钟的工作已移到 `_grid_observe`（每帧一次、每识别窗去重；已锁定做
+          update / 低票 update_rate；未锁定做多窗一致性锁定判定）。本方法**只取当前拍位
+          并发布连续性 hint**，不再含"未锁定自由跑锚"分支：
+          · 未锁定的拍位不再经此（走原有拍钟，见 `_grid_state`）——那段时间的绝对位置
+            不需要准，用原有 4 拍拍钟即可（产品目标："前几秒只保证 4 拍"）。
+          · 于是 `_pos_ref`/`_grid_last_pos` 只在锁定后更新，退出网格时坐标续接
+            （`_beat_pos` 里的 `_grid_coord_delta`）仍连续。
+
+        ★ 票数门槛与首次锁定判定的说明见 `_grid_observe`（GRID_MIN_VOTES / GRID_CONSIST_*）。
+
+        ★ hint 发布：网格坐标 pos 在挂钟 now 时刻对应原曲位置 = anchor + pos·beat_len
+          （= 识别窗**末端**，与 audio_engine 的 recognized_offset = off + 4.5·r 同轴）；
+          窗口**起点**再回退 4.5·r 秒（r=输入速率，4.5s=识别窗长，见 audio_engine）。
+          已锁定（clock.sid==sid）时才发布，保证 hint 属于当前歌的坐标系。
+          R3：时钟刚发生 >jump_max（>32 拍）的硬重锚时，`hint_hold()`>0 —— 有界暂停发布
+          （开环复核），避免"连续 2 个强错窗重锚到错坐标后 hint 又把它锁住"。"""
+        _grid, bl, anchor, off, r, sid = gs
         now = time.perf_counter()
-        ref = getattr(self, "_pos_ref", None)
-        if ref is None or now - ref[0] > 8.0:
-            # 长时间无鼓点：以「当前推算拍位」为新基准继续走（保持连续）。
-            # 旧实现这里写成 (now, ref[1])——取的是旧基准，导致每 8 秒拍位突然跳回旧值，
-            # 触发 _auto_switch_tick 的 pos<switch_pos 重置 → 切换间隔翻倍甚至切不动
-            # （BPM 未锁定、走这条 120BPM 回退时钟时最明显：快切 8 拍实际变成 16 拍）。
-            cur = (ref[1] + (now - ref[0]) * (120.0 / 60.0)) if ref else 0.0
-            self._pos_ref = (now, cur)
-            ref = self._pos_ref
-        return ref[1] + (now - ref[0]) * (120.0 / 60.0)   # 回退时钟：120 BPM
+        clock = self._grid_clock
+        pos = clock.pos(now)
+        # 记录连续拍位：网格模式关掉后回退时钟可从这里接续，避免突然跳变
+        self._pos_ref = (now, pos)
+        self._grid_last_pos = pos
+        if clock.hint_hold() > 0:
+            _publish_grid_hint(self, -1.0)
+        else:
+            _publish_grid_hint(self, anchor + pos * bl - 4.5 * r,
+                               hint_window_frames(bl))
+        return pos
+
+    def phrase_countdown(self, snap):
+        """网格模式下「距下一个八拍头还有几拍 / 几秒」；非网格模式返回 None。
+
+        秒的换算必须用 r：原曲 1 拍 = beat_len 秒，播放快 r 倍 ⇒ 1 拍 = beat_len/r 秒。"""
+        gs = self._grid_state(snap)
+        if gs is None:
+            return None
+        _grid, bl, _anchor, _off, r, _sid = gs
+        self._beat_pos(snap)      # 先推进网格时钟（保证本帧已吸收最新识别参考）
+        beats = max(0.0, self._grid_clock.beats_to_phrase(time.perf_counter()))
+        # 手动相位翻转：时钟坐标里的八拍头在 `≡0 (mod 8)`，翻转后真正的乐句头在 `≡4 (mod 8)`，
+        # 所以"还有几拍到八拍头"要跟着挪半句。flip=0 时与旧行为逐值一致（零回归）。
+        flip = float(getattr(self, "_grid_flip", 0.0)) % 8.0
+        if flip:
+            pos = (8.0 - beats) % 8.0                 # 当前在组内的位置 [0, 8)
+            nxt = (flip - pos) % 8.0
+            beats = nxt if nxt > 1e-6 else 8.0
+        sec = beats * bl / max(1e-6, r)
+        return beats, sec
+
+    def flip_phrase_now(self, snap):
+        """把**当前识别到的这首歌**的八拍相位翻转半个乐句（+4 拍），**就地生效**。
+
+        用途：离线算出来的 `phrase`（0/4 二选一）判错时，用户一听就知道"差半个乐句/差 4 拍"，
+        这里一键翻过来。做法只改注入表里那首歌的 `flip`（`_grid_observe` 每帧读它）
+        ⇒ **拍位不变、锁定不丢**，只有"哪条线算乐句头"整体挪 4 拍（`_bar_off` 跟着走，
+        所以切换对齐、HUD 倒计时、预览网格线**同时**生效）。
+
+        返回 `(True, 新相位)`；不适用时返回 `(False, 原因)`（`no_song` / `no_grid`）。
+        持久化由调用方写进 `cfg["music_meta"][path]["grid_flip"]`（引擎不碰配置）。
+        """
+        sid = snap.get("recognized_song_id", -1)
+        if sid is None or sid < 0:
+            return False, "no_song"
+        g = self._song_grid_lookup.get(sid)
+        if not isinstance(g, dict):
+            return False, "no_grid"
+        cur = float(g.get("flip") or 0.0) % 8.0
+        new = 0.0 if cur >= 2.0 else 4.0
+        g["flip"] = new
+        self._grid_flip = new
+        return True, new
+
+    def beat_grid_view(self, snap):
+        """预览「节拍网格线」浮层用的极简数据：返回 (组内位置, 组宽) 或 None。
+
+        - **组宽 w**：网格模式 8（八拍乐句），否则 4（4/4 小节）—— 与 `_align_width` 同一来源。
+        - **组内位置**：当前拍在 `[0, w)` 中的位置，**0 = 正好踩在乐句头/小节头上**。
+          界面以它为左端往右画 2 组，于是"哪条线是乐句头、现在离它多远"一眼可见。
+        - ★ 相位与切换对齐**共用** `_align_width/_bar_off`（含手动「下一素材」重定义、含网格坐标
+          续接 delta）⇒ HUD 上画出来的那条线**就是切换实际踩的那条线**，不会画出一条好看但
+          与实际不符的网格（早先 `_bar_off` 漏掉 `_grid_coord_delta` 时，显示与实际就差了半个乐句）。
+        取不到拍位（未开始 / 无拍钟）时返回 None。
+        """
+        try:
+            p = self._beat_pos(snap)
+        except Exception:
+            return None
+        if p is None:
+            return None
+        w = int(self._align_width(snap) or 0)
+        if w <= 0:
+            return None
+        try:
+            off = float(self._bar_off(snap))
+        except Exception:
+            off = 0.0
+        idx = int(round(int(math.floor(float(p))) - off)) % w
+        return idx, w
 
     def _beat_recent(self, snap):
         """最近是否检测到鼓点活动"""
@@ -840,20 +1238,40 @@ class AutoVJEngine(QObject):
             return None
         return max(0, int(math.ceil(float(remain)) - 1))
 
-    def _bar_off(self, snap):
-        """当前生效的「小节头相位」（0~3）：手动重定义优先，否则用音频识别出来的。
+    def _align_width(self, snap):
+        """切换点对齐的栅格宽度（拍）：网格模式=8（八拍乐句头），否则=4（4/4 小节线，现状）。"""
+        return 8.0 if self._grid_state(snap) is not None else 4.0
 
-        「下一素材」按下时会把相位就地重定义成他按的那一拍（见 next_scene）——
-        用户 2026-09-24 选的方案：**按下即第 1 拍**，之后所有切换都跟着他的拍走，
-        这样既不会和自动贴小节线打架，间隔也是精确的 16 / 8 拍。
-        换歌（长静音）后自动失效，回到音频识别的相位。"""
+    def _bar_off(self, snap):
+        """当前生效的「对齐相位」（模 `_align_width`）：手动重定义优先，否则用音频/网格给的。
+
+        「下一素材」按下时会把相位就地重定义（见 next_scene）——用户 2026-09-24 选的方案：
+        **按下即第 1 拍**，之后所有切换都跟着他的拍走，间隔也是精确的 16 / 8 拍。
+        换歌（长静音）后自动失效，回到音频识别的相位。
+
+        ★ `_bar_off_user` 存的是**绝对拍位**，这里按当前栅格宽度取模：
+          非网格模式 w=4 → `beat % 4`，与旧实现（存 `beat % 4` 再原样返回）**逐值一致**；
+          网格模式 w=8 → `beat % 8`（对齐到八拍头）。"""
+        w = self._align_width(snap)
         u = self._bar_off_user
         if u is not None:
-            return float(u)
+            return float(u) % w
+        if w == 8.0:
+            # 网格模式：对齐到网格锚点（八拍头 = anchor + 8n·beat_len ⇒ **网格坐标** 8n）。
+            # ⚠ `_beat_pos` 返回的是「网格坐标 + `_grid_coord_delta`」（delta = 坐标续接平移量，
+            #   见 `_beat_pos`）。网格坐标 8n 在本坐标系（out）里落在 `out ≡ delta (mod 8)`，
+            #   所以对齐相位必须返回 `delta % 8`，**不能**返回 0：返回 0 会把切换对齐到
+            #   `out ≡ 0`，离真实八拍头相差 `delta % 8` 拍 —— 实测 anchor≠0 时偏差可达 ±4 拍
+            #   （tools/_gridfix5_handoff.py：anchor=2.0s(=5 拍) 现状偏 3.04 拍 → 修正后 0.62 拍；
+            #   anchor=1.6s(=4 拍) 现状偏 -3.96 拍 → 修正后 0.62 拍）。
+            #   网格模式恒为锁定态（w==8 ⇔ `_grid_state` 非 None），delta 此时有效。
+            return (float(getattr(self, "_grid_coord_delta", 0.0))
+                    + float(getattr(self, "_grid_flip", 0.0))) % w
         return float(snap.get("downbeat_off", 0) or 0)
 
     def _bar_floor(self, pos, snap):
-        """拍位所在小节的起始拍位（按小节头相位对齐，floor 到当前小节）"""
+        """拍位所在小节的起始拍位（按小节头相位对齐，floor 到当前小节）
+        注：始终按 4 拍一小节 floor —— 网格坐标里的"拍"就是真实拍，bar=4 拍在任何模式下都对。"""
         off = self._bar_off(snap)
         return off + math.floor((pos - off) / 4.0) * 4.0
 
@@ -865,14 +1283,25 @@ class AutoVJEngine(QObject):
     ALIGN_MIN_OFFSET = 1.0
 
     def _next_switch_due(self, snap):
-        """下一次切换的目标拍位：**就近对齐到 4/4 小节线**（每 4 拍，按小节头相位起算）。
-        目标 = 当前基准 + 固定间隔（常规 16 / 快切 8 拍，都是 4 的倍数），再四舍五入到
-        最近的小节线——对不齐时最多加/减 1~2 拍把它凑到整小节上，这样素材切换始终踩在
-        音乐的整小节（1-2-3-4 | 2-2-3-4 …）上，而不会切在拍子中间。
+        """下一次切换的目标拍位：**就近对齐到栅格线**（网格模式=八拍头，否则=4 拍小节线）。
+        目标 = 当前基准 + 固定间隔（常规 16 / 快切 8 拍，都是 8 的倍数，网格下自然落在八拍头），
+        再四舍五入到最近的栅格线——对不齐时最多加/减几拍把它凑到栅格上，这样素材切换始终踩在
+        音乐的整乐句（网格模式）或整小节（否则）上，而不会切在拍子中间。
         （旧版用 ceil 向上取整：目标差 1 拍到小节线时会多等 3 拍才切，听感上就是"没对齐"。）
 
-        小节线相位由音频侧的 downbeat（小节头）识别给出（`_bar_off()`，手动重定义优先）。
-        相位识别出来/变化时，把已排好的切换点重新贴到新的小节线上（偏移 ≤2 拍，听不出跳动）。
+        对齐相位由音频侧 downbeat（小节头）或离线网格给出（`_bar_off()`，手动重定义优先）。
+        相位识别出来/变化时，把已排好的切换点重新贴到新的栅格上（偏移 ≤半个栅格，听不出跳动）。
+
+        ★ 「栅格变粗」（4→8）的特例（未锁定→锁定交接，本轮修）：
+          从原拍钟（w=4）切到网格（w=8）那一帧，若照旧「就近贴线」，可能把已排好的目标
+          重贴到当前 pos **之前**（实测 −2.4~−3.4 拍），于是锁定帧立刻触发一次
+          「该切没到、纯 4 拍不会切」的提前/额外切换（240 组合扫描旧实现 9 例、其中 6 例
+          lock→首切 = 0.000s）。修法：变粗时**只许往后贴**——
+            · 先取离原目标最近的八拍头；若它会**明显提前**（≥ ALIGN_MIN_OFFSET 拍）则改取
+              「≥ 原目标」的最近八拍头（绝不允许提前；0.04 拍级的边界残差不触发跳句）；
+            · 若结果仍落在当前 pos 上/之前，再取 pos 之后的最近八拍头。
+          这样锁定帧的切换**一定晚于**当时拍位，且相对原排程最多推迟一个八拍乐句（≤8 拍）。
+          w 不变（含关闭/无网格/未锁定）时**不走此分支**，与旧实现逐值一致（零回归）。
 
         缓存 _next_due：模式切换不重置、能量波动不重算，倒计时稳定连续；
         只在切换发生/拍钟重置/静音/进入无间隔模式时清空重算。"""
@@ -880,22 +1309,45 @@ class AutoVJEngine(QObject):
         if iv is None:
             self._next_due = None
             return None
+        w = self._align_width(snap)
         off = self._bar_off(snap)
         if self._next_due is None:
             target = self.switch_pos + iv
-            near = off + math.floor((target - off) / 4.0 + 0.5) * 4.0
+            near = off + math.floor((target - off) / w + 0.5) * w
             # 只有明显偏移才拉正（见 ALIGN_MIN_OFFSET）：小偏差原样保留，不打断节奏
             self._next_due = near if abs(near - target) >= self.ALIGN_MIN_OFFSET else target
             self._due_off = off
+        elif (getattr(self, "_due_w", None) is not None) and w > self._due_w:
+            # ★ 栅格变粗（4→8，锁定交接）：只许往后贴，绝不允许提前。
+            pos = getattr(self, "_grid_last_out", None)
+            if pos is None:
+                pos = self.switch_pos
+            t0 = self._next_due
+            near = off + round((t0 - off) / w) * w
+            if abs(near - t0) < self.ALIGN_MIN_OFFSET:
+                # 就近贴线的位移微不足道（含 0.0x 拍级的边界残差）⇒ 保持原目标，
+                # 与旧实现一致；避免残差把目标跳整整一个乐句。
+                near = t0
+            elif near < t0:
+                # 就近贴线会明显**提前** ⇒ 改取「≥ 原目标」的最近八拍头（最多推迟一个乐句）
+                near = off + math.ceil((t0 - off) / w) * w
+            if near <= pos + 1e-9:
+                # 仍落在当前拍位上/之前（会立刻切）⇒ 取 pos 之后的最近八拍头
+                near = off + math.ceil((pos - off) / w) * w
+                while near <= pos + 1e-9:
+                    near += w
+            self._next_due = near
+            self._due_off = off
         elif off != getattr(self, "_due_off", off):
-            # 小节头相位变了：只有挪动幅度够明显才把已排好的切换点重新贴线，
+            # 对齐相位变了：只有挪动幅度够明显才把已排好的切换点重新贴线，
             # 否则保持原目标（细碎的相位更新不再动切换点）
-            near = off + round((self._next_due - off) / 4.0) * 4.0
+            near = off + round((self._next_due - off) / w) * w
             if abs(near - self._next_due) >= self.ALIGN_MIN_OFFSET:
                 self._next_due = near
             self._due_off = off
         if self._next_due <= self.switch_pos:
-            self._next_due += 4.0   # 对齐后必须前进，避免原地打转
+            self._next_due += w   # 对齐后必须前进，避免原地打转
+        self._due_w = w
         return self._next_due
 
     def _auto_switch_tick(self, snap):
@@ -1152,7 +1604,9 @@ class AutoVJEngine(QObject):
         pos = self._beat_pos(snap)
         beat = math.floor(pos)               # 对齐到整拍，避免基准落在拍中间
         self.switch_pos = beat
-        self._bar_off_user = beat % 4        # ★ 按下即小节头（0~3 相位，网格 = 相位 + 4k）
+        # ★ 按下即栅格头：存**绝对拍位**（_bar_off 再按当前宽度取模）
+        #   —— 非网格（w=4）等价于旧的 `beat % 4`；网格模式（w=8）即"按下即八拍头"。
+        self._bar_off_user = float(beat)
         self._next_due = None                # 强制重排下一次切换
         self._due_off = self._bar_off(snap)
         for lay in self.layers:

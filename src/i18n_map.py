@@ -273,6 +273,24 @@ ZH2EN = {
         "Follow mode: Normal = Fade, Beat = Cut",
     "能量映射": "Energy Mapping",
     "BPM Sync 视频速度": "BPM Sync Video Speed",
+    "节拍网格（八拍乐句对齐）": "Beat Grid (8-beat phrase align)",
+    "认出曲库里的歌时，用离线算好的八拍网格驱动拍位：素材切换踩在八拍乐句头，变速播放也能对齐。关掉则完全回到原来的实时拍钟。":
+        "When a library track is recognized, drive the beat position from the offline 8-beat "
+        "grid: clip switches land on 8-beat phrase heads, and it stays aligned even when the "
+        "track is pitched. Off = fall back entirely to the original real-time beat clock.",
+    "八拍相位翻转": "Flip 8-beat phase",
+    "离线网格把「两个小节里哪一个是乐句头」判反时（听感上差 4 拍）点这里。"
+    "只作用于当前正在放、且已被识别出来的那首歌，就地生效（不用重扫、不打断已对齐的拍位），"
+    "并记进配置，下次放同一首仍然生效。点一下翻转，再点一下翻回来。"
+    "怎么听：看预览里的节拍网格线，「◆」应该正好落在音乐换句的地方。":
+        "Use this when the offline grid picked the wrong bar as the phrase head (you hear it as "
+        "being 4 beats off). It applies to the track that is playing and currently recognized, "
+        "takes effect immediately (no re-scan, does not disturb the aligned beat position) and is "
+        "saved to the config so it sticks next time the same track plays. Click again to flip back. "
+        "How to check: in the preview beat-grid strip, the \"◆\" should land exactly where the "
+        "music changes phrase.",
+    "没有正在识别的歌": "No track is being recognized",
+    "相位 {}": "Phase {}",
     "交替间隔": "Alternation Interval",
     "1/4 拍": "1/4 beat",
     "1/2 拍": "1/2 beat",
@@ -504,6 +522,37 @@ ZH2EN = {
     "后处理": "Post-FX",
     "逐拍交替参数": "Beat Alternation",
     "实验性": "Experimental",
+    # 2026-09-27 设置面板重组后的新分区标题（7 区 → 4 区，按用途归组）
+    "演出行为": "Show Behavior",
+    "画面效果": "Visual Effects",
+    "性能": "Performance",
+    # 「画面效果」里的子标签页（用户反馈：四组堆一起更乱 ⇒ 拆成子标签）
+    "基础": "Basics",
+    # 工具条「⋯」收纳菜单
+    "⋯ 更多": "⋯ More",
+    "更多：主题 / 语言 / 快捷键 / 关于": "More: theme / language / hotkeys / about",
+    # ==================== 右键菜单（2026-09-27 P4：长条目拆短，说明挪进悬停提示）====================
+    # ⚠ 短标题也必须进词表：菜单是用 i18n.retranslate(menu) 遍历替换的，缺了就露中文。
+    "Solo": "Solo",
+    "自动匹配模式": "Auto Match",
+    "锁定画面": "Lock Picture",
+    "保留透明通道": "Keep Alpha",
+    "上移": "Move Up",
+    "下移": "Move Down",
+    "播放到图层": "Play to Layer",
+    "排除自动打标/匹配": "Exclude from auto-tag/match",
+    "全量重扫打标": "Full re-scan & tag",
+    "只显示本层": "Show this layer only",
+    "按曲风给本层自动挑素材": "Auto-pick clips for this layer by genre",
+    "画面不随能量脉冲/漂移": "Picture ignores the energy pulse / drift",
+    "保留素材自带的 alpha 通道（透明区域）":
+        "Keep the clip's own alpha channel (transparent areas)",
+    "更靠上（合成顺序）": "Further up (composite order)",
+    "更靠下（合成顺序）": "Further down (composite order)",
+    "立即切换，不等下一拍": "Switch immediately, do not wait for the next beat",
+    "logo 等固定素材：不参与自动打标与匹配":
+        "Fixed clips such as logos: not auto-tagged or auto-matched",
+    "含已打标的一起重扫": "Re-scan everything, including already-tagged clips",
 
     # ==================== Kv 主视觉图层设置 ====================
     "静音判定阈值": "Silence Threshold",
@@ -693,6 +742,7 @@ ZH2EN = {
     "自动换色中（{}，剩余 {} 秒后轮换）": "Auto color cycling ({} · next in {} s)",
     "当前能量：{}　{}": "Energy: {}  {}",
     "  |  还有 {} 拍切换": "  |  {} beats to next switch",
+    "  |  距八拍头 {} 拍（{} 秒）": "  |  {} beats ({} s) to next 8-beat phrase",
     "正在扫描… {}": "Scanning… {}",
     "当前：": "Current: ",
     "窗口模式（可拖动）": "Window mode (draggable)",

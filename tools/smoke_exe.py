@@ -32,6 +32,61 @@ def _default_log():
                         "AutoVJ", "startup_error.log")
 
 
+def _dist_pids():
+    """列出 **exe 路径就在 `dist/` 下** 的 EasyRealityAutoVJ 进程 PID。
+
+    ⚠ 只认 dist 里那份 —— 用户自己那份装在别的目录（例如 `Y:\\EasyRealityAutoVJ\\`），
+      **绝不能误杀**，所以必须按「可执行文件路径」判断，不能只按进程名。
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wt.HANDLE
+    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq EasyRealityAutoVJ.exe",
+                          "/FO", "CSV", "/NH"],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace").stdout
+    want = os.path.dirname(EXE).lower()
+    pids = []
+    for line in out.splitlines():
+        parts = [x.strip('"') for x in line.split('","')]
+        if len(parts) < 2 or not parts[0].lower().startswith("easyreality"):
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        h = k32.OpenProcess(0x1000, False, pid)
+        if not h:
+            continue
+        buf = ctypes.create_unicode_buffer(2048)
+        size = ctypes.c_ulong(2048)
+        try:
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                if os.path.dirname(buf.value).lower() == want:
+                    pids.append(pid)
+        finally:
+            k32.CloseHandle(h)
+    return pids
+
+
+def _reap_dist_instances(quiet=False):
+    """兜底清理：杀掉 dist 里残留的实例。返回清掉的 PID 列表。
+
+    ★ 2026-09-27 补：光靠 `Popen.terminate()` **实测偶尔会残留**一个实例占住 `dist/`，
+      后果是**下次打包 `os.rename(dist/…)` 报 `WinError 32 另一个程序正在使用此文件`**，
+      排查一次要几分钟。这里按路径再兜一遍，把这个问题挡在冒烟阶段。
+    """
+    pids = _dist_pids()
+    for pid in pids:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, encoding="utf-8", errors="replace")
+    if pids and not quiet:
+        print("★ 冒烟收尾：清掉 dist 里残留的实例 %s（否则下次打包会 WinError 32）"
+              % ", ".join(str(x) for x in pids))
+    return pids
+
+
 def main():
     args = sys.argv[1:]
     isolated = "--isolated" in args
@@ -109,6 +164,8 @@ def main():
         subprocess.run(["taskkill", "/F", "/IM", "EasyRealityAutoVJ.exe"],
                        capture_output=True, encoding="utf-8", errors="replace")
     time.sleep(1)
+    # ★ 兜底：按「可执行文件路径」清掉 dist 里的残留（只动 dist 那份，不碰用户的实例）
+    _reap_dist_instances()
 
     ok = alive and not err
     print("")

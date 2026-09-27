@@ -24,6 +24,52 @@ MIN_CONFIDENCE = 0.05
 PEAK_NEIGHBORHOOD = 20   # 41×41 邻域严格局部极大值（VJVision peaks.cpp 同款）
 FP_SCHEMA_VERSION = 2    # 峰值检测算法版本（v1=规则分块；v2=邻域极大值，抗变速）
 
+# 「连续性提示」窗口（单位 = hop 帧，与 match 内部的 delta 同一坐标轴）。
+# 背景：强重复段落里，同一段音频在歌里出现多次，查询窗与"另一处出现"哈希对得上，
+#   票数甚至高于正确位置 ⇒ 纯靠票数取全局众数会挑到错位置（实测偏差 148~738 拍，
+#   ≈1490~7450 帧）。引擎若把「当前预测位置」作为 hint 传进来，就能在这堆候选里
+#   优先选**靠近预测位置**的那一个，从根上避开重复段落歧义。
+# 取值依据（tools/_fix3_d_hint.py 实测，20 首真实逐窗序列、逐窗投票直方图）：
+#   · 正确候选距"真值"的偏差：max 10.3 帧（p99 0.6）—— 指纹量化误差；
+#   · 生产侧 hint 误差：时钟跟踪 ≲1 拍(≈10.7 帧) + 一窗时滞(≈0.5s≈10.8 帧) ⇒ 合计 ≲21 帧；
+#   · 可触发硬重锚的错误候选(|err|≥3.5 拍)距"真值"的下界：min 37.7 帧（p1 50.7）。
+#   取 **32 帧**≈1.5s：≥3× 正确候选偏差、覆盖 hint 误差(21 帧)并留余量，且低于错误候选下界
+#   (37.7 帧)。端到端实测 W∈[16,32] 全局 max|err| ≤ 3.78 拍；W≥40 升到 7.28；W≥96 反升到
+#   14.55（开始放进错误候选）。窗口内无候选 ⇒ 退回全局众数 ⇒ 真实远距离 seek 仍生效。
+#
+# ⚠ 32 帧是**帧**坐标，换算成拍数随 BPM 变化（1 拍 = beat_len·SR/HOP 帧）：
+#   128BPM ⇒ 32 帧 ≈ 2.97 拍；200BPM ⇒ 32 帧 ≈ 4.44 拍（已越过 3.5 拍错误候选下界！）；
+#   90BPM ⇒ 32 帧 ≈ 1.87 拍。⇒ 固定帧窗在两端 BPM 都不合理。**受支持的定义改为按拍数**：
+#   `HINT_W` 仅作为「调用方未显式给窗口」时的缺省（保持旧调用方与既有行为逐值一致）。
+#   引擎按当前歌 grid 的 beat_len 用 `hint_window_frames()` 换算后传 `hint_w`。
+HINT_W = 32
+
+# 「连续性提示」窗口半宽的**受支持定义**（单位 = 拍）：跨 BPM 一致。
+# 依据（第三轮 fix：正确候选偏差 ≲0.5 拍；生产侧 hint 误差 ≲1 拍跟踪 + 0.5s 时滞；
+#   可触发硬重锚的错误候选下界 ≈3.5 拍）：
+#   · 下界：须覆盖 hint 误差。时滞 0.5s 在帧坐标里是常数(≈10.8 帧)，折成拍数 = 0.5/bl，
+#     高 BPM（bl 小）时更大；1 拍跟踪 + 0.5/bl 拍 ≈ 2.0 拍(150BPM)~2.7 拍(200BPM)。
+#   · 上界：必须 < 3.5 拍（错误候选下界），否则会放进"另一处出现"的高票错候选。
+#   实测扫描（tools/_gridfix4_accept.py，真实逐窗直方图 × 跨 BPM）取 **2.5 拍**：
+#     既覆盖 hint 误差（含 200BPM 的 2.67 拍仍在校验范围），又低于 3.5 拍错误下界。
+HINT_W_BEATS = 2.5
+
+
+def hint_window_frames(beat_len, w_beats=None):
+    """把「hint 窗口半宽（拍）」换算成 delta 坐标的 hop 帧数。
+
+    delta 的单位 = 44100 下的 hop 帧。1 拍 = beat_len 秒 = beat_len·SR/HOP 帧。
+    `w_beats` 缺省用 `HINT_W_BEATS`。`beat_len` 非法时回退缺省帧窗 `HINT_W`。
+    """
+    try:
+        bl = float(beat_len)
+    except (TypeError, ValueError):
+        bl = 0.0
+    wb = HINT_W_BEATS if w_beats is None else float(w_beats)
+    if bl <= 0.0 or wb <= 0.0:
+        return float(HINT_W)
+    return wb * bl * SAMPLE_RATE / HOP_SIZE
+
 
 def _spectrogram(sig):
     """mono float32(44.1k) → log-power 谱 (dB)，shape [freq_bins, frames]"""
@@ -187,8 +233,48 @@ class FingerprintDB:
         except Exception:                                                # noqa: BLE001
             pass
 
-    def match(self, sig, sr):
-        """返回 (song_id, aligned_votes, offset_sec) 或 (-1, 0, 0.0)"""
+    @staticmethod
+    def _pick(votes, hint_delta=None, hint_w=None):
+        """从 (song_id, delta)->votes 的投票表里挑出结果，返回 ((sid, delta), votes) 或 None。
+
+        · hint_delta 为 None：与旧实现**逐值一致** —— `max(items, key=votes)`（同分取先出现的）。
+        · hint_delta 给定：先在 |delta - hint_delta| <= hint_w 的候选里取最高票；该窗口内
+          **没有候选时**才退回全局众数（保证真实远距离 seek 仍有结果）。
+          ⚠ 这里**只按"窗口内是否命中有候选"选择，不判断 hint 本身是否正确**：
+          一旦窗口内存在候选（哪怕是"另一处出现"的同歌候选），就取它 —— 即 hint 能给错时
+          会把它带到错位置。这是**有意的**：没有可靠的"hint 对不对"判据（QA 实测"投票比"
+          区分不了"hint 正确但弱"与"hint 错误"，两者全局票都更高）。因此**调用方必须**
+          只在坐标系可信时给 hint（见 engine._beat_pos_grid：未锁定不发布；重锚后有界暂停）。
+          hint_w 缺省用 `HINT_W`（帧）—— 引擎按该歌 beat_len 换算后传入，跨 BPM 一致。
+        delta 单位 = hop 帧；窗内同分同样取先出现者（dict 插入序确定）。
+        """
+        if not votes:
+            return None
+        if hint_delta is not None:
+            w = HINT_W if hint_w is None else float(hint_w)
+            if w < 0.0:
+                w = 0.0
+            lo = hint_delta - w
+            hi = hint_delta + w
+            best = None
+            for key, cnt in votes.items():
+                if lo <= key[1] <= hi and (best is None or cnt > best[1]):
+                    best = (key, cnt)
+            if best is not None:
+                return best
+        return max(votes.items(), key=lambda kv: kv[1])
+
+    def match(self, sig, sr, hint_delta=None, hint_w=None):
+        """返回 (song_id, aligned_votes, offset_sec) 或 (-1, 0, 0.0)
+
+        hint_delta: 可选。预测的「对齐帧偏移」（单位 = HOP 帧，与内部 delta 同轴）。
+          None（默认）⇒ 与改动前**逐值一致**（全局众数）；给定值 ⇒ 优先选预测位置
+          附近（±hint_w 帧）的最高票候选，避开强重复段落的歧义错匹配；**窗内无候选**
+          时才退回全局众数。
+        hint_w: 可选。hint 窗口半宽（帧）。None ⇒ 用缺省 `HINT_W`（保持旧调用方逐值一致）。
+          引擎按该歌 grid 的 beat_len 用 `hint_window_frames()` 换算后传入，使窗口
+          **按拍数**定义、跨 BPM 一致（固定帧窗在 90~200BPM 间对应的拍数差 2 倍以上）。
+          调用点见 engine._beat_pos_grid → audio_engine._recognize_loop。"""
         hs = fingerprint_audio(sig, sr)
         if not hs:
             return -1, 0, 0.0
@@ -208,9 +294,10 @@ class FingerprintDB:
                 for qoff in qoff_map.get(h, ()):
                     key = (song_id, dboff - qoff)
                     votes[key] = votes.get(key, 0) + 1
-        if not votes:
+        picked = self._pick(votes, hint_delta, hint_w)
+        if picked is None:
             return -1, 0, 0.0
-        (song_id, delta), cnt = max(votes.items(), key=lambda kv: kv[1])
+        (song_id, delta), cnt = picked
         return song_id, cnt, delta * HOP_SIZE / SAMPLE_RATE
 
     def close(self):

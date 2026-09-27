@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.09.26.15
+Version 2026.09.27.09
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -239,6 +239,29 @@ The "Clip Switch Tempo" dropdown on the right has four options:
     driver still misbehaves, only that single clip briefly falls back to software decoding (the
     picture keeps playing) and GPU use is retried 60 seconds later - the UI can no longer be
     dragged down. It is safe to leave this switch on.
+  · Beat grid (8-beat phrase alignment): when a library track is recognised, the offline-computed
+    8-beat grid drives the beat position, so clips switch on 8-beat phrase boundaries instead of any
+    4-beat line. It also follows tempo changes. Turn it off to return to the original real-time clock.
+      · Only applies to tracks that have a grid AND are recognised right now. Otherwise the original
+        clock is used - identical to what you see today.
+      · The first ~20-40 seconds are spent waiting for a stable identification; during that time the
+        original 4-beat alignment is used (the rhythm is correct, it just has no phrase level).
+      · On a few tracks with heavily repeated sections the position may briefly lock onto the
+        neighbouring 4-beat line: switches still land ON the beat, never off-beat, and it normally
+        corrects itself within 30-40 seconds.
+      · A long system stall makes it silently fall back to the original 4-beat alignment.
+      · Re-run a library scan ("Scan & Analyze") once after upgrading so grid data gets generated.
+      · A **beat grid strip** is drawn in the preview, right under the HUD, sweeping left to right
+        with the music: "◆" = 8-beat phrase head (**the line the switching actually aligns to**),
+        "●" = bar head, "·" = plain beat, the white cursor on the left = now. To check alignment,
+        watch whether the music changes phrase exactly when the cursor hits a ◆. Once the 8-beat
+        lock kicks in the strip goes from groups of 4 to groups of 8 (that is why it gets wider).
+      · **If a track sounds 4 beats off** (exactly half a phrase - the offline step picked the wrong
+        bar as the phrase head), use **"Flip 8-beat phase"** in the Effect panel: it only affects the
+        **track that is playing**, takes effect **immediately** (no re-scan, does not disturb the
+        aligned beat position) and is saved to the config so it sticks next time. Click again to flip
+        back. After clicking, the ◆ lines in the preview strip shift by 4 beats - listen and you will
+        hear it.
 
 
 ────────────────────────────────────────

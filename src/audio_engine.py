@@ -11,6 +11,7 @@ soundcard 库导入时会在【当前线程】一次性 CoInitializeEx(MTA)，�
 绝不能在 GUI 主线程触碰 soundcard，否则 Qt OleInitialize 失败（0x80010106），
 系统文件对话框（IFileDialog 需要 COM STA）会直接卡死。
 """
+import math
 import time
 import queue
 import threading
@@ -60,6 +61,78 @@ def _band_energy(spec, freqs, lo, hi):
     return float(np.mean(spec[m]))
 
 
+class RateEstimator:
+    """由相邻两次指纹识别的 (offset_orig, wall_t) 估计输入音乐的播放速率 r。
+
+    原理（识别链路的事实）：识别窗口每 0.5s 前移一次，窗口起点在**原曲时间轴**上的
+    偏移 `off` 也随之前移；`off` 的前移速率 = 音乐播放速率 r：
+
+        r ≈ Δoff_原曲 / Δt_挂钟
+
+    做法：
+      - 只在**同一首歌连续识别**时累计；换歌 / 识别丢失时 `reset()`；
+      - **EMA 平滑**（时间常数约 3s），并做范围钳位 [MIN_R, MAX_R]；
+      - 瞬时值越界视为不可信 → 不动 EMA（单次抖动不丢历史），返回当前估计，初值 1.0。
+
+    ⚠ 这是**输入侧**的速率，与引擎里 `speed`（输出端 VJ 素材倍速）完全是两回事，
+      绝不可复用。
+    """
+
+    MIN_R = 0.8          # 合理下限（-20%）
+    MAX_R = 1.25         # 合理上限（+25%）
+    MIN_DT = 0.2         # 挂钟增量下限（太小则噪声主导）
+    MAX_DT = 2.0         # 挂钟增量上限（太大则视为不连续）
+    MIN_DOFF = 0.05      # |Δoff| 下限（过小不可信）
+
+    def __init__(self, tau=3.0):
+        self._tau = float(tau)
+        self.reset()
+
+    def reset(self):
+        """清空估计（换歌 / 识别丢失 / 静音回待机时调用）。"""
+        self.song_id = -1
+        self._last_off = None
+        self._last_t = None
+        self.rate = 1.0
+        self._ready = False
+
+    def update(self, song_id, off, wall_t):
+        """喂一次识别结果，返回当前 r 估计（未收敛时 1.0）。"""
+        if song_id is None or song_id < 0:
+            self.reset()
+            return self.rate
+        if song_id != self.song_id:
+            # 换歌：重置并本次做新基准（首帧不产速率）
+            self.song_id = song_id
+            self._last_off = off
+            self._last_t = wall_t
+            self.rate = 1.0
+            self._ready = False
+            return self.rate
+        if self._last_off is None or self._last_t is None:
+            self._last_off = off
+            self._last_t = wall_t
+            return self.rate
+        dt = wall_t - self._last_t
+        doff = off - self._last_off
+        self._last_off = off
+        self._last_t = wall_t
+        if not (self.MIN_DT <= dt <= self.MAX_DT):
+            return self.rate       # 不连续：本次不采信，保留历史
+        if abs(doff) < self.MIN_DOFF:
+            return self.rate
+        r_inst = doff / dt
+        if not (self.MIN_R <= r_inst <= self.MAX_R):
+            return self.rate       # 越界：单次抖动，不动 EMA
+        if not self._ready:
+            self.rate = r_inst     # 首个可信样本：直接采用（响应快）
+            self._ready = True
+        else:
+            alpha = 1.0 - math.exp(-dt / self._tau)
+            self.rate += alpha * (r_inst - self.rate)
+        return self.rate
+
+
 class AudioState:
     """线程间共享的音频分析状态"""
 
@@ -107,6 +180,24 @@ class AudioState:
         self.genre_styles = []      # 实时曲风英文风格名
         self.recognized_song_id = -1  # 指纹识别确认的歌 id（-1=无/待机）
         self.recognized_offset = -1.0  # 该歌当前播放位置（秒，来自指纹匹配 offset；-1=无）
+        # 输入音乐播放速率（EMEA 估计，默认 1.0）：指纹链路用它把"识别窗口起点偏移"
+        # 换算成"当前播放位置"，引擎网格时钟也用它把"拍"换算成"秒"（1 拍 = beat_len/r 秒）。
+        self.recognized_rate = 1.0
+        # 该识别结果对应的挂钟时刻（time.perf_counter()）：引擎据此把参考拍位推进到"现在"。
+        self.recognized_t = 0.0
+        # 本次指纹匹配的**对齐票数**（fp.match 的 aligned_votes）：命中重复段落时票数会骤降
+        # （实测好样本 241 / 歧义坏样本 44），引擎据它决定 offset 是否可信、是否参与网格校正。
+        self.recognized_votes = 0
+        # ★ 网格时钟预测的「识别窗起点」在原曲时间轴上的秒数（<0 = 无预测）。
+        #   引擎每帧写、识别线程每 0.5s 读：作为 fp.match 的 hint_delta，让匹配在强重复段落里
+        #   优先选**靠近预测位置**的候选，避开「另一处出现」的高票错匹配（阻塞项 C）。
+        #   只在网格时钟**已锁定**（当前歌有可信坐标系）时才有值；否则 -1，匹配退回全局众数。
+        self.grid_pred_orig = -1.0
+        # ★ 与 `grid_pred_orig` 配套的 hint **窗口半宽**（单位 = hop 帧）。引擎按当前歌 grid 的
+        #   beat_len 用 `fp.hint_window_frames()` 换算后写这里；识别线程把它作为 `fp.match`
+        #   的 `hint_w`。这样窗口**按拍数**定义、跨 BPM 一致（固定帧窗在 90~200BPM 间对应
+        #   的拍数差 2 倍以上）。None ⇒ 用 fp 缺省 HINT_W（保持旧调用方逐值一致）。
+        self.grid_pred_w = None
         self.running = False
         self.error = ""
         self.device_desc = ""
@@ -134,6 +225,9 @@ class AudioState:
                 "error": self.error, "device_desc": self.device_desc,
                 "recognized_song_id": self.recognized_song_id,
                 "recognized_offset": self.recognized_offset,
+                "recognized_rate": self.recognized_rate,
+                "recognized_t": self.recognized_t,
+                "recognized_votes": self.recognized_votes,
                 "genre_tags": list(self.genre_tags),
                 "dbg": dict(self.dbg),      # 能量分项（诊断工具用）
             }
@@ -155,6 +249,8 @@ class _Analyzer:
         self.bpm_display = 0.0               # 显示用（未锁定也可有值），不参与拍钟
         self._bpm_votes = deque(maxlen=60)   # 60s 投票窗口，众数取 BPM（换歌静音清空）
         self._bpm_lock = False               # 锁定建立标志（主段稳定后锁定，breakdown 不扰动）
+        self._bpm_song = -1                  # 上次识别到的 song_id：变了就清投票+解锁（见 feed）
+        self._bpm_far_sec = 0.0              # 众数持续偏离锁定值的累计秒（未识别到歌时的换歌兜底）
         self.prev_bass_spec = None         # kick 频段上一帧谱（低频通量用）
         self.bass_flux_hist = np.zeros(max(16, int(round(10.0 / self.block_sec))), dtype=np.float32)
         self.beat_interval = 0.5
@@ -220,6 +316,20 @@ class _Analyzer:
     def feed(self, data, st):
         """分析一个采集块并更新共享状态。任何异常由调用方兜底，不影响线程存活。"""
         now = time.perf_counter()
+        # ★ 换歌检测（指纹认出的歌变了）→ 清空 BPM 投票并解锁，让新歌的 BPM 能被重新估计。
+        #   为什么必须做：`_bpm_lock` 建立后只接受与锁定值 **±8 BPM** 内的修正（见下方 BPM 段），
+        #   而解锁原来只靠「连续静音 >10s」。**DJ 接歌混播没有静音** ⇒ 132BPM 切到 150BPM 时
+        #   bpm_smooth 永远停在旧值：界面 BPM 不更新，拍钟也继续按旧速度跑
+        #   （用户 2026-09-27 报「从 Can We Believe That 切到 Cosmic String 一直是 133」）。
+        #   用指纹识别结果判换歌最准（每 0.5s 一轮），而且不怕两首歌混音重叠。
+        #   ⚠ 只清投票 + 解锁，**不清 bpm_smooth** —— 保留它让拍钟继续走，等新歌重新投票
+        #     出够票数（约几秒）自然接管，避免换歌瞬间拍钟停摆。
+        sid = getattr(st, "recognized_song_id", -1)
+        if sid is not None and sid >= 0 and sid != self._bpm_song:
+            self._bpm_song = sid
+            self._bpm_votes.clear()
+            self._bpm_lock = False
+            self._bpm_far_sec = 0.0
         sig = np.mean(data, axis=1) if data.shape[1] > 1 else data[:, 0]
         rms = float(np.sqrt(np.mean(sig ** 2)))
 
@@ -363,6 +473,20 @@ class _Analyzer:
                     else:
                         if abs(mode - self.bpm_smooth) <= 8:
                             self.bpm_smooth = self.bpm_smooth * 0.7 + mode * 0.3
+                            self._bpm_far_sec = 0.0
+                        else:
+                            # 兜底（**没识别到歌**时用）：60s 众数**持续**偏离锁定值 ⇒ 大概率换歌了。
+                            # 阈值刻意保守（连续 ≥20s 且众数集中度 ≥0.50），避免 breakdown 段被旋律
+                            # 带飞的瞬时飞值触发误解锁 —— 那正是「±8 门控」要防的「2:20 飞到 180」。
+                            # 本段约 1s 执行一次，所以用 +1.0 累加近似秒数。
+                            if conf >= 0.50:
+                                self._bpm_far_sec += 1.0
+                                if self._bpm_far_sec >= 20.0:
+                                    self._bpm_votes.clear()
+                                    self._bpm_lock = False
+                                    self._bpm_far_sec = 0.0
+                            else:
+                                self._bpm_far_sec = 0.0
                     # ---- 显示用 BPM（**不参与拍钟/切换节奏**）----
                     # 门控只影响「锁不锁」，但界面显示不该被门控连坐：慢歌、极快曲、
                     # 被估成半速的歌都要能看到一个数字。票数≥10 且 conf≥0.40 就发布，
@@ -901,6 +1025,8 @@ class AudioEngine:
         # 现场指纹识别：指纹库 + 音乐电池引擎（main 用 set_recognizer 启用）
         self._fp_db = None
         self._recognizer_engine = None
+        # 输入音乐播放速率估计（识别链路用；见 RateEstimator）
+        self._rate_est = RateEstimator()
         self._recognize_thread = threading.Thread(
             target=self._recognize_loop, daemon=True, name="autovj-recognize")
         self._recognize_thread.start()
@@ -1047,27 +1173,60 @@ class AudioEngine:
                 silent = self.state.silent_sec
             if silent > 10.0:
                 eng.reset()
+                self._rate_est.reset()
                 with self.state.lock:
                     self.state.recognized_song_id = -1
                     self.state.recognized_offset = -1.0
+                    self.state.recognized_rate = 1.0
+                    self.state.recognized_votes = 0
                 continue
             with self._genre_lock:
                 if self._genre_buf.filled < 16000:
                     continue
                 # 只要最近 4.5 秒（指纹匹配窗口）；numpy 切片拷贝，不再 list(deque) 全量复制
                 buf = self._genre_buf.last(int(self._genre_sr * 4.5))
+                # 窗口末端的挂钟时刻：识别结果对应的"当前时刻"（给引擎网格时钟对齐用）
+                t_read = _t.perf_counter()
             try:
                 sig = _np.asarray(buf, dtype=_np.float32)
-                sid, votes, off = fp_db.match(sig, self._genre_sr)
+                # ★ 连续性提示：引擎网格时钟预测的「本识别窗起点」原曲秒数 → 帧数，交给
+                #   fp.match。强重复段落里同一段音频在歌里出现多次，纯靠票数会挑到"另一处
+                #   出现"的高票错位置；带 hint 时优先选预测位置附近（±窗口 帧）的候选，
+                #   窗内无候选则退回全局众数（真实远距离 seek 仍生效）。无预测（-1）⇒ 与
+                #   旧行为逐值一致。读取在 state.lock 下（引擎每帧写入，见 engine._beat_pos_grid）。
+                #   窗口按拍数定义（引擎按 beat_len 换算，见 fp.hint_window_frames/state.grid_pred_w）。
+                from fp import SAMPLE_RATE as _FP_SR, HOP_SIZE as _FP_HOP
+                with self.state.lock:
+                    _pred = self.state.grid_pred_orig
+                    _pred_w = self.state.grid_pred_w
+                _hint = (_pred * _FP_SR / _FP_HOP) if (_pred is not None and _pred >= 0.0) else None
+                # hint 窗口（帧）：引擎按该歌 beat_len 换算后写入；缺省 None ⇒ fp 用缺省 HINT_W
+                _hint_w = (float(_pred_w) if (_hint is not None and _pred_w is not None
+                                             and float(_pred_w) > 0.0) else None)
+                sid, votes, off = fp_db.match(sig, self._genre_sr,
+                                              hint_delta=_hint, hint_w=_hint_w)
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
+                cur = eng.current_song_id
                 with self.state.lock:
-                    self.state.recognized_song_id = eng.current_song_id
-                    if sid == eng.current_song_id and votes > 0:
-                        # off 是最近 4.5s 窗口起始在歌里的秒数，窗口末尾≈当前播放秒
-                        self.state.recognized_offset = off + 4.5
-                    elif eng.current_song_id < 0:
-                        self.state.recognized_offset = -1.0
+                    self.state.recognized_song_id = cur
+                    if cur >= 0 and sid == cur and votes > 0:
+                        # 估计输入播放速率 r（同一首歌连续识别时累计；Δoff/Δt 即 r）
+                        r = self._rate_est.update(cur, off, t_read)
+                        self.state.recognized_rate = r
+                        # off 是识别窗口起点在**原曲**时间轴上的秒数，窗口末端≈当前播放秒。
+                        # ⚠ 变速倍率 r≠1 时，4.5s 挂钟对应 4.5*r 秒原曲 —— 旧写法固定 +4.5 是错的。
+                        self.state.recognized_offset = off + 4.5 * r
+                        self.state.recognized_t = t_read
+                        # 对齐票数交给引擎：低于门槛时 offset 不可信，网格时钟不做任何校正
+                        self.state.recognized_votes = int(votes)
+                    else:
+                        # 本窗票数不可用（换曲/歧义/无票）：票数清零，引擎据此停用本次校正
+                        self.state.recognized_votes = 0
+                        if cur < 0:
+                            self.state.recognized_offset = -1.0
+                            self.state.recognized_rate = 1.0
+                            self._rate_est.reset()
             except Exception:
                 pass
 

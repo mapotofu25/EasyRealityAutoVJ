@@ -13,7 +13,7 @@ import os
 from tags_def import (TAG_CATEGORIES, DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER)
 from PySide6.QtCore import Qt, QSize, Signal, QMimeData, QTimer, QPoint
-from PySide6.QtGui import QColor, QPixmap, QImage, QDrag, QAction
+from PySide6.QtGui import QColor, QPixmap, QImage, QDrag, QAction, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSlider,
     QComboBox, QScrollArea, QListWidget, QListWidgetItem, QListView, QFrame,
@@ -940,7 +940,8 @@ class MusicLibraryDialog(I18nDialog):
         edit = menu.addAction("纠正曲风…")
         rescan = menu.addAction("重新分析扫描此曲目")
         info = menu.addAction("此曲目信息")
-        rm = menu.addAction("从曲库移除")
+        menu.addSeparator()
+        rm = menu.addAction(theme.danger_icon(), "从曲库移除")
         i18n_retranslate(menu)      # 临时菜单：弹出前刷语言
         act = menu.exec(self.list.mapToGlobal(pos))
         if act == edit:
@@ -1054,6 +1055,7 @@ class LibraryGrid(MediaGrid):
     def _menu(self, pos):
         sel = [it.data(Qt.UserRole) for it in self.selectedItems()]
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)   # ★ 长条目拆短后，说明挪进悬停提示
 
         add_menu = menu.addMenu("添加到图层")
         for i, lay in enumerate(self.main.engine.layers):
@@ -1062,7 +1064,8 @@ class LibraryGrid(MediaGrid):
             a.setEnabled(not auto)   # 自动图层素材由曲风匹配管理，不接受手动添加
             a.triggered.connect(lambda _c=False, ii=i, ms=list(sel): self.main.add_to_layer(ii, ms))
 
-        play_menu = menu.addMenu("播放到图层（立即切换）")
+        play_menu = menu.addMenu("播放到图层")
+        play_menu.setToolTip(T("立即切换，不等下一拍"))
         for i, lay in enumerate(self.main.engine.layers):
             auto = getattr(lay, "auto_mode", False)
             a = play_menu.addAction(lay.name + (T("  [自动]") if auto else ""))
@@ -1070,7 +1073,7 @@ class LibraryGrid(MediaGrid):
             a.triggered.connect(lambda _c=False, ii=i, ms=list(sel): self.main.play_to_layer(ii, ms))
 
         menu.addSeparator()
-        role_menu = StayOpenMenu(T("角色（单选）"))
+        role_menu = StayOpenMenu(T("角色"))
         menu.addMenu(role_menu)
         for key, name in (("fg", "前景"), ("bg", "背景")):
             a = role_menu.addAction(T(name))
@@ -1080,23 +1083,28 @@ class LibraryGrid(MediaGrid):
                 a.setChecked(all(bool(m.roles.get(key)) and not m.roles.get("bg" if key == "fg" else "fg")
                                  for m in sel))
             a.triggered.connect(lambda _c=False, k=key, ms=list(sel): self.main.toggle_role(k, ms))
-        a_excl = menu.addAction("排除自动打标/匹配（logo 等固定素材）")
+        a_excl = menu.addAction("排除自动打标/匹配")
+        a_excl.setToolTip(T("logo 等固定素材：不参与自动打标与匹配"))
         a_excl.setCheckable(True)
         if sel:
             a_excl.setChecked(all(bool(getattr(m, "excluded", False)) for m in sel))
         a_excl.setEnabled(bool(sel))
         a_excl.triggered.connect(lambda _c=False, ms=list(sel): self.main.toggle_exclude(ms))
+        menu.addSeparator()          # 分组：打标类
         scan_one = menu.addAction("扫描打标此素材")
         scan_one.setEnabled(bool(sel))
         edit_tags = menu.addAction("编辑标签…")
         edit_tags.setEnabled(bool(sel))
-        rescan_all = menu.addAction("全量重扫打标（含已打标）")
+        rescan_all = menu.addAction("全量重扫打标")
+        rescan_all.setToolTip(T("含已打标的一起重扫"))
 
-        rm_layer = menu.addAction("从所有图层移除")
+        menu.addSeparator()          # 分组：危险操作（红点标记）
+        rm_layer = menu.addAction(theme.danger_icon(), "从所有图层移除")
         rm_layer.setEnabled(bool(sel))
-        rm_lib = menu.addAction("从素材库移除当前素材")
+        rm_lib = menu.addAction(theme.danger_icon(), "从素材库移除")
         rm_lib.setEnabled(bool(sel))
 
+        menu.addSeparator()
         size_menu = menu.addMenu("预览大小")
         acts = []
         cur = int(self.main.cfg["ui"].get("thumb_size", 1))
@@ -1961,6 +1969,73 @@ class MiniLevel(QWidget):
         p.end()
 
 
+class BeatGridOverlay(QWidget):
+    """预览里的「节拍网格线」浮层（用户 2026-09-27 要求）。
+
+    以**当前拍**为最左一格，向右画 2 组栅格（网格模式 8 拍/组 = 16 拍；普通模式 4 拍/组 = 8 拍）：
+      · 普通拍       —— 短刻线（暗）
+      · 小节头(4 拍) —— 长刻线（亮）
+      · 乐句头(8 拍) —— 最长刻线 + 琥珀色，**这才是切换真正对齐的那条线**
+      · 当前拍       —— 最左的白色游标，随时间从左扫到右，扫到头就换下一组
+
+    ★ 相位直接来自 `engine.beat_grid_view()`，而它内部走的是与切换对齐**同一套** `_align_width/_bar_off`
+      ⇒ 这条线就是"切换实际踩的那条线"，不会画出一条好看但和实际不符的网格。
+    ★ 只画在**预览浮层**里，不进合成画面 ⇒ 输出窗口 / Spout / NDI 都不会带上它。
+    """
+
+    CELL = 15          # 每拍像素宽
+    HH = 22            # 浮层高度
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._idx = None       # 当前拍在栅格里的位置 0..w-1
+        self._w = 4            # 栅格宽度（8=八拍乐句，4=小节）
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+    def has_grid(self):
+        return self._idx is not None
+
+    def set_grid(self, idx, w):
+        """idx=None / w 非法 ⇒ 视为无数据（隐藏）。"""
+        if idx is None or not w or int(w) <= 0:
+            if self._idx is None:
+                return
+            self._idx = None
+            self.update()
+            return
+        key = (int(idx), int(w))
+        if key == (self._idx, self._w):
+            return                      # 同格内不重画（HUD 每帧都会喂）
+        self._idx, self._w = key
+        self.setFixedSize(int(self.CELL * self._w * 2) + 2, self.HH)
+        self.update()
+
+    def paintEvent(self, _e):
+        if self._idx is None:
+            return
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 150))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 3, 3)
+        n = self._w * 2
+        for j in range(n):
+            gp = (self._idx + j) % self._w      # 该格在本组里的位置
+            x = j * self.CELL + 2
+            if gp == 0:                          # 乐句头（八拍头 / 普通模式下即小节头）
+                p.setPen(QPen(QColor(255, 213, 79), 2))
+                p.drawLine(x, 3, x, h - 4)
+            elif gp % 4 == 0:                    # 小节头（网格模式下 = 每 4 拍）
+                p.setPen(QPen(QColor(255, 255, 255, 150), 1))
+                p.drawLine(x, 6, x, h - 4)
+            else:                                # 普通拍
+                p.setPen(QPen(QColor(255, 255, 255, 70), 1))
+                p.drawLine(x, h - 8, x, h - 4)
+        p.setPen(QPen(QColor(255, 255, 255, 225), 2))   # 当前拍游标
+        p.drawLine(2, 2, 2, h - 2)
+
+
 class PreviewPanel(QWidget):
     """输出预览 + HUD + 下一个素材预看"""
 
@@ -2009,6 +2084,9 @@ class PreviewPanel(QWidget):
         self.hud.move(8, 8)
         self.hud.hide()
 
+        # 「节拍网格线」浮层：贴在 HUD 下方（用户 2026-09-27 要求）
+        self.beatbar = BeatGridOverlay(self.view)
+
         self.next_box = QLabel(self.view)
         self.next_box.setStyleSheet("background:rgba(0,0,0,150);color:#ffd54f;"
                                     "padding:2px 4px;border-radius:3px;font-size:10px;")
@@ -2031,6 +2109,7 @@ class PreviewPanel(QWidget):
         w, h = self.view.width(), self.view.height()
         self.hud.adjustSize()
         self.hud.move(8, 8)
+        self.beatbar.move(8, 8 + self.hud.height() + 4)
         self._place_thumbs()
 
     def _place_thumbs(self):
@@ -2043,9 +2122,22 @@ class PreviewPanel(QWidget):
     def _sync_overlays(self, *_):
         on = self.preview_on()
         self.hud.setVisible(on and self.chk_hud.isChecked())
+        self.beatbar.setVisible(on and self.chk_hud.isChecked() and self.beatbar.has_grid())
         if not on or not self.chk_next.isChecked():
             for lbl in self.layer_thumbs:
                 lbl.hide()
+
+    def update_grid(self, idx, w):
+        """预览「节拍网格线」浮层：idx=当前拍在栅格里的位置(0..w-1)，w=栅格宽度(8=八拍乐句/4=小节)。
+
+        `idx=None` ⇒ 无数据（未开始 / 无拍钟）⇒ 隐藏。相位由 engine.beat_grid_view() 提供，
+        与切换对齐共用同一套 `_align_width/_bar_off`，所以画出来的就是切换实际踩的那条线。
+        每帧调用一次即可（同格内不重画，开销可忽略）。
+        """
+        self.beatbar.set_grid(idx, w)
+        self.beatbar.setVisible(self.preview_on() and self.chk_hud.isChecked()
+                                and self.beatbar.has_grid())
+        self.beatbar.move(8, 8 + self.hud.height() + 4)
 
     # ---------------- 预览开关（用户 2026-09-25 要求：预览画面设置里可关闭预览） ----------------
     def preview_on(self):

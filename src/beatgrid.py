@@ -28,6 +28,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import threading
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
@@ -49,6 +50,12 @@ BPM_PRIOR = (110.0, 190.0)  # DJ 音乐的先验区间：半速歧义时优先�
 PHRASE_MIN, PHRASE_MAX = 0.62, 1.30   # 八拍相位对比度阈值（低于此判定"证据不足"）
 
 DEFAULT_VDJ = ""           # 不硬编码路径，统一由 vdj_db_path() 自动探测
+
+# 网格算法版本：算法 / 参数变更时递增。曲库增量扫描据此判断「已有记录的网格是否过期」，
+# 只对过期 / 缺失的网格重算（见 ui_main 扫描），而不用整库全量重扫。
+#   1 = 初版（隐式，未写入 grid dict）
+#   2 = 2026-09-27：_assemble 输出显式带 grid_ver；配合增量补网格
+GRID_VER = 2
 
 
 # ==========================================================================
@@ -607,7 +614,8 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
         return {"bpm": e["bpm"], "beat_len": e["beat_len"], "anchor": e["anchor"],
                 "phrase": 0, "contrast": 0.0, "src": "vdj", "conf": 0.9,
                 "dur": e["dur"] or (dur or 0.0), "remix": list(e["remix"]),
-                "vdj_bpm": e["bpm"], "vdj_delta": 0.0, "peaks": []}
+                "vdj_bpm": e["bpm"], "vdj_delta": 0.0, "peaks": [],
+                "grid_ver": GRID_VER}
     if do_scan is None:
         do_scan = (e is None)
     bpm_hint = e["bpm"] if e else None
@@ -621,7 +629,7 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
                     "phrase": 0, "contrast": 0.0, "src": "vdj", "conf": 0.5,
                     "dur": e["dur"] or (dur or 0.0), "remix": list(e["remix"]),
                     "vdj_bpm": e["bpm"], "vdj_delta": 0.0, "peaks": [],
-                    "err": str(ex)[:120]}
+                    "err": str(ex)[:120], "grid_ver": GRID_VER}
         return None
 
     bpm = a["bpm"]
@@ -641,6 +649,7 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
         "vdj_delta": a.get("bpm_delta", 0.0),
         "remix": list(e["remix"]) if e else [],
         "peaks": a["peaks"],
+        "grid_ver": GRID_VER,
     }
 
 
@@ -727,3 +736,243 @@ def grid_beat_index(grid, offset_sec, phrase_len=8):
     a = grid.get("anchor") or 0.0
     k = (offset_sec - a) / bl
     return int(math.floor(k)) % phrase_len
+
+
+# ==========================================================================
+# 7. 演出用的「网格时钟」——把离线网格变成一条连续、单调、防抖的拍位
+# ==========================================================================
+class GridClock:
+    """把「离线八拍网格」变成一条**连续、单调、抗抖**的实时拍位时钟。
+
+    为什么需要它（而不是每帧直接拿识别结果算拍位）：
+      指纹识别每 0.5s 才出一次结果，且结果带 ±几十 ms 抖动。若每帧直接用它推算，
+      拍位会随识别抖动一跳一跳 —— 素材切换点跟着抖，演出就是"乱切"。
+      正确做法（照引擎现有 PLL 拍钟思路）：识别结果只做**有限增益相位校正**，
+      两次识别之间由局部时钟**自由匀速推进**。
+
+    坐标定义（与 `grid_anchor_after` 完全一致）：
+        beat_pos = (offset_orig - anchor) / beat_len
+      ⇒ 八拍头（原曲 anchor + 8n·beat_len 秒）落在 **beat_pos = 8n**（8 的整数倍）。
+      于是"对齐到八拍头"在网格坐标里就是"对齐到 8 的整数倍"，消费方只记这一条。
+
+    速度换算（关键）：原曲 1 拍 = beat_len 秒；播放快 r 倍 ⇒ 挂钟 1 秒前进 r/beat_len 拍。
+      反向换算（节拍→秒）必须**除以 r**：1 拍 = beat_len/r 秒。
+
+    update() 的输入：
+        sid      当前确认的歌 id
+        beat_len 该歌网格的拍长（秒）
+        anchor   该歌网格的八拍头锚点（秒）
+        off      识别窗口末端在**原曲时间轴**上的秒数（已含 +4.5·r 修正，见 audio_engine）
+        r        输入音乐播放速率（EMEA 估计，未知时 1.0）
+        ref_t    该识别结果对应的挂钟时刻（time.perf_counter()）
+    """
+
+    def __init__(self, phrase=8.0, gain=0.20, max_corr=0.25, big_gap=2.0,
+                 seek_beats=3.5, jump_err=0.75, jump_run=2, jump_max=32.0,
+                 hint_hold_wins=3):
+        self.phrase = float(phrase)        # 乐句长度（拍）：八拍
+        self.gain = float(gain)            # 相位校正有限增益（每 0.5s 一次，小步防抖）
+        self.max_corr = float(max_corr)    # 单次相位校正上限（拍）：一次抖动绝不跳拍
+        self.big_gap = float(big_gap)      # 识别空档超过这么久 → 硬重锚（坐标系可能已漂移）
+        # ★ 相位误差「判为真跳转」的阈值（拍），与「单调保护」（last_pos 钳位）**解耦**：
+        #   旧实现只用单一阈值 `abs(err) >= seek_beats`（=4.0）。问题：
+        #     · 恰好 4 拍的 Loop 被浮点判成 < 4.0 ⇒ 落进微调分支，而微调上限仅
+        #       gain·max_corr = 0.05 拍/次（≈0.1 拍/秒）⇒ 几乎拽不动，时钟既不后退也不跟随，
+        #       连打 20s 实测最大滞后 +7.8 拍；
+        #     · −1 / −2 拍 Beat Jump（err≈−1/−2，远小于 4）更是永远进不了重锚，留下持续偏差。
+        #   现在改为「单次巨跳 OR 连续同向超小阈值」两条独立判据：
+        #     · |err| ≥ seek_beats（≥半个乐句）        → 单次即判真跳转（保留原大跳保护）；
+        #     · 连续 jump_run 次 err 同向且 |err| ≥ jump_err → 判真跳转（覆盖 −1/−2 拍小回跳）。
+        #   jump_err=0.75 的依据：识别 offset 的量化抖动上限 ≈ ±0.4 拍
+        #   （DT_QUANT=4 帧 ≈ 186ms @128BPM），远低于 0.75；而 −1 拍 Beat Jump 的 err ≈ −1.0
+        #   明显高于它 ⇒ 干净切分。要求「连续 2 次」是为了进一步压掉偶发单次大抖动：
+        #   一次坏窗只让 err 超阈 1 次，run=1 不触发（只做有界微调）；真跳转是持续偏移，
+        #   第 2 个窗仍同向超阈 ⇒ run=2 触发硬重锚。
+        #   seek_beats=3.5（略小于半个乐句）：4 拍 Loop 的 err 在浮点 + 之前微调残留下会在
+        #   4.0 上下浮动（实测有 −3.86），取 3.5 保证「恰好 4 拍的回跳」也能**单次**命中、
+        #   不必等第 2 个窗（把识别窗残余从 ~3.9 拍压到 ~0）。量化抖动 max≈0.37 远低于它。
+        self.seek_beats = float(seek_beats)
+        self.jump_err = float(jump_err)    # 「连续同向」判据的阈值（拍）
+        self.jump_run = int(jump_run)      # 连续同向超阈次数达到它 ⇒ 判真跳转
+        # ★ 单次巨跳（强窗）允许的**最大幅值**（拍）：超过它就不再「单帧立即跟随」，改走
+        #   「连续同向确认」（jump_run 次）后才硬重锚。
+        #   为什么（阻塞项 C：强重复段落的高票错窗）：同一段音频在歌里出现多次时，查询窗会
+        #   与"另一处出现"哈希对上，票数甚至高于正确位置且票数≥强门槛；旧的 `big=strong and
+        #   |err|≥seek_beats` 会让这种**孤立**的强错窗**单帧**把整条时钟拽到错坐标（实测
+        #   瞬时偏移 148~738 拍）。DJ 软件的 Beat Jump 档位最大 **32 拍**，所以：
+        #     · |err| ≤ 32 拍（1/2/4/8/16/32 拍 Loop 与 Beat Jump）→ 仍**单帧立即跟随**（不退化）；
+        #     · |err| > 32 拍 = 远距离 seek 或错匹配 → 必须**连续 2 个可信窗一致**才硬重锚
+        #       （多等一个识别窗 ≈0.5s，对真 seek 可接受；把孤立强错窗挡在门外）。
+        self.jump_max = float(jump_max)
+        # ★ R3（闭环自证偏差，已锁定后的边界情况）：>jump_max（>32 拍）的**硬重锚**后，
+        #   暂停向外发布"连续性提示(hint)"若干识别窗，让 fp.match 在**开环**（全局众数）下
+        #   重新验证坐标：若位置保持不变（开环仍报新坐标）说明重锚正确，恢复发布 hint；
+        #   若开环把位置拉回旧坐标，则时钟会在后续窗按连续同向判据再重锚回来。
+        #   为什么只针对 >jump_max：≤32 拍的重锚是「1/2/4/8/16/32 拍 Loop/Beat Jump」的
+        #   正常跟随（可信、无害），不该因此丢掉连续性提示。取 3：>jump_max 的重锚需
+        #   **连续 jump_run(=2)** 个同向强窗确认，再留 3 个开环窗复核（≈1.5s）足够让
+        #   正确的全局众数重新出现。**有界**（仅 3 窗），不改变常规路径。
+        self.hint_hold_wins = int(hint_hold_wins)
+        # ★ 自带内部锁（必须是 RLock：beats_to_phrase 内部会复用 _pos_locked 逻辑）：
+        #   本时钟会被「引擎线程（每帧 update/取拍位）」与「GUI HUD 线程（只读取拍位）」
+        #   并发访问。**绝不能**为此去拿 engine._tick_lock —— 那是引擎每帧整帧渲染期间
+        #   持有的总锁，HUD 去等它会被慢帧拖住（违反「GUI 不能因引擎卡而卡」）。
+        #   这把锁只保护下面几行**纯数学**的状态读写；锁内不做任何可能阻塞的操作
+        #   （不 sleep、不 IO、不等待事件）。
+        self._lock = threading.RLock()
+        self.reset()
+
+    def reset(self):
+        """清空时钟（换歌库 / 重扫 / 识别丢失时调用）。"""
+        with self._lock:
+            self.sid = None
+            self.t0 = 0.0        # 时钟基准挂钟时刻
+            self.pos0 = 0.0      # 时钟在 t0 时刻的拍位
+            self.bl = 1.0        # 当前 beat_len（秒/拍）
+            self.r = 1.0         # 当前输入速率
+            self.ref_t = 0.0     # 上次用于校正的识别参考时刻
+            self.last_pos = None # 单调保护：上次返回的拍位
+            self._err_run = 0    # 真跳转判据：连续同向超阈次数
+            self._err_sign = 0   # 该连续段的方向（+1 / -1 / 0）
+            self._hint_hold = 0  # R3：>jump_max 重锚后仍要暂停发布 hint 的剩余窗数
+
+    def _speed(self):
+        """每挂钟秒前进多少拍（= r / beat_len）。只在持锁时调用。"""
+        if self.bl <= 0:
+            return 0.0
+        return self.r / self.bl
+
+    def update(self, sid, beat_len, anchor, off, r, ref_t, strong=True):
+        """喂一次识别参考，更新内部时钟（不返回拍位；拍位由 pos(now) 取）。
+
+        `strong`：该识别窗是否为**强匹配**（票数 ≥ 强门槛，默认 True 兼容直接调用）。
+          强窗才允许「单次小幅巨跳」（|err| 在 [seek_beats, jump_max]）立即硬重锚；弱窗
+          （票数介于普通门槛与强门槛之间）即便 err 很大也不单次重锚 —— 一次坏匹配（重复段落
+          歧义）若不设防会直接把坐标拽到错位置（阻塞项 B）。**任何窗**只要 |err| > jump_max
+          （>32 拍：远距离 seek 或错匹配）都**不**单帧重锚，须靠**连续同向**（jump_run 次）
+          确认后才重锚（阻塞项 C）。"""
+        if beat_len is None or beat_len <= 0:
+            return
+        r = 1.0 if (r is None or not (0.5 <= r <= 2.0)) else float(r)
+        with self._lock:
+            ref_pos = (off - anchor) / beat_len
+            # 换歌 / 首次：硬锚定到参考点（坐标整体换系，不做平滑）
+            if self.sid != sid:
+                self.sid = sid
+                self.bl = float(beat_len)
+                self.r = r
+                self.t0 = ref_t
+                self.pos0 = ref_pos
+                self.ref_t = ref_t
+                self.last_pos = None
+                self._err_run = 0
+                self._err_sign = 0
+                self._hint_hold = 0
+                return
+            if ref_t > self.ref_t + 1e-6:
+                # R3：每个新识别窗消耗一次"暂停发布 hint"额度（额度在下面的重锚里补充）
+                if self._hint_hold > 0:
+                    self._hint_hold -= 1
+                gap = ref_t - self.ref_t
+                pred = self.pos0 + (ref_t - self.t0) * self._speed()
+                err = ref_pos - pred
+                # ★ 真跳转判据（与单调保护解耦，见 __init__ 说明）：
+                #   连续同向超 jump_err 计数；单次巨跳（仅强窗）或计数达标 ⇒ 硬重锚。
+                sign = 1 if err > 0.0 else (-1 if err < 0.0 else 0)
+                if sign != 0 and abs(err) >= self.jump_err:
+                    if sign == self._err_sign:
+                        self._err_run += 1
+                    else:
+                        self._err_sign = sign
+                        self._err_run = 1
+                else:
+                    self._err_run = 0
+                    self._err_sign = 0
+                big = (strong and self.seek_beats <= abs(err) <= self.jump_max)
+                run_hit = (self._err_run >= self.jump_run)
+                if (gap > self.big_gap or big or run_hit):
+                    # 坐标系真的跳了：识别中断后重出现（gap 过大）、强窗**小幅**巨跳（|err|
+                    # 落在 [seek_beats, jump_max]：1/2/4/8/16/32 拍 Loop/Beat Jump，单帧跟随），
+                    # 或误差连续同向超阈（含 >jump_max 的远距离 seek：需连续 jump_run 个窗确认）
+                    # —— 硬重锚到参考点，清空单调保护（last_pos=None）以允许 pos 后退到新坐标。
+                    # ★ >jump_max（32 拍）的跳变**不再**走单帧 big：孤立强错窗只会有界微调，
+                    #   连续 jump_run 个同向窗一致才重锚（阻塞项 C：强重复段落高票错窗）。
+                    self.t0 = ref_t
+                    self.pos0 = ref_pos
+                    self.last_pos = None
+                    self._err_run = 0
+                    self._err_sign = 0
+                    # ★ R3：>jump_max（>32 拍）的硬重锚且**由连续同向强错窗确认**（run_hit，
+                    #   不是识别中断 gap 重锚）—— 正常路径只有「远距离 seek」与「连续同向强错窗
+                    #   把坐标拽走」两种；后者会让后续 hint 继续指向错坐标（闭环自证）。这里
+                    #   **有界**暂停发布 hint（hint_hold_wins 个窗），让 fp.match 在开环下复核：
+                    #   正确坐标会在 1~2 个窗内重新出现并被采纳。仅在 run_hit 时触发（gap 重锚
+                    #   多为识别中断后的正常复位，不应丢连续性提示）。
+                    if run_hit and abs(err) > self.jump_max:
+                        self._hint_hold = self.hint_hold_wins
+                else:
+                    # 有限增益相位校正：只把预测值朝参考值靠一小步（防抖、不跳拍）
+                    e = max(-self.max_corr, min(self.max_corr, err))
+                    self.t0 = ref_t
+                    self.pos0 = pred + self.gain * e
+                self.ref_t = ref_t
+                self.bl = float(beat_len)
+                self.r = r
+            else:
+                # 同一参考期内（识别还没出新结果）：速率做 EMA 平滑采纳，避免速度突变
+                self.bl = float(beat_len)
+                self.r = self.r * 0.6 + r * 0.4
+
+    def update_rate(self, beat_len, r):
+        """低票数窗的**轻量**更新：只刷新速率（r / beat_len），**绝不触碰相位**。
+
+        为什么需要（阻塞项 A）：低票数时引擎会跳过 `update`（offset 不可信，不能做相位
+        校正），但 `RateEstimator` 仍在收敛新的 r；若时钟的 r / beat_len 一直冻结在旧值，
+        自由跑期间时钟会按**错误速度**推进，等恢复可信窗时误差已积累到数拍 ⇒ 单帧猛跳
+        （实测 60s@(1.05/1.00) 跳变 6.65 拍）。这里只让速度跟上估计值，相位
+        （pos0 / t0 / last_pos）一律不动 ⇒ 自由跑速度正确、恢复时无需大跳。
+        """
+        if beat_len is None or beat_len <= 0:
+            return
+        r = 1.0 if (r is None or not (0.5 <= r <= 2.0)) else float(r)
+        with self._lock:
+            if self.sid is None:
+                return          # 还没锁定坐标系：速率无意义，不动
+            self.bl = float(beat_len)
+            self.r = r
+
+    def _pos_locked(self, now):
+        """持锁状态下取拍位（单调不减）。"""
+        p = self.pos0 + (now - self.t0) * self._speed()
+        if self.last_pos is not None and p < self.last_pos:
+            p = self.last_pos
+        self.last_pos = p
+        return p
+
+    def pos(self, now):
+        """当前拍位（网格坐标）。单调不减：一次识别抖动绝不后退。线程安全。"""
+        with self._lock:
+            return self._pos_locked(now)
+
+    def beats_to_phrase(self, now):
+        """距下一个八拍头还有几拍。线程安全。
+
+        ★ 恰好踩在八拍头（拍位是 phrase 的整数倍）时返回 **0.0**，而不是 phrase。
+          旧实现 `(floor(p/phrase)+1)*phrase - p` 在整点会返回 8.0（"还要等整整一个乐句"），
+          与题意不符（此刻就在八拍头上，剩余 0 拍）。"""
+        with self._lock:
+            p = self._pos_locked(now)
+            r = p % self.phrase
+            if r < 1e-9:
+                return 0.0
+            return self.phrase - r
+
+    def ref_time(self):
+        """最近一次用于校正的识别参考时刻（线程安全读取；缺失返回 0）。"""
+        with self._lock:
+            return self.ref_t
+
+    def hint_hold(self):
+        """R3：还剩几个识别窗要暂停发布 hint（线程安全读取）。>0 时调用方不应发布 hint。"""
+        with self._lock:
+            return self._hint_hold
