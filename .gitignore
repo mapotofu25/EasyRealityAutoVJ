@@ -44,6 +44,18 @@ NDI局域网测试/
 dist_audio_probe/
 dist_ndi_probe/
 
+# ---------- ASIO SDK：**构建时下载，绝不入库**（2026-10-01）----------
+# ⚠⚠ Steinberg 的 ASIO SDK 许可**明确禁止再分发其源码**（允许分发编译产物）
+#   ⇒ `tools/build_asio.py` 首次运行自动下到 `_asio_sdk/`；这个目录**永远不进 git**。
+#   2026-10-01 我犯过一次：一次 `git add -A` 把整个 SDK（139 个文件，含两份 PDF 许可）
+#   提交了进去 —— 虽然是本地提交、还没推送，也已经 amend 清掉了。
+#   ⚠ 教训：**新增了"构建时下载"的外部依赖，第一件事就是先写 .gitignore**，
+#     别等 `git add -A` 把不该进的东西吃进去。
+/_asio_sdk/
+# 编译中间产物（DLL 随包，.pdb/.lib 不需要）
+src/*.pdb
+src/*.lib
+
 # ---------- 模型权重（体积大；见 NOTICE.md，Discogs-EffNet 另有非商业限制）----------
 assets/models/
 assets/thumbs/
