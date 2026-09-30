@@ -24,7 +24,12 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "dist", "EasyRealityAutoVJ", "EasyRealityAutoVJ.exe")
+# ⚠ 与 build_exe.py / make_zip.py 保持同一套口径：支持 `AUTOVJ_DIST` 指定另一个产物目录。
+#   为什么需要它（2026-09-28 实测）：`dist/EasyRealityAutoVJ` 偶尔会被某个进程按住目录句柄
+#   （改不了名、删不掉，WinError 32），此时**新产物只能先落到另一个目录**，
+#   否则打包直接失败。`_dist_pids()` 也用 EXE 反推目录，所以这里一改就一起生效。
+DIST_NAME = os.environ.get("AUTOVJ_DIST", "dist")
+EXE = os.path.join(ROOT, DIST_NAME, "EasyRealityAutoVJ", "EasyRealityAutoVJ.exe")
 
 
 def _default_log():
@@ -124,6 +129,16 @@ def main():
         except OSError as e:
             print("⚠ 删不掉旧日志（可能被占用）：%s" % e)
 
+    # ★ 单实例锁：从源码跑的实例（python main.py）也占这把锁，而它**不叫**
+    #   EasyRealityAutoVJ.exe ⇒ 上面的 taskkill 清不掉它 ⇒ 新 exe 会以为"已在运行"
+    #   直接退出，冒烟就误报失败。这里先探一下，让结论别被误读。
+    _lock = os.path.join(tempfile.gettempdir(), "EasyRealityAutoVJ.lock")
+    lock_held = os.path.exists(_lock)
+    if lock_held:
+        print("⚠ 单实例锁已存在（%s）" % _lock)
+        print("  ⇒ 若本机还有『从源码跑的实例』或旧实例，新 exe 会判定"
+              "「已在运行」并立刻退出 —— 那不是打包失败！")
+
     print("启动 exe，等待 %d 秒…" % secs)
     p = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env)
     alive, t0 = True, time.time()
@@ -169,6 +184,11 @@ def main():
 
     ok = alive and not err
     print("")
+    if not ok and lock_held and not err:
+        print("结论：⚠ 结果不可信 —— 进程提前退出，但单实例锁在冒烟前就已存在，")
+        print("      极可能是被『另一个实例（含从源码跑的 python main.py）』挡住了。")
+        print("      请先关掉所有实例再重跑本脚本，再下结论。")
+        return 2
     print("结论：%s" % ("✅ 冒烟通过" if ok else "★ 冒烟失败，别发这个包"))
     return 0 if ok else 1
 

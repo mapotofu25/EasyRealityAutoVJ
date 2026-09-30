@@ -110,33 +110,49 @@ def _find_peaks(spec):
     inner = spec[N:F - N, N:T - N]
     cand = np.where((inner == sqMax[N:F - N, N:T - N]) & (inner > AMP_MIN))
     peaks = []
+    ap = peaks.append
     for r, c in zip(*cand):
         f, t = int(r) + N, int(c) + N
         val = spec[f, t]
-        nb = spec[f - N:f + N + 1, t - N:t + N + 1].copy()
-        nb[N, N] = -np.inf
-        if np.any(nb >= val):          # 平顶并列 → 非严格最大，跳过
+        # ⚠ 原来这里 `.copy()` 一个 41×41 邻域、把中心改成 -inf 再 any(>= val)；
+        #   候选峰动辄上千个 ⇒ 每次识别白拷贝几 MB。改成"切片视图 + 计数"：
+        #   邻域里 >= val 的个数减去中心自己（它恒等于 val）> 0 ⇒ 存在并列。
+        #   语义与原写法**完全等价**，但零拷贝。
+        nb = spec[f - N:f + N + 1, t - N:t + N + 1]
+        if int(np.count_nonzero(nb >= val)) > 1:
             continue
-        peaks.append((f, t))
+        ap((f, t))
     peaks.sort(key=lambda p: (p[1], p[0]))
     return peaks
 
 
 def _hashes(peaks):
+    """峰对 → [(hash, offset)]。
+
+    ⚠⚠ **不要改这里的哈希算法**：换了就等于换指纹格式，用户库里 1421 首得整库重扫
+    （`FP_SCHEMA_VERSION` 会检测到并清空 fingerprints 表）。所以下面只做
+    「输出逐字节相同」的加速：
+      · `f1 // FREQ_QUANT` 提到内层循环外（原来每对峰都重算一次）；
+      · `b"%d|%d|%d" % (...)` 直接产 bytes，省掉 str→encode 的一次分配；
+      · 常量与 append 提成局部变量（内层循环每窗口要跑 ~1700 次）。
+    """
     out = []
+    ap = out.append
     n = len(peaks)
+    fq, dq, hl = FREQ_QUANT, DT_QUANT, HASH_LEN
+    fan, dmax = FAN_VALUE, MAX_HASH_TIME_DELTA
     for i in range(n):
         f1, t1 = peaks[i]
-        for j in range(1, FAN_VALUE):
+        q1 = f1 // fq
+        for j in range(1, fan):
             if i + j >= n:
                 break
             f2, t2 = peaks[i + j]
             dt = t2 - t1
-            if dt < 0 or dt > MAX_HASH_TIME_DELTA:
+            if dt < 0 or dt > dmax:
                 continue
-            key = f"{f1 // FREQ_QUANT}|{f2 // FREQ_QUANT}|{dt // DT_QUANT}"
-            h = hashlib.sha1(key.encode()).hexdigest()[:HASH_LEN]
-            out.append((h, t1))
+            h = hashlib.sha1(b"%d|%d|%d" % (q1, f2 // fq, dt // dq)).hexdigest()[:hl]
+            ap((h, t1))
     return out
 
 

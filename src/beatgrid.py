@@ -21,7 +21,7 @@
     `phrase` 记录它相对上游锚点的偏移（0=首个八拍头就在锚点处；4=要往后推 4 拍），
     仅用于诊断。
 
-存储：`cfg["music_meta"][path]["grid"]`（见 `store_grid`）。
+存储：`cfg["music_meta"][path]["grid"]`（**由曲库扫描直接写**；本模块的 `store_grid` / `get_grid` 是等价封装，目前只有 tools 在用）。
 """
 from __future__ import annotations
 
@@ -55,7 +55,8 @@ DEFAULT_VDJ = ""           # 不硬编码路径，统一由 vdj_db_path() 自动
 # 只对过期 / 缺失的网格重算（见 ui_main 扫描），而不用整库全量重扫。
 #   1 = 初版（隐式，未写入 grid dict）
 #   2 = 2026-09-27：_assemble 输出显式带 grid_ver；配合增量补网格
-GRID_VER = 2
+GRID_VER = 3          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的曲目改为 src="bt"）
+                      # ⚠ 每次改网格算法都要 +1：ui_main 的 `_need_grid` 靠它判断"该重算"。
 
 
 # ==========================================================================
@@ -322,11 +323,28 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
     f = features(mono, sr)
     env = onset_env(f, "mix")
 
-    if do_scan or not bpm_hint:
+    # ★ Beat This!（本地神经网络）补位：**只在没有 VDJ 提示时**用。
+    #   它解决的是"哪一拍是小节头"（我们自算的 `phase_of` 实测 21 首全错、偏 1~2 拍），
+    #   而"两个小节里哪一个是乐句头"那 1 bit 仍交给下面的 `phrase_phase` 判。
+    #   实测（2026-09-28，21 首）：小节相位 21/21 判对；窗口 60 秒 → 约 1.9 秒/首。
+    #   不可用时（模型缺失 / onnxruntime 异常）静默退回原路径，绝不影响扫描。
+    bt_used = False
+    if anchor_hint is None and bpm_hint is None:
+        try:
+            import phrase_bt
+            r = phrase_bt.analyze(mono, sr, maxsec=phrase_bt.WIN_DEFAULT)
+            if r and r.get("bpm", 0) > 0:
+                bpm_hint = float(r["bpm"])
+                anchor_hint = float(r["anchor"])
+                bt_used = True
+        except Exception:                                        # noqa: BLE001
+            bt_used = False
+
+    if (do_scan and not bt_used) or not bpm_hint:
         peaks = scan_bpm(f, env)
         bpm_auto, _ = pick_bpm(peaks)
     else:
-        peaks, bpm_auto = [], 0.0
+        peaks, bpm_auto = [], (float(bpm_hint) if bt_used else 0.0)
 
     bpm = float(bpm_hint) if bpm_hint else bpm_auto
     if bpm <= 0:
@@ -355,6 +373,7 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
         "phase_conc": round(float(conc), 3),
         "peaks": [(round(b, 2), round(s, 3)) for b, s in peaks[:4]],
         "dur_analyzed": round(dur, 2),
+        "bt": bt_used,          # 是否用了 Beat This 的小节头（_assemble 据此定 src）
     }
 
 
@@ -640,10 +659,16 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
     conf = 0.55 + min(0.4, max(0.0, (a["contrast"] - PHRASE_MIN) * 2.0))
     if e:
         conf = min(1.0, conf + 0.25)
+    elif a.get("bt"):
+        # Beat This 的小节头实测 21/21 对（偏置 ≤0.25 拍）⇒ 给足置信度，
+        # 让 ui_main 的 `conf>=0.6` 二次保险能过。⚠ 它只保证"小节头"，
+        # 那 1 bit（0/4）仍来自 phrase_phase（对比度低时由用户手动翻转）。
+        conf = max(conf, 0.85)
     return {
         "bpm": bpm, "beat_len": round(bl, 6), "anchor": a["anchor"],
         "phrase": a["phrase"], "contrast": a["contrast"],
-        "src": "vdj" if e else "local", "conf": round(conf, 3),
+        "src": ("vdj" if e else ("bt" if a.get("bt") else "local")),
+        "conf": round(conf, 3),
         "dur": dur or a.get("dur_analyzed", 0.0),
         "vdj_bpm": (round(e["bpm"], 3) if e else 0.0),
         "vdj_delta": a.get("bpm_delta", 0.0),

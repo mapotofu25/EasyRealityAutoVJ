@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.09.27.09
+Version 2026.10.01.06
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -23,6 +23,35 @@ If it's your first time, just read it top to bottom.
 Tip: the folder can live on any drive or USB stick, and non-ASCII paths
      are fine. Just avoid directories that need admin rights
      (e.g. C:\Program Files).
+
+
+────────────────────────────────────────
+The Three Pages (top-left tabs, one click apart)
+────────────────────────────────────────
+The app is split into three pages that share one rendering engine and one
+set of clips. The tabs are always visible in the top-left corner:
+
+  🎬 Live           For the show: layers + preview + **media library** +
+                    effects + output
+  🗂 Library        A **full-screen copy** of the Live page's media library:
+                    search / filter / import / tag
+  🎵 Music · Genres Prep work: music library (import + genre scan) /
+                    genre mapping
+
+· The **media library also stays on the Live page** (side by side with the
+  preview), so you can grab clips and **drag them straight into a layer**
+  during the show; double-clicking a thumbnail plays it on the current layer.
+· Tab 2 is the **full-screen version** of the same library: same clips, and
+  the search / filter state is **shared** between the two, so you always
+  see the same result. Handy when importing a large batch.
+  ⚠ **Dragging a clip into a layer only works on the Live page**
+  (Qt does not support cross-page drag & drop).
+· The toolbar's "🎵 Music Library / Genre Mapping" buttons moved to page 3.
+· On the next launch the app **opens on the page you were last on**.
+· The top toolbar (▶ Start / Blackout / Freeze / Pause Auto / Next Clip /
+  Audio / GPU Decode) is **always visible on all three pages**, so nothing
+  about live operation changes.
+· "⋯ More" (top-right) holds: theme, language, hotkeys and about.
 
 
 ────────────────────────────────────────
@@ -56,7 +85,7 @@ Step 4 — Create layers and set their role
   foreground overlay — that gives the best depth.
 
 Step 5 — Scan your music library first (strongly recommended, do it before the show)
-  Click "🎵 Music Library" at the top, import your music folder and click
+  Click "🎵 Music Library…" on page 3 ("🎵 Music · Genres"), import your music folder and click
   "Scan & Analyze". The app fingerprints each track and detects its genre
   (background, resumable — you only scan once).
   Only after this can it recognize "what genre is playing" and pick
@@ -111,6 +140,15 @@ That's it. Everything below is fine-tuning.
 ────────────────────────────────────────
 4. Media Library
 ────────────────────────────────────────
+There are **two copies** of the same library:
+  · the one on the Live page (side by side with the preview) — for the show;
+    **dragging a clip into a layer only works here**;
+  · the full-screen copy on tab 2 — for importing / filtering / tagging,
+    where you can actually see what you're doing.
+  The search box and filters are **shared**, so switching tabs shows the same
+  result. In either copy, double-clicking a thumbnail plays it on the current
+  layer, and the import / scan / tag buttons are available.
+
 [Import]
 The first import asks how to import, with a "remember my choice" option:
   · Copy into library (keep originals) — recommended. Clips stay together,
@@ -159,6 +197,10 @@ Click "+ Layer" at the top of the layer area. Three types:
                                     matching clips automatically
   · Kv Main Visual — the idle layer, see section 9
 
+[Layer-head colours tell them apart at a glance]
+  · Background (auto) = blue border   · Foreground (auto) = orange border
+  · Kv Main Visual = violet border
+
 [Layer role (auto layers only)]
   · Background: a full-frame environment to sit under everything
   · Foreground: dark/alpha overlay elements (effects, light)
@@ -182,7 +224,8 @@ layer's settings, delete the layer, and more.
 
 [Drag & drop]
 Clips can be dragged between layers (drop onto the target layer's row).
-Thumbnails in the library can also be dragged straight into a layer.
+Library thumbnails can also be dragged straight into a layer;
+**double-clicking** one plays it on the current layer instead (faster - handy mid-show).
 
 
 ────────────────────────────────────────
@@ -251,6 +294,14 @@ The "Clip Switch Tempo" dropdown on the right has four options:
         corrects itself within 30-40 seconds.
       · A long system stall makes it silently fall back to the original 4-beat alignment.
       · Re-run a library scan ("Scan & Analyze") once after upgrading so grid data gets generated.
+      · **Every track can now have a grid** (earlier builds only had one for tracks analysed by
+        VirtualDJ - without VirtualDJ there was none at all). Tracks with no VirtualDJ data are
+        filled in by a **local bar-detection pass**: about **2 seconds per track**, one-off,
+        stored in the library and never recomputed. So the first "Scan & Analyze" after upgrading
+        is slower than usual; later scans are back to normal speed.
+      · To sanity-check the local bar detection: watch the grid's "●" bar-head marker and confirm
+        the music changes bar exactly as it passes. If a whole track is offset, use the
+        "Invert 8-beat phase" button described below.
       · A **beat grid strip** is drawn in the preview, right under the HUD, sweeping left to right
         with the music: "◆" = 8-beat phrase head (**the line the switching actually aligns to**),
         "●" = bar head, "·" = plain beat, the white cursor on the left = now. To check alignment,
@@ -270,6 +321,21 @@ The "Clip Switch Tempo" dropdown on the right has four options:
 [Build the music library]
 See step 5 above: "🎵 Music Library" → "Import Music Folder" →
 "Scan & Analyze". Do this before the show; you only need to scan once.
+
+[Sorting & Filtering] (the left column of the "🎵 Music · Genres" tab)
+· **Sort**: original order / title / artist / BPM low→high / BPM high→low /
+  duration short→long / duration long→short
+· **BPM range**: All / No grid / <100 / 100–128 / 128–150 / 150–180 / ≥180
+· **Duration**: All / Unknown / <3 min / 3–5 min / 5–7 min / ≥7 min
+· **Missing files only**: tracks that can no longer be found after moving
+  drives or renaming — your repair list.
+· "Reset filters" clears everything.
+
+  ⚠ BPM and duration come from the **beat grid computed during the library
+  scan**, not from casual metadata tags. So the "No grid" bucket is exactly
+  the set of tracks that **cannot use 8-beat phrase alignment** — worth a
+  pass of its own. Newly imported tracks need another "Scan & Analyze"
+  before they get a grid.
 
 [What happens live]
   · The app hears the music, identifies the track and knows its genre
@@ -426,9 +492,17 @@ is the window **position** — your chosen resolution is never overwritten.
 
 · Spout Output: share frames with other local apps in real time
                  (install the Spout plugin in OBS, then pick this Sender)
-· NDI Output: sends video + audio over the network
-               (receiver needs NDI Runtime) — note you must install
-               NDI Runtime on this machine first.
+                 ⚠ Spout carries **video only — no audio**. Use NDI or a
+                 virtual audio device if you need sound.
+· NDI Output: sends the picture over the network to other machines / apps.
+                 The **runtime ships with the app — nothing to install on
+                 this machine**; only the **receiver** needs NDI Runtime.
+· Send NDI audio (48 kHz stereo): sends the captured sound along with NDI.
+                 **Off by default** — the app captures the *system loopback*,
+                 so if the receiver is already monitoring the same sound you
+                 would hear doubling/echo. Only enable it when the receiver
+                 needs the audio on its own (requires NDI Output to be on;
+                 this checkbox stays greyed out until then).
 
 ⚠ Output buttons only become available after you click "Start Auto VJ",
   which prevents accidentally changing the show output.
@@ -437,7 +511,7 @@ is the window **position** — your chosen resolution is never overwritten.
 ────────────────────────────────────────
 13. Hotkeys
 ────────────────────────────────────────
-Open "Hotkeys" at the top to view, rebind, enable/disable, and optionally
+Open "⋯ More → Hotkeys" at the top to view, rebind, enable/disable, and optionally
 make them global (they then work even when the window isn't focused).
 
   Space          Start / Stop
@@ -459,9 +533,9 @@ make them global (they then work even when the window isn't focused).
 ────────────────────────────────────────
 14. Language & About
 ────────────────────────────────────────
-· Language dropdown at the top: 中文 / English — takes effect IMMEDIATELY,
+· Language (top "⋯ More → Language"): 中文 / English — takes effect IMMEDIATELY,
   no restart needed.
-· "About" at the top: version info, highlights, author & feedback,
+· About (top "⋯ More → About"): version info, highlights, author & feedback,
   **open-source projects / AI models / credits** (every entry is a clickable
   link that opens in your browser), third-party licenses, and the disclaimer.
   It also has "Open Data Folder" and "User Manual" buttons.

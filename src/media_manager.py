@@ -1202,13 +1202,39 @@ def gpu_status():
         glctx.preinit()
         worker = glctx.GLWorker.get()
         if not worker.ensure():
-            _GPU_DISABLED = "GL 工作线程不可用：%s" % (worker.last_error or "未知")
-            return _fail(_GPU_DISABLED)
+            # ⚠ **不要**把瞬时状态写进全局 `_GPU_DISABLED`：那会自动堵住后面所有
+            #   播放器的 GPU 路径（用户就是在设置里开关一次 GPU 之后再也回不到 GPU）。
+            return _fail("GL 工作线程暂不可用：%s" % (worker.last_error or "未知"))
     except Exception as e:                                            # noqa: BLE001
-        _GPU_DISABLED = "GL 初始化异常：%s" % str(e)[:80]
-        return _fail(_GPU_DISABLED)
+        # 同上：初始化异常也只作显示，不做全局封杀（下次探测可能就好了）
+        return _fail("GL 初始化异常：%s" % str(e)[:80])
     _GPU_STATUS = (True, "GPU 解码可用")
     return _GPU_STATUS
+
+
+# ---- 解码生成器的"空转退避"（2026-10-01 现场：CPU 从 2 核悄悄涨到满核）----
+#   ⚠ 三个取帧生成器都是 `while True: 解码一趟 → _rewind() → 再解码`。只要某趟
+#     **一个帧都没产出**（decode 抛异常 / demux 全是坏包 / frame_blocks 全返回 None），
+#     而 `_rewind()` 又成功（能 seek 回片头），这个 while 就**没有任何 sleep**
+#     ⇒ 白占一个核 + 反复重开容器（磁盘狂读），且**永不自愈**。
+#     现场实测：正在软解的线程 12 秒内从 2 个涨到 18 个、CPU 一路到 100%。
+#   ⇒ 连续空转就退避，连续空转太多就判定"这个素材解不出来"、收工（释放容器）。
+_SOFT_EMPTY_BACKOFF_AFTER = 3      # 连续空转几趟后开始 sleep
+_SOFT_EMPTY_GIVEUP = 30            # 连续空转这么多趟 ⇒ 放弃这个素材
+# 解码线程连续"打不开容器 / 拿不到帧"这么多次 ⇒ 才真的收工（期间退避重试，见 `_loop`）。
+# 用户 2026-10-01 报「素材会突然卡住不动，直到下一个切进来才恢复」就是因为它原来**一次
+# 失败就永久死亡**；现在会自愈重开，只有连续失败这么多次才放弃。
+_REOPEN_MAX = 6
+
+
+def _log_decoder_giveup(path, why):
+    """解码器放弃时记一行（best-effort，绝不抛）。"""
+    try:
+        import stallwatch
+        stallwatch.log_line("!! 解码器放弃：%s（%s）—— 已停止该路解码，避免空转烧 CPU"
+                            % (os.path.basename(str(path or "")), why))
+    except Exception:                                              # noqa: BLE001
+        pass
 
 
 class GpuDxvPlayer:
@@ -1244,7 +1270,9 @@ class GpuDxvPlayer:
         self._src_w = 0
         self._src_h = 0
         self._fmt = 0
-        self.gpu = False           # 诊断：是否走 GPU
+        self.gpu = False           # 诊断：**当前**是否真的走 GPU
+        self.gpu_want = False      # ★ 素材允许走 GPU（即使此刻工作线程没就绪）
+                                   #   ⇒ 用 `_gpu_frames()` 进自愈路径，别用 `_soft_frames`
         self.reason = "未探测"      # 诊断：走 / 不走 GPU 的原因
         self._t = None                  # 不再持有 Thread 对象（见 _start_decoder_thread 的说明）
         _start_decoder_thread(self._loop, name="autovj-dec")
@@ -1285,9 +1313,9 @@ class GpuDxvPlayer:
         """能不能走 GPU；能则设好 self._fmt 并返回 True（GL 上下文由全局工作线程持有）。"""
         global _GPU_DISABLED
         try:
-            if _GPU_DISABLED:
-                self.reason = _GPU_DISABLED
-                return False
+            # ⚠ 不再因为全局 `_GPU_DISABLED` 就一票否决：它可能只是**上一次**的
+            #   瞬时失败（GL 工作线程起得慢 / 正在冷却）。真正的硬失败（dxvnative
+            #   缺失、依赖导入失败）下面各有独立判据，照样会退回软解。
             if st.codec_context.name != "dxv":
                 self.reason = "非 DXV（%s）" % st.codec_context.name
                 return False
@@ -1335,11 +1363,18 @@ class GpuDxvPlayer:
                 err = worker.last_error or "未知"
                 # ⚠ 「配额达上限」只是**这一个素材**的事（走软解就行），
                 #   不能把整条 GPU 路径全局关掉 —— 否则一次瞬时超限会永久禁用 GPU 解码。
-                if "已达上限" in err:
-                    self.reason = err
-                else:
-                    _GPU_DISABLED = "GL 工作线程不可用：%s" % err
-                    self.reason = _GPU_DISABLED
+                # ⚠⚠ 这里**绝不能就这么 return False 完事**（2026-09-29 现场
+                #   CPU 50%+ / 磁盘 300MB/s 的根因）：软解路径 `_soft_frames` 是
+                #   **建播放器那一刻定一次、永不重探**的 —— 只要此刻 GL 工作线程
+                #   还没就绪（或正在冷却期），这个播放器就**一辈子软解**，
+                #   每个 DXV-1080p 烧 0.6~0.95 核 + 一路磁盘读。
+                #   正确做法：标记 `gpu_want` 后照常进 `_gpu_frames()` —— 它开头就
+                #   `yield from _soft_until_recover()`，**每 3 秒重探**，工作线程一
+                #   恢复就自动切回 GPU（这条自愈路径本来就有，只是没人走进去）。
+                #   「配额达上限」同理：那是这一个素材的事，不是全局判死刑。
+                self.gpu_want = True
+                self.reason = ("GL 工作线程暂不可用（%s）—— 先软解，"
+                               "恢复后自动切回 GPU" % err)
                 return False
             self._fmt = fmt
             self.gpu = True
@@ -1393,6 +1428,7 @@ class GpuDxvPlayer:
         import dxvnative
         import glctx
         worker = glctx.GLWorker.get()
+        empty = 0
         while True:
             if not worker.available():
                 self.reason = worker.last_message() or "GL 工作线程不可用，已切软解"
@@ -1407,6 +1443,7 @@ class GpuDxvPlayer:
                     "5" if self._fmt == 5 else "1", self._src_w, self._src_h)
                 continue
             gone = False
+            produced = 0
             try:
                 for pkt in self.c.demux(self.st):
                     if not pkt.size:
@@ -1423,11 +1460,22 @@ class GpuDxvPlayer:
                             gone = True
                             break
                         continue
+                    produced += 1
                     yield QImage(arr.data, dw, dh, 4 * dw, self._qfmt).copy()
-            except Exception:
+            except Exception:                                          # noqa: BLE001
                 pass
             if gone:
                 continue                  # 回顶部：降级 → 软解 + 周期重探（worker 恢复即回 GPU）
+            # ⚠ 空转退避：整趟 demux 一个帧都没解出来（全是坏包 / 不是真 DXV）时，
+            #   立刻 `_rewind()` 会变成无 sleep 的死循环，而且每趟都白跑一次 native 解包。
+            empty = 0 if produced else empty + 1
+            if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
+                time.sleep(min(0.2, 0.02 * empty))
+            if self._dead:             # 已被淘汰/关闭：立刻收工
+                return
+            if empty >= _SOFT_EMPTY_GIVEUP:
+                _log_decoder_giveup(self.path, "GPU 路径连续 %d 趟无帧" % empty)
+                return
             if not self._rewind():
                 return
 
@@ -1439,9 +1487,12 @@ class GpuDxvPlayer:
         **绝不阻塞、绝不每帧查**，所以软解出帧节奏完全不受影响。
         """
         next_probe = time.perf_counter() + self._GPU_REPROBE_SECS
+        empty = 0
         while True:
+            got = 0
             try:
                 for frame in self.c.decode(video=0):
+                    got += 1
                     arr = frame.to_ndarray(format="bgra")
                     h, w = arr.shape[:2]
                     if self._max_w and self._max_h:
@@ -1456,18 +1507,34 @@ class GpuDxvPlayer:
                         next_probe = now + self._GPU_REPROBE_SECS
                         if worker.available():
                             return True       # ★ 恢复：切回 GPU 路径
-            except Exception:
+            except Exception:                                      # noqa: BLE001
                 pass
+            # ⚠ 空转退避：理由同 `_soft_frames`（解不出来的素材不能占着一个核空转）
+            empty = 0 if got else empty + 1
+            if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
+                time.sleep(min(0.2, 0.02 * empty))
+            if self._dead:             # 已被淘汰/关闭：立刻收工
+                return False
+            if empty >= _SOFT_EMPTY_GIVEUP:
+                _log_decoder_giveup(self.path, "软解(重探)连续 %d 趟无帧" % empty)
+                return False
             if not self._rewind():
                 return False
             if worker.available():            # 片尾也顺带探一次
                 return True
 
     def _soft_frames(self):
-        """软解路径：与 AvAlphaPlayer 完全一致的 PyAV 解码（降级用）。"""
+        """软解路径：与 AvAlphaPlayer 完全一致的 PyAV 解码（降级用）。
+
+        ⚠ 必须有"空转退避"：见 `_SOFT_EMPTY_BACKOFF_AFTER` 的说明 —— 否则一个解不出来
+          的素材会**占满一个核空转**，而且现场就是这样把 CPU 一点点拖到 100% 的。
+        """
+        empty = 0
         while True:
+            got = 0
             try:
                 for frame in self.c.decode(video=0):
+                    got += 1
                     arr = frame.to_ndarray(format="bgra")
                     h, w = arr.shape[:2]
                     if self._max_w and self._max_h:
@@ -1477,40 +1544,85 @@ class GpuDxvPlayer:
                                              interpolation=cv2.INTER_AREA)
                             h, w = arr.shape[:2]
                     yield QImage(arr.data, w, h, 4 * w, self._qfmt).copy()
-            except Exception:
+            except Exception:                                      # noqa: BLE001
                 pass
+            empty = 0 if got else empty + 1
+            if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
+                time.sleep(min(0.2, 0.02 * empty))
+            if self._dead:             # 已被淘汰/关闭：立刻收工，别继续空转
+                return
+            if empty >= _SOFT_EMPTY_GIVEUP:
+                _log_decoder_giveup(self.path, "软解连续 %d 趟无帧" % empty)
+                return
             if not self._rewind():
                 return
 
     def _loop(self):
-        try:
-            self.c, self.st = self._open()
-        except Exception:
-            return
-        if self._dead:                     # 打开期间就被关掉了
-            self._release()
-            return
-        interval = 1.0 / max(self.fps, 1.0)
-        frames = self._gpu_frames() if self.gpu else self._soft_frames()
+        """解码线程主体。
+
+        ⚠⚠ 必须能**自愈重开**（2026-10-01 用户报「素材会突然卡住不动，直到下一个切进来才恢复」）：
+          原来 `_open()` 一抛异常就 `return`、取帧生成器一收工就 `break`
+          ⇒ 这个播放器**永久死掉**，画面停在最后一帧（引擎拿的是 `_img` 的旧值），
+          直到下一次切素材新建播放器才恢复正常 —— 与用户描述完全一致。
+          现在：打开失败 / 取帧收工 ⇒ **退避后重开容器再试**（最多 `_REOPEN_MAX` 轮），
+          只有连续失败那么多次才真的收工；期间一律 sleep 退避，**绝不忙等**。
+        """
+        tries = 0
         while not self._dead:
-            if not self._active:
-                if self._warm <= 0:
-                    time.sleep(0.05)
-                    continue
-                self._warm -= 1            # 预热：不活跃也只解这一帧
-            t0 = time.perf_counter()
+            # ---- ① 打开容器：失败就退避重试，而不是直接死掉 ----
             try:
-                img = next(frames)
-            except StopIteration:
-                break
-            except Exception:
-                time.sleep(0.02)
+                self.c, self.st = self._open()
+            except Exception:                                      # noqa: BLE001
+                tries += 1
+                if tries >= _REOPEN_MAX:
+                    _log_decoder_giveup(self.path, "连续 %d 次打开失败" % tries)
+                    break
+                time.sleep(min(2.0, 0.25 * tries))
                 continue
-            if img is not None:
-                self._img = img
-            wait = float(interval / self.speed - (time.perf_counter() - t0))
-            if wait > 0:
-                time.sleep(wait)
+            if self._dead:                 # 打开期间就被关掉了
+                break
+            interval = 1.0 / max(self.fps, 1.0)
+            gen_gpu = (self.gpu or self.gpu_want) and gpu_decode_enabled()
+            frames = self._gpu_frames() if gen_gpu else self._soft_frames()
+            produced = False
+            while not self._dead:
+                # ★ 只有"该不该走 GPU"这一件事允许中途换生成器：设置里开关 GPU 解码
+                #   立刻生效（以前只在建播放器那一刻定一次 ⇒ 改完开关得重开软件才行）。
+                want = (self.gpu or self.gpu_want) and gpu_decode_enabled()
+                if want != gen_gpu:
+                    gen_gpu = want
+                    frames = self._gpu_frames() if want else self._soft_frames()
+                if not self._active:
+                    if self._warm <= 0:
+                        time.sleep(0.05)
+                        continue
+                    self._warm -= 1        # 预热：不活跃也只解这一帧
+                t0 = time.perf_counter()
+                try:
+                    img = next(frames)
+                except StopIteration:
+                    break                  # 生成器收工 ⇒ 走下面"重开再试"
+                except Exception:                                      # noqa: BLE001
+                    time.sleep(0.02)
+                    continue
+                if img is not None:
+                    self._img = img
+                    produced = True
+                wait = float(interval / self.speed - (time.perf_counter() - t0))
+                if wait > 0:
+                    time.sleep(wait)
+            if self._dead:
+                break
+            # ---- ② 取帧收工：出过帧说明素材是好的，重置计数；否则累加 ----
+            if produced:
+                tries = 0
+            else:
+                tries += 1
+            if tries >= _REOPEN_MAX:
+                _log_decoder_giveup(self.path, "连续 %d 轮取帧收工" % tries)
+                break
+            self._release()
+            time.sleep(min(2.0, 0.25 * tries))
         self._release()
 
     def _release(self):

@@ -12,7 +12,7 @@ import os
 
 from tags_def import (TAG_CATEGORIES, DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER)
-from PySide6.QtCore import Qt, QSize, Signal, QMimeData, QTimer, QPoint
+from PySide6.QtCore import Qt, QSize, Signal, QMimeData, QTimer, QPoint, QRectF
 from PySide6.QtGui import QColor, QPixmap, QImage, QDrag, QAction, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSlider,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QMenu, QDialog, QCheckBox, QProgressBar, QDialogButtonBox,
     QSizePolicy, QApplication, QDoubleSpinBox, QSpinBox, QGroupBox, QToolBox,
     QInputDialog, QLineEdit, QRadioButton, QButtonGroup, QSplitter,
+    QFileDialog, QMessageBox, QPlainTextEdit, QStyledItemDelegate,
 )
 
 from engine import BLEND_MODES, BLEND_LABELS, MODE_LABELS
@@ -62,7 +63,10 @@ class StayOpenMenu(QMenu):
 
 
 class NewLayerDialog(I18nDialog):
-    """新建图层对话框：名称 + 类型(手动/自动) + 角色(前景/背景)。自动图层按曲风匹配画面。"""
+    """新建图层对话框：名称 + 类型(手动 / 自动 / Kv 主视觉) + 角色(前景/背景)。
+
+    自动图层按曲风匹配画面；Kv 主视觉是唯一的待机层。
+    """
 
     KV_DEFAULT_NAME = "Kv 主视觉"
 
@@ -152,6 +156,9 @@ class NewLayerDialog(I18nDialog):
                 self.name_edit.setText(self._default_name)
 
     def result_data(self):
+        """返回 (name, auto, role, is_kv)。唯一调用点：ui_main.layer_add。
+
+        ⚠ 改返回值元数必须 grep 全部调用点（项目铁律）。"""
         name = self.name_edit.text().strip()
         auto = self.rb_auto.isChecked()
         is_kv = self.rb_kv.isChecked()
@@ -954,6 +961,265 @@ class MusicLibraryDialog(I18nDialog):
             self.main.remove_music(path)
 
 
+class MusicLibraryPanel(QWidget):
+    """音乐曲库**整页**面板：左栏「排序 / 筛选」+ 右侧曲目列表。
+
+    ★ 用户要求（2026-10-01）：「曲库管理改成全屏的，左边增加一个排序和筛选的选项」。
+      原来是 660×540 的弹窗（`MusicLibraryDialog`），这里做成能铺满主区的整页。
+
+    ⚠ 成员名与旧弹窗**刻意对齐**（`refresh()` / `progress` / `lbl` / `btn_scan` / `list`）：
+      主窗口里那 5 处「扫描进度 / 刷新列表」的代码直接复用，不用改一行
+      （它们都是 `getattr(self, "music_dialog")` 之后调这几个成员）。
+
+    数据来源：`cfg["music_library"]`（路径列表）+ `cfg["music_meta"][路径]`：
+      · **BPM 与时长都在 `meta[路径]["grid"]` 里**（`bpm` / `dur` 秒），曲库扫描建库时写入
+        （VDJ 库优先，读不到才本地算）；
+      · 文件是否还在 = `os.path.isfile`（几百首很快，不做缓存）。
+    """
+
+    # 左栏候选（先按用户点的两组：BPM 区间 + 时长区间/文件缺失）
+    BPM_FILTERS = [("全部", None), ("无节拍网格", "none"), ("<100", (0, 100)),
+                   ("100–128", (100, 128)), ("128–150", (128, 150)),
+                   ("150–180", (150, 180)), ("≥180", (180, 1e9))]
+    DUR_FILTERS = [("全部", None), ("时长未知", "none"), ("<3 分钟", (0, 180)),
+                   ("3–5 分钟", (180, 300)), ("5–7 分钟", (300, 420)),
+                   ("≥7 分钟", (420, 1e9))]
+    SORTS = [("原顺序", "orig"), ("曲名", "title"), ("艺人", "artist"),
+             ("BPM 从低到高", "bpm"), ("BPM 从高到低", "bpm_d"),
+             ("时长从短到长", "dur"), ("时长从长到短", "dur_d")]
+
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.main = main
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+
+        # ---------------- 左栏：排序 / 筛选 ----------------
+        left_w = QWidget()
+        left_w.setFixedWidth(216)
+        lv = QVBoxLayout(left_w)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(6)
+        t = QLabel(T("排序 / 筛选"))
+        t.setStyleSheet("font-weight:bold;color:" + theme.V("text") + ";")
+        lv.addWidget(t)
+
+        lv.addWidget(QLabel(T("排序")))
+        self.cb_sort = QComboBox()
+        for label, _key in self.SORTS:
+            self.cb_sort.addItem(label)
+        self.cb_sort.currentIndexChanged.connect(lambda _i: self.refresh())
+        lv.addWidget(self.cb_sort)
+
+        lv.addWidget(QLabel(T("BPM（按节拍网格）")))
+        self.cb_bpm = QComboBox()
+        for label, _v in self.BPM_FILTERS:
+            self.cb_bpm.addItem(label)
+        self.cb_bpm.currentIndexChanged.connect(lambda _i: self.refresh())
+        lv.addWidget(self.cb_bpm)
+
+        lv.addWidget(QLabel(T("时长")))
+        self.cb_dur = QComboBox()
+        for label, _v in self.DUR_FILTERS:
+            self.cb_dur.addItem(label)
+        self.cb_dur.currentIndexChanged.connect(lambda _i: self.refresh())
+        lv.addWidget(self.cb_dur)
+
+        self.chk_missing = QCheckBox(T("只看文件缺失"))
+        self.chk_missing.setToolTip(T("换盘 / 改名之后找不到文件的曲目（修复清单）"))
+        self.chk_missing.toggled.connect(lambda _s: self.refresh())
+        lv.addWidget(self.chk_missing)
+
+        b_reset = QPushButton(T("重置筛选"))
+        b_reset.clicked.connect(self.reset_filters)
+        lv.addWidget(b_reset)
+
+        hint = QLabel(T("BPM / 时长来自曲库扫描时建的节拍网格；「无节拍网格」的曲目"
+                        "八拍乐句对齐用不了，是需要处理的清单。"))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
+        lv.addWidget(hint)
+        lv.addStretch(1)
+        self.lbl_filter = QLabel("")
+        self.lbl_filter.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
+        self.lbl_filter.setWordWrap(True)
+        lv.addWidget(self.lbl_filter)
+        lay.addWidget(left_w, 0)
+
+        # ---------------- 右侧：工具栏 + 列表 ----------------
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        row = QHBoxLayout()
+        b_dir = QPushButton(T("导入音乐文件夹"))
+        b_file = QPushButton(T("导入音乐文件"))
+        self.btn_scan = QPushButton(T("扫描分析"))
+        self.btn_scan.setToolTip(T("逐首建指纹 + 查曲风（后台、增量）"))
+        b_rescan = QPushButton(T("全量重扫"))
+        b_rescan.setToolTip(T("忽略已有结果，重新分析全部"))
+        b_clear = QPushButton(T("清除分析数据"))
+        b_clear.setToolTip(T("删除全部指纹与自动识别的曲风（可选保留手动设置）"))
+        b_dir.clicked.connect(self.main.import_music_dir)
+        b_file.clicked.connect(self.main.import_music_files)
+        self.btn_scan.clicked.connect(lambda: self.main.scan_music(force=False))
+        b_rescan.clicked.connect(lambda: self.main.scan_music(force=True))
+        b_clear.clicked.connect(self.main.show_clear_music_analysis)
+        for b in (b_dir, b_file, self.btn_scan, b_rescan, b_clear):
+            row.addWidget(b)
+        row.addStretch(1)
+        right.addLayout(row)
+
+        self.progress = QProgressBar()
+        self.progress.hide()
+        right.addWidget(self.progress)
+
+        self.list = QListWidget()
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._ctx_menu)
+        right.addWidget(self.list, 1)
+
+        self.lbl = QLabel("")
+        self.lbl.setStyleSheet("color:" + theme.V("muted") + ";")
+        right.addWidget(self.lbl)
+        lay.addLayout(right, 1)
+
+        self.refresh()
+
+    # ---------------- 数据 ----------------
+    @staticmethod
+    def _info(meta, path):
+        """取一首曲目的 (bpm, 时长秒, 文件在不在)。缺的返回 None。"""
+        m = meta.get(path) or {}
+        g = m.get("grid") if isinstance(m.get("grid"), dict) else {}
+        bpm = g.get("bpm") if g else None
+        dur = g.get("dur") if g else None
+        try:
+            bpm = float(bpm) if bpm else None
+        except (TypeError, ValueError):
+            bpm = None
+        try:
+            dur = float(dur) if dur else None
+        except (TypeError, ValueError):
+            dur = None
+        try:
+            exists = os.path.isfile(path)
+        except Exception:                                          # noqa: BLE001
+            exists = False
+        return bpm, dur, exists
+
+    @staticmethod
+    def _in_bucket(val, bucket):
+        """bucket 为 None=全部；"none"=缺失；否则 (lo, hi) 区间。"""
+        if bucket is None:
+            return True
+        if bucket == "none":
+            return val is None
+        if val is None:
+            return False
+        lo, hi = bucket
+        return lo <= val < hi
+
+    def reset_filters(self):
+        for cb in (self.cb_sort, self.cb_bpm, self.cb_dur):
+            cb.blockSignals(True)
+            cb.setCurrentIndex(0)
+            cb.blockSignals(False)
+        self.chk_missing.setChecked(False)
+        self.refresh()
+
+    def _sort_key(self, key, meta):
+        def k(path):
+            bpm, dur, _e = self._info(meta, path)
+            name = os.path.basename(path)
+            if key == "title":
+                return (name.lower(),)
+            if key == "artist":
+                return ((meta.get(path) or {}).get("artist") or "").lower()
+            if key == "bpm":
+                return (bpm is None, bpm or 0.0, name.lower())
+            if key == "bpm_d":
+                return (bpm is None, -(bpm or 0.0), name.lower())
+            if key == "dur":
+                return (dur is None, dur or 0.0, name.lower())
+            if key == "dur_d":
+                return (dur is None, -(dur or 0.0), name.lower())
+            return (0,)
+        return k
+
+    def refresh(self):
+        """按左栏的排序/筛选重建列表（廉价操作，几百首毫秒级）。"""
+        try:
+            meta = self.main.cfg["music_meta"] or {}
+            lib = list(self.main.cfg["music_library"] or [])
+            bpm_b = self.BPM_FILTERS[self.cb_bpm.currentIndex()][1]
+            dur_b = self.DUR_FILTERS[self.cb_dur.currentIndex()][1]
+            only_miss = self.chk_missing.isChecked()
+            rows = []
+            for p in lib:
+                bpm, dur, exists = self._info(meta, p)
+                if not self._in_bucket(bpm, bpm_b):
+                    continue
+                if not self._in_bucket(dur, dur_b):
+                    continue
+                if only_miss and exists:
+                    continue
+                rows.append((p, bpm, dur, exists))
+            sk = self.SORTS[self.cb_sort.currentIndex()][1]
+            if sk != "orig":
+                order = {p: i for i, p in enumerate(lib)}
+                rows.sort(key=lambda r: (self._sort_key(sk, meta)(r[0]),
+                                         order.get(r[0], 0)))
+            self.list.clear()
+            for p, bpm, dur, exists in rows:
+                m = meta.get(p) or {}
+                genres = "、".join(m.get("genres") or []) or T("未分析")
+                src = m.get("source") or ""
+                bits = []
+                if bpm:
+                    bits.append("BPM %.0f" % bpm)
+                else:
+                    bits.append(T("无网格"))
+                if dur:
+                    bits.append("%d:%02d" % (int(dur) // 60, int(dur) % 60))
+                if not exists:
+                    bits.append(T("文件缺失"))
+                txt = "%s    →    %s    (%s)  ｜ %s" % (
+                    os.path.basename(p), genres, src, " ｜ ".join(bits))
+                it = QListWidgetItem(txt)
+                it.setData(Qt.UserRole, p)
+                if not exists:
+                    it.setForeground(QColor("#e06666"))
+                self.list.addItem(it)
+            done = sum(1 for p in lib if p in meta)
+            self.lbl.setText(Tf("共 {} 首，已分析 {} 首（当前显示 {} 首）",
+                                len(lib), done, len(rows)))
+            self.lbl_filter.setText(Tf("筛选后 {} / {} 首", len(rows), len(lib)))
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _ctx_menu(self, pos):
+        it = self.list.itemAt(pos)
+        if it is None:
+            return
+        path = it.data(Qt.UserRole)
+        menu = QMenu(self)
+        edit = menu.addAction(T("纠正曲风…"))
+        rescan = menu.addAction(T("重新分析扫描此曲目"))
+        info = menu.addAction(T("此曲目信息"))
+        menu.addSeparator()
+        rm = menu.addAction(theme.danger_icon(), T("从曲库移除"))
+        i18n_retranslate(menu)      # 临时菜单：弹出前刷语言
+        act = menu.exec(self.list.mapToGlobal(pos))
+        if act == edit:
+            self.main.edit_music_genre(path)
+        elif act == rescan:
+            self.main.rescan_music(path)
+        elif act == info:
+            self.main.show_music_info(path)
+        elif act == rm:
+            self.main.remove_music(path)
+
+
 class LibraryGrid(MediaGrid):
     """素材库网格：支持拖出到图层行 + 从资源管理器拖入导入 + 自定义右键菜单"""
     files_dropped = Signal(list)   # 外部拖入的文件/文件夹路径列表
@@ -965,6 +1231,21 @@ class LibraryGrid(MediaGrid):
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
+        # ★ 2026-09-28：双击缩略图 = **立即播放到当前图层**（等价于右键 →「播放到图层」→ 选中那层）。
+        #   比"拖到图层"更快，演出中一只手就能用；自动图层会被 add_to_layer 里的
+        #   auto_mode 判断挡掉，不会污染自动匹配。
+        self.itemDoubleClicked.connect(self._on_double_click)
+
+    def _on_double_click(self, item):
+        """双击素材 = 播放到当前图层（快捷方式；拖拽依然可用）。"""
+        try:
+            m = item.data(Qt.UserRole)
+            if m is None:
+                return
+            idx = int(getattr(self.main, "_cur_layer", 0) or 0)
+            self.main.play_to_layer(idx, [m])
+        except Exception:                                        # noqa: BLE001
+            pass
 
     # ---- 外部拖入（资源管理器 → 素材库） ----
     def dragEnterEvent(self, e):
@@ -1180,6 +1461,35 @@ class _DropViewport(QWidget):
         self.row._vp_drop(e)
 
 
+# "这个格子正在播"的标记 role（给 _PlayBorderDelegate 画金边用）
+PLAY_ROLE = Qt.UserRole + 7
+
+
+class _PlayBorderDelegate(QStyledItemDelegate):
+    """在"正在播放"的素材格上，**压在缩略图之上**再画一道金边。
+
+    为什么光靠 `item.setBackground` 不够（用户 2026-09-30 说"没修好"）：
+    缩略图几乎铺满整格，金黄底只在四周露出 ~4px，一屏深色素材里根本看不见。
+    金边画在最后 ⇒ 无论素材多亮多花，都能一眼认出哪一格在播。
+    """
+
+    def paint(self, painter, opt, idx):
+        super().paint(painter, opt, idx)
+        if not idx.data(PLAY_ROLE):
+            return
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            r = QRectF(opt.rect).adjusted(1.0, 1.0, -1.5, -1.5)
+            pen = QPen(QColor(255, 205, 0, 255))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(r, 5, 5)
+        finally:
+            painter.restore()
+
+
 class ClipRow(QListWidget):
     """一个图层的素材行：横向排列、内部拖动排序、可接收素材库拖入"""
 
@@ -1211,6 +1521,8 @@ class ClipRow(QListWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setObjectName("clipRow")
+        # ★ 播放高亮的金边靠它画（见 _PlayBorderDelegate）
+        self.setItemDelegate(_PlayBorderDelegate(self))
         # 注意：不能写 ::item 规则！一旦用样式表绘制列表项，setBackground() 的高亮会失效
         self._apply_theme()
         theme.register(self, self._apply_theme)   # 主题切换时重设（弱引用，销毁后自动摘除）
@@ -1247,44 +1559,6 @@ class ClipRow(QListWidget):
         if self._handle_drop(e):
             return
         e.ignore()
-
-    # ---- 手动接管拖动（保证左键拖素材一定起效果）----
-    def mousePressEvent(self, e):
-        self._press_pos = None
-        self._press_item = None
-        if e.button() == Qt.LeftButton:
-            pt = e.position().toPoint() if hasattr(e, "position") else e.pos()
-            it = self.itemAt(pt)
-            if it is not None:
-                self._press_item = it
-                self._press_pos = pt
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if not (e.buttons() & Qt.LeftButton) or self._press_item is None or self._press_pos is None:
-            super().mouseMoveEvent(e)
-            return
-        pt = e.position().toPoint() if hasattr(e, "position") else e.pos()
-        if (pt - self._press_pos).manhattanLength() < QApplication.startDragDistance():
-            super().mouseMoveEvent(e)
-            return
-        # 自行发起拖动
-        m = self._press_item.data(Qt.UserRole)
-        self._drag_paths = [m.path]
-        md = QMimeData()
-        md.setData(CLIP_MIME, m.path.encode("utf-8"))
-        md.setText(m.path)
-        drag = QDrag(self)
-        drag.setMimeData(md)
-        pm = m.pixmap(CELL_W - 8, CELL_H - 10)
-        if not pm.isNull():
-            drag.setPixmap(pm)
-            drag.setHotSpot(QPoint(pm.width() // 2, pm.height() // 2))
-        drag.exec(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
-        self._drag_paths = []
-        self._press_item = None
-        self._press_pos = None
-        e.accept()
 
     # ---- 拖放 ----
     def eventFilter(self, obj, ev):
@@ -1643,8 +1917,8 @@ class LayerStackPanel(QWidget):
 
     @staticmethod
     def _header_style(lay):
-        """图层头样式：普通层中性边框；自动层角色色（前景橙/背景蓝）；
-        Kv 主视觉图层用专属紫金配色（与前景/背景同款结构，一眼区分）。"""
+        """图层头样式：普通层中性边框；自动层角色色（前景橙 / 背景蓝）；
+        Kv 主视觉图层专属紫金。"""
         if getattr(lay, "is_kv", False):
             border, bg = "#a06cf0", "#221430"
         elif getattr(lay, "auto_mode", False) and getattr(lay, "role", "bg") == "fg":
@@ -1852,26 +2126,59 @@ class LayerStackPanel(QWidget):
 
     # ---- 播放高亮：所有正在播放的素材（含过渡中的上一个）都高亮 ----
     def refresh_playing(self):
+        """给"正在使用的素材"打金黄底。
+
+        ⚠⚠ **必须按素材路径比对，不能按对象身份比对**（2026-09-29 用户报"底色没了"）：
+          自动图层每次重算素材池都会 `lay.clips = list(picked)`（engine._refresh_auto_layers），
+          `sync_layer()` 又把行里的项整批重建 ⇒ 行里存的 MediaItem 和 `lay.clips` 里的
+          已经不是同一批对象，`m in playing` 永远为假 ⇒ **一个格子都不亮**。
+          换成路径比对后，对象怎么重建都能对上。
+
+        ⚠ 再加一层兜底：`cur == -1`（引擎停了 / 正在等切换点）时 `lay.clips[lay.cur]` 取不到，
+          但图层播放器还在解那个文件 —— 用播放器的路径高亮。用户要的是"正在使用的素材"
+          的底色，而不是"引擎此刻的索引"。
+        """
+        def _key(p):
+            return os.path.normcase(str(p or ""))
+
         for i, (_, grid) in enumerate(self.rows):
             if i >= len(self.main.engine.layers):
                 continue
             lay = self.main.engine.layers[i]
             playing = set()
-            if 0 <= lay.cur < len(lay.clips):
-                playing.add(lay.clips[lay.cur])
-            if lay.trans_active and 0 <= lay.prev_idx < len(lay.clips):
-                playing.add(lay.clips[lay.prev_idx])
+            # ⚠ `prev_idx` 只在**过渡进行中**才算"正在使用"：引擎过渡结束后**不会**
+            #   把它重置成 -1（只在换池/硬切时置 -1）⇒ 无条件带上它就会
+            #   **永远有两个金框**（用户 2026-10-01 反馈「不在逐拍为什么有两个框」）。
+            idxs = [getattr(lay, "cur", -1)]
+            if getattr(lay, "trans_active", False):
+                idxs.append(getattr(lay, "prev_idx", -1))
+            for idx in idxs:
+                try:
+                    if isinstance(idx, int) and 0 <= idx < len(lay.clips):
+                        playing.add(_key(getattr(lay.clips[idx], "path", "")))
+                except Exception:                                  # noqa: BLE001
+                    pass
+            playing.discard("")
+            if not playing:
+                # 兜底：直接用播放器当前解的文件（引擎停止/待切换时仍有画面在放）
+                for attr in ("player", "prev_player"):
+                    p = getattr(getattr(lay, attr, None), "path", "")
+                    if p:
+                        playing.add(_key(p))
             for k in range(grid.count()):
                 it = grid.item(k)
                 m = it.data(Qt.UserRole)
-                if m in playing:
+                pth = getattr(m, "path", None) or (m if isinstance(m, str) else "")
+                if _key(pth) and _key(pth) in playing:
                     it.setBackground(QColor(255, 205, 0, 235))   # 正在播放：金黄打底
+                    it.setData(PLAY_ROLE, True)                  # ↑ delegate 再压一道金边
                     it.setForeground(QColor(25, 25, 25))
                     f = it.font()
                     f.setBold(True)
                     it.setFont(f)
                 else:
                     it.setBackground(QColor(0, 0, 0, 0))
+                    it.setData(PLAY_ROLE, False)
                     it.setForeground(QColor(230, 230, 230))
                     f = it.font()
                     f.setBold(False)
@@ -2702,4 +3009,7 @@ class PreviewSettingsDialog(I18nDialog):
         self.fit.setCurrentIndex(0)
         self.fps.setCurrentIndex(0)
         self._apply()
+
+
+
 

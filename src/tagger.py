@@ -367,6 +367,9 @@ class Tagger:
         """统一入口：图片/视频 → {'tags':[(zh,score)], 'colors':[], 'bright':'', 'motion', 'flicker'}"""
         import cv2
         motion, flicker, _diff = self.analyze_dynamic(path, kind)
+        # ⚠ 显式初始化：视频分支不会赋值，以前靠 `locals().get("has_alpha", False)`
+        #   反射当前帧的局部变量 —— 重构一次就错，且读代码的人根本看不出这里有赋值。
+        has_alpha = False
         if kind == "image":
             img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
             if img is None:
@@ -390,7 +393,7 @@ class Tagger:
             if frame is None:
                 frame = np.zeros((224, 224, 3), dtype=np.uint8)
         cb = self.color_brightness(frame)
-        alpha = bool(locals().get("has_alpha", False))
+        alpha = bool(has_alpha)
         coverage = self.coverage_score(frame) if frame is not None else None
         dynamic = motion in (DYNAMIC_MID, DYNAMIC_HIGH)
         # 过滤 CLIP 误打的动态词：动态标签只应由帧差/频闪检测产出（DYNAMIC_TAGS 不进 CLIP 词表，

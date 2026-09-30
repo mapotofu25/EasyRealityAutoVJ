@@ -42,7 +42,6 @@ cmd = [
     "--hidden-import", "charge_engine",
     "--hidden-import", "fp",
     "--hidden-import", "match_engine",
-    "--hidden-import", "section_analyze",
     "--hidden-import", "postprocess",
     "--hidden-import", "colorfx",
     "--hidden-import", "i18n",

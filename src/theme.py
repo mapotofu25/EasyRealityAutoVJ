@@ -187,7 +187,13 @@ QCheckBox::indicator, QRadioButton::indicator {{ width: 16px; height: 16px;
 QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border-color: {v['accent']}; }}
 /* ★ 用户反馈（2026-09-27）：选中态**不要整块填满** —— 要「里面的色块比外轮廓小一圈」。
    做法：用 3px 边框把填色往里缩，外轮廓仍是 border 色，中间露出 accent 方块。 */
+/* ⚠⚠ 这里必须写 `width/height: 12px`（而不是沿用 16px）——Qt 的 width/height 是
+   **内容盒**，边框画在外面：未勾选 = 16+2×1 = 18px，勾选若仍写 16 就变成 16+2×3 = 22px
+   ⇒ **勾选后整块胀大 4px、标签跟着右移**，一列复选框看起来"间距不一样"
+   （用户 2026-10-01 截图反馈）。改成 12px 后 12+6 = 18px，与未勾选**外轮廓等大**，
+   里层色块依旧比外轮廓小一圈（保留 2026-09-27 的设计意图）。 */
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+             width: 12px; height: 12px;
              background: {v['accent']}; border: 3px solid {v['border']}; }}
 QCheckBox::indicator:checked:hover, QRadioButton::indicator:checked:hover {{
              border-color: {v['accent']}; }}

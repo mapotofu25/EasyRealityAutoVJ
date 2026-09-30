@@ -45,10 +45,6 @@ class OutputWindow(QWidget):
         self._pause_repaint()
         super().moveEvent(e)
 
-    def resizeEvent(self, e):
-        self._pause_repaint()
-        super().resizeEvent(e)
-
     def set_frame(self, img: QImage):
         if time.perf_counter() < self._drag_pause_until:
             return   # 拖动中只丢帧不重绘
@@ -160,6 +156,21 @@ class OutputWindow(QWidget):
         self.show()
         self.raise_()
 
+    def _dpr(self, scr=None):
+        """当前屏幕的缩放比例（Windows 150% ⇒ 1.5；100% ⇒ 1.0）。
+
+        ⚠ 必须用它：Qt6 的 `resize()` / `geometry()` 全是**逻辑像素**，而用户在
+          设置里填的"输出分辨率 1600×900"指的是**物理像素**。
+          150% 缩放下直接 `resize(1600,900)` ⇒ 物理 2400×1350 ⇒ **超出屏幕**
+          （用户 2026-10-01 报的就是这个）。正确做法：1600÷1.5 = 逻辑 1067×600，
+          系统再 ×1.5 渲染，物理正好 1600×900。
+        """
+        try:
+            s = scr if scr is not None else (self.screen() or QGuiApplication.primaryScreen())
+            return float(s.devicePixelRatio()) if s is not None else 1.0
+        except Exception:                                          # noqa: BLE001
+            return 1.0
+
     def apply_window_size(self):
         """窗口模式：**严格按设置里的输出分辨率**重置窗口大小（不再缩到屏幕 80%）。
 
@@ -170,14 +181,20 @@ class OutputWindow(QWidget):
         # 解除可能的尺寸约束（否则 resize 可能被 min/max size 卡住不生效）
         self.setMinimumSize(1, 1)
         self.setMaximumSize(16777215, 16777215)
+        # 用户填的是**物理**分辨率；Qt 用的是**逻辑**像素 ⇒ 先除以缩放比例。
         w = int(self.cfg["output"].get("width", 1280))
         h = int(self.cfg["output"].get("height", 720))
-        self.resize(w, h)
         scr = self.screen() or QGuiApplication.primaryScreen()
+        dpr = self._dpr(scr)
+        lw = max(1, int(round(w / dpr)))
+        lh = max(1, int(round(h / dpr)))
+        self.resize(lw, lh)
         sg = scr.availableGeometry() if scr is not None else None
         if sg is None:
             return
-        if w > sg.width() or h > sg.height():
+        # ⚠ 边界判断要用**物理**尺寸：availableGeometry() 给的是逻辑尺寸
+        pw, ph = int(sg.width() * dpr), int(sg.height() * dpr)
+        if w > pw or h > ph:
             self.move(sg.x(), sg.y())
             return
         geo = getattr(self, "_win_geom", None) or self.cfg["output"].get("geometry")
@@ -187,10 +204,10 @@ class OutputWindow(QWidget):
         if (x is None or y is None
                 or not (sg.x() - 50 <= x <= sg.x() + sg.width())
                 or not (sg.y() - 50 <= y <= sg.y() + sg.height())):
-            x = sg.x() + (sg.width() - w) // 2
-            y = sg.y() + (sg.height() - h) // 2
-        x = max(sg.x(), min(x, sg.x() + sg.width() - w))
-        y = max(sg.y(), min(y, sg.y() + sg.height() - h))
+            x = sg.x() + (sg.width() - lw) // 2
+            y = sg.y() + (sg.height() - lh) // 2
+        x = max(sg.x(), min(x, sg.x() + sg.width() - lw))
+        y = max(sg.y(), min(y, sg.y() + sg.height() - lh))
         self.move(x, y)
 
     def _restore_window_geom(self):
@@ -201,11 +218,15 @@ class OutputWindow(QWidget):
         if not geo or len(geo) != 4:
             # 没有记录过：按输出分辨率给一个不超过屏幕 65% 的窗口
             if sg is not None:
-                w = min(int(ow), int(sg.width() * 0.65))
-                h = min(int(oh), int(sg.height() * 0.65))
-                if ow and oh:
-                    k = min(w / ow, h / oh)
-                    w, h = max(320, int(ow * k)), max(180, int(oh * k))
+                # ⚠ 同上：ow/oh 是**物理**分辨率，屏幕尺寸是**逻辑**的，先换算再比
+                dpr = self._dpr(scr)
+                lw0 = max(1.0, ow / dpr)
+                lh0 = max(1.0, oh / dpr)
+                w = min(int(lw0), int(sg.width() * 0.65))
+                h = min(int(lh0), int(sg.height() * 0.65))
+                if lw0 and lh0:
+                    k = min(w / lw0, h / lh0)
+                    w, h = max(320, int(lw0 * k)), max(180, int(lh0 * k))
                 geo = None
                 self.resize(w, h)
                 if sg is not None:
@@ -270,4 +291,8 @@ class OutputWindow(QWidget):
         super().closeEvent(ev)
 
     def resizeEvent(self, ev):
+        # ⚠ 这里曾经有**两份** resizeEvent：先定义的这份带 _pause_repaint()，后定义的
+        #   只调 super() —— 后者静默覆盖前者，「移动/缩放窗口期间暂停重绘」就失效了
+        #   （表现为拖窗口时预览抢主线程，越拖越卡）。合并成一份。
+        self._pause_repaint()
         super().resizeEvent(ev)

@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """主窗口 UI（Arena 风格布局）
 
+★ 2026-09-28 起主区拆成**两界面**（`QStackedWidget`，共用同一个引擎）：
+  ① 演出台     —— 图层 + 预览 + 设置 + 输出（现场用）
+  ② 素材·曲库·曲风 —— 素材库独占整幅宽 + 音乐曲库 / 曲风映射入口（演出前准备）
+
 布局：
   顶部工具条：返回/开始/黑场/冻结/暂停自动/下一素材/音源(含迷你电平)/语言/快捷键
   ┌──────────────┬──────────────────────────────┬──────────────┐
@@ -17,7 +21,8 @@ import math
 import ctypes
 
 from PySide6.QtCore import Qt, QTimer, QSize, QThread, Signal, QPoint, QObject, QEvent
-from PySide6.QtGui import QImage, QPixmap, QAction, QKeySequence, QIcon, QGuiApplication
+from PySide6.QtGui import (QImage, QPixmap, QAction, QKeySequence, QIcon,
+                          QGuiApplication, QCursor)
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QGridLayout,
     QComboBox, QPushButton, QSlider, QCheckBox, QSpinBox, QListWidget,
@@ -40,7 +45,7 @@ from output_window import OutputWindow
 from hotkeys import HotkeyManager
 from panels import (LayerStackPanel, PreviewPanel, AudioSourceDialog, MiniLevel,
                     LibraryGrid, CollapsibleSection, CLIP_MIME, LIB_THUMB_SIZES,
-                    NewLayerDialog, I18nDialog)
+                    NewLayerDialog, I18nDialog, MusicLibraryPanel)
 
 MEDIA_FILTER = "媒体素材 (*.mp4 *.mov *.webm *.avi *.mkv *.gif *.png *.jpg *.jpeg *.bmp *.webp);;All Files (*)"
 MUSIC_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".aiff", ".aif", ".aac", ".ogg", ".opus", ".wma"}
@@ -780,7 +785,9 @@ class OutputPanel(QWidget):
         go.addWidget(self.chk_border, 2, 1)
         go.addWidget(self.chk_top, 3, 0)
         self.btn_reset_win = QPushButton("重置窗口大小")
-        self.btn_reset_win.setToolTip("把输出窗口按当前分辨率设置重置（退出全屏/按比例缩放到屏幕内）")
+        # ⚠ 文案必须与 output_window.apply_window_size 的实际行为一致：它是**严格按输出
+        #   分辨率**重置窗口大小（不再做"缩到屏幕 80%"那种改动）。
+        self.btn_reset_win.setToolTip(T("退出全屏并按输出分辨率重置窗口大小"))
         self.btn_reset_win.clicked.connect(main.reset_window_size)
         go.addWidget(self.btn_reset_win, 3, 1)
         go.addWidget(QLabel("输出显示器"), 4, 0)
@@ -806,6 +813,22 @@ class OutputPanel(QWidget):
         self.ndi_name = QLineEdit()
         self.ndi_name.setPlaceholderText("NDI 源名称")
         go.addWidget(self.ndi_name, 6, 1)
+        # ★ NDI 音频单独一个开关，**默认关**：把系统回环再发出去，若接收端同时
+        #   监听着同一路声音会听到**双声/回声**。NDI 输出没开时置灰。
+        self.chk_ndi_audio = QCheckBox("NDI 传输音频（48 kHz 立体声）")
+        self.chk_ndi_audio.setToolTip(
+            "把采集到的声音随 NDI 一起发出去（48 kHz 立体声）。默认关闭："
+            "接收端若本来就在监听同一路声音，会听到双声/回声；"
+            "只在接收端需要单独取声音时才打开。")
+        self.chk_ndi_audio.setEnabled(False)
+        go.addWidget(self.chk_ndi_audio, 7, 0, 1, 2)
+        # Spout 协议层面**没有音频**，必须写清楚，否则用户会以为勾了就有声音
+        self.lbl_spout_audio = QLabel(
+            "Spout 只传画面，不含音频。需要音频请用 NDI 或虚拟声卡。")
+        self.lbl_spout_audio.setWordWrap(True)
+        self.lbl_spout_audio.setStyleSheet(
+            "color:" + theme.V("muted") + ";font-size:11px;")
+        go.addWidget(self.lbl_spout_audio, 8, 0, 1, 2)
         outer.addWidget(g)
         self.resolution.currentIndexChanged.connect(main.set_resolution)
         self.resolution.editTextChanged.connect(main.set_resolution_text)
@@ -817,6 +840,7 @@ class OutputPanel(QWidget):
         self.spout_name.editingFinished.connect(main.set_spout_name)
         self.chk_ndi.stateChanged.connect(main.set_ndi_enabled)
         self.ndi_name.editingFinished.connect(main.set_ndi_name)
+        self.chk_ndi_audio.stateChanged.connect(main.set_ndi_audio)
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
 
     def set_gate(self, running):
@@ -1946,7 +1970,6 @@ class MainWindow(QMainWindow):
         # 一次性校正 alpha 判定（修好 av.open 的 GBK bug）—— 等缩略图补扫跑完再动，
         # 因为它要重建一部分缩略图文件，和补扫同时写会打架。
         QTimer.singleShot(6000, self._start_alpha_migration)
-        self._hl_tick = 0
         # 自动按已保存配置开始采集（主界面可直接演出）
         if self.cfg["audio"].get("source_type"):
             self.start_audio(silent=True)
@@ -1961,15 +1984,20 @@ class MainWindow(QMainWindow):
             f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;border-color:#2f6f9f;}}")
 
     def _style_kind_buttons(self):
-        """主题感知的筛选按钮样式（注册进 theme，切换亮暗时重设）"""
+        """主题感知的筛选按钮样式（注册进 theme，切换亮暗时重设；**两页都覆盖**）"""
         v = theme.V
-        for b in self.kind_group.buttons():
+        btns = list(self.kind_group.buttons())
+        g2 = getattr(self, "kind_group2", None)
+        if g2 is not None:
+            btns += list(g2.buttons())
+        for b in btns:
             b.setStyleSheet(
                 f"QPushButton{{padding:2px 10px;border:1px solid {v('border')};"
                 f"background:{v('btn')};color:{v('text')};}}"
                 f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;border-color:#2f6f9f;}}")
 
     def _style_grid(self):
+        """演出台那份素材库网格的样式（全屏那份见 `_style_lib_full`）。"""
         self.grid.setStyleSheet(
             f"QListWidget{{background:{theme.V('panel2')};"
             f"border:1px solid {theme.V('border')};}}")
@@ -2028,20 +2056,10 @@ class MainWindow(QMainWindow):
 
         tb.addStretch(1)
         # ---- 右端：工具入口 ----
-        # ★ 2026-09-27 工具条收纳（用户选）：**主题 / 语言 / 快捷键 / 关于** 收进「⋯」菜单
-        #   —— 这几个属于"设置时用一次"，不是现场操作；**音乐曲库 / 曲风映射** 留在工具条上。
-        #   工具条原本 17 个控件混在一起（演出控制 + 设备 + 工具入口 + 杂项），现在按用途分组：
-        #     [开始|黑场|冻结|暂停自动|下一素材] │ [音源 电平] │ [GPU 解码] │ [音乐曲库|曲风映射|⋯]
-        self.btn_music = QPushButton("🎵 音乐曲库")
-        self.btn_music.setMinimumHeight(32)
-        self.btn_music.setToolTip("导入音乐、扫描分析曲风（演出前准备）")
-        self.btn_music.clicked.connect(self.open_music_library)
-        tb.addWidget(self.btn_music)
-        self.btn_gvmap = QPushButton("曲风映射")
-        self.btn_gvmap.setMinimumHeight(32)
-        self.btn_gvmap.setToolTip("编辑曲风→画面标签的绑定关系")
-        self.btn_gvmap.clicked.connect(self.open_genre_visual_editor)
-        tb.addWidget(self.btn_gvmap)
+        # ★ 2026-09-27 收纳（用户选）：主题 / 语言 / 快捷键 / 关于 →「⋯ 更多」。
+        # ★ 2026-09-28 再收纳（用户要求）：「🎵 音乐曲库 / 曲风映射」也挪去第 2 个界面
+        #   「🎵 曲库 · 曲风」—— 它们属于"演出前准备"，不该占着现场工具条。
+        #   现在工具条 = [开始|黑场|冻结|暂停自动|下一素材] │ [音源 电平] │ [GPU 解码] │ [⋯ 更多]
 
         # 主题按钮保留为**隐藏控件**：`_sync_theme_btn()` 仍要靠它同步文案，
         # ⋯ 菜单里的「主题」动作转发到它 ⇒ 行为与原来逐字一致（不是重写一遍逻辑）。
@@ -2082,17 +2100,21 @@ class MainWindow(QMainWindow):
         self._sync_more_menu()
         mv.addLayout(tb)
 
-        # ---- 主区 ----
+        # ---- 主区（两界面容器，见 _build_pages）----
         main_split = QSplitter(Qt.Horizontal)
         left_split = QSplitter(Qt.Vertical)
 
         self.layers_panel = LayerStackPanel(self)          # 红 + 黄
         left_split.addWidget(self.layers_panel)
 
+        # 演出台 = 图层 + 预览 + 素材库。
+        # ★ 2026-09-28 用户要求把素材库**留在主界面**：「不然我怎么手动添加素材」——
+        #   而且素材库与图层同页，才能把缩略图**直接拖进图层**（跨页拖拽在 Qt 里做不到）。
         bottom = QSplitter(Qt.Horizontal)
         self.preview_panel = PreviewPanel(self)            # 绿
         bottom.addWidget(self.preview_panel)
-        bottom.addWidget(self._build_library())            # 蓝
+        self.library_panel = self._build_library()         # 蓝
+        bottom.addWidget(self.library_panel)
         bottom.setSizes([560, 520])
         left_split.addWidget(bottom)
         left_split.setSizes([430, 380])
@@ -2113,7 +2135,8 @@ class MainWindow(QMainWindow):
         rv.addWidget(self.output_panel, 0)
         main_split.addWidget(right)
         main_split.setSizes([1150, 360])
-        mv.addWidget(main_split, 1)
+        self._build_pages(main_split)
+        mv.addWidget(self.pages, 1)
 
         # ---- 状态栏 ----
         sb = QStatusBar()
@@ -2127,6 +2150,12 @@ class MainWindow(QMainWindow):
         for w in (self.lbl_status, self.lbl_warn, self.lbl_bpm, self.lbl_energy, self.lbl_cpu):
             sb.addPermanentWidget(w)
 
+        # ★ 播放高亮（图层里正在用的素材打金黄底）改由**独立定时器**刷新：
+        #   以前它挂在 _update_preview 里（每 6 帧一次），而那条路只在**预览帧到达**时跑 ——
+        #   换页 / 关预览 / 引擎不产帧时高亮就整个不动了（用户反馈过）。
+        self._hl_timer = QTimer(self)
+        self._hl_timer.timeout.connect(self.layers_panel.refresh_playing)
+        self._hl_timer.start(1000)
         self.engine.frame_ready.connect(self._on_engine_frame)
         self.refresh_grid()
         self.layers_panel.rebuild()
@@ -2139,6 +2168,284 @@ class MainWindow(QMainWindow):
         self.preview_panel.chk_next.toggled.connect(
             lambda s: self.engine_cfg("ui", "next_preview", bool(s)))
 
+    # ================= 两界面（演出台 / 素材·曲库·曲风）=================
+    def _style_page_buttons(self):
+        """两界面页签样式（主题感知；注册进 theme，切亮暗时重设）。"""
+        v = theme.V
+        for b in getattr(self, "_page_btns", []):
+            b.setStyleSheet(
+                f"QPushButton{{padding:4px 14px;border:1px solid {v('border')};"
+                f"background:{v('btn')};color:{v('text')};}}"
+                f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;"
+                f"border-color:#2f6f9f;font-weight:bold;}}")
+
+    def _build_pages(self, show_split):
+        """★ 主区拆成**两界面**（`QStackedWidget`），共用同一个引擎。
+
+        为什么拆（用户反馈「看起来乱乱的」）：演出控制与素材整理是**两个完全不同的
+        场合**（现场 / 演出前准备），混在一屏里互相挤。拆开后每页都能占满宽度，
+        页签常显、一键来回切。
+        """
+        self.pages = QStackedWidget()
+
+        # ---- 页签条（常显）----
+        bar = QHBoxLayout()
+        bar.setSpacing(0)
+        self._page_group = QButtonGroup(self)
+        self._page_btns = []
+        for i, (txt, tip) in enumerate((
+                ("🎬 演出台", "现场：预览 / 图层 / 效果 / 输出"),
+                ("🗂 素材库", "全屏管理素材：搜索 / 筛选 / 导入 / 打标签（演出台那份原样不动）"),
+                ("🎵 曲库 · 曲风", "演出前准备：音乐曲库（导入音乐 + 扫描分析曲风）/ 曲风映射"))):
+            b = QPushButton(T(txt))
+            b.setCheckable(True)
+            b.setMinimumHeight(28)
+            b.setToolTip(T(tip))
+            b.clicked.connect(lambda _c=False, ii=i: self.switch_page(ii))
+            self._page_group.addButton(b, i)
+            self._page_btns.append(b)
+            bar.addWidget(b)
+        bar.addStretch(1)
+        self._style_page_buttons()
+        theme.register(self, self._style_page_buttons)
+        self.main_view.layout().addLayout(bar)
+
+        # ---- 第 1 页：演出台（图层 + 预览 + 设置 + 输出，原样）----
+        p1 = QWidget()
+        l1 = QVBoxLayout(p1)
+        l1.setContentsMargins(0, 0, 0, 0)
+        l1.addWidget(show_split)
+        self.pages.addWidget(p1)
+
+        # ---- 第 2 页：素材库（**全屏副本**；演出台那份原样不动）----
+        self.pages.addWidget(self._build_library_page())
+
+        # ---- 第 2 页：曲库 · 曲风（演出前准备；素材库在演出台）----
+        p2 = QWidget()
+        l2 = QVBoxLayout(p2)
+        l2.setContentsMargins(12, 12, 12, 12)
+        l2.setSpacing(8)
+        t2 = QLabel(T("🎵 曲库 · 曲风"))
+        t2.setStyleSheet("font-weight:bold;font-size:15px;color:" + theme.V("text") + ";")
+        l2.addWidget(t2)
+        self.lbl_p2_desc = QLabel(T(
+            "演出前的准备工作都在这里：导入音乐、扫描分析曲风（每首歌的曲风 + 节拍网格），"
+            "以及编辑「曲风 → 画面标签」的绑定关系。\n"
+            "素材库在「🎬 演出台」上，演出中随时能取素材、直接拖进图层。"))
+        self.lbl_p2_desc.setWordWrap(True)
+        self.lbl_p2_desc.setStyleSheet("color:" + theme.V("muted") + ";")
+        l2.addWidget(self.lbl_p2_desc)
+        # ★ 用户要求：曲库管理**从弹窗改成整页**，左边加排序/筛选（见 MusicLibraryPanel）。
+        #   ⚠ 面板的成员名与旧弹窗刻意对齐（refresh/progress/lbl/btn_scan/list）⇒
+        #     主窗口里那些「扫描进度 / 刷新列表」的代码直接复用，并把 music_dialog 指过来。
+        self.music_panel = MusicLibraryPanel(self)
+        self.music_dialog = self.music_panel
+        l2.addWidget(self.music_panel, 1)
+        row2 = QHBoxLayout()
+        self.btn_p2_gvmap = QPushButton(T("曲风映射…"))
+        self.btn_p2_gvmap.setMinimumHeight(34)
+        self.btn_p2_gvmap.setToolTip(T("编辑曲风→画面标签的绑定关系"))
+        self.btn_p2_gvmap.clicked.connect(self.open_genre_visual_editor)
+        row2.addWidget(self.btn_p2_gvmap)
+        row2.addStretch(1)
+        l2.addLayout(row2)
+        self.lbl_p2_stat = QLabel("")
+        self.lbl_p2_stat.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
+        l2.addWidget(self.lbl_p2_stat)
+        l2.addStretch(1)
+        self.pages.addWidget(p2)
+        self._sync_p2_stat()
+
+        try:
+            idx = int(self.cfg["ui"].get("page", 0) or 0)
+        except Exception:                                         # noqa: BLE001
+            idx = 0
+        # ⚠ 上界是 2（三页：演出台 / 素材库 / 曲库·曲风）。老配置里的值一律钳回合法范围，
+        #   否则 setCurrentIndex 会切到不存在的页，界面一片空白。
+        self.switch_page(idx if 0 <= idx <= 2 else 0, save=False)
+
+    def _build_library_page(self):
+        """第 2 页：**全屏素材库**（演出台那份原样不动，这里是复制出来的一份）。
+
+        ★ 用户要求：页签做成「演出台 / 素材库 / 曲库·曲风」，演出台的素材库不要动，
+          在素材库页**再复制一个出来**，相当于有个能全屏操作的地方。
+
+        ⚠ 两页**共用同一套筛选状态**（类型/角色/标签/搜索词）：任何一个控件改了都会
+          同步到另一页（`_sync_lib_controls`），否则两页显示不一致会更迷惑。
+        ⚠ 跨页拖拽在 Qt 里要求两端同时可见 ⇒ **拖素材进图层仍然只能在演出台做**；
+          这一页给的是：搜索 / 筛选 / 导入 / 双击播放到当前图层 / 右键菜单。
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        t = QLabel(T("🗂 素材库"))
+        t.setStyleSheet("font-weight:bold;font-size:15px;color:" + theme.V("text") + ";")
+        lay.addWidget(t)
+        self.lbl_lib2_desc = QLabel(T(
+            "这里是全屏版素材库，和「🎬 演出台」上那份是同一批素材（那份保持原样）。\n"
+            "搜索 / 筛选 / 导入 / 右键打标签都在这里做；双击缩略图 = 播放到当前图层。\n"
+            "⚠ 「拖进图层」只能在演出台做（跨页面拖拽系统不允许）。"))
+        self.lbl_lib2_desc.setWordWrap(True)
+        self.lbl_lib2_desc.setStyleSheet("color:" + theme.V("muted") + ";")
+        lay.addWidget(self.lbl_lib2_desc)
+
+        # ---- 筛选条（与演出台同一套状态）----
+        fbar = QHBoxLayout()
+        self.kind_group2 = QButtonGroup(self)
+        for i, name in enumerate(("全部", "图片", "视频")):
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setChecked(i == 0)
+            b.setFixedHeight(24)
+            b.clicked.connect(lambda _c=False, ii=i: self.set_kind_filter(ii))
+            self.kind_group2.addButton(b, i)
+            fbar.addWidget(b)
+        fbar.addWidget(QLabel("标签"))
+        self.btn_tagfilter2 = QPushButton("标签: 全部")
+        self.btn_tagfilter2.setToolTip("按标签筛选素材（可多选）")
+        self.btn_tagfilter2.clicked.connect(self.open_tag_filter)
+        fbar.addWidget(self.btn_tagfilter2, 1)
+        fbar.addWidget(QLabel("角色"))
+        self.role_combo2 = QComboBox()
+        self.role_combo2.addItems(["全部", "前景", "背景"])
+        self.role_combo2.currentIndexChanged.connect(self.set_role_filter)
+        fbar.addWidget(self.role_combo2, 0)
+        fbar.addWidget(QLabel("数量:"))
+        self.lbl_lib_count2 = QLabel("0")
+        fbar.addWidget(self.lbl_lib_count2)
+        lay.addLayout(fbar)
+
+        # ---- 搜索 + 导入 + 打标 ----
+        sbar = QHBoxLayout()
+        self.search_box2 = QLineEdit()
+        self.search_box2.setPlaceholderText("搜索文件名 / 标签")
+        self.search_box2.setClearButtonEnabled(True)
+        self.search_box2.textChanged.connect(
+            lambda t, s=None: self._on_search_changed(t, self.search_box2))
+        sbar.addWidget(self.search_box2, 1)
+        b1 = QPushButton(tr("import_folder"))
+        b1.clicked.connect(self.import_folder)
+        b2 = QPushButton(tr("import_files"))
+        b2.clicked.connect(self.import_files)
+        b3 = QPushButton("扫描打标")
+        b3.setToolTip("用本地视觉模型为素材自动打内容标签（后台、可续扫）")
+        b3.clicked.connect(lambda: self.scan_tags())
+        for b in (b1, b2, b3):
+            sbar.addWidget(b)
+        lay.addLayout(sbar)
+
+        # ---- 大网格 ----
+        self.grid_full = LibraryGrid(self)
+        self.grid_full.remove_from_layer.connect(self.remove_from_all_layers)
+        self.grid_full.files_dropped.connect(self._import_paths)
+        self.grid_full.apply_thumb_size(int(self.cfg["ui"].get("thumb_size", 1)))
+        lay.addWidget(self.grid_full, 1)
+        self._lib_full_dirty = True
+        self._style_lib_full()
+        theme.register(self, self._style_lib_full)
+        return w
+
+    def _style_lib_full(self):
+        """全屏素材库网格的样式（主题感知）。"""
+        try:
+            self.grid_full.setStyleSheet(
+                f"QListWidget{{background:{theme.V('panel2')};"
+                f"border:1px solid {theme.V('border')};}}")
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _on_search_changed(self, text=None, src=None):
+        """任一页的搜索框改动 ⇒ 写进共享状态、同步另一页、刷新两份网格。
+
+        ⚠ 别用 `hasFocus()` 判断"是谁改的"：两个框都没焦点时（程序化 setText、失焦、
+          离屏测试）就永远不会更新 `lib_kw` ⇒ 搜索失效（实测踩到）。这里由信号**显式
+          把来源控件传进来**（`textChanged` 连接处带 `src=`）。
+        """
+        if src is not None:
+            self.lib_kw = text or ""
+        else:
+            for ed in (getattr(self, "search_box", None),
+                       getattr(self, "search_box2", None)):
+                if ed is not None and ed.text() != getattr(self, "lib_kw", ""):
+                    self.lib_kw = ed.text() or ""
+                    break
+        self.refresh_grid()
+
+    def _sync_lib_controls(self):
+        """把共享的筛选状态镜像到**两页**的控件上（避免两页显示不一致）。"""
+        try:
+            kf = int(self.kind_filter)
+            rf = int(self.role_filter)
+            for grp in (getattr(self, "kind_group", None), getattr(self, "kind_group2", None)):
+                if grp is None:
+                    continue
+                for i, b in enumerate(grp.buttons()):
+                    b.blockSignals(True)
+                    b.setChecked(i == kf)
+                    b.blockSignals(False)
+            for cb in (getattr(self, "role_combo", None), getattr(self, "role_combo2", None)):
+                if cb is None:
+                    continue
+                cb.blockSignals(True)
+                cb.setCurrentIndex(max(0, min(2, rf)))
+                cb.blockSignals(False)
+            txt = (f"标签: 已选 {len(self.tag_selected)}" if self.tag_selected
+                   else "标签: 全部")
+            for b in (getattr(self, "btn_tagfilter", None),
+                      getattr(self, "btn_tagfilter2", None)):
+                if b is not None:
+                    b.setText(txt)
+            kw = getattr(self, "lib_kw", "")
+            for ed in (getattr(self, "search_box", None), getattr(self, "search_box2", None)):
+                if ed is None or ed.text() == kw:
+                    continue
+                ed.blockSignals(True)
+                ed.setText(kw)
+                ed.blockSignals(False)
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _sync_p2_stat(self):
+        """第 2 页的曲库概况（只读一行）：已导入多少首、其中多少首有节拍网格。"""
+        try:
+            # ⚠ Config 没有 .get()（只有 __getitem__）—— 记过的坑
+            lib = list(self.cfg["music_library"] or [])
+            meta = self.cfg["music_meta"] or {}
+            with_grid = sum(1 for p in lib
+                            if isinstance(meta.get(p), dict) and meta[p].get("grid"))
+            self.lbl_p2_stat.setText(Tf(
+                "曲库：已导入 {} 首；其中 {} 首已有节拍网格（八拍乐句对齐要用它）",
+                len(lib), with_grid))
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def switch_page(self, i, save=True):
+        """切到三界面之一（页签条 / 「⋯ 更多」菜单都走这里）。"""
+        try:
+            i = max(0, min(2, int(i)))
+        except Exception:                                         # noqa: BLE001
+            i = 0
+        self.pages.setCurrentIndex(i)
+        # ⚠ 全屏素材库那份是"不可见就不填充、先标脏"的（见 refresh_grid）⇒ 切过来时补上
+        if i == 1 and getattr(self, "_lib_full_dirty", False):
+            try:
+                self._populate_grid(self.grid_full, getattr(self, "lbl_lib_count2", None))
+                self._lib_full_dirty = False
+            except Exception:                                     # noqa: BLE001
+                pass
+        if getattr(self, "grid_full", None) is not None:
+            self._sync_lib_controls()
+        for k, b in enumerate(getattr(self, "_page_btns", [])):
+            b.setChecked(k == i)
+        if save:
+            try:
+                if int(self.cfg["ui"].get("page", -1) or -1) != i:
+                    self.cfg["ui"]["page"] = i
+                    self.cfg.save()
+            except Exception:                                     # noqa: BLE001
+                pass
+
     def _build_library(self):
         """蓝色区：素材库（标签 + 导入 + 网格）"""
         self.lbl_lib_count = QLabel("0")
@@ -2148,6 +2455,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(3)
         self.kind_filter = 0   # 0 全部 / 1 图片 / 2 视频
         self.role_filter = 0   # 0 全部 / 1 前景 / 2 背景
+        self.lib_kw = ""       # 搜索词（两页共用，见 _build_library_page）
         bar = QHBoxLayout()
         t = QLabel("素材库")
         t.setStyleSheet("color:" + theme.V("muted") + ";font-weight:bold;")
@@ -2184,7 +2492,9 @@ class MainWindow(QMainWindow):
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("搜索文件名 / 标签")
         self.search_box.setClearButtonEnabled(True)
-        self.search_box.textChanged.connect(lambda _t: self.refresh_grid())
+        # ⚠ 两页共用一个搜索词（`lib_kw`）；同步逻辑见 _on_search_changed/_sync_lib_controls
+        self.search_box.textChanged.connect(
+            lambda t, s=None: self._on_search_changed(t, self.search_box))
         fbar.addWidget(self.search_box, 1)
         self.btn_scan = QPushButton("扫描打标")
         self.btn_scan.setToolTip("用本地视觉模型为素材自动打内容标签（后台、可续扫）")
@@ -2590,8 +2900,9 @@ class MainWindow(QMainWindow):
     def set_resolution_text(self, text):
         """手动输入分辨率（宽 x 高）"""
         import re
-        if getattr(self, "_loading_ui", False):
-            return
+        # ⚠ 这里原来有个 `if getattr(self, "_loading_ui", False): return` 守卫，但全库
+        #   没有任何一处把它置 True ⇒ 恒不生效的死守卫，删掉。程序化回填时若要抑制，
+        #   正确做法是 `blockSignals(True/False)`（见 _load_settings_to_ui 里其它控件的写法）。
         m = re.search(r"(\d{2,5})\s*[xX\u00d7*\s]\s*(\d{2,5})", str(text or ""))
         if not m:
             return
@@ -2731,9 +3042,15 @@ class MainWindow(QMainWindow):
             if self.engine._ndi is not None:
                 self.engine._ndi.close()
                 self.engine._ndi = None
-        # 同步给采集循环：未启用 NDI 时它就不再为每块音频做 asarray/reshape/copy
+        # NDI 音频：**必须 NDI 输出开着 + 用户另勾了「NDI 传输音频」**才发。
+        # 给采集循环同步一个布尔量：False 时它连每块的 asarray/reshape/copy 都省掉。
         try:
-            self.audio.state.ndi_audio_on = bool(self.cfg["output"].get("ndi_enabled"))
+            self.audio.state.ndi_audio_on = bool(
+                s and self.cfg["output"].get("ndi_audio", False))
+        except Exception:
+            pass
+        try:
+            self.output_panel.chk_ndi_audio.setEnabled(bool(s))
         except Exception:
             pass
 
@@ -2742,9 +3059,29 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         self.engine._ndi = None
 
+    def set_ndi_audio(self, s):
+        """「NDI 传输音频」开关（**默认关**）。
+
+        ⚠ 默认关是有意的：采集的是**系统回环**，接收端若本来就在监听同一路声音，
+          再发一遍会变成**双声/回声**。只有接收端需要单独取声音时才打开。
+        """
+        s = bool(s) and bool(self.cfg["output"].get("ndi_enabled"))
+        self.cfg["output"]["ndi_audio"] = s
+        self.cfg.save()
+        try:
+            self.audio.state.ndi_audio_on = s
+        except Exception:                                     # noqa: BLE001
+            pass
+
     def _ndi_audio_feed(self, pcm, sr):
         ndi = self.engine._ndi
         if ndi is not None and self.cfg["output"].get("ndi_enabled"):
+            # ⚠ 音频帧的采样率只能在 `open()` **之前**定好 ⇒ 每次都把当前采集率告诉它
+            #   （`set_audio_rate` 只是存一个提示值，开销可忽略；非 48k 设备靠它才对）
+            try:
+                ndi.set_audio_rate(sr)
+            except Exception:                                     # noqa: BLE001
+                pass
             ndi.feed_audio(pcm, sr)
 
     def apply_output_screen(self):
@@ -2908,6 +3245,9 @@ class MainWindow(QMainWindow):
         self.output_panel.spout_name.setText(o.get("spout_name", "EasyRealityAutoVJ"))
         self.output_panel.chk_ndi.setChecked(o.get("ndi_enabled", False))
         self.output_panel.ndi_name.setText(o.get("ndi_name", "EasyRealityAutoVJ"))
+        self.output_panel.chk_ndi_audio.setChecked(bool(o.get("ndi_audio", False)))
+        # NDI 输出开着才允许勾"传输音频"（否则勾了也没意义）
+        self.output_panel.chk_ndi_audio.setEnabled(bool(o.get("ndi_enabled", False)))
         # Kv 主视觉图层设置区显隐（按当前是否已存在 Kv 图层）
         self.settings.sync_kv_section()
 
@@ -2930,12 +3270,15 @@ class MainWindow(QMainWindow):
         宁可退回现有实时拍钟，也不用不可信的网格去驱动切换。
         网格结构见 beatgrid：统一约定 **八拍头 = anchor + 8n × beat_len**。
 
-        ★ 来源门槛 `src == "vdj"`（不可省略，也不能用 conf 替代）：
-          本地自算的相位不可信 —— 实测 21 首有 VDJ 真值的样例里，纯本地相位仅 1/21 与
-          VDJ 对齐；而这 15 首找不到 VDJ 的歌，本地 grid 的 conf 全是 0.95（对比度大就顶到
-          上限）⇒ 单靠 conf≥0.6 会**全部放进网格模式**，相位很可能整体偏拍。conf 反映的是
-          「相位对比度」，不是「锚点对不对」，所以来源必须单独判：**只对 VDJ 来源启用**，
-          本地一律退回现有拍钟。
+        ★ 来源门槛 `src ∈ {"vdj", "bt"}`（**不能省，也不能用 conf 替代**）：
+          · `vdj` —— VirtualDJ 库的锚点，最准，且 0 成本（有就用）。
+          · `bt`  —— **Beat This! 本地小节检测**（2026-09-28 新增）。给**没有 VDJ 数据**的
+                     曲目补位：实测 21/21 小节头判对（偏置 ≤0.25 拍），单首约 1.9 秒。
+          · `local` —— **我们自己那套（`phase_of` + 组合特征）实测小节头 0/21 对**
+                     （偏 1~2 个整拍），**一律不用**。
+          ⚠ 为什么不能用 conf 代替来源判定：`local` 网格的 conf 也会顶到上限
+            （conf 反映的是「八拍相位对比度」，不是「锚点对不对」）——
+            历史上正是这个原因让 15 首错的本地网格差点全被放进网格模式。
         """
         meta = self.cfg["music_meta"] or {}
         out = {}
@@ -2948,8 +3291,8 @@ class MainWindow(QMainWindow):
             g = m.get("grid")
             if not sid or not isinstance(g, dict):
                 continue
-            # 只认 VDJ 真值来源的网格（本地来源相位不可信，见上方说明）
-            if g.get("src") != "vdj":
+            # 只认 vdj / bt 两个可信来源（local 小节头不可信，见上方说明）
+            if g.get("src") not in ("vdj", "bt"):
                 continue
             try:
                 bl = float(g.get("beat_len") or 0.0)
@@ -3015,9 +3358,13 @@ class MainWindow(QMainWindow):
             pass
 
     def open_music_library(self):
-        from panels import MusicLibraryDialog
-        self.music_dialog = MusicLibraryDialog(self)
-        self.music_dialog.exec()
+        """打开音乐曲库 —— 它现在是**第 3 页**（曲库·曲风）里的整页面板，不再是弹窗。"""
+        try:
+            self.switch_page(2)
+            if getattr(self, "music_panel", None) is not None:
+                self.music_panel.refresh()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def open_genre_visual_editor(self):
         """曲风→画面标签 映射编辑器（保存后自动图层按新映射重匹配）"""
@@ -3076,7 +3423,9 @@ class MainWindow(QMainWindow):
         GenreEditDialog(self, path, m.get("genres") or []).exec()
 
     def rescan_music(self, path):
-        """重新分析扫描单首曲目（重建指纹 + 重查曲风 + 重算段落）"""
+        """重新分析扫描单首曲目（重建指纹 + 重查曲风 + 重算节拍网格）。
+
+        段落分析已移除（见 `_music_scan` 的说明），别再写「重算段落」。"""
         if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
             QMessageBox.information(self, "重新分析", "已有扫描在进行中，请稍候。")
             return
@@ -3590,9 +3939,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(Tf("已补齐 {} 个素材的缩略图", n), 6000)
 
     def _fill_tag_combo(self):
-        """标签集合变化后刷新筛选按钮文案（兼容旧调用点）"""
-        self.btn_tagfilter.setText(
-            f"标签: 已选 {len(self.tag_selected)}" if self.tag_selected else "标签: 全部")
+        """标签集合变化后刷新筛选按钮文案（**两页都要**，兼容旧调用点）"""
+        self._sync_lib_controls()
 
     def open_tag_filter(self):
         from panels import TagFilterDialog
@@ -3603,11 +3951,27 @@ class MainWindow(QMainWindow):
             self.refresh_grid()
 
     def refresh_grid(self, icons_only=False):
-        sz = self.grid.iconSize()
+        """刷新素材库网格（**两页共用**：演出台那份 + 全屏素材库那份）。"""
+        self._populate_grid(self.grid, self.lbl_lib_count, icons_only)
+        g2 = getattr(self, "grid_full", None)
+        if g2 is None:
+            return
+        # ⚠ 全屏那份**只在可见时填充**（库大时填充很贵，每次搜索都填两遍会明显变卡）：
+        #   不可见就先标脏，切到那一页时再补（见 switch_page）。
+        if self.pages.currentIndex() == 1:
+            self._populate_grid(g2, getattr(self, "lbl_lib_count2", None), icons_only)
+            self._lib_full_dirty = False
+        else:
+            self._lib_full_dirty = True
+        self._sync_lib_controls()
+
+    def _populate_grid(self, grid, count_lbl, icons_only=False):
+        """把筛选后的素材填进 `grid`（演出台那份与全屏那份共用这段逻辑）。"""
+        sz = grid.iconSize()
         if not icons_only:
-            self.grid.clear()
+            grid.clear()
             sel = self.tag_selected
-            kw = (self.search_box.text() or "").strip().lower()
+            kw = (getattr(self, "lib_kw", "") or "").strip().lower()
             for it in self.library.values():
                 has_tags = bool(it.all_tags())
                 has_roles = any(it.roles.values())
@@ -3629,16 +3993,17 @@ class MainWindow(QMainWindow):
                 li.setData(Qt.UserRole, it)
                 li.setToolTip(self._item_tooltip(it))
                 self._tint_role(li, it)
-                self.grid.addItem(li)
+                grid.addItem(li)
         else:
-            for i in range(self.grid.count()):
-                li = self.grid.item(i)
+            for i in range(grid.count()):
+                li = grid.item(i)
                 it = li.data(Qt.UserRole)
                 li.setIcon(it.icon_cached(sz.width(), sz.height()))
                 li.setText(self._item_text(it))
                 li.setToolTip(self._item_tooltip(it))
                 self._tint_role(li, it)
-        self.lbl_lib_count.setText(f"{self.grid.count()}/{len(self.library)}")
+        if count_lbl is not None:
+            count_lbl.setText(f"{grid.count()}/{len(self.library)}")
 
     def _exists_cached(self, path):
         """文件是否存在（带 30 秒缓存）：素材上万时每次刷新都 stat 一遍会拖慢界面"""
@@ -3694,10 +4059,12 @@ class MainWindow(QMainWindow):
 
     def set_kind_filter(self, i):
         self.kind_filter = i
+        self._sync_lib_controls()
         self.refresh_grid()
 
     def set_role_filter(self, i):
         self.role_filter = i
+        self._sync_lib_controls()
         self.refresh_grid()
 
     def edit_tags(self, item):
@@ -4455,9 +4822,9 @@ class MainWindow(QMainWindow):
         if time.perf_counter() < getattr(self, "_drag_pause_until", 0.0):
             return   # 拖动/缩放窗口中：只存帧不重绘，松手后自然恢复
         self.preview_panel.set_frame(img)
-        self._hl_tick += 1
-        if self._hl_tick % 6 == 0:      # ~10fps 刷新高亮，省 CPU
-            self.layers_panel.refresh_playing()
+        # ⚠ 播放高亮**不在这里刷**：已交给独立的 1 秒定时器（`self._hl_timer`）。
+        #   这条旧通路是"每 6 帧 ≈10fps 重建整张高亮表"，而预览帧在换页/隐藏时根本不来
+        #   ⇒ 既白烧 CPU（图层多时每轮遍历所有格子）又不可靠。别再搬回来。
 
     def _bpm_text(self, snap, prefix="BPM "):
         """BPM 显示文案。用 bpm_display（未锁定也可有值）而不是 bpm（只有锁定值）。

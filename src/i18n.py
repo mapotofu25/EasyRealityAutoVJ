@@ -341,7 +341,3 @@ def _rt_tabs(tw):
     except Exception:
         pass
 
-
-def missing_keys():
-    """返回词表里已有、但代码中已不存在的条目（用于清理），以及反向缺失检查辅助。"""
-    return sorted(k for k in ZH2EN if not k)

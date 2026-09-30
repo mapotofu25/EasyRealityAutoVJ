@@ -104,6 +104,22 @@ ZH2EN = {
     "从本层移除": "Remove from this layer",
     "移到其他图层": "Move to another layer",
 
+    # ==================== 两界面（页签条）====================
+    "🎬 演出台": "🎬 Live",
+    "🎵 曲库 · 曲风": "🎵 Music · Genres",
+    "现场：预览 / 图层 / 效果 / 输出": "Live: preview / layers / effects / output",
+    "演出前准备：音乐曲库（导入音乐 + 扫描分析曲风）/ 曲风映射":
+        "Pre-show prep: music library (import + genre scan) / genre mapping",
+    "双击缩略图 = 立即播放到当前图层；右键可「添加到图层」": "Double-click a thumbnail = play it on the current layer; right-click for \"Add to layer\"",
+    "演出前的准备工作都在这里：导入音乐、扫描分析曲风（每首歌的曲风 + 节拍网格），以及编辑「曲风 → 画面标签」的绑定关系。\n素材库在「🎬 演出台」上，演出中随时能取素材、直接拖进图层。":
+        "All the pre-show prep lives here: import music, scan & analyze genres (per-track genre + beat "
+        "grid), and edit the \"genre → visual tag\" bindings.\nThe media library is on the \"🎬 Live\" "
+        "page, so you can grab clips and drag them into layers during the show.",
+    "🎵 音乐曲库…": "🎵 Music Library…",
+    "曲风映射…": "Genre Mapping…",
+    "曲库：已导入 {} 首；其中 {} 首已有节拍网格（八拍乐句对齐要用它）":
+        "Library: {} track(s) imported; {} of them have a beat grid (used for 8-beat phrase alignment)",
+
     # ==================== 素材库 ====================
     "素材库": "Media Library",
     "标签: 全部": "Tag: All",
@@ -239,6 +255,13 @@ ZH2EN = {
         "release package again and retry.",
     "错误详情：": "Error details:",
     "NDI 源名称": "NDI Source Name",
+    "NDI 传输音频（48 kHz 立体声）": "Send NDI audio (48 kHz stereo)",
+    "把采集到的声音随 NDI 一起发出去（48 kHz 立体声）。默认关闭：接收端若本来就在监听同一路声音，会听到双声/回声；只在接收端需要单独取声音时才打开。":
+        "Send the captured sound along with NDI (48 kHz stereo). Off by default: if the receiver is "
+        "already monitoring the same sound, you will hear doubling/echo - only enable it when the "
+        "receiver needs the audio on its own.",
+    "Spout 只传画面，不含音频。需要音频请用 NDI 或虚拟声卡。":
+        "Spout carries video only - no audio. Use NDI or a virtual audio device if you need sound.",
     "全局": "Global",
     "仅窗口": "Window only",
     "不保存": "Don't Save",
@@ -855,6 +878,31 @@ ZH2EN = {
     "纠正曲风 - ": "Correct Genre - ",
     "在「{}」里新建一个曲风（会出现在纠正曲风里）":
         "Add a genre to “{}” (it will also show up in Fix Genre)",
+    "退出全屏并按输出分辨率重置窗口大小": "Leave fullscreen and reset the window to the output resolution",
+    "🗂 素材库": "🗂 Library",
+    "全屏管理素材：搜索 / 筛选 / 导入 / 打标签（演出台那份原样不动）":
+        "Manage clips full-screen: search / filter / import / tag (the Live-page copy stays untouched)",
+    "这里是全屏版素材库，和「🎬 演出台」上那份是同一批素材（那份保持原样）。\n搜索 / 筛选 / 导入 / 右键打标签都在这里做；双击缩略图 = 播放到当前图层。\n⚠ 「拖进图层」只能在演出台做（跨页面拖拽系统不允许）。":
+        "This is the full-screen copy of the media library (same clips as the 🎬 Live page, which stays untouched).\nSearch / filter / import / right-click to tag here; double-click a thumbnail to play it on the current layer.\n⚠ Dragging a clip into a layer only works on the Live page (cross-page drag is not supported by Qt).",
+    "排序 / 筛选": "Sort / Filter",
+    "排序": "Sort",
+    "BPM（按节拍网格）": "BPM (from beat grid)",
+    "时长": "Duration",
+    "只看文件缺失": "Missing files only",
+    "换盘 / 改名之后找不到文件的曲目（修复清单）":
+        "Tracks that can no longer be found after moving drives / renaming (repair list)",
+    "重置筛选": "Reset filters",
+    "BPM / 时长来自曲库扫描时建的节拍网格；「无节拍网格」的曲目"
+    "八拍乐句对齐用不了，是需要处理的清单。":
+        "BPM / duration come from the beat grid built during the library scan; "
+        "tracks without a grid cannot use 8-beat phrase alignment — that is your "
+        "to-do list.",
+    "未分析": "Not analysed",
+    "无网格": "No grid",
+    "文件缺失": "File missing",
+    "共 {} 首，已分析 {} 首（当前显示 {} 首）":
+        "{} tracks, {} analysed (showing {})",
+    "筛选后 {} / {} 首": "Filtered: {} / {}",
 }
 
 
@@ -889,4 +937,3 @@ CATEGORY_EN = {
 }
 
 _inject_tag_labels()
-

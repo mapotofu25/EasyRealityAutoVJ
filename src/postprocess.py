@@ -96,7 +96,16 @@ _TRAIL = {"buf": None}
 
 
 def fx_trails(bgr, strength, reset=False):
-    """拖影：上一帧衰减后与本帧取 max（不叠白）。强度越大残影越久"""
+    """拖影：上一帧衰减后与本帧取 max（不叠白）。强度越大残影越久。
+
+    ⚠ `bgr=None` 是**清空拖影缓冲**的约定（引擎在「效果关闭 / 被 Kv 接管」时
+      调 `fx_trails(None, 0.0, reset=True)`）。旧实现直接 `bgr.copy()` ⇒
+      `AttributeError` ⇒ 被上层 `except Exception: pass` 吞掉 ⇒ **缓冲永远清不掉**，
+      下次再开拖影会闪一下上一场的残影（症状很隐蔽，日志里什么都没有）。
+    """
+    if bgr is None:
+        _TRAIL["buf"] = None
+        return None
     prev = _TRAIL["buf"]
     if reset or prev is None or prev.shape != bgr.shape:
         _TRAIL["buf"] = bgr.copy()

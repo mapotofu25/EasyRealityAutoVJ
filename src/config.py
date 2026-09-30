@@ -177,6 +177,7 @@ DEFAULTS = {
         "spout_name": "EasyRealityAutoVJ",
         "ndi_enabled": False,         # NDI 输出（音画同步；运行时随包自带，用户无需安装）
         "ndi_name": "EasyRealityAutoVJ",
+        "ndi_audio": False,           # NDI 是否随画面一起发声音（默认关：怕双声/回声）
     },
     "hotkeys": DEFAULT_HOTKEYS,
     "library": [],

@@ -29,6 +29,15 @@ MANUALS = ["使用说明.txt", "使用说明_EN.txt"]
 # 「更新内容.txt / _EN.txt」只放在项目根，**不打进压缩包**（用户 2026-09-23 要求）
 
 
+def _is_cyndilib_junk(path):
+    """cyndilib 里运行时用不上的文件（打包时直接跳过，见 main 里的说明）。"""
+    low = os.path.basename(path).lower()
+    if "/cyndilib/" not in path.replace("\\", "/").lower():
+        return False
+    return (low.endswith((".cpp", ".pyx", ".pxd", ".html", ".lib", ".so", ".a"))
+            or "directshow" in low or "uwp" in low)
+
+
 def slim_cyndilib():
     """cyndilib 自带 3 平台 NDI 运行库 + 源码文件，只用得上 x64 → 省约 80MB。"""
     internal = os.path.join(DIST, "_internal", "cyndilib")
@@ -80,7 +89,11 @@ def main():
 
     print(f"版本 {ver}（{date_key} 第 {seq} 次生成）")
     print(f"包名 {zip_name}")
-    print("cyndilib 瘦身删除:", slim_cyndilib(), "个文件")
+    # ★ 2026-09-28：cyndilib 的无用文件改由「**写包时跳过**」（见 _is_cyndilib_junk）。
+    #   **不再删 dist 里的文件** —— 逐文件删除会被 safe-delete 钩子拦
+    #   （SAFE_DELETE_BULK_CONFIRM_REQUIRED），拦下来还会终止整个进程、连累打包失败。
+    #   slim_cyndilib() 保留着（手动需要时可以在允许删除的环境里调），主流程不再调它。
+    print("cyndilib 无用文件：写包时跳过（dist 里不删）")
 
     for m in MANUALS:
         src = os.path.join(ROOT, m)
@@ -93,12 +106,21 @@ def main():
                  and "使用说明" in f]
 
     n = 0
+    skipped = 0
     t0 = time.time()
     # compresslevel=6：与之前几版包大小一致（约 470MB）；用 1 会大 15MB 左右
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for root, dirs, files in os.walk(DIST):
             for f in files:
                 p = os.path.join(root, f)
+                # ★ 2026-09-28：**打包时直接跳过 cyndilib 的无用文件**（3 平台 NDI 运行库源码、
+                #   DirectShow / UWP 那两份 DLL，约 80MB，运行时全用不上）。
+                #   为什么不再靠 "先删掉再打包"：slim_cyndilib() 的逐文件删除**会被 safe-delete
+                #   钩子拦**（SAFE_DELETE_BULK_CONFIRM_REQUIRED），拦下来还会**终止整条进程**，
+                #   连累打包直接失败。改成写包时跳过就完全不碰删除，包大小与原来一致。
+                if _is_cyndilib_junk(p):
+                    skipped += 1
+                    continue
                 rel = os.path.relpath(p, os.path.dirname(DIST))   # 保留 EasyRealityAutoVJ/ 前缀
                 z.write(p, rel)
                 n += 1
@@ -106,7 +128,8 @@ def main():
             z.write(os.path.join(DIST, f), f)
             n += 1
     print(f"完成：{zip_path}")
-    print(f"      {n} 条目 / {os.path.getsize(zip_path) / 1048576:.1f} MB / 用时 {time.time() - t0:.0f}s")
+    print(f"      {n} 条目 / {os.path.getsize(zip_path) / 1048576:.1f} MB / 用时 {time.time() - t0:.0f}s"
+          + (f"（另跳过 cyndilib 无用文件 {skipped} 个）" if skipped else ""))
     return 0
 
 

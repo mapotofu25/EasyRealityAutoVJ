@@ -49,6 +49,8 @@ class MatchTick:
         self.cur_votes = 0
         self.streak_votes = 0
         self.streak_ticks = 0
+        self.evidence_votes = 0     # ⚠ __slots__ 里声明了就必须初始化：
+                                    #   漏了会 AttributeError（谁读谁炸，而且很难联想）
 
 
 class ChargeBarEngine:

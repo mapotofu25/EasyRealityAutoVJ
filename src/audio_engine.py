@@ -20,6 +20,28 @@ import numpy as np
 
 BLOCK = 1024
 
+# NDI 音频转发队列上限（单位=块）：BLOCK=1024 @48kHz ≈ 21ms/块 ⇒ 48 块 ≈ 1 秒。
+# 满了自动丢最老的块 —— 宁可少发一秒音频，也绝不让采集线程等（见 _ndi_audio_loop）。
+_NDI_Q_MAX = 48
+
+# ==========================================================================
+# 能量公式的可调参数（**抽成模块常量只为能做离线 A/B**；默认值 = 原行为，一字未改）
+#   诊断见 tools/_energy_ab.py：2026-09-28 查「劲爆 drop 却只有 0.4」时发现
+#   `kick_e` 的映射窗口极窄（(rel-0.48)/0.30 ⇒ 只有 rel 0.48~0.78 这一段产出，
+#   全曲峰值 50% 的段落直接判 0），叠加 bass/fluct 同类死区与人声惩罚后，
+#   「响度只差 1.4 dB、但低频冲击是全曲峰值 50%」的段落就掉到 0.35。
+# ==========================================================================
+EN_TAU_LOUD_BASE = 80.0            # 响度自适应基线时间常数（秒）
+EN_W_LOUD, EN_W_EV = 0.4, 0.6      # 响度项 / 低频证据项的融合权重
+EN_KICK_DEAD, EN_KICK_SLOPE = 0.48, 0.30
+EN_BASS_DEAD, EN_BASS_SLOPE = 0.45, 0.22
+EN_FLUCT_DEAD, EN_FLUCT_SLOPE = 0.45, 0.22
+EN_VOC_MAX, EN_VOC_KNEE, EN_VOC_SPAN = 0.45, 0.30, 0.35
+# 绝对响度兜底项（2026-09-28 新增，见 feed() 内注释）：固定 dBFS 窗口，不用任何自适应基线
+EN_ABS_LO_DB, EN_ABS_HI_DB = -14.0, -6.0
+EN_LV_TAU = 1.0                    # 绝对响度（RMS dBFS）的平滑时间常数（秒）
+EN_ABS_W = 1.0                     # 兜底项权重（0 = 关闭该项，用于 A/B 对照）
+
 
 def _sc():
     """导入 soundcard（只能在音频后台线程调用一次）"""
@@ -55,10 +77,27 @@ def _native_samplerate(mic):
 
 
 def _band_energy(spec, freqs, lo, hi):
+    """频带平均能量（保留原接口，供外部/测试用）。
+
+    ⚠ 热路径**不要**用它 —— 每次都要建布尔掩码再索引。`_Analyzer` 内部改用
+    `_band_mean(spec, (i0, i1))`（切片求平均，索引由 `_fft_plan()` 预算好）。
+    """
     m = (freqs >= lo) & (freqs < hi)
     if not m.any():
         return 0.0
     return float(np.mean(spec[m]))
+
+
+def _band_mean(spec, rg):
+    """按预算好的频带索引区间求平均（空区间返回 0.0，与 _band_energy 一致）。
+
+    RFFT 的频率轴是单调递增的 ⇒ `freqs >= lo & freqs < hi` 一定是**连续区间**，
+    可以直接用切片，不必每次建掩码。
+    """
+    i0, i1 = rg
+    if i1 <= i0:
+        return 0.0
+    return float(np.mean(spec[i0:i1]))
 
 
 class RateEstimator:
@@ -309,9 +348,38 @@ class _Analyzer:
         self.cx_smooth = 0.0
         self.energy_hist = deque(maxlen=192)
         self.voc_smooth = 0.0
+        self.lv_smooth = -60.0                 # 绝对响度（RMS dBFS）的平滑值，见 EN_ABS_* 
         self.seg_state = {"quiet_since": None, "build_since": None, "last_drop": 0.0,
                           "was_high": False, "high_since": None, "label": "none",
                           "seg_until": 0.0, "prev_e": 0.0}
+
+    def _fft_plan(self):
+        """FFT 相关的预算表：(freqs, 低频区间, 中频区间, 高频区间, 24 段边界, BPM 周期)。
+
+        返回 (freqs, 低/中/高频区间, 24 段边界, BPM 判定周期, kick 频带区间)。
+
+        采样率在一次采集里是固定的 ⇒ 只算一次，按 sr 缓存（换设备/换采样率自动重算）。
+        频带区间用 searchsorted 求**连续下标**：RFFT 频率轴单调递增，所以
+        「freqs >= lo 且 < hi」等价于一个切片，比每次建布尔掩码快得多。
+        """
+        got = getattr(self, "_fft_plan_cache", None)
+        if got is not None and got[0] == self.sr:
+            return got[1]
+        freqs = np.fft.rfftfreq(2048, 1.0 / self.sr)
+
+        def _rg(lo, hi):
+            return (int(np.searchsorted(freqs, lo, "left")),
+                    int(np.searchsorted(freqs, hi, "left")))
+
+        edges = np.unique(np.geomspace(2, len(freqs) - 1, 25).astype(int))
+        # ⚠ kick 频带原来是 `(freqs >= 20) & (freqs <= 200)` —— **右端是闭区间**，
+        #   所以这里用 searchsorted "right" 才不会漏掉正好落在 200Hz 的那个 bin。
+        rg_kick = (int(np.searchsorted(freqs, 20, "left")),
+                   int(np.searchsorted(freqs, 200, "right")))
+        plan = (freqs, _rg(20, 160), _rg(160, 2000), _rg(2000, 12000),
+                edges, max(1, int(self.sr // BLOCK)), rg_kick)
+        self._fft_plan_cache = (self.sr, plan)
+        return plan
 
     def feed(self, data, st):
         """分析一个采集块并更新共享状态。任何异常由调用方兜底，不影响线程存活。"""
@@ -334,14 +402,16 @@ class _Analyzer:
         rms = float(np.sqrt(np.mean(sig ** 2)))
 
         # ---- FFT ----
+        # ★ 频带边界 / 24 段频谱的边界 / BPM 判定周期**只算一次**（见 _fft_plan）：
+        #   原来每块（≈46 次/秒）都要 rfftfreq + geomspace + 三组布尔掩码。
+        freqs, rg_bass, rg_mid, rg_high, edges, bpm_period, rg_kick = self._fft_plan()
         buf = np.zeros(2048, dtype=np.float32)
         n = min(len(sig), 2048)
         buf[:n] = sig[:n]
         spec = np.abs(np.fft.rfft(buf * self.win)) / 1024.0
-        freqs = np.fft.rfftfreq(2048, 1.0 / self.sr)
-        bass = _band_energy(spec, freqs, 20, 160)
-        mid = _band_energy(spec, freqs, 160, 2000)
-        high = _band_energy(spec, freqs, 2000, 12000)
+        bass = _band_mean(spec, rg_bass)
+        mid = _band_mean(spec, rg_mid)
+        high = _band_mean(spec, rg_high)
         # 低频「起伏变化量」：相邻块低频能量的上升差分，1s 窗口累计。
         # drop 段的 kick 让低频一拍一拍地大起大落（起伏大且密），平稳垫底/pad 段起伏小。
         # 与 kick（频谱级通量）互补：录屏/压缩削瞬态通量时，能量级的起伏通常仍在。
@@ -350,8 +420,6 @@ class _Analyzer:
         self.prev_bass_e = bass
 
         # ---- 24 段对数频谱（可视化特效数据源：径向频谱/音频反应变形）----
-        edges = np.geomspace(2, len(spec) - 1, 25).astype(int)
-        edges = np.unique(edges)
         band_vals = np.array([spec[edges[i]:max(edges[i] + 1, edges[i + 1])].mean()
                               for i in range(len(edges) - 1)], dtype=np.float32)
         # 滚动峰值归一（慢衰减，自动适配音量），再 EMA 平滑
@@ -379,8 +447,8 @@ class _Analyzer:
         self.flux_ref = max(self.flux_ref * 0.999, flux)
 
         # ---- 低频(kick)通量：踢鼓节奏比全频稳定（全频易被旋律乐句周期带偏）----
-        bass_mask = (freqs >= 20) & (freqs <= 200)
-        bass_spec = spec[bass_mask]
+        # ★ 掩码由 `_fft_plan()` 预算（原来每块都要建一次布尔数组 + fancy index）
+        bass_spec = spec[rg_kick[0]:rg_kick[1]]
         if self.prev_bass_spec is None:
             self.prev_bass_spec = bass_spec
         bflux = float(np.sum(np.maximum(bass_spec - self.prev_bass_spec, 0)))
@@ -398,7 +466,7 @@ class _Analyzer:
         self.kick_peak = max(self.kick_peak, kick_density)
 
         # ---- BPM 估计 v6（每 ~1s）：kick 节奏优先 + 谐波梳状 + 60s 投票众数 ----
-        if self.flux_i % int(self.sr // BLOCK) == 0:
+        if self.flux_i % bpm_period == 0:
             fps = self.sr / BLOCK
             bh = self.bass_flux_hist.copy()
             fh = self.flux_hist.copy()
@@ -597,7 +665,7 @@ class _Analyzer:
             if self.wdb_base <= -59.9:
                 self.wdb_base = wdb                      # 冷启动：锚定第一声
             else:
-                tau = 80.0
+                tau = EN_TAU_LOUD_BASE
                 self.wdb_base += (wdb - self.wdb_base) * (1.0 - float(np.exp(-self.block_sec / tau)))
         rel = wdb - self.wdb_base
         if rel < 0:
@@ -623,7 +691,7 @@ class _Analyzer:
         # 映射带 0.50 死区：实测鼓点段 kick_rel 0.71~0.84、钢琴/人声段 0.08~0.50（BW 钢琴
         # 和弦的低频瞬态会贡献 0.3~0.5，但远低于真 kick）；Bunsen 类全程均匀 kick 的歌
         # rel 长期 0.55~0.75，拐点不能高过 0.5（否则全程高潮被误压成中能量）。
-        kick_e = max(0.0, min(1.0, (kick_rel - 0.48) / 0.30))
+        kick_e = max(0.0, min(1.0, (kick_rel - EN_KICK_DEAD) / EN_KICK_SLOPE))
         # 持续打击平滑（τ≈1.2s 对称 EMA）：真鼓点 kick_e 连续多秒高、钢琴/人声段的偶发低频
         # 敲击（钢琴低音伴奏的节奏敲击）是短促的——不平滑会被 0.7 权重放大成能量横跳
         # （BW 钢琴段 0.2↔0.6 反复、跨档滞回等不到稳定低值）。EMA 抹掉短促尖峰、保留持续
@@ -636,12 +704,12 @@ class _Analyzer:
         # NVIDIA 录制会抹平 kick 冲击（低频通量），但低频持续能量还在，用它区分 drop/钢琴。
         self.bass_peak = max(self.bass_peak, bass)
         bass_rel = bass / max(self.bass_peak, 1e-6)
-        bass_factor = max(0.0, min(1.0, (bass_rel - 0.45) / 0.22))
+        bass_factor = max(0.0, min(1.0, (bass_rel - EN_BASS_DEAD) / EN_BASS_SLOPE))
         # 低频起伏变化量因子（用户：高能量时低频起伏大）：起伏量相对全曲慢峰（只升不降）。
         # 映射与 bass_factor 同构（拐点 0.45/斜率 0.22）——起伏和低频水平高度相关。
         self.fluct_peak = max(self.fluct_peak, fluct_density)
         fluct_rel = fluct_density / max(self.fluct_peak, 1e-9)
-        fluct_factor = max(0.0, min(1.0, (fluct_rel - 0.45) / 0.22))
+        fluct_factor = max(0.0, min(1.0, (fluct_rel - EN_FLUCT_DEAD) / EN_FLUCT_SLOPE))
         # 门控（用户语义：低频值超过阈值后起伏才算高能量）：低频水平不足（bass_factor 低）时
         # 起伏量不参与——防止钢琴/人声段「起伏均匀但低频水平不高」被起伏量误抬。
         fluct_factor *= min(1.0, bass_factor * 2.0)
@@ -651,15 +719,34 @@ class _Analyzer:
         # 0.35/0.25）会两头不讨好：kick 权重低则 ITA 类「响度不突出、靠 kick 撑 drop」的歌被
         # 压到 0.5；bass 权重低则录屏场景兜不住。钢琴/人声段两者都低（bass_rel<拐点、kick<死区），
         # max 后仍为 0，不会误抬。
+        # ── 绝对响度兜底项（2026-09-28 新增）─────────────────────────────────
+        # 起因：`Alcohol Duper -Hardstyle VIP-` 3:03~3:29 的 drop 只读到 0.38，
+        #   而它的**整体响度只比全曲最猛的 3:44 段低 1.4 dB**（实测 −7.81 vs −6.40 dBFS）。
+        # 根因是低频证据项全部走「全曲慢峰 + 死区」：该段 kick 只有峰值的 ~50% ⟹ kick_e≈0，
+        #   bass/fluct 同样掉进死区；而响度项又走 80s 自适应基线（持续响的段落被压平）。
+        #   ⇒ 「整体很响、但低频冲击不是全曲最猛」的段落两头落空。
+        # 这一项用**固定 dBFS 尺度**（不依赖任何自适应基线）作为 max() 的加项：
+        #   **只会抬高、不会压低**，因此不会破坏任何既有判定。
+        # 实测分离度（各段 RMS dBFS）：本曲 drop −7.8 / 最猛段 −6.4 / 同曲 intro −19.5 /
+        #   Black Warrior 钢琴 breakdown −11.9 / Cosmic String 常规段 −12.4 /
+        #   BW 3:00 段 −15.7。
+        #   ⇒ 窗口取 [−14, −6]：drop 得 0.65~0.83；钢琴段只有 0.14、intro 与 BW3:00 为 0。
+        lv_db_now = 20.0 * float(np.log10(max(rms, 1e-5)))
+        self.lv_smooth += (lv_db_now - self.lv_smooth) * (
+            1.0 - float(np.exp(-self.block_sec / EN_LV_TAU)))
+        abs_ev = max(0.0, min(1.0, (self.lv_smooth - EN_ABS_LO_DB)
+                              / (EN_ABS_HI_DB - EN_ABS_LO_DB))) * EN_ABS_W
         loud_term = e_loud                                  # 响度项（0~1，融合前）
-        ev_term = max(kick_e, bass_factor, fluct_factor)    # 低频证据项（0~1）
-        e_loud = 0.4 * loud_term + 0.6 * ev_term
+        # 低频证据项（0~1）：kick 冲击 / 低频能量 / 低频起伏 / **绝对响度** 取 max
+        ev_term = max(kick_e, bass_factor, fluct_factor, abs_ev)
+        e_loud = EN_W_LOUD * loud_term + EN_W_EV * ev_term
         # 人声惩罚：人声中频占比高 → 砍能量。响度均衡是宽频增益、不改变频谱形状，
         # 所以人声段中频占比始终高（压缩鲁棒的人声检测）。voc_smooth 为上一块的中频占比平滑值。
         # 惩罚系数 0.7 → 0.6（2026-09-24 用户要求「削弱一点人声惩罚」）：人声段能量会整体抬高
         # 约 5~15%（人声明显时抬得多），最大惩罚从 -70% 变 -60%。
         vocalness_now = min(1.0, self.voc_smooth * 1.6)
-        vocal_factor = 1.0 - 0.6 * max(0.0, min(1.0, (vocalness_now - 0.25) / 0.35))
+        vocal_factor = 1.0 - EN_VOC_MAX * max(0.0, min(1.0,
+                            (vocalness_now - EN_VOC_KNEE) / EN_VOC_SPAN))
         e_loud *= vocal_factor
         # 调试观测字段（无副作用，排障用）
         self.dbg_rel = rel
@@ -670,6 +757,7 @@ class _Analyzer:
         try:
             st.dbg = {"loud": loud_term, "kick_e": kick_e, "bass_f": bass_factor,
                       "fluct_f": fluct_factor, "vocal_f": vocal_factor, "ev": ev_term,
+                      "abs_f": abs_ev,
                       "rel": rel, "kick_rel": kick_rel, "bass_rel": bass_rel, "pre": e_loud}
         except Exception:
             pass
@@ -951,6 +1039,13 @@ class _Analyzer:
         self._db_conf_ever = True
 
 
+# 现场指纹识别的**窗口长度**（秒）：每次取最近这么长的一段音频去做匹配。
+# ⚠ 这个数在**两处**必须一致 —— ① 切窗 `last(sr*FP_WIN_SEC)`；② 位置补偿
+#   `recognized_offset = off + FP_WIN_SEC * r`（窗口起点→窗口末端的原曲秒数）。
+#   以前两处各写一个 4.5，改一处就会让「现在放到第几秒」整体偏移几秒（很难查）。
+FP_WIN_SEC = 4.5
+
+
 class _AudioRing:
     """固定容量单声道环形缓冲（numpy 实现，零 Python 对象分配）。
 
@@ -1038,6 +1133,16 @@ class AudioEngine:
         self._dev_worker = threading.Thread(
             target=self._dev_loop, daemon=True, name="autovj-audio-dev")
         self._dev_worker.start()
+        # ---- NDI 音频转发：**独立线程 + 有界队列**（见 _ndi_audio_loop）----
+        # ⚠ 铁律：`ndi.feed_audio()` 要写 cyndilib 缓冲并 send_audio，接收端稍慢就会
+        #   把它拖住 ⇒ **绝不能放在采集线程上** —— 那条线程还担着能量分析、拍钟、
+        #   指纹识别，一堵就是整场掉拍。这里只入队（deque 带 maxlen ⇒ 满自动丢最老）。
+        self._ndi_q = deque(maxlen=_NDI_Q_MAX)
+        self._ndi_cv = threading.Condition()
+        self._ndi_stop = False
+        self._ndi_thread = threading.Thread(
+            target=self._ndi_audio_loop, daemon=True, name="autovj-ndi-audio")
+        self._ndi_thread.start()
 
     def _dev_loop(self):
         sc = None
@@ -1053,6 +1158,42 @@ class AudioEngine:
                 job(sc)
             except Exception:
                 pass
+
+    def _ndi_audio_loop(self):
+        """把采集线程投递的 PCM 转发给 NDI 发送器（**独立线程**，见 __init__）。
+
+        队列满由 `deque(maxlen=…)` 自动丢最老的块；NDI 没接线时直接丢弃。
+        全程**不阻塞采集线程**，也不做任何等待。
+        """
+        while not self._ndi_stop:
+            item = None
+            try:
+                with self._ndi_cv:
+                    if self._ndi_q:
+                        item = self._ndi_q.popleft()
+                    else:
+                        self._ndi_cv.wait(0.2)
+            except Exception:                                 # noqa: BLE001
+                time.sleep(0.1)
+                continue
+            if item is None:
+                continue
+            fn = self.state.ndi_feed
+            if fn is None:
+                continue
+            try:
+                fn(item[0], item[1])
+            except Exception:                                 # noqa: BLE001
+                pass
+
+    def push_ndi_audio(self, pcm_interleaved, sr):
+        """采集线程调用：**只入队**（O(1) 不阻塞），真正发送在 `_ndi_audio_loop`。"""
+        try:
+            with self._ndi_cv:
+                self._ndi_q.append((pcm_interleaved, sr))
+                self._ndi_cv.notify()
+        except Exception:                                     # noqa: BLE001
+            pass
 
     def _worker_loop(self):
         sc = None
@@ -1116,6 +1257,13 @@ class AudioEngine:
     def shutdown(self):
         self._gen += 1
         self._genre_stop.set()
+        self._ndi_stop = True
+        try:
+            with self._ndi_cv:
+                self._ndi_q.clear()
+                self._ndi_cv.notify_all()
+        except Exception:                                     # noqa: BLE001
+            pass
         try:
             self._jobs.put(None)
         except Exception:
@@ -1184,7 +1332,7 @@ class AudioEngine:
                 if self._genre_buf.filled < 16000:
                     continue
                 # 只要最近 4.5 秒（指纹匹配窗口）；numpy 切片拷贝，不再 list(deque) 全量复制
-                buf = self._genre_buf.last(int(self._genre_sr * 4.5))
+                buf = self._genre_buf.last(int(self._genre_sr * FP_WIN_SEC))
                 # 窗口末端的挂钟时刻：识别结果对应的"当前时刻"（给引擎网格时钟对齐用）
                 t_read = _t.perf_counter()
             try:
@@ -1215,8 +1363,9 @@ class AudioEngine:
                         r = self._rate_est.update(cur, off, t_read)
                         self.state.recognized_rate = r
                         # off 是识别窗口起点在**原曲**时间轴上的秒数，窗口末端≈当前播放秒。
-                        # ⚠ 变速倍率 r≠1 时，4.5s 挂钟对应 4.5*r 秒原曲 —— 旧写法固定 +4.5 是错的。
-                        self.state.recognized_offset = off + 4.5 * r
+                        # ⚠ 变速倍率 r≠1 时，窗口秒数对应 FP_WIN_SEC*r 秒原曲
+                        #   —— 旧写法固定 +4.5（且与切窗各写一份）是错的。
+                        self.state.recognized_offset = off + FP_WIN_SEC * r
                         self.state.recognized_t = t_read
                         # 对齐票数交给引擎：低于门槛时 offset 不可信，网格时钟不做任何校正
                         self.state.recognized_votes = int(votes)
@@ -1285,7 +1434,14 @@ class AudioEngine:
         # 连续失败若干次就主动退出循环，让 worker 空出来接手切换请求。
         err_streak = 0
         with mic.recorder(samplerate=sr, channels=2) as rec:
-            self._genre_sr = sr
+            with self._genre_lock:
+                self._genre_sr = sr
+                # ★ 缓冲容量必须按**实际采样率**给足：原来写死 `48000 * 8`，
+                #   设备跑 96k 时 8 秒的缓冲只剩 4 秒 ⇒ 识别窗（FP_WIN_SEC）被截短、
+                #   票数变少、甚至低于对齐门槛。12 秒足够容纳识别窗 + 曲风窗（8s）。
+                need = int(sr * 12)
+                if self._genre_buf.cap < need:
+                    self._genre_buf = _AudioRing(need)
             while self._gen == gen:   # 只在自己这一代有效；切换设备后立即退出
                 try:
                     # 实时透传能量伽马校正（用户调滑块后下一块立即生效，不能在启动时只拷贝一次）
@@ -1298,17 +1454,19 @@ class AudioEngine:
                         analyzer.feed(data[:, :1], st)
                     else:
                         analyzer.feed(data, st)
-                    # NDI 音频（音画同步）：把采集到的立体声 PCM 喂给 NDI 发送器
-                    # 未启用 NDI 时**直接跳过**，省掉每块的 asarray/reshape/copy（原来无条件执行）
+                    # NDI 音频（音画同步）：把采集到的立体声 PCM **入队**给独立转发线程
+                    # ★ 2026-09-28 改：不再在本线程直接调 `ndi.feed_audio()` —— 它会写
+                    #   cyndilib 缓冲并 send_audio，接收端一慢就把采集线程拖住，
+                    #   连带能量/拍位/指纹全停（现场掉拍）。现在只投递，队列满丢帧。
+                    #   未启用时**直接跳过**，省掉每块的 asarray/reshape/copy。
                     try:
-                        ndi = st.ndi_feed
-                        if ndi is not None and st.ndi_audio_on:
+                        if st.ndi_audio_on and st.ndi_feed is not None:
                             arr = _np.asarray(data, dtype=_np.float32)
                             if arr.ndim == 1:
                                 arr = _np.column_stack([arr, arr])
                             elif arr.shape[1] == 1:
                                 arr = _np.repeat(arr, 2, axis=1)
-                            ndi(arr.reshape(-1).copy(), sr)
+                            self.push_ndi_audio(arr.reshape(-1).copy(), sr)
                     except Exception:
                         pass
                     # 喂曲风环形缓冲（左声道 float32）——numpy 环形缓冲，零对象分配

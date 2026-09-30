@@ -71,6 +71,8 @@ _bpm_*.txt
 
 # ---------- 开发期临时诊断脚本（含本机个人路径，不进公开仓库）----------
 tools/_*.py
+tools/_*.md
+tools/_archive/
 tools/audio_cost.py
 tools/bpm_check.py
 tools/bpm_live.py
@@ -184,3 +186,35 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 System Volume Information/
+
+# ---------- 2026-09-28：打包中间产物（本地留档，绝不进仓库）----------
+_zips_old/
+build_log_*.log
+_parked_cyndilib*/
+
+# ---------- 2026-09-30：测试夹具残留（测试脚本曾在**项目根**建临时目录）----------
+# ⚠ 测试脚本请用 `tempfile.mkdtemp()`（不带 dir=），夹具一律落系统临时目录；
+#   这里再兜一层，免得手滑 `git add -A` 把几十 MB 的测试素材提交上去。
+/demo_src/
+/demochk*/
+/ercue_pr*/
+/ercue_ui*/
+/hl_rr_*/
+/hlreal_*/
+/_energy_one.csv
+/示例码表.ercue
+/示例码表.media/
+
+# ---------- 2026-10-01：根目录开发期截图 / 临时脚本 ----------
+# ⚠ 取证截图（_hl_row*.png、_live*.png …）和一次性脚本（_ui_before_pages.py）
+#   都是开发过程产物，含本机界面，绝不进仓库。
+#   规律：仓库根下以 `_` 开头的文件一律视为开发期临时物。
+/_*.png
+/_*.py
+/_*.txt
+/_*.html
+/_*.json
+/_*.md
+/_*.csv
+# 码表功能已于 2026-09-30 整体移除，这个目录是那时的残留（备份在 P:\AutoVJ_码表备份_20260930\）
+/cuesheets/

@@ -120,7 +120,11 @@ def main():
     for _ in range(400):
         an.feed(data, st)
     vf = st.dbg.get("vocal_f", None)
-    check("vocal_f 已按 0.6 生效（人声段 ~0.40）", vf is not None and 0.33 < vf < 0.46,
+    # ⚠ 2026-09-28 更新：人声惩罚由 0.60/knee0.25 改为 **0.45/knee0.30**（能量算法修复的一部分，
+    #   起因是 hardstyle drop 的"失真主音"被误判成人声、砍掉 25~33% 能量）。
+    #   本用例（1kHz 正弦 = 强中频）新口径下 vocal_f = 0.55。
+    check("vocal_f 已按 0.45/knee0.30 生效（人声段 ~0.55）",
+          vf is not None and 0.50 < vf < 0.60,
           "vocal_f=%.3f" % (vf if vf is not None else -1))
 
     # ---------- 3) 低能量偏好常规切 ----------
