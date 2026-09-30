@@ -2832,7 +2832,7 @@ class AudioSourceDialog(I18nDialog):
             self._asio_ok, self._asio_why = asio_engine.available()
         except Exception as e:                                 # noqa: BLE001
             self._asio_why = str(e)
-        self.source.addItem("ASIO（低延迟）")
+        self.source.addItem("ASIO（低延迟 · 未完成）")
         self._asio_idx = 3
         if not self._asio_ok:
             try:

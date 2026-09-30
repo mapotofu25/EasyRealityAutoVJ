@@ -619,27 +619,55 @@ class _DecoderHealth:
         self._frames = getattr(self, "_frames", 0) + 1
         self._last_t = time.perf_counter()
 
-    def stalled(self, secs=_STALL_SECS):
-        """活跃播放器是否卡帧。已放弃（_ended）时无条件 True。
+    def _set_active(self, a):
+        """统一活跃开关：只在 **False→True 跳变**时打戳 `_active_since`。
 
-        ⚠ 还没出过首帧时给 `secs*4` 的宽限：打开容器 + 解首帧实测要 70~690ms，
-          正常慢启动不能被误判成卡死。
+        ⚠ 引擎每 tick 会对缓存里每个播放器都调一次 `set_active()`（绝大多数是"值没变"），
+          所以这里**不能**无条件打戳，否则"连续活跃时间"永远归零、真卡帧永远判不出来。
+        ⚠ 全部用 `getattr` 兜底：`_active_since` 可能未初始化（测试里 `__new__` 构造的用法）。
+        """
+        a = bool(a)
+        if a and not getattr(self, "_active", False):
+            self._active_since = time.perf_counter()
+        self._active = a
+
+    def stalled(self, secs=_STALL_SECS):
+        """活跃播放器是否卡帧（★ 只统计**连续活跃**的时间）。
+
+        判据基准 `base = max(最后一帧时刻 _last_t, 本次变活跃时刻 _active_since)`：
+          · 不活跃期间（预热中 / 被切走挂在缓存里）**不累积**停滞；
+          · 刚被激活的播放器必须拿满完整 `secs` 连续活跃才可能被判卡帧。
+
+        现场根因（2026-10-01，用户报"播放中卡在某一帧"）：旧判据从 `_last_t` 起算，
+        把"它合法地不活跃"的那段时间也算进去 ⇒ 每次切素材（16 拍一次）一激活就发现
+        "6~30s 没出帧" ⇒ 立刻砸掉重建（开容器 70~690ms）⇒ 这段时间画面停住 ——
+        **卡帧是看门狗自己造的**。实测修复前用真实配置跑 120s：20/20 次重建的
+        `active_age` 都 ≈0.0s（全是误杀）。
+
+        ⚠ 还没出过首帧时给 `secs*4` 的宽限（正常慢启动 70~690ms 不能被误判成卡死）。
         """
         if getattr(self, "_ended", False):
             return True
+        now = time.perf_counter()
         last = getattr(self, "_last_t", 0.0)
-        if not last:
+        active_since = getattr(self, "_active_since", 0.0)
+        base = last if last > active_since else active_since
+        if not base:
             born = getattr(self, "_born", None)
             if born is None:
-                self._born = born = time.perf_counter()
-            return (time.perf_counter() - born) > secs * 4
-        return (time.perf_counter() - last) > secs
+                self._born = born = now
+            return (now - born) > secs * 4
+        return (now - base) > secs
 
     def health(self):
+        now = time.perf_counter()
         t = getattr(self, "_last_t", 0.0)
+        a = getattr(self, "_active_since", 0.0)
         return {"ended": getattr(self, "_ended", False),
                 "frames": getattr(self, "_frames", 0),
-                "age": (time.perf_counter() - t) if t else None,
+                "age": (now - t) if t else None,
+                "active_age": (now - a) if a else None,   # 距上次"变活跃"的时间（诊断用）
+                "active": bool(getattr(self, "_active", False)),
                 "reason": getattr(self, "gave_up_reason", "")}
 
     def _init_health(self):
@@ -647,6 +675,7 @@ class _DecoderHealth:
         self._frames = 0                    # 产出帧总数（可观测判据）
         self._last_t = 0.0                  # 最后一次产帧时刻
         self._born = time.perf_counter()    # 对象创建时刻
+        self._active_since = 0.0            # 最近一次"变活跃"（False→True）的时刻
         self._ended = False                 # 解码循环已彻底退出（★ 比 _dead 准确）
         self.gave_up_reason = ""
 
@@ -688,7 +717,7 @@ class VideoPlayer(_DecoderHealth):
         self.speed = float(max(0.1, min(3.0, s)))
 
     def set_active(self, a: bool):
-        self._active = a
+        self._set_active(a)
 
     def warm_up(self):
         """预热：提前在解码线程里「开容器 + 解出首帧」。
@@ -934,7 +963,7 @@ class AvAlphaPlayer(_DecoderHealth):
         self.speed = float(max(0.1, min(3.0, s)))
 
     def set_active(self, a: bool):
-        self._active = a
+        self._set_active(a)
 
     def warm_up(self):
         """预热：提前在解码线程里打开容器并解出首帧（切到时立即有画面）。
@@ -1453,7 +1482,7 @@ class GpuDxvPlayer(_DecoderHealth):
         self.speed = float(max(0.1, min(3.0, s)))
 
     def set_active(self, a: bool):
-        self._active = a
+        self._set_active(a)
 
     def warm_up(self):
         """预热：提前在解码线程里开容器 + 判路径 + 解出首帧（切到时立即有画面）。"""

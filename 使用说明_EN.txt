@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.10.01.08
+Version 2026.10.01.09
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -63,6 +63,9 @@ Step 1 — Pick an audio source
   (Using an external sound card / DJ controller? Choose "Line-In / Sound Card".)
 
   ▼ Want lower latency? Choose "ASIO (low latency)"
+    ⚠ **Not finished yet — for testing only** (the UI entry is marked
+    "not finished" as well). The notes below describe the intent; for real
+    shows please keep using "System Sound" for now.
     ASIO bypasses the system mixer and talks straight to the sound-card driver —
     measured **11 ms** on this machine (WASAPI is typically 20-60 ms), so
     beat-accurate cuts and spectral transients track more tightly.
@@ -513,6 +516,8 @@ is the window **position** — your chosen resolution is never overwritten.
                  The **runtime ships with the app — nothing to install on
                  this machine**; only the **receiver** needs NDI Runtime.
 · Send NDI audio (48 kHz stereo): sends the captured sound along with NDI.
+                 ⚠ **Not finished yet — for testing only** (the UI checkbox
+                 is marked "not finished" as well).
                  **Off by default** — the app captures the *system loopback*,
                  so if the receiver is already monitoring the same sound you
                  would hear doubling/echo. Only enable it when the receiver

@@ -54,6 +54,20 @@ cmd = [
     "--hidden-import", "glctx",
     "--hidden-import", "SpoutGL",
     "--hidden-import", "SpoutGL.enums",
+    # —— 排除项目用不到的 Qt 模块（2026-10-01 取证：src/ 只 import QtCore/QtGui/QtWidgets）——
+    #   ⚠ 重要：这些 Qt6*.dll（Quick/Qml/Pdf/Svg/Network/OpenGL/VirtualKeyboard）是
+    #   **Qt 各类插件**（qsvgicon / qsvg / qpdf / qtvirtualkeyboard / tls …）的**二进制依赖**，
+    #   PyInstaller 会沿 PE 导入表自动跟随，**--exclude-module 拦不住 DLL 本体**，
+    #   它只能拦住 Python 绑定（如 PySide6.QtNetwork 的 .pyd）并阻止对应 hook 触发。
+    #   因此 DLL 本体另由 tools/make_zip.py 的 _is_qt_unused 在写包时跳过（可靠，且不碰 dist）。
+    #   两处配合：这里少收绑定/hook，make_zip 兜底剔除插件与 DLL。取证见 tools/_qt_reach.md。
+    "--exclude-module", "PySide6.QtQuick",
+    "--exclude-module", "PySide6.QtQml",
+    "--exclude-module", "PySide6.QtPdf",
+    "--exclude-module", "PySide6.QtSvg",
+    "--exclude-module", "PySide6.QtNetwork",
+    "--exclude-module", "PySide6.QtOpenGL",
+    "--exclude-module", "PySide6.QtOpenGLWidgets",
     "--collect-all", "cyndilib",
     # GPU 解码（实验）：glfw 用来建离屏 GL 上下文（自带 glfw3.dll）；
     # _dxvlz.dll 是自研的 DXV3 LZ 解包（zig 编译，187KB），必须随包。

@@ -1687,11 +1687,15 @@ class AutoVJEngine(QObject):
             h = {}
         frames = h.get("frames", getattr(p, "_frames", 0))
         age = h.get("age")
+        active_age = h.get("active_age")
         reason = h.get("reason") or ""
         if age is None:
             detail = "frames=%s, 无产帧时间戳" % frames
         else:
             detail = "frames=%s, %.1fs 无新帧" % (frames, age)
+        # 距上次"变活跃"的时间：用来识别"刚上场就被砸"的误杀（active_age 很小）
+        if active_age is not None:
+            detail += ", active=%.1fs" % active_age
         if reason:
             detail += "；" + reason
         # —— 通过全部限流：执行重建，并记账 ——

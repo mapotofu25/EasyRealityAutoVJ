@@ -38,6 +38,50 @@ def _is_cyndilib_junk(path):
             or "directshow" in low or "uwp" in low)
 
 
+# —— PySide6 里项目用不到的 Qt 模块 / 插件（2026-10-01 取证：src/ 只 import QtCore/QtGui/QtWidgets）——
+# 为什么要在「写包时跳过」而不是 build_exe 里 --exclude-module：
+#   这些 Qt6*.dll 是 **Qt 插件**（qsvgicon / qsvg / qpdf / qtvirtualkeyboard / tls …）的
+#   **二进制依赖**，PyInstaller 会沿 PE 导入表自动跟随收进 dist；--exclude-module 只拦得住
+#   Python 绑定（如 QtNetwork.pyd），拦不住 DLL 本体。跳过的每一份都经「临时改名 + 冒烟 +
+#   界面渲染」实测确认用不到（tools/_qt_reach.md 有完整证据链）。
+_QT_UNUSED_TOP = {
+    "qt6quick.dll", "qt6qml.dll", "qt6qmlmodels.dll", "qt6qmlmeta.dll",
+    "qt6qmlworkerscript.dll",      # QML/Quick 家族：无绑定、无插件依赖
+    "qt6pdf.dll",                  # 仅 imageformats/qpdf.dll 用
+    "qt6svg.dll",                  # 仅 qsvgicon / qsvg 插件用
+    "qt6virtualkeyboard.dll",      # 仅 qtvirtualkeyboardplugin 用
+    "qt6network.dll",              # 仅 networkinformation / tls 插件用
+    "qt6opengl.dll",               # 项目用 glfw 建 GL 上下文，不碰 QOpenGLWidget
+    "qtnetwork.pyd",               # 对应 Python 绑定
+}
+# 相对 PySide6/plugins/ 的 (插件类型目录, 文件名)
+_QT_UNUSED_PLUGINS = {
+    ("platforminputcontexts", "qtvirtualkeyboardplugin.dll"),   # ★ 根因：拉进整个 Qml/Quick/OpenGL 家族
+    ("imageformats", "qpdf.dll"),
+    ("imageformats", "qsvg.dll"),
+    ("iconengines", "qsvgicon.dll"),
+    ("networkinformation", "qnetworklistmanager.dll"),
+    ("tls", "qcertonlybackend.dll"),
+    ("tls", "qopensslbackend.dll"),
+    ("tls", "qschannelbackend.dll"),
+    # ★ 2026-10-01：TUIO 多点触控设备输入插件（触摸桌/交互墙用），桌面鼠标场景永不加载。
+    #   它 PE 硬依赖被跳过的 Qt6Network.dll —— 与其为它多带整条 Networking 链，
+    #   不如连它一起跳过（见 tools/_dep_audit.md 的悬空依赖审计）。
+    ("generic", "qtuiotouchplugin.dll"),
+}
+
+
+def _is_qt_unused(path):
+    """PySide6 里项目用不到的 Qt 模块/插件（写包时跳过，约 23MB）。"""
+    p = path.replace("\\", "/").lower()
+    if "/pyside6/" not in p:
+        return False
+    base = os.path.basename(p)
+    if base in _QT_UNUSED_TOP:
+        return True
+    return (os.path.basename(os.path.dirname(p)), base) in _QT_UNUSED_PLUGINS
+
+
 def slim_cyndilib():
     """cyndilib 自带 3 平台 NDI 运行库 + 源码文件，只用得上 x64 → 省约 80MB。"""
     internal = os.path.join(DIST, "_internal", "cyndilib")
@@ -107,6 +151,7 @@ def main():
 
     n = 0
     skipped = 0
+    qt_skipped = 0
     t0 = time.time()
     # compresslevel=6：与之前几版包大小一致（约 470MB）；用 1 会大 15MB 左右
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
@@ -121,6 +166,10 @@ def main():
                 if _is_cyndilib_junk(p):
                     skipped += 1
                     continue
+                # ★ 2026-10-01：同样在写包时跳过 PySide6 里用不到的 Qt 模块/插件（约 23MB）。
+                if _is_qt_unused(p):
+                    qt_skipped += 1
+                    continue
                 rel = os.path.relpath(p, os.path.dirname(DIST))   # 保留 EasyRealityAutoVJ/ 前缀
                 z.write(p, rel)
                 n += 1
@@ -129,7 +178,8 @@ def main():
             n += 1
     print(f"完成：{zip_path}")
     print(f"      {n} 条目 / {os.path.getsize(zip_path) / 1048576:.1f} MB / 用时 {time.time() - t0:.0f}s"
-          + (f"（另跳过 cyndilib 无用文件 {skipped} 个）" if skipped else ""))
+          + (f"（另跳过 cyndilib 无用文件 {skipped} 个）" if skipped else "")
+          + (f"（跳过未用 Qt 文件 {qt_skipped} 个）" if qt_skipped else ""))
     return 0
 
 

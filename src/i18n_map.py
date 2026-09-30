@@ -930,6 +930,13 @@ ZH2EN = {
     "让这个曲风不再映射到任何画面标签（保存后生效；自定义曲风同时从大类里移除）":
         "Make this genre map to no visual tags (applies after saving; a custom genre "
         "is also removed from its family)",
+    # ==================== 「未完成」标注（2026-10-01）====================
+    # 音源下拉里的 ASIO 项（panels.AudioSourceDialog）。注意：下拉项的类别是靠
+    # **索引**（SOURCE_KEYS / _src_key()）取的，文案改动不影响任何分支逻辑。
+    "ASIO（低延迟 · 未完成）": "ASIO (low latency · not finished)",
+    # NDI 音频输出勾选框（ui_main.OutputPanel.chk_ndi_audio）。
+    "NDI 传输音频（48 kHz 立体声 · 未完成）":
+        "Send NDI audio (48 kHz stereo · not finished)",
 }
 
 

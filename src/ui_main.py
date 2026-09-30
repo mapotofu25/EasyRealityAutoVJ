@@ -815,7 +815,7 @@ class OutputPanel(QWidget):
         go.addWidget(self.ndi_name, 6, 1)
         # ★ NDI 音频单独一个开关，**默认关**：把系统回环再发出去，若接收端同时
         #   监听着同一路声音会听到**双声/回声**。NDI 输出没开时置灰。
-        self.chk_ndi_audio = QCheckBox("NDI 传输音频（48 kHz 立体声）")
+        self.chk_ndi_audio = QCheckBox("NDI 传输音频（48 kHz 立体声 · 未完成）")
         self.chk_ndi_audio.setToolTip(
             "把采集到的声音随 NDI 一起发出去（48 kHz 立体声）。默认关闭："
             "接收端若本来就在监听同一路声音，会听到双声/回声；"
