@@ -205,6 +205,12 @@ class AudioState:
         self.ndi_audio_on = False   # NDI 音频是否启用：False 时采集循环**不做任何拷贝**，
                                     # 直接把 PCM 丢掉（原实现不管有没有开 NDI，每块都要
                                     # np.asarray + reshape(-1) + copy() 一次）
+        # ---- ASIO 低延迟输入（见 src/asio_engine.py + src/native/asiohost.cpp）----
+        # ⚠ 硬要求：ASIO 打不开（多半是被 VirtualDJ/DAW 独占）时**必须自动回退 WASAPI**，
+        #   演出不能因为换个音源就没声音。
+        self.asio_active = False    # 当前是否**真的**在用 ASIO 采集
+        self.asio_info = ""         # 一行状态（驱动 / 采样率 / 缓冲 / 延迟），界面显示
+        self.asio_failed = ""       # 非空 = ASIO 打开失败的原因（此时已回退到系统声音）
         # ---- 行为模式自动选择所需的实时指标 ----
         self.onset_density = 0.0    # 瞬态密度：每秒打击次数（近 4s 窗口）
         self.bpm_stab = 0.0         # BPM 稳定性 0..1
@@ -262,6 +268,10 @@ class AudioState:
                 "silent_sec": self.silent_sec, "running": self.running,
                 "lv_db": self.lv_db,
                 "error": self.error, "device_desc": self.device_desc,
+                # ASIO 低延迟输入状态（界面显示"当前是不是真在用 ASIO、延迟多少"，
+                # 以及"ASIO 打不开的原因"）——不放进来界面就只能 getattr 私有字段
+                "asio_active": self.asio_active, "asio_info": self.asio_info,
+                "asio_failed": self.asio_failed,
                 "recognized_song_id": self.recognized_song_id,
                 "recognized_offset": self.recognized_offset,
                 "recognized_rate": self.recognized_rate,
@@ -1106,6 +1116,7 @@ class AudioEngine:
     def __init__(self):
         self.state = AudioState()
         self._gen = 0            # 采集代际编号：start/stop 递增，旧采集自动失效
+        self._asio_cap = None    # 当前 ASIO 会话（切设备/停止时要关掉，见 _run_asio）
         self.energy_scale = 1.0  # 能量伽马校正，运行时实时透传给采集分析器
         self._jobs = queue.Queue()
         # 曲风识别：环形缓冲 + 后台线程（每 3 秒用最近 2 秒音频跑一次 Discogs-EffNet）
@@ -1219,24 +1230,34 @@ class AudioEngine:
 
     # ---------------- 设备枚举（阻塞，供后台扫描线程调用） ----------------
     def list_devices(self, timeout=8.0):
-        """返回 {'system': [..], 'mic': [..]}。走独立的设备线程，不受采集占用影响。"""
+        """返回 {'system': [..], 'mic': [..], 'asio': [..]}。走独立的设备线程，不受采集占用影响。
+
+        ⚠ ASIO 的"设备"就是**驱动名**（一个驱动背后可能是整台声卡的多路输入），
+          不走 soundcard、也不需要 COM 设备枚举 —— 直接问原生宿主。
+        """
         result = {}
         done = threading.Event()
 
         def job(sc):
-            out = {"system": [], "mic": []}
+            out = {"system": [], "mic": [], "asio": []}
             if sc is not None:
                 for m in sc.all_microphones(include_loopback=True):
                     if m.isloopback:
                         out["system"].append(m.name)
                     else:
                         out["mic"].append(m.name)
+            try:
+                import asio_engine
+                if asio_engine.available()[0]:
+                    out["asio"] = ["ASIO: " + n for n in asio_engine.list_drivers()]
+            except Exception:                                  # noqa: BLE001
+                pass
             result.update(out)
             done.set()
 
         self._dev_jobs.put(job)
         done.wait(timeout)
-        return result or {"system": [], "mic": []}
+        return result or {"system": [], "mic": [], "asio": []}
 
     # ---------------- 采集生命周期 ----------------
     def start(self, source_type="system", device_name="", mono=True, sr=48000):
@@ -1380,8 +1401,84 @@ class AudioEngine:
                 pass
 
     # ---------------- 采集（运行在音频线程） ----------------
+    def _run_asio(self, st, device_name, mono, sr, gen):
+        """ASIO 采集。**跑完返回 None**；打不开则返回错误原因（由 `_run` 负责回退）。
+
+        ★ 复用 `_capture_loop`：ASIO 侧只提供一个「soundcard recorder 形状」的适配器
+          （`asio_engine.AsioDevice`），下游的能量 / 拍钟 / 指纹 / 曲风 / NDI 转发
+          **一行都不用改**——那是现场验证过的代码，不该为了换个音源再抄一份。
+        """
+        try:
+            import asio_engine
+        except Exception as e:                                 # noqa: BLE001
+            return "ASIO 模块导入失败：%s" % e
+        ok, why = asio_engine.available()
+        if not ok:
+            return why
+        # 采样率交给驱动当前值（sr=0）：ASIO 的采样率是**驱动全局**的，
+        # 我们改了会影响同一驱动的其它客户端（比如 VirtualDJ 那边）。
+        # ⚠ 设备下拉里存的是 "ASIO: <驱动名>"（为了和人名区分），这里要把前缀剥掉。
+        drv = (device_name or "")
+        if drv.startswith("ASIO: "):
+            drv = drv[6:].strip()
+        cap = asio_engine.AsioCapture(drv or None, sr=0.0)
+        ok, err = cap.open()
+        if not ok:
+            return err
+        self._asio_cap = cap
+        sr_use = cap.sample_rate or 48000
+        info = "%s ｜ %d Hz ｜ 缓冲 %d 帧(%.1f ms) ｜ 输入延迟 %.1f ms" % (
+            cap.driver, sr_use, cap.buffer_frames,
+            cap.buffer_frames * 1000.0 / sr_use, cap.latency_ms())
+        with st.lock:
+            st.asio_active = True
+            st.asio_failed = ""
+            st.asio_info = info
+            st.device_desc = "ASIO: " + cap.driver
+            st.error = ""
+            st.running = True
+        print("[ASIO] 已开始采集：%s" % info)
+        try:
+            self._capture_loop(asio_engine.AsioDevice(cap), mono, sr_use, gen)
+            ov = cap.overflows()
+            if ov > 0:
+                # 环形缓冲被读得太慢（通常意味着主线程/分析线程被别的东西拖住）
+                print("[ASIO] 警告：环形缓冲溢出 %d 次（读线程跟不上）" % ov)
+        finally:
+            try:
+                cap.close()
+            except Exception:                                  # noqa: BLE001
+                pass
+            self._asio_cap = None
+            with st.lock:
+                st.asio_active = False
+        return None
+
     def _run(self, sc, source_type, device_name, mono, sr, gen):
         st = self.state
+        # ---- ASIO 低延迟输入：**独立分支**，不碰 soundcard ----
+        # ⚠ 失败必须优雅回退：ASIO 是**单客户端独占**的，VirtualDJ / DAW 占着就一定开不了，
+        #   这时候绝不能"报个错就完了"——演出不能停，自动退回系统声音（WASAPI）。
+        if source_type == "asio":
+            err = None
+            try:
+                err = self._run_asio(st, device_name, mono, sr, gen)
+            except Exception as e:                             # noqa: BLE001
+                err = "%s: %s" % (type(e).__name__, e)
+            if err is None:
+                return                      # 正常跑完了（切设备/停止）
+            with st.lock:
+                st.asio_active = False
+                st.asio_failed = err
+                st.error = "ASIO 不可用：%s —— 已自动回退到系统声音" % err
+            print("[ASIO] 打开失败，回退系统声音：%s" % err)
+            source_type, device_name = "system", ""
+            if self._gen != gen:
+                return
+        else:
+            with st.lock:
+                st.asio_active = False
+                st.asio_failed = ""
         if sc is None:
             with st.lock:
                 st.error = "soundcard 不可用，无法采集音频"

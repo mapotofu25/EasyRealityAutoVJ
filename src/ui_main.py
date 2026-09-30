@@ -1652,6 +1652,16 @@ class MusicScanThread(QThread):
                             r["grid"] = g
                     except Exception:
                         pass
+                # ★ 歌曲封面（列表左侧那张图）：**在建库时离线取一次**入库。
+                #   演出中列表只读缓存路径，绝不为了封面去开容器/解码（实测 12~18ms/首）。
+                #   ⚠ 单独 try：取不到封面（无内嵌也无同目录图）不能影响曲风/网格入库。
+                try:
+                    import music_cover as _mcover
+                    _cv = _mcover.extract(p)
+                    if _cv:
+                        r["cover"] = _cv
+                except Exception:
+                    pass
                 return p, r, (t1 - t0), (t2 - t1), (t3 - t2)
             except Exception:
                 return p, None, 0.0, 0.0, 0.0
@@ -1729,6 +1739,44 @@ class MusicScanThread(QThread):
                 pass
             _log("阶段1b（补网格）完成：%d 首只补网格，成功 %d 首，用时 %.1f 秒"
                  % (len(todo_grid), okg, _tm.perf_counter() - tg0))
+
+        # ---- 阶段 1c：**补封面**（存量歌还没有封面路径的）----
+        # 为什么要单独一遍：本轮之前扫过的歌，meta 里没有 "cover" 键；
+        # 用户点一次「扫描分析」就能把全库封面补齐（~15ms/首，几百首也就几秒）。
+        try:
+            import music_cover as _mcover
+            todo_cover = [p for p in items
+                          if isinstance(meta.get(p), dict) and not meta[p].get("cover")]
+        except Exception:                                            # noqa: BLE001
+            _mcover, todo_cover = None, []
+        if todo_cover and _mcover is not None:
+            tc0 = _tm.perf_counter()
+            okc = 0
+
+            def _cover_one(p):
+                try:
+                    if not _os.path.isfile(p):
+                        return p, None
+                    return p, _mcover.extract(p)
+                except Exception:                                    # noqa: BLE001
+                    return p, None
+
+            try:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    for p, cv in ex.map(_cover_one, todo_cover):
+                        if cv:
+                            rec = dict(meta.get(p) or {})
+                            rec["cover"] = cv
+                            meta[p] = rec
+                            okc += 1
+            except Exception as e:                                   # noqa: BLE001
+                _log("阶段1c（补封面）异常终止：%s" % e)
+            try:
+                self.main.cfg.save()
+            except Exception:
+                pass
+            _log("阶段1c（补封面）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
+                 % (len(todo_cover), okc, _tm.perf_counter() - tc0))
 
         # ---- 阶段 2：**串行**补在线曲风（尊重限流；网络差就提前收手）----
         if todo and not gl.online_blocked():
@@ -2220,14 +2268,26 @@ class MainWindow(QMainWindow):
         # ---- 第 2 页：素材库（**全屏副本**；演出台那份原样不动）----
         self.pages.addWidget(self._build_library_page())
 
-        # ---- 第 2 页：曲库 · 曲风（演出前准备；素材库在演出台）----
+        # ---- 第 3 页：曲库 · 曲风（演出前准备；素材库在演出台）----
         p2 = QWidget()
         l2 = QVBoxLayout(p2)
         l2.setContentsMargins(12, 12, 12, 12)
         l2.setSpacing(8)
+        # ★ 标题行：「🎵 曲库 · 曲风」在左，「曲风映射…」在**右上角**（用户要求）。
+        #   ⚠ 原来是单独一行放在**页面左下角**（row2 + 末尾 addStretch），
+        #     那个 addStretch 还会跟曲库面板**平分剩余高度** ⇒ 面板只长到一半，
+        #     下面一大片空白（用户反馈「整个 UI 的显示区域」没占满）。两个问题一起修。
+        head = QHBoxLayout()
         t2 = QLabel(T("🎵 曲库 · 曲风"))
         t2.setStyleSheet("font-weight:bold;font-size:15px;color:" + theme.V("text") + ";")
-        l2.addWidget(t2)
+        head.addWidget(t2)
+        head.addStretch(1)
+        self.btn_p2_gvmap = QPushButton(T("曲风映射…"))
+        self.btn_p2_gvmap.setMinimumHeight(28)
+        self.btn_p2_gvmap.setToolTip(T("编辑曲风→画面标签的绑定关系"))
+        self.btn_p2_gvmap.clicked.connect(self.open_genre_visual_editor)
+        head.addWidget(self.btn_p2_gvmap)
+        l2.addLayout(head)
         self.lbl_p2_desc = QLabel(T(
             "演出前的准备工作都在这里：导入音乐、扫描分析曲风（每首歌的曲风 + 节拍网格），"
             "以及编辑「曲风 → 画面标签」的绑定关系。\n"
@@ -2240,19 +2300,11 @@ class MainWindow(QMainWindow):
         #     主窗口里那些「扫描进度 / 刷新列表」的代码直接复用，并把 music_dialog 指过来。
         self.music_panel = MusicLibraryPanel(self)
         self.music_dialog = self.music_panel
+        # ⚠ stretch=1 且**后面不能再有 addStretch**（否则面板只拿一半高度）
         l2.addWidget(self.music_panel, 1)
-        row2 = QHBoxLayout()
-        self.btn_p2_gvmap = QPushButton(T("曲风映射…"))
-        self.btn_p2_gvmap.setMinimumHeight(34)
-        self.btn_p2_gvmap.setToolTip(T("编辑曲风→画面标签的绑定关系"))
-        self.btn_p2_gvmap.clicked.connect(self.open_genre_visual_editor)
-        row2.addWidget(self.btn_p2_gvmap)
-        row2.addStretch(1)
-        l2.addLayout(row2)
         self.lbl_p2_stat = QLabel("")
         self.lbl_p2_stat.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
         l2.addWidget(self.lbl_p2_stat)
-        l2.addStretch(1)
         self.pages.addWidget(p2)
         self._sync_p2_stat()
 
@@ -3053,6 +3105,14 @@ class MainWindow(QMainWindow):
             self.output_panel.chk_ndi_audio.setEnabled(bool(s))
         except Exception:
             pass
+        # 现场可查：勾选框 / cfg / 采集侧布尔量三者必须一致（见 _NDI音频诊断.md §6 验收判据）
+        try:
+            print("[NDI] enabled=%r  audio_cfg=%r  ndi_audio_on=%r  (checkbox=%r)"
+                  % (s, bool(self.cfg["output"].get("ndi_audio")),
+                     bool(self.audio.state.ndi_audio_on),
+                     bool(self.output_panel.chk_ndi_audio.isChecked())))
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def set_ndi_name(self):
         self.cfg["output"]["ndi_name"] = self.output_panel.ndi_name.text().strip() or "EasyRealityAutoVJ"
@@ -3068,20 +3128,30 @@ class MainWindow(QMainWindow):
         s = bool(s) and bool(self.cfg["output"].get("ndi_enabled"))
         self.cfg["output"]["ndi_audio"] = s
         self.cfg.save()
+        # ★ 把「真实生效值」回写勾选框：杜绝「看起来勾了、其实没开」
+        #   （信号被屏蔽后手动对齐，避免递归触发本槽）
+        try:
+            w = self.output_panel.chk_ndi_audio
+            if w.isChecked() != s:
+                w.blockSignals(True)
+                w.setChecked(s)
+                w.blockSignals(False)
+        except Exception:                                     # noqa: BLE001
+            pass
         try:
             self.audio.state.ndi_audio_on = s
         except Exception:                                     # noqa: BLE001
             pass
+        # 现场可查：这三个值必须永远一致
+        print("[NDI] ndi_audio=%r  cfg.ndi_enabled=%r  ndi_audio_on=%r"
+              % (s, bool(self.cfg["output"].get("ndi_enabled")), s))
 
     def _ndi_audio_feed(self, pcm, sr):
         ndi = self.engine._ndi
         if ndi is not None and self.cfg["output"].get("ndi_enabled"):
-            # ⚠ 音频帧的采样率只能在 `open()` **之前**定好 ⇒ 每次都把当前采集率告诉它
-            #   （`set_audio_rate` 只是存一个提示值，开销可忽略；非 48k 设备靠它才对）
-            try:
-                ndi.set_audio_rate(sr)
-            except Exception:                                     # noqa: BLE001
-                pass
+            # ⚠ 这里**不再**调 `set_audio_rate()`：帧的采样率在 open() 时就被冻结，
+            #   现在帧固定 48k、非 48k 的数据由 `feed_audio()` 自己重采样
+            #   （原来每块告诉它一次采样率既无效又误导，见 _NDI音频诊断.md §1.3）。
             ndi.feed_audio(pcm, sr)
 
     def apply_output_screen(self):
@@ -3243,11 +3313,49 @@ class MainWindow(QMainWindow):
             self.output_panel.screen_combo.setCurrentIndex(0)
         self.output_panel.chk_spout.setChecked(o.get("spout_enabled", False))
         self.output_panel.spout_name.setText(o.get("spout_name", "EasyRealityAutoVJ"))
-        self.output_panel.chk_ndi.setChecked(o.get("ndi_enabled", False))
+        # ⚠⚠ NDI / NDI 音频：用配置回填 UI **必须屏蔽信号**（2026-10-01 修，现场"没声音"的直接原因）
+        #   原来直接 `setChecked(ndi_audio)` 会触发 `set_ndi_audio()` 槽，而那个槽里
+        #   `s = bool(s) and cfg["output"]["ndi_enabled"]` —— 启动时 NDI 输出还没开，
+        #   于是**把已经存好的 ndi_audio=True 改写成 False**，而勾选框看起来仍是勾选的
+        #   ⇒ 用户以为"开了"，实际 `audio.state.ndi_audio_on=False`，
+        #     采集循环整块跳过、一个字节都不喂给 NDI，而且没有任何日志。
+        for _w, _v in ((self.output_panel.chk_ndi, o.get("ndi_enabled", False)),
+                       (self.output_panel.chk_ndi_audio, bool(o.get("ndi_audio", False)))):
+            _w.blockSignals(True)
+            _w.setChecked(bool(_v))
+            _w.blockSignals(False)
         self.output_panel.ndi_name.setText(o.get("ndi_name", "EasyRealityAutoVJ"))
-        self.output_panel.chk_ndi_audio.setChecked(bool(o.get("ndi_audio", False)))
         # NDI 输出开着才允许勾"传输音频"（否则勾了也没意义）
         self.output_panel.chk_ndi_audio.setEnabled(bool(o.get("ndi_enabled", False)))
+        # 信号被屏蔽了，槽不会再跑 ⇒ 这里显式同步一次采集侧的布尔量（不要在这里做运行时探测：
+        # 启动时弹「NDI 不可用」会很烦；真正的探测交给 set_ndi_enabled）
+        try:
+            self.audio.state.ndi_audio_on = bool(
+                o.get("ndi_enabled") and o.get("ndi_audio"))
+        except Exception:                                          # noqa: BLE001
+            pass
+        # ⚠ 同样因为信号被屏蔽，原来"靠 setChecked 触发 set_ndi_enabled ⇒ 启动即启用 NDI"
+        #   这条路径没了，必须显式补上，否则重启后 NDI 输出不会自动恢复。
+        #   这里**不弹窗**（启动弹窗很烦）：运行时不可用就只记日志 + 把勾去掉，
+        #   用户手动再勾时会由 set_ndi_enabled 给出完整说明。
+        try:
+            eng = getattr(self, "engine", None)
+            if o.get("ndi_enabled") and eng is not None:
+                from ndi_out import get_ndi, probe_runtime
+                _ok, _detail = probe_runtime()
+                if _ok:
+                    eng._ndi = get_ndi(o.get("ndi_name") or "EasyRealityAutoVJ")
+                    eng._ndi_fail = False
+                    print("[NDI] 启动恢复输出（运行时 %s）；发送端等第一帧按实际分辨率建立"
+                          % _detail)
+                else:
+                    print("[NDI] 启动时运行时不可用，NDI 输出未启用：%s" % _detail)
+                    self.cfg["output"]["ndi_enabled"] = False
+                    self.output_panel.chk_ndi.blockSignals(True)
+                    self.output_panel.chk_ndi.setChecked(False)
+                    self.output_panel.chk_ndi.blockSignals(False)
+        except Exception as _e:                                    # noqa: BLE001
+            print("[NDI] 启动恢复 NDI 失败：%s" % _e)
         # Kv 主视觉图层设置区显隐（按当前是否已存在 Kv 图层）
         self.settings.sync_kv_section()
 

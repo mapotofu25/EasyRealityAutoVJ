@@ -22,7 +22,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal, Qt, QRectF, Slot, QMetaObject
 from PySide6.QtGui import QImage, QPainter, QColor
 
-from media_manager import make_player
+from media_manager import make_player, _STALL_SECS
 from match_engine import match_clips
 from beatgrid import GridClock
 from fp import hint_window_frames
@@ -907,6 +907,12 @@ class AutoVJEngine(QObject):
                 lsp = 1.0 if getattr(lay, "is_kv", False) else speed
                 p.set_speed(max(0.1, min(4.0, lsp * float(getattr(lay, "speed", 1.0) or 1.0))))
 
+        # ★ 卡帧看门狗：活跃播放器超过 `_STALL_SECS` 没有新帧 ⇒ 关掉、从缓存摘除、重建。
+        #   放在活跃循环**之外**（避免遍历 cache 时改 dict）。
+        #   这是"素材解不出来也不会永久冻帧"的兜底，覆盖 R1/R2/R4/R6/R9。
+        for lay in self.layers:
+            self._heal_stalled(lay)
+
         # 合成
         self._compose(snap)
         # 颜色渲染（一键调色）：放在后处理之前，让辉光/色差等特效吃到调色后的画面
@@ -1569,6 +1575,60 @@ class AutoVJEngine(QObject):
             lay.pre_idx = pick
             self._do_warm(lay, pick)
 
+    def _heal_stalled(self, lay):
+        """当前播放器超过 `media_manager._STALL_SECS` 没有新帧 ⇒ 重建解码器。
+
+        为什么要这个兜底（用户报「素材突然卡在某一帧，直到下一个切进来才恢复」）：
+          播放器对象**还活着**、`current()` 一直返回最后一帧图像，引擎看不出异常，
+          于是一直显示那张冻住的图。有了产帧计数 + 时间戳判据（`_DecoderHealth`），
+          这里就能主动发现并重建 —— 即使将来还有未知的"解码线程死掉"路径，
+          表现也只会是**短暂一卡**，而不再是永久冻帧。
+
+        ⚠ 三处不能误杀：
+          ① 图层不可见；
+          ② 播放器不在活跃状态（静音暂停 / 预热挂起本来就该不出帧）；
+          ③ 从未出过帧的对象由 `stalled()` 自身给 4 倍宽限（冷启动最坏 690ms）。
+        """
+        p = lay.player
+        if p is None or not hasattr(p, "stalled"):
+            return
+        if not getattr(lay, "visible", True):
+            return
+        if not getattr(p, "_active", True):
+            return
+        try:
+            if not p.stalled(_STALL_SECS):
+                return
+        except Exception:                                      # noqa: BLE001
+            return
+        if not (0 <= lay.cur < len(lay.clips)):
+            return
+        clip = lay.clips[lay.cur]
+        reason = ""
+        try:
+            reason = (p.health().get("reason") or "")
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            p.close()
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            lay.cache.pop(clip.path, None)      # ★ 关键：别把僵尸留在缓存里
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            lay.player = self._get_player(lay, clip)
+        except Exception:                                      # noqa: BLE001
+            lay.player = None
+        try:
+            import stallwatch
+            stallwatch.log_line("!! 卡帧看门狗：重建解码器 %s（%s）"
+                                % (os.path.basename(getattr(clip, "path", "")),
+                                   reason or "超过 %.1fs 无新帧" % _STALL_SECS))
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _get_player(self, lay, clip):
         """取该素材的解码器；缓存命中则复用（切换零开销）。LRU 上限 8。"""
         # 解码缩放上限：画布 ×1.5（留 img_scale 放大余量），4K/5K 素材在解码线程缩到该尺寸，
@@ -1589,6 +1649,24 @@ class AutoVJEngine(QObject):
                         pass
             # 正在播的话这次不动它，标记留着，下次取该素材时再换（避免切换中把画面掐掉）
         p = lay.cache.get(clip.path)
+        if p is not None:
+            # ★ 健康校验（2026-10-01 加，`_卡帧诊断.md` R2/R6）：
+            #   解码线程"真收工"后对象**不会**被置 `_dead`，但缓存里还留着它 ——
+            #   于是引擎会把一个**再也出不了帧的僵尸**反复交回来，
+            #   画面就永远冻在最后一帧（用户报的「素材突然卡住不动」）。
+            #   命中即校验：已放弃（_ended）/ 已关闭（_dead）⇒ 丢掉重开。
+            bad = False
+            try:
+                bad = bool(getattr(p, "_ended", False)) or bool(getattr(p, "_dead", False))
+            except Exception:                                  # noqa: BLE001
+                bad = False
+            if bad:
+                lay.cache.pop(clip.path, None)
+                try:
+                    p.close()
+                except Exception:                              # noqa: BLE001
+                    pass
+                p = None
         if p is not None:
             lay.cache.pop(clip.path)
             lay.cache[clip.path] = p

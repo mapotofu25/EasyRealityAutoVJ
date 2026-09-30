@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.10.01.06
+Version 2026.10.01.07
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -61,6 +61,21 @@ Step 1 — Pick an audio source
   Click "🎛 Audio" at the top and choose "System Sound" so the app can
   hear whatever your computer is playing.
   (Using an external sound card / DJ controller? Choose "Line-In / Sound Card".)
+
+  ▼ Want lower latency? Choose "ASIO (low latency)"
+    ASIO bypasses the system mixer and talks straight to the sound-card driver —
+    measured **11 ms** on this machine (WASAPI is typically 20-60 ms), so
+    beat-accurate cuts and spectral transients track more tightly.
+    · The list shows **drivers** (they ship with your sound card / DJ controller).
+      With none installed the entry is greyed out; hover it for the reason.
+    · ⚠ A driver can be used by **one program at a time**. If VirtualDJ or a DAW
+      holds it, ASIO cannot connect — the app then **falls back to system sound
+      automatically** and tells you, so the show never goes silent.  Close whatever
+      holds it and click "Apply" again to use ASIO.
+    · ⚠ The ASIO sample rate is driver-global and this app **never changes it**
+      (so it cannot disturb VirtualDJ), which is why "Sample rate" greys out.
+    · With an external interface prefer **its own** ASIO driver; the motherboard's
+      built-in ASIO (e.g. Realtek ASIO) is usually the weakest option.
 
 Step 2 — Import clips
   Click "Import Folder" or "Import Files" and load your video/image clips.

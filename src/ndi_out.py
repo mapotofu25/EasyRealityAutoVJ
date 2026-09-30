@@ -12,16 +12,115 @@ PyInstaller 会把它一起打进包（实测本机 `Program Files` 下从未安
 Runtime 未安装时：import 成功但 Sender.open() 会失败 → 静默禁用，不影响其余功能。
 视频从引擎线程喂帧，音频从采集线程喂 PCM（内部加锁）。
 """
+import ctypes
 import threading
 import time
 
-_ERR_ONCE = {"shown": False}
+# ⚠⚠ 日志必须**按 key 去重**，不能全局只打一次（2026-10-01 修）
+#   原来用 `_ERR_ONCE = {"shown": False}`：第一条日志之后**所有**日志永久静默。
+#   于是「还没有接收端连上」这条无害提示一旦打印过，后面真正的错误
+#   （音频发送失败、采样率不对、write_data 卡死……）**全部被吞掉**，
+#   直接制造了「有画面、没声音、而且日志里啥也没有」这种最难查的现场。
+#   现在：同一条 key 只打一次，不同 key 互不干扰。
+_LOGGED = set()
+_LOG_LOCK = threading.Lock()
 
 
-def _log(msg):
-    if not _ERR_ONCE["shown"]:
-        _ERR_ONCE["shown"] = True
-        print("[NDI]", msg)
+def _log(msg, key=None):
+    k = key if key is not None else msg
+    if k in _LOGGED:
+        return
+    with _LOG_LOCK:
+        if k in _LOGGED:
+            return
+        _LOGGED.add(k)
+    print("[NDI]", msg)
+
+
+# NDI 规范：音频固定 48 kHz。⚠ 帧的采样率在 `open()` 那一刻就被**冻结**进每个
+# buffer item（`audio_frame_copy()` 只做一次性快照），之后再改母板也不生效 ⇒
+# 我们只能固定 48k，并在喂数据时自己重采样（见 feed_audio）。
+_AUDIO_SR = 48000
+
+
+def _mbi_readable(addr, size=8):
+    """该地址是否落在已提交、可读的内存页里（探测野指针用）。"""
+    try:
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class MBI(ctypes.Structure):
+            _fields_ = [("BaseAddress", ctypes.c_void_p),
+                        ("AllocationBase", ctypes.c_void_p),
+                        ("AllocationProtect", wintypes.DWORD),
+                        ("RegionSize", ctypes.c_size_t),
+                        ("State", wintypes.DWORD), ("Protect", wintypes.DWORD),
+                        ("Type", wintypes.DWORD)]
+        if not addr:
+            return False
+        mbi = MBI()
+        if not k32.VirtualQuery(ctypes.c_void_p(addr), ctypes.byref(mbi),
+                                ctypes.sizeof(mbi)):
+            return False
+        # 0x1000 = MEM_COMMIT；0x01 = PAGE_NOACCESS；0x100 = PAGE_GUARD
+        if mbi.State != 0x1000 or (mbi.Protect & 0x01) or (mbi.Protect & 0x100):
+            return False
+        base = mbi.BaseAddress or 0
+        return base <= addr and addr + size <= base + mbi.RegionSize
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def _fix_audio_metadata(a, span=1024):
+    """修 cyndilib 0.1.1 的致命 bug：音频帧的 `p_metadata` 是**野指针**。
+
+    ## 为什么必须修（2026-10-01 实测，见 `_NDI音频诊断.md`）
+    cyndilib 的 `ndi_structs.pyx:87 audio_frame_create_default()` 用 `malloc`（**不清零**）
+    建 `NDIlib_audio_frame_v3_t`，却漏了 `p_metadata = NULL`
+    —— 对照同文件的**视频**版本 `video_frame_create_default()` 是有这一行的。
+    `audio_frame_copy()` 也不复制它。
+    实测在对象内存里扫出的 3 个音频帧结构体，`p_metadata` **3/3 都是垃圾**
+    （读出来是残留的 JSON 文本，典型的"malloc 到别人用过的堆块"）；视频则是 NULL。
+
+    **后果**：只要真有接收端在听，NDI 会把这个指针当 C 字符串读 ⇒
+    `0xC0000005` 访问冲突，发送进程 1 秒内必崩（跨进程实验：只发视频 exit=0，
+    只发音频 exit=3221225477）。没有接收端时反而不崩，所以很容易误判成"没接收端才会崩"。
+
+    **修法**：在 `set_audio_frame()` 之后、`open()` **之前**，
+    把"母板"帧结构体的 `p_metadata` 置 NULL
+    （`open()` 时的 `audio_frame_copy()` 会把母板拷进 3 个 buffer item，所以改母板就够）。
+    对照实验：置 NULL 后同样的回环测试从"必崩"变成稳定跑满 8 秒、
+    接收端收到 42 帧**全部非静音**。
+
+    ⚠ 用结构体特征（sample_rate / 声道数 / FourCC=FLTp）来认帧，而不是硬编码偏移，
+      这样 cyndilib 结构变了也不会误写别人内存。
+    """
+    try:
+        base = id(a)
+        n = 0
+        for off in range(8, span, 8):
+            p = ctypes.c_void_p.from_address(base + off).value or 0
+            if not _mbi_readable(p, 64):
+                continue
+            if ctypes.c_int.from_address(p + 0).value != _AUDIO_SR:   # sample_rate
+                continue
+            if ctypes.c_int.from_address(p + 4).value != 2:           # no_channels
+                continue
+            # FourCC: 'FLTp' little-endian = 0x70544C46
+            if (ctypes.c_int.from_address(p + 24).value & 0xFFFFFFFF) != 0x70544C46:
+                continue
+            ctypes.c_void_p.from_address(p + 48).value = None         # p_metadata = NULL
+            n += 1
+        if n:
+            _log("已修 cyndilib 音频帧野指针：%d 个帧结构体的 p_metadata 置 NULL"
+                 "（不修的话一开声音就 0xC0000005 崩溃）" % n, key="pmeta")
+        else:
+            _log("⚠ 没找到音频帧结构体，p_metadata 野指针**未修**"
+                 "（若此后音频一开就崩，就是这里）", key="pmeta-miss")
+        return n
+    except Exception as e:                                     # noqa: BLE001
+        _log("修 p_metadata 失败：%s（音频可能一开就崩）" % e, key="pmeta-err")
+        return 0
 
 
 def probe_runtime():
@@ -60,9 +159,11 @@ class NDIOutput:
         self._last_err = ""
         self._dropped = 0        # 因缓冲未就绪而丢掉的帧数（诊断用，正常应接近 0）
         # ---- 音频（2026-10-01 修：原来三个错叠在一起，NDI 音频从来没响过）----
-        self._audio_sr = 48000   # 采集采样率提示：帧必须在 open() 之前定好采样率
+        self._audio_sr = 48000   # 采集采样率提示（**已不再用于帧设置**：帧固定 48k，见 _AUDIO_SR）
         self._audio_ok = 0       # 成功发出的音频块数（诊断）
         self._audio_dropped = 0  # 因缓冲未就绪丢掉的块数
+        self._audio_resampled = 0  # 因采集率≠48k 而重采样的块数（诊断）
+        self._audio_last_log = 0.0  # 上次打心跳日志的时刻（每 ~10 秒一行）
         self._audio_err = ""     # 最近一次发送错误（诊断）
         self._audio_err_logged = None   # 只把**第一条**错误写日志，避免刷屏
         self._err_logged = None         # 视频侧同样只记第一条
@@ -115,17 +216,17 @@ class NDIOutput:
             v.set_frame_rate(60)
             v.set_progressive(True)
             s.set_video_frame(v)
-            # 音频帧：float32 立体声 48k
+            # 音频帧：float32 立体声 **固定 48k**（NDI 规范要求；见 _AUDIO_SR 的说明）
             a = AudioSendFrame()
             try:
-                # ⚠ 采样率必须**在 open() 之前**定好，所以用采集侧提前告知的值
-                #   （`set_audio_rate()`；没告知就按 48k）。立体声、每帧最多 4800 样本。
-                a.sample_rate = int(self._audio_sr or 48000)
+                a.sample_rate = _AUDIO_SR
                 a.num_channels = 2
                 a.set_max_num_samples(4800)
             except Exception:
                 pass
             s.set_audio_frame(a)
+            # ★★ 必须在 open() 之前修掉 cyndilib 的 p_metadata 野指针（见 _fix_audio_metadata）
+            _fix_audio_metadata(a)
             s.open()
             self._opened_at = time.perf_counter()   # ★ 开始算静默期（见 _WARMUP_SECS）
             self._sender, self._video, self._audio = s, v, a
@@ -195,7 +296,13 @@ class NDIOutput:
                 _log("!! NDI 发送视频失败（只记一次，后续继续尝试）：%s" % self._last_err)
 
     def set_audio_rate(self, sr):
-        """采集侧提前告知采样率：音频帧的采样率**只能在 open() 之前设**。"""
+        """记录采集侧采样率（**仅供诊断/日志**）。
+
+        ⚠ 2026-10-01 修正：这里**不再**用来设置音频帧的采样率。
+          NDI 规范要求音频固定 48 kHz，而且帧的采样率在 `open()` 那一刻就被冻结
+          （`audio_frame_copy()` 是一次性快照，之后改母板不传播）
+          ⇒ 帧固定 48k，采集侧非 48k 的数据由 `feed_audio()` 自己重采样。
+        """
         try:
             self._audio_sr = int(sr)
         except Exception:                                          # noqa: BLE001
@@ -226,19 +333,9 @@ class NDIOutput:
                 a = self._audio
                 if a is None:
                     return
-                sr = int(sr or 0)
-                if sr > 0 and int(a.sample_rate) != sr:
-                    a.sample_rate = sr          # ★ 属性赋值（没有 set_sample_rate 方法）
                 # ⚠ 开门静默期：这一条是**防段错误**的（实测 open 后立刻 send_audio 会崩）
                 if time.perf_counter() - self._opened_at < self._WARMUP_SECS:
                     self._audio_dropped += 1
-                    return
-                # ⚠⚠ 没有任何接收端连上时，`send_audio()` 会**段错误**（实测）。
-                #   没人听就没必要发 —— 直接丢块，绝不碰 native 调用。
-                if self._conns() <= 0:
-                    self._audio_dropped += 1
-                    if self._audio_dropped == 1:
-                        _log("[NDI] 音频暂时不发：还没有接收端连上（连上后自动开始）")
                     return
                 ch = int(a.num_channels or 2) or 2
                 pcm = _np.asarray(pcm_interleaved, dtype=_np.float32)
@@ -247,6 +344,19 @@ class NDIOutput:
                     pcm = pcm[:n].reshape(-1, ch)
                 elif pcm.shape[0] == ch and pcm.shape[1] != ch:
                     pcm = pcm.T                 # 已经是平面 (ch, n) → 转成 (n, ch) 统一处理
+                # ★ 重采样到 48k（NDI 只认 48k，而帧的采样率在 open() 时就被冻结，
+                #   之后 `a.sample_rate = sr` 不报错但**完全无效** —— 实测确认）。
+                #   不重采样的话：若设备是 44.1k，接收端会按 48k 播 ⇒ 快 8.8%、音调升高。
+                if sr and int(sr) != _AUDIO_SR and len(pcm):
+                    n_in = int(pcm.shape[0])
+                    n_out = int(round(n_in * _AUDIO_SR / float(sr)))
+                    if n_in > 1 and n_out > 1:
+                        x_in = _np.arange(n_in, dtype=_np.float64)
+                        x_out = _np.linspace(0.0, n_in - 1, n_out, dtype=_np.float64)
+                        pcm = _np.stack(
+                            [_np.interp(x_out, x_in, pcm[:, c].astype(_np.float64))
+                             for c in range(pcm.shape[1])], axis=1).astype(_np.float32)
+                        self._audio_resampled += 1
                 # 交错 (n, ch) → 平面 (ch, n)，并保证 C 连续（cyndilib 直接按缓冲读）
                 planar = _np.ascontiguousarray(pcm.T)
                 # 与视频同样的坑：缓冲没空出来时 write_data 会抛 —— 这一块直接丢，不关输出
@@ -254,15 +364,49 @@ class NDIOutput:
                     self._audio_dropped += 1
                     return
                 a.write_data(planar)
-                self._sender.send_audio()
-                self._audio_ok += 1
-                if self._audio_ok == 1:
-                    _log("[NDI] 音频已开始发送（%.1f kHz / 2ch）" % (sr / 1000.0))
+                # ⚠ 不再用「连接数门控」（2026-10-01 实测修正）：
+                #   原来以为"没有接收端时 send_audio() 会段错误"，实测**不成立**
+                #   （无接收端时它只是返回 False，真正会崩的是 p_metadata 野指针，已修）。
+                #   而 `get_num_connections()` 在「接收端刚连上、计数还没上报」的窗口返回 0，
+                #   门控会把那一段音频**整块丢掉且毫无日志** —— 正是"没有声音"的隐形帮凶。
+                #   现在改成：发不出去就丢这一块，并计数 + 周期性打日志。
+                ok = True
+                try:
+                    if hasattr(self._sender, "send_audio"):
+                        ok = bool(self._sender.send_audio())
+                except Exception as e:                             # noqa: BLE001
+                    ok = False
+                    self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
+                if ok:
+                    self._audio_ok += 1
+                else:
+                    self._audio_dropped += 1
+                if self._audio_ok and self._audio_ok == 1:
+                    _log("音频已开始发送（%.1f kHz → %.1f kHz / 2ch）"
+                         % ((sr or _AUDIO_SR) / 1000.0, _AUDIO_SR / 1000.0), key="audio-start")
+                # 每 ~10 秒给一行心跳，现场据此就能判断"到底有没有在发"
+                now = time.perf_counter()
+                if now - getattr(self, "_audio_last_log", 0.0) >= 10.0:
+                    self._audio_last_log = now
+                    _log("audio: src=%d -> %d, ok=%d dropped=%d resampled=%d conns=%d err=%s"
+                         % (int(sr or 0), _AUDIO_SR, self._audio_ok, self._audio_dropped,
+                            self._audio_resampled, self._conns(), self._audio_err or "-"),
+                         key="audio-hb-%d" % (self._audio_ok // max(1, self._audio_ok)))
         except Exception as e:                                     # noqa: BLE001
             self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
             if self._audio_err_logged is None:
                 self._audio_err_logged = self._audio_err
                 _log("!! NDI 音频发送失败（只记一次）：%s" % self._audio_err)
+            # ⚠ 已知坑：`write_data` 一旦因「样本数超过 max」失败，cyndilib 的
+            #   `buffer_write_item` 会**永久卡住**，之后每次 write_data 都报
+            #   `buffer_write_item is not null` ⇒ 音频永久停摆。
+            #   出现这类错误就**重建会话**，而不是继续用坏帧。
+            if "not null" in self._audio_err or "exceeds maximum" in self._audio_err:
+                _log("检测到音频缓冲卡死，重建 NDI 会话以恢复", key="audio-rebuild")
+                try:
+                    self.close()
+                except Exception:                                  # noqa: BLE001
+                    pass
 
     def close(self):
         try:

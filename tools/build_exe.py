@@ -50,6 +50,7 @@ cmd = [
     "--hidden-import", "_build_ver",
     "--hidden-import", "ndi_out",
     "--hidden-import", "dxvnative",
+    "--hidden-import", "asio_engine",
     "--hidden-import", "glctx",
     "--hidden-import", "SpoutGL",
     "--hidden-import", "SpoutGL.enums",
@@ -59,6 +60,11 @@ cmd = [
     # dxvnative.dll_path() 在打包环境下解析到 _internal（= _MEIPASS），与此处目标一致。
     "--collect-all", "glfw",
     "--add-binary", os.path.join(SRC, "_dxvlz.dll") + os.pathsep + ".",
+    # ASIO 低延迟输入的原生宿主（zig 编译，~195KB）。asio_engine.dll_path() 在打包
+    # 环境下解析到 _MEIPASS（= _internal），与此处目标 `.` 一致。
+    # ⚠ 它是用 `-nostdinc++ -fno-exceptions -fno-rtti` 编的，**不依赖任何 C++ 运行时 DLL**
+    #   （operator new/delete 在 asiohost.cpp 里自带垫片），所以不需要额外带 libstdc++。
+    "--add-binary", os.path.join(SRC, "_asiohost.dll") + os.pathsep + ".",
     "--add-data", os.path.join(ROOT, "assets", "models") + os.pathsep + "assets" + os.path.sep + "models",
     os.path.join(SRC, "main.py"),
 ]

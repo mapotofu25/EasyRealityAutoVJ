@@ -74,6 +74,9 @@ FALLBACK_LOW = {"星空", "云", "渐变", "纹理", "天空"}
 # 非空时整体替换默认表（完整快照语义）；空则用默认 GENRE_TO_VISUAL。
 _custom_map = {}
 
+# 完整默认表（138 个曲风全覆盖）懒加载缓存，见 `_default_map()`。
+_default_cache = None
+
 
 def set_custom_visual_map(m):
     """注入用户自定义的曲风→画面标签映射。传空 dict 恢复默认。"""
@@ -81,11 +84,54 @@ def set_custom_visual_map(m):
     _custom_map = {g: list(t) for g, t in (m or {}).items()}
 
 
+def _default_map():
+    """完整默认映射：**先铺满 138 个曲风，再让 GENRE_TO_VISUAL 覆盖回去**。
+
+    为什么要这个顺序（2026-10-01）：
+      · 用户反馈「曲风映射里有很多是空的」—— 因为 GENRE_TO_VISUAL 只有 33 个键，
+        而编辑器按 `genre_keywords.GENRE_GROUPS` 列 **138** 个曲风，剩下的全是空白；
+      · 但 GENRE_TO_VISUAL 那 33 个是**照着素材打标做过相似度校准**的（见文件头注释），
+        **不能动**，否则会劣化现有的自动匹配质量。
+      ⇒ 所以：`genre_visual_default.build_default()` 负责「**一个都不空**」，
+        `GENRE_TO_VISUAL` 负责「**已调好的保持原样**」。
+    """
+    global _default_cache
+    if _default_cache is None:
+        base = {}
+        try:
+            from genre_visual_default import build_default
+            base = {g: list(t) for g, t in build_default().items()}
+        except Exception:                                      # noqa: BLE001
+            base = {}
+        for g, vis in GENRE_TO_VISUAL.items():                  # 精调过的覆盖回去
+            base[g] = sorted(vis)
+        _default_cache = base
+    return _default_cache
+
+
+def default_genre_visual_map():
+    """**纯默认**映射（137→138 个曲风全覆盖，不看用户自定义）。返回 {曲风: set(标签)}。
+
+    与 `get_genre_visual_map()` 的区别：这个函数**忽略 cfg 里的自定义映射**，
+    所以「恢复默认」按钮和「保存时只写差异」都必须用它。
+    """
+    return {g: set(v) for g, v in _default_map().items()}
+
+
 def get_genre_visual_map():
-    """当前生效映射：用户自定义非空则整体替换默认，否则用默认"""
-    if _custom_map:
-        return {g: set(t) for g, t in _custom_map.items()}
-    return {g: set(v) for g, v in GENRE_TO_VISUAL.items()}
+    """当前生效映射 = **默认铺满** + **用户自定义按条覆盖**。
+
+    ⚠ 语义变更（2026-10-01，用户反馈「里面有很多是空的」）：
+      旧实现是「自定义非空则**整体替换**默认表」。可用户一旦点过保存，cfg 里只会有
+      他配过的那几十条（`GenreVisualEditDialog._save` 刻意不写没配过的曲风），
+      于是**剩下上百个曲风在编辑器里全是空白** —— 正是用户看到的现象。
+      现在改成「按条覆盖」：cfg 里**没有**的曲风一律吃默认（一个都不空），
+      cfg 里**有**的按用户的值（包括用户清空成的空集 = 这个曲风不映射）。
+    """
+    base = default_genre_visual_map()
+    for g, tags in (_custom_map or {}).items():
+        base[g] = set(tags)
+    return base
 
 
 def _norm_genre(gl):

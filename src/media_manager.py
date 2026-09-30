@@ -588,7 +588,70 @@ def _start_decoder_thread(target, name=None):
 
 
 # ---------------- 播放器 ----------------
-class VideoPlayer:
+# ============================================================================
+# 解码器自愈 / 卡帧看门狗的统一约定（三个播放器共用）
+# ----------------------------------------------------------------------------
+# 用户报：「运行时素材突然卡在某一帧，直到下一个切进来才恢复」。
+# 2026-10-01 复核发现**上一轮只修了 GpuDxvPlayer 一条路径**
+# （tools/_fix_freeze.py 的锚点只匹配到它），VideoPlayer / AvAlphaPlayer
+# 的 `_loop` 里 `_open()` 失败一次就 `return`、线程永久死亡 —— 这才是主凶。
+# 详见 `_卡帧诊断.md`。
+# ============================================================================
+_REOPEN_BACKOFF_MAX = 2.0      # 重开退避上限（秒）
+_REOPEN_BACKOFF_BASE = 0.15    # 首轮退避（原 0.25；缩短以减小可见冻帧）
+_STALL_SECS = 1.5              # 活跃播放器超过这么久没有新帧 ⇒ 判定"卡帧"
+
+
+class _DecoderHealth:
+    """解码器健康度：产帧计数 + 卡帧判据。
+
+    为什么要它（`_卡帧诊断.md` R5）：三个播放器**都没有任何"已死/卡帧"的可观测判据**，
+    引擎只能一直显示最后一帧 —— 于是 R1~R4 的每一个小故障都会变成"永久冻帧"。
+    """
+
+    def _mark_frame(self):
+        """每产出一帧调用一次（看门狗心跳）。
+
+        ⚠ 全部用 `getattr` 兜底：本方法跑在**解码线程**上，一旦抛异常就等于把
+          解码线程打死 —— 那正是我们要修的病。所以它绝不能因为"少了个字段"而炸
+          （测试里有用 `__new__` 绕过 `__init__` 构造播放器的用法）。
+        """
+        self._frames = getattr(self, "_frames", 0) + 1
+        self._last_t = time.perf_counter()
+
+    def stalled(self, secs=_STALL_SECS):
+        """活跃播放器是否卡帧。已放弃（_ended）时无条件 True。
+
+        ⚠ 还没出过首帧时给 `secs*4` 的宽限：打开容器 + 解首帧实测要 70~690ms，
+          正常慢启动不能被误判成卡死。
+        """
+        if getattr(self, "_ended", False):
+            return True
+        last = getattr(self, "_last_t", 0.0)
+        if not last:
+            born = getattr(self, "_born", None)
+            if born is None:
+                self._born = born = time.perf_counter()
+            return (time.perf_counter() - born) > secs * 4
+        return (time.perf_counter() - last) > secs
+
+    def health(self):
+        t = getattr(self, "_last_t", 0.0)
+        return {"ended": getattr(self, "_ended", False),
+                "frames": getattr(self, "_frames", 0),
+                "age": (time.perf_counter() - t) if t else None,
+                "reason": getattr(self, "gave_up_reason", "")}
+
+    def _init_health(self):
+        """在 __init__ 里调用。"""
+        self._frames = 0                    # 产出帧总数（可观测判据）
+        self._last_t = 0.0                  # 最后一次产帧时刻
+        self._born = time.perf_counter()    # 对象创建时刻
+        self._ended = False                 # 解码循环已彻底退出（★ 比 _dead 准确）
+        self.gave_up_reason = ""
+
+
+class VideoPlayer(_DecoderHealth):
     """OpenCV 视频循环播放线程，提供最新帧；非活跃时挂起省 CPU。
 
     **容器必须在解码线程里打开**：`cv2.VideoCapture(path)` 对 4K/DXV 素材要 60~250ms，
@@ -612,6 +675,7 @@ class VideoPlayer:
         self._max_w = 0        # 解码缩放上限（长边超过则缩到画布 1.5 倍，省 CPU/内存）
         self._max_h = 0
         self._t = None                  # 不再持有 Thread 对象（见 _start_decoder_thread 的说明）
+        self._init_health()             # 产帧计数 / 卡帧判据（见 _DecoderHealth）
         _start_decoder_thread(self._loop, name="autovj-dec")
 
     def set_max_size(self, w, h):
@@ -651,46 +715,91 @@ class VideoPlayer:
         return cap
 
     def _loop(self):
-        self.cap = self._open()
-        if self.cap is None:
-            return
-        if self._dead:                     # 打开期间就被关掉了
-            self._release()
-            return
-        interval = 1.0 / max(self.fps, 1.0)
-        try:
-            while not self._dead and self.cap is not None:
-                if not self._active:
-                    if self._warm <= 0:
-                        time.sleep(0.05)
-                        continue
-                    self._warm -= 1      # 预热：不活跃也只解这一帧，解完回到挂起
-                t0 = time.perf_counter()
-                ok, frame = self.cap.read()
-                if not ok:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 循环
-                    ok, frame = self.cap.read()
-                    if not ok:
-                        time.sleep(0.05)
-                        continue
-                if ok and frame is not None:
-                    if self._max_w and self._max_h:
-                        fh, fw = frame.shape[:2]
-                        s = min(self._max_w / fw, self._max_h / fh)
-                        if s < 1.0:
-                            frame = cv2.resize(
-                                frame, (max(1, int(fw * s)), max(1, int(fh * s))),
-                                interpolation=cv2.INTER_AREA)
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    h, w, _ = rgb.shape
-                    img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-                    self._img = img.copy()
-                wait = float(interval / self.speed - (time.perf_counter() - t0))
-                if wait > 0:
-                    time.sleep(wait)
-        finally:
-            self._release()
+        """解码主循环（**自愈**，2026-10-01 重写）。
 
+        ⚠⚠ 老实现的致命问题（用户报「素材突然卡在某一帧」的主凶）：
+          `self.cap = self._open(); if self.cap is None: return` ——
+          **打开失败一次，解码线程就永久退出**；此时对象还活着、`current()` 一直返回
+          最后一帧图像 ⇒ 引擎看起来"在播"，实际画面冻死，直到下一个素材切进来。
+        ⇒ 现在：打开失败**退避重试**；读失败累计到阈值就**跳出重开容器**；
+          只有「从来没出过帧 + 连续 `_REOPEN_MAX` 轮失败」才真放弃
+          （出过帧的素材**永不放弃** —— 瞬时抖动不该让素材永久黑掉）。
+        """
+        tries = 0
+        ever = False                       # ★ 是否产出过帧
+        while not self._dead:
+            try:
+                self.cap = self._open()
+            except Exception:                                  # noqa: BLE001
+                self.cap = None
+            if self.cap is None:
+                tries += 1
+                if (not ever) and tries >= _REOPEN_MAX:
+                    self._ended = True
+                    self.gave_up_reason = "连续 %d 次打开失败" % tries
+                    _log_decoder_giveup(self.path, self.gave_up_reason)
+                    return
+                time.sleep(min(_REOPEN_BACKOFF_MAX, _REOPEN_BACKOFF_BASE * tries))
+                continue
+            if self._dead:                 # 打开期间就被关掉了
+                self._release()
+                return
+            interval = 1.0 / max(self.fps, 1.0)
+            fail = 0
+            try:
+                while not self._dead and self.cap is not None:
+                    if not self._active:
+                        if self._warm <= 0:
+                            time.sleep(0.05)
+                            continue
+                        self._warm -= 1  # 预热：不活跃也只解这一帧，解完回到挂起
+                    t0 = time.perf_counter()
+                    ok, frame = self.cap.read()
+                    if not ok or frame is None:
+                        fail += 1
+                        try:
+                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 片尾回卷
+                        except Exception:                      # noqa: BLE001
+                            pass
+                        ok, frame = self.cap.read()
+                        if not ok or frame is None:
+                            # ★ 连续读失败 ⇒ 容器坏了，跳出重开。
+                            #   ⚠ 老实现这里是 `time.sleep(0.05); continue` **无限空转**，
+                            #     画面永远停在最后一帧（正是用户看到的现象）。
+                            if fail >= 20:
+                                break
+                            time.sleep(0.03)
+                            continue
+                    fail = 0
+                    if frame is not None:
+                        if self._max_w and self._max_h:
+                            fh, fw = frame.shape[:2]
+                            sc = min(self._max_w / fw, self._max_h / fh)
+                            if sc < 1.0:
+                                frame = cv2.resize(
+                                    frame, (max(1, int(fw * sc)), max(1, int(fh * sc))),
+                                    interpolation=cv2.INTER_AREA)
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        h, w, _ = rgb.shape
+                        img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+                        self._img = img.copy()
+                        self._mark_frame()             # ★ 看门狗心跳
+                        ever = True
+                    wait = float(interval / self.speed - (time.perf_counter() - t0))
+                    if wait > 0:
+                        time.sleep(wait)
+            finally:
+                self._release()
+            if self._dead:
+                break
+            tries = 0 if ever else tries + 1   # ★ 出过帧 ⇒ 计数清零，不放弃
+            if (not ever) and tries >= _REOPEN_MAX:
+                self._ended = True
+                self.gave_up_reason = "连续 %d 轮取不到帧" % tries
+                _log_decoder_giveup(self.path, self.gave_up_reason)
+                break
+            time.sleep(min(_REOPEN_BACKOFF_MAX, _REOPEN_BACKOFF_BASE * tries))
+        self._release()
     def _release(self):
         """解码器只在解码线程内释放，避免跨线程 release 崩溃"""
         if self.cap is not None:
@@ -780,7 +889,7 @@ def _av_probe_alpha(path, deep=True):
         return av, False
 
 
-class AvAlphaPlayer:
+class AvAlphaPlayer(_DecoderHealth):
     """带 alpha 视频的循环播放（PyAV 解码，输出 ARGB32 QImage），接口与 VideoPlayer 一致。
 
     与 VideoPlayer 同样：**容器在解码线程里打开**（`av.open` 对大素材也要几十到几百毫秒），
@@ -802,6 +911,7 @@ class AvAlphaPlayer:
         self._max_w = 0
         self._max_h = 0
         self._t = None                  # 不再持有 Thread 对象（见 _start_decoder_thread 的说明）
+        self._init_health()             # 产帧计数 / 卡帧判据（见 _DecoderHealth）
         _start_decoder_thread(self._loop, name="autovj-dec")
 
     def _open(self):
@@ -846,57 +956,113 @@ class AvAlphaPlayer:
                     self.c.close()
                 except Exception:
                     pass
-                self.c = self._av.open(self.path, metadata_errors="replace")
+                # ⚠⚠ 这里原来**没有 try**：重开容器一旦抛异常（文件被删/盘拔了/句柄失效），
+                #   异常会一路穿过生成器、穿过 `_loop` 的 `except StopIteration`，
+                #   **直接打死解码线程** ⇒ 画面永久冻在最后一帧（正是用户报的现象）。
+                #   现在失败就结束这个生成器，让 `_loop` 去退避重开。
+                try:
+                    self.c = self._av.open(self.path, metadata_errors="replace")
+                    self.st = self.c.streams.video[0]
+                    _cap_decode_threads(self.st)
+                except Exception:                              # noqa: BLE001
+                    return
 
     def _loop(self):
-        try:
-            self.c, self.st = self._open()
-        except Exception:
-            return
-        if self._dead:                     # 打开期间就被关掉了
+        """alpha 素材解码主循环（**自愈**，2026-10-01 重写；与 VideoPlayer 同构）。
+
+        ⚠⚠ 老实现的三条永久死亡路径：
+          ① `self.c, self.st = self._open()` 失败就 `return` ⇒ 线程永久退出；
+          ② `_iter_frames` 里重开容器抛异常会**穿透**到 `_loop`（只捕获 StopIteration）；
+          ③ 帧转换 `except Exception: pass` ⇒ 一直转换失败也永远不重开、不报错。
+          三条的结果都是同一个：**对象活着、画面冻在最后一帧**。
+        """
+        tries = 0
+        ever = False                       # ★ 是否产出过帧
+        while not self._dead:
+            try:
+                self.c, self.st = self._open()
+            except Exception:                                  # noqa: BLE001
+                self.c = None
+            if self.c is None:
+                tries += 1
+                if (not ever) and tries >= _REOPEN_MAX:
+                    self._ended = True
+                    self.gave_up_reason = "连续 %d 次打开失败" % tries
+                    _log_decoder_giveup(self.path, self.gave_up_reason)
+                    return
+                time.sleep(min(_REOPEN_BACKOFF_MAX, _REOPEN_BACKOFF_BASE * tries))
+                continue
+            if self._dead:                 # 打开期间就被关掉了
+                try:
+                    self.c.close()
+                except Exception:                              # noqa: BLE001
+                    pass
+                self.c = None
+                return
+            interval = 1.0 / max(self.fps, 1.0)
+            frames = self._iter_frames()
+            fail = 0
+            while not self._dead:
+                if not self._active:
+                    if self._warm <= 0:
+                        time.sleep(0.05)
+                        continue
+                    self._warm -= 1      # 预热：不活跃也只解这一帧
+                t0 = time.perf_counter()
+                try:
+                    frame = next(frames)
+                except StopIteration:
+                    break                      # ★ 生成器收工 ⇒ 跳出重开容器
+                except Exception:                                 # noqa: BLE001
+                    fail += 1
+                    if fail >= 20:
+                        break
+                    time.sleep(0.03)
+                    continue
+                ok = False
+                try:
+                    arr = frame.to_ndarray(format="bgra")   # BGRA，与 engine._np_view 一致
+                    h, w = arr.shape[:2]
+                    if self._max_w and self._max_h:
+                        sc = min(self._max_w / w, self._max_h / h)
+                        if sc < 1.0:
+                            arr = cv2.resize(
+                                arr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                                interpolation=cv2.INTER_AREA)
+                            h, w = arr.shape[:2]
+                    img = QImage(arr.data, w, h, 4 * w, QImage.Format_ARGB32)
+                    self._img = img.copy()
+                    ok = True
+                except Exception:                              # noqa: BLE001
+                    ok = False
+                if ok:
+                    fail = 0
+                    self._mark_frame()             # ★ 看门狗心跳
+                    ever = True
+                else:
+                    # ★ 转换一直失败也算"卡帧"：累计到阈值要能重开，
+                    #   不能像老实现那样 `pass` 掉永远空转
+                    fail += 1
+                    if fail >= 20:
+                        break
+                wait = float(interval / self.speed - (time.perf_counter() - t0))
+                if wait > 0:
+                    time.sleep(wait)
+            # 本轮结束：释放容器（解码器只在解码线程内释放，避免跨线程崩溃）
             try:
                 self.c.close()
-            except Exception:
+            except Exception:                                  # noqa: BLE001
                 pass
             self.c = None
-            return
-        interval = 1.0 / max(self.fps, 1.0)
-        frames = self._iter_frames()
-        while not self._dead:
-            if not self._active:
-                if self._warm <= 0:
-                    time.sleep(0.05)
-                    continue
-                self._warm -= 1      # 预热：不活跃也只解这一帧
-            t0 = time.perf_counter()
-            try:
-                frame = next(frames)
-            except StopIteration:
-                time.sleep(0.05)
-                continue
-            try:
-                arr = frame.to_ndarray(format="bgra")      # BGRA，与 engine._np_view 一致
-                h, w = arr.shape[:2]
-                if self._max_w and self._max_h:
-                    s = min(self._max_w / w, self._max_h / h)
-                    if s < 1.0:
-                        arr = cv2.resize(
-                            arr, (max(1, int(w * s)), max(1, int(h * s))),
-                            interpolation=cv2.INTER_AREA)
-                        h, w = arr.shape[:2]
-                img = QImage(arr.data, w, h, 4 * w, QImage.Format_ARGB32)
-                self._img = img.copy()
-            except Exception:
-                pass
-            wait = float(interval / self.speed - (time.perf_counter() - t0))
-            if wait > 0:
-                time.sleep(wait)
-        # 解码器只在解码线程内释放，避免跨线程崩溃
-        try:
-            self.c.close()
-        except Exception:
-            pass
-
+            if self._dead:
+                break
+            tries = 0 if ever else tries + 1   # ★ 出过帧 ⇒ 计数清零，不放弃
+            if (not ever) and tries >= _REOPEN_MAX:
+                self._ended = True
+                self.gave_up_reason = "连续 %d 轮取不到帧" % tries
+                _log_decoder_giveup(self.path, self.gave_up_reason)
+                break
+            time.sleep(min(_REOPEN_BACKOFF_MAX, _REOPEN_BACKOFF_BASE * tries))
     def current(self) -> QImage:
         return self._img
 
@@ -1237,7 +1403,7 @@ def _log_decoder_giveup(path, why):
         pass
 
 
-class GpuDxvPlayer:
+class GpuDxvPlayer(_DecoderHealth):
     """DXV3 素材的 GPU 解码播放器（实验）。接口与 AvAlphaPlayer 完全一致，可直接替换。
 
     **内部全自动降级**：容器打开后若发现不是 DXV3 / 帧头不受支持（DXV2-LZF、YCG6）/
@@ -1275,6 +1441,7 @@ class GpuDxvPlayer:
                                    #   ⇒ 用 `_gpu_frames()` 进自愈路径，别用 `_soft_frames`
         self.reason = "未探测"      # 诊断：走 / 不走 GPU 的原因
         self._t = None                  # 不再持有 Thread 对象（见 _start_decoder_thread 的说明）
+        self._init_health()             # 产帧计数 / 卡帧判据（见 _DecoderHealth）
         _start_decoder_thread(self._loop, name="autovj-dec")
 
     # ---------------- 与 VideoPlayer / AvAlphaPlayer 一致的接口 ----------------
@@ -1575,9 +1742,11 @@ class GpuDxvPlayer:
             except Exception:                                      # noqa: BLE001
                 tries += 1
                 if tries >= _REOPEN_MAX:
-                    _log_decoder_giveup(self.path, "连续 %d 次打开失败" % tries)
+                    self._ended = True
+                    self.gave_up_reason = "连续 %d 次打开失败" % tries
+                    _log_decoder_giveup(self.path, self.gave_up_reason)
                     break
-                time.sleep(min(2.0, 0.25 * tries))
+                time.sleep(min(_REOPEN_BACKOFF_MAX, _REOPEN_BACKOFF_BASE * tries))
                 continue
             if self._dead:                 # 打开期间就被关掉了
                 break
@@ -1585,6 +1754,7 @@ class GpuDxvPlayer:
             gen_gpu = (self.gpu or self.gpu_want) and gpu_decode_enabled()
             frames = self._gpu_frames() if gen_gpu else self._soft_frames()
             produced = False
+            fail = 0
             while not self._dead:
                 # ★ 只有"该不该走 GPU"这一件事允许中途换生成器：设置里开关 GPU 解码
                 #   立刻生效（以前只在建播放器那一刻定一次 ⇒ 改完开关得重开软件才行）。
@@ -1603,11 +1773,18 @@ class GpuDxvPlayer:
                 except StopIteration:
                     break                  # 生成器收工 ⇒ 走下面"重开再试"
                 except Exception:                                      # noqa: BLE001
+                    # ⚠ 生成器一直抛异常时必须能累积到"重开"，
+                    #   否则这里就是 50Hz 无限空转、画面永远冻着、也永远不重开
+                    fail += 1
+                    if fail >= 20:
+                        break
                     time.sleep(0.02)
                     continue
                 if img is not None:
                     self._img = img
                     produced = True
+                    fail = 0
+                    self._mark_frame()             # ★ 看门狗心跳
                 wait = float(interval / self.speed - (time.perf_counter() - t0))
                 if wait > 0:
                     time.sleep(wait)
@@ -1619,10 +1796,12 @@ class GpuDxvPlayer:
             else:
                 tries += 1
             if tries >= _REOPEN_MAX:
-                _log_decoder_giveup(self.path, "连续 %d 轮取帧收工" % tries)
+                self._ended = True
+                self.gave_up_reason = "连续 %d 轮取帧收工" % tries
+                _log_decoder_giveup(self.path, self.gave_up_reason)
                 break
             self._release()
-            time.sleep(min(2.0, 0.25 * tries))
+            time.sleep(min(_REOPEN_BACKOFF_MAX, _REOPEN_BACKOFF_BASE * tries))
         self._release()
 
     def _release(self):

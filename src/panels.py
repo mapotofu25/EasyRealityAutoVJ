@@ -12,8 +12,10 @@ import os
 
 from tags_def import (TAG_CATEGORIES, DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER)
-from PySide6.QtCore import Qt, QSize, Signal, QMimeData, QTimer, QPoint, QRectF
-from PySide6.QtGui import QColor, QPixmap, QImage, QDrag, QAction, QPainter, QPen
+from PySide6.QtCore import (Qt, QSize, Signal, QMimeData, QTimer, QPoint, QRectF,
+                            QThread)
+from PySide6.QtGui import (QColor, QPixmap, QImage, QDrag, QAction, QPainter, QPen,
+                           QIcon, QFont)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSlider,
     QComboBox, QScrollArea, QListWidget, QListWidgetItem, QListView, QFrame,
@@ -31,6 +33,7 @@ import theme
 CLIP_MIME = "application/x-autovj-media"
 HEADER_W = 456          # 图层头列宽
 LIB_THUMB_SIZES = [(96, 54, 112, 82), (160, 90, 178, 138), (240, 135, 262, 194)]
+COVER_ICON = 64         # 曲库列表每行左侧的歌曲封面边长（px）
 
 
 class I18nDialog(QDialog):
@@ -624,8 +627,9 @@ class GenreVisualEditDialog(I18nDialog):
         super().__init__(main)
         self.main = main
         from match_engine import get_genre_visual_map
+        # ★ 现在拿到的是「默认铺满（138 个曲风）+ 用户自定义按条覆盖」的**完整表** ⇒
+        #   打开编辑器时**没有一个曲风是空白的**（用户反馈的原问题）。
         self.map = {g: set(t) for g, t in get_genre_visual_map().items()}
-        self._orig_keys = set(self.map)     # 原有键：保存时即使标签为空也保留
         self.custom = {k: list(v) for k, v in (main.cfg["custom_genres"] or {}).items()}
         self.cur_genre = None
         self.setWindowTitle("曲风 → 画面标签映射")
@@ -649,7 +653,8 @@ class GenreVisualEditDialog(I18nDialog):
         lv.addWidget(self.genre_scroll, 1)
         lrow = QHBoxLayout()
         b_del = QPushButton("删除曲风")
-        b_del.setToolTip("删除当前曲风在映射表里的条目；自定义曲风同时从大类里移除")
+        b_del.setToolTip("让这个曲风不再映射到任何画面标签（保存后生效；"
+                         "自定义曲风同时从大类里移除）")
         b_del.clicked.connect(self._del_genre)
         b_reset = QPushButton("恢复默认")
         b_reset.setToolTip("丢弃自定义映射，恢复软件内置的默认曲风→画面标签表")
@@ -832,11 +837,16 @@ class GenreVisualEditDialog(I18nDialog):
         self._select_genre(name)
 
     def _del_genre(self):
+        """让这个曲风**不再映射到任何画面标签**（而不是从表里抹掉）。
+
+        ⚠ 为什么不是 `pop`：现在生效表是「默认铺满 + 按条覆盖」，
+          仅把它从 map 里删掉 ⇒ 下次打开又会吃默认值，"删除"等于没删。
+          所以这里写成一个**空集**（相对于默认值是一个差异），存进 cfg 后永久生效。
+        """
         if not self.cur_genre:
             return
         name = self.cur_genre
-        self.map.pop(name, None)
-        self._orig_keys.discard(name)
+        self.map[name] = set()
         for g in list(self.custom.keys()):
             self.custom[g] = [c for c in self.custom[g] if c != name]
             if not self.custom[g]:
@@ -852,22 +862,34 @@ class GenreVisualEditDialog(I18nDialog):
             QMessageBox.Yes | QMessageBox.Cancel)
         if ret != QMessageBox.Yes:
             return
-        from match_engine import GENRE_TO_VISUAL
-        self.map = {g: set(t) for g, t in GENRE_TO_VISUAL.items()}
-        self._orig_keys = set(self.map)
+        # ★ 必须用**纯默认表**（不是 get_genre_visual_map —— 那个已经掺了用户的覆盖，
+        #   拿它当"默认"会把用户的自定义又抄回去，等于点了没反应）
+        from match_engine import default_genre_visual_map
+        self.map = {g: set(t) for g, t in default_genre_visual_map().items()}
+        self.custom = {}
+        self.cur_genre = None
         self._rebuild_genres()
 
     def _save(self):
-        # 只保存「有标签的」+「原本就存在的」+「本次新建的曲风」三类，
-        # 避免把大类里那一百多个没配过的曲风全写进映射表（会把默认兜底也顶掉）
+        """只把**与默认值的差异**写进 cfg（不是整张表）。
+
+        为什么这样（2026-10-01 改）：
+          · 旧实现写「有标签的 + 原本存在的 + 新建的」，用户点一次保存就固化了几十条，
+            以后软件再补默认表也**轮不到他**（他的 cfg 直接顶掉了默认）；
+          · 现在写「差异」：没动过的曲风**不写**，永远跟着软件的最新默认走；
+            用户清空的曲风写成 `[]`（与默认不同 ⇒ 差异 ⇒ 会被保存，删除才真正生效）。
+        """
+        from match_engine import default_genre_visual_map, set_custom_visual_map
+        dflt = default_genre_visual_map()
         custom_names = {c for names in self.custom.values() for c in names}
         out = {}
         for g, tags in self.map.items():
-            if tags or g in self._orig_keys or g in custom_names:
-                out[g] = sorted(tags)
+            t = sorted(tags)
+            base = sorted(dflt.get(g) or ())
+            if t != base or g in custom_names:
+                out[g] = t
         self.main.cfg["genre_visual_map"] = out
         self.main.cfg["custom_genres"] = {k: list(v) for k, v in self.custom.items() if v}
-        from match_engine import set_custom_visual_map
         set_custom_visual_map(out)
         self.main.cfg.save()
         self.main.engine._last_genres = None
@@ -959,6 +981,126 @@ class MusicLibraryDialog(I18nDialog):
             self.main.show_music_info(path)
         elif act == rm:
             self.main.remove_music(path)
+
+
+_cover_placeholder_cache = {}
+
+
+def cover_placeholder(size):
+    """没有封面时的占位图（圆角方块 + 音符），按尺寸缓存。
+
+    ⚠ 只画一次：几百上千行列表如果每行都现画 QPixmap，滚动会明显卡。
+    """
+    key = int(size)
+    hit = _cover_placeholder_cache.get(key)
+    if hit is not None:
+        return hit
+    pm = QPixmap(key, key)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    try:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.V("btn")))
+        p.drawRoundedRect(0, 0, key, key, 6, 6)
+        f = QFont()
+        f.setPointSize(max(9, int(key * 0.40)))
+        p.setFont(f)
+        p.setPen(QPen(QColor(theme.V("muted"))))
+        p.drawText(pm.rect(), Qt.AlignCenter, "♪")
+    finally:
+        p.end()
+    _cover_placeholder_cache[key] = pm
+    return pm
+
+
+def load_cover_pixmap(path, size):
+    """读封面缓存文件 → 缩放到 size（带缩放缓存）。失败返回 None。
+
+    ⚠ **只读缓存**（`music_cover.cached()` 的产物），绝不在主线程提取。
+    """
+    if not path:
+        return None
+    key = (path, int(size))
+    hit = _cover_pix_cache.get(key)
+    if hit is not None:
+        return hit if hit is not False else None
+    pm = None
+    try:
+        if os.path.isfile(path):
+            raw = QPixmap()
+            if raw.load(path):
+                pm = raw.scaled(int(size), int(size), Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation)
+    except Exception:                                          # noqa: BLE001
+        pm = None
+    if len(_cover_pix_cache) > 4000:                            # 别无限涨
+        _cover_pix_cache.clear()
+    _cover_pix_cache[key] = pm if pm is not None else False
+    return pm
+
+
+_cover_pix_cache = {}
+
+
+def cover_cached(path):
+    """曲目封面缓存文件（**只查盘，不提取**，主线程安全）。没有则 None。"""
+    try:
+        import music_cover
+        return music_cover.cached(path)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def cover_icon_for(meta_rec, path, size, need_out=None):
+    """取一行的封面图标：`meta["cover"]` → 缓存查询 → 占位图。
+
+    need_out：传 list 时，把「需要后台补封面」的路径塞进去（调用方据此起补图线程）。
+    """
+    cp = meta_rec.get("cover") if isinstance(meta_rec, dict) else None
+    if not (isinstance(cp, str) and os.path.isfile(cp)):
+        cp = cover_cached(path)
+    pm = load_cover_pixmap(cp, size) if cp else None
+    if pm is None:
+        if need_out is not None and os.path.isfile(path):
+            need_out.append(path)
+        pm = cover_placeholder(size)
+    return QIcon(pm)
+
+
+class CoverBackfillWorker(QThread):
+    """后台补封面：把还缺封面的曲目挨个提取一遍，完成后发信号让列表刷新。
+
+    ⚠ 与项目其它缩略图一致：**主线程只读缓存**，提取一律在后台。
+    ⚠ 串行、可中断、自己吞异常 —— 补图是锦上添花，绝不能影响演出。
+    """
+
+    done = Signal(int)
+
+    def __init__(self, paths, parent=None):
+        super().__init__(parent)
+        self.paths = list(paths or [])
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        n = 0
+        try:
+            import music_cover
+        except Exception:                                      # noqa: BLE001
+            self.done.emit(0)
+            return
+        for p in self.paths:
+            if self._stop:
+                break
+            try:
+                if music_cover.extract(p):
+                    n += 1
+            except Exception:                                  # noqa: BLE001
+                pass
+        self.done.emit(n)
 
 
 class MusicLibraryPanel(QWidget):
@@ -1074,6 +1216,11 @@ class MusicLibraryPanel(QWidget):
         right.addWidget(self.progress)
 
         self.list = QListWidget()
+        # ★ 歌曲封面（用户要求 2026-10-01）：每行左侧显示封面，且给足尺寸。
+        #   ⚠ 主线程只读缓存（`cover_cached`），缺图的交给后台 `CoverBackfillWorker`。
+        self.list.setIconSize(QSize(COVER_ICON, COVER_ICON))
+        self.list.setSpacing(1)
+        self._cover_job = None
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
         right.addWidget(self.list, 1)
@@ -1170,6 +1317,7 @@ class MusicLibraryPanel(QWidget):
                 rows.sort(key=lambda r: (self._sort_key(sk, meta)(r[0]),
                                          order.get(r[0], 0)))
             self.list.clear()
+            need_cover = []
             for p, bpm, dur, exists in rows:
                 m = meta.get(p) or {}
                 genres = "、".join(m.get("genres") or []) or T("未分析")
@@ -1185,7 +1333,7 @@ class MusicLibraryPanel(QWidget):
                     bits.append(T("文件缺失"))
                 txt = "%s    →    %s    (%s)  ｜ %s" % (
                     os.path.basename(p), genres, src, " ｜ ".join(bits))
-                it = QListWidgetItem(txt)
+                it = QListWidgetItem(cover_icon_for(m, p, COVER_ICON, need_cover), txt)
                 it.setData(Qt.UserRole, p)
                 if not exists:
                     it.setForeground(QColor("#e06666"))
@@ -1194,8 +1342,42 @@ class MusicLibraryPanel(QWidget):
             self.lbl.setText(Tf("共 {} 首，已分析 {} 首（当前显示 {} 首）",
                                 len(lib), done, len(rows)))
             self.lbl_filter.setText(Tf("筛选后 {} / {} 首", len(rows), len(lib)))
+            # 缺封面 ⇒ 起一次后台补图，补完再刷一遍（不阻塞、不重复起）
+            self._start_cover_backfill(need_cover)
         except Exception:                                          # noqa: BLE001
             pass
+
+    def _start_cover_backfill(self, paths):
+        """后台补封面（串行、可中断）。⚠ 已经在跑就不重复起。"""
+        try:
+            if not paths:
+                return
+            job = self._cover_job
+            if job is not None and job.isRunning():
+                return
+            w = CoverBackfillWorker(paths, self)
+            w.done.connect(self._on_cover_done)
+            self._cover_job = w
+            w.start()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _on_cover_done(self, n):
+        """补图完成 → 刷新列表（封面从缓存里读，主线程不做提取）。"""
+        try:
+            if n > 0:
+                self.refresh()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def closeEvent(self, ev):
+        try:
+            if self._cover_job is not None and self._cover_job.isRunning():
+                self._cover_job.stop()
+                self._cover_job.wait(1500)
+        except Exception:                                          # noqa: BLE001
+            pass
+        super().closeEvent(ev)
 
     def _ctx_menu(self, pos):
         it = self.list.itemAt(pos)
@@ -2584,7 +2766,7 @@ class AudioSourceDialog(I18nDialog):
         self.main = main
         self.setWindowTitle("音源设置")
         self.setMinimumWidth(460)
-        self._devs = {"system": [], "mic": []}
+        self._devs = {"system": [], "mic": [], "asio": []}
         self._scanner = None
 
         lay = QVBoxLayout(self)
@@ -2592,6 +2774,28 @@ class AudioSourceDialog(I18nDialog):
         g.addWidget(QLabel("音源类型"), 0, 0)
         self.source = QComboBox()
         self.source.addItems(["系统声音（WASAPI Loopback）", "麦克风", "线路输入/声卡"])
+        # ★ ASIO（低延迟）：本机没有注册任何 ASIO 驱动时**加进去但不让选**，
+        #   并把原因写进 tooltip —— 比"菜单里干脆没有这一项"更容易解释清楚。
+        self._asio_ok, self._asio_why = False, ""
+        try:
+            import asio_engine
+            self._asio_ok, self._asio_why = asio_engine.available()
+        except Exception as e:                                 # noqa: BLE001
+            self._asio_why = str(e)
+        self.source.addItem("ASIO（低延迟）")
+        self._asio_idx = 3
+        if not self._asio_ok:
+            try:
+                self.source.model().item(self._asio_idx).setEnabled(False)
+            except Exception:                                  # noqa: BLE001
+                pass
+            self.source.setItemData(self._asio_idx,
+                                    T("不可用：") + (self._asio_why or ""), Qt.ToolTipRole)
+        else:
+            self.source.setItemData(self._asio_idx, T(
+                "绕过系统混音器直连声卡驱动，延迟 1~10ms。"
+                "⚠ 同一驱动同时只允许一个程序使用 —— VirtualDJ / DAW 占着时会连不上，"
+                "此时会自动回退到系统声音。"), Qt.ToolTipRole)
         g.addWidget(self.source, 0, 1, 1, 2)
 
         g.addWidget(QLabel("设备"), 1, 0)
@@ -2668,10 +2872,10 @@ class AudioSourceDialog(I18nDialog):
         self.scan_devices()
 
     # ---- 配置载入/应用 ----
-    SOURCE_KEYS = ("system", "mic", "mic")   # 下拉索引 → 设备类别（线路输入并入 mic）
+    SOURCE_KEYS = ("system", "mic", "mic", "asio")   # 下拉索引 → 设备类别（线路输入并入 mic；索引 3 = ASIO）
 
     def _src_key(self):
-        return self.SOURCE_KEYS[max(0, min(2, self.source.currentIndex()))]
+        return self.SOURCE_KEYS[max(0, min(3, self.source.currentIndex()))]
 
     def _remembered_dev(self):
         """本音源类型上次使用的设备 → (设备名, 是否已被「应用」确认过)。
@@ -2689,14 +2893,14 @@ class AudioSourceDialog(I18nDialog):
         legacy = a.get("device_name") or ""
         if not legacy:
             return "", False
-        cfg_idx = {"system": 0, "mic": 1, "linein": 2}.get(a.get("source_type", "system"), 0)
+        cfg_idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3}.get(a.get("source_type", "system"), 0)
         if self.SOURCE_KEYS[cfg_idx] == kind:
             return legacy, False     # 可能是本类型，但没确认过 → 静默处理
         return "", False
 
     def _load_from_cfg(self):
         a = self.main.cfg["audio"]
-        idx = {"system": 0, "mic": 1, "linein": 2}.get(a.get("source_type", "system"), 0)
+        idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3}.get(a.get("source_type", "system"), 0)
         self.source.blockSignals(True)      # 载入配置不触发「类型变化 → 重扫」
         self.source.setCurrentIndex(idx)
         self.source.blockSignals(False)
@@ -2742,7 +2946,7 @@ class AudioSourceDialog(I18nDialog):
 
     def _fill_devices(self, devs=None):
         if devs is not None:
-            self._devs = devs if "error" not in devs else {"system": [], "mic": []}
+            self._devs = devs if "error" not in devs else {"system": [], "mic": [], "asio": []}
         kind = self._src_key()
         items = self._devs.get(kind, [])
         self.device.blockSignals(True)
@@ -2798,16 +3002,26 @@ class AudioSourceDialog(I18nDialog):
 
     def _on_source_changed(self, _i=0):
         """切换音源类型：立刻按缓存填充，同时后台重新扫描设备列表。"""
+        # ASIO 的采样率是**驱动全局**的（改了会影响同一驱动的其它客户端，比如 VDJ），
+        # 我们始终沿用驱动当前值 ⇒ 选 ASIO 时把采样率下拉灰掉，免得用户白设。
+        try:
+            self.rate.setEnabled(self._src_key() != "asio")
+        except Exception:                                          # noqa: BLE001
+            pass
         self._fill_devices()
         self.scan_devices()
 
     def apply(self):
-        t = self.SOURCE_KEYS[max(0, min(2, self.source.currentIndex()))]
+        t = self.SOURCE_KEYS[max(0, min(3, self.source.currentIndex()))]
         dev = (self.device.currentText() or "").strip()
         # 占位文本（扫描中／未找到设备）不能当设备名保存
         if dev.startswith(("（", "(")) or dev in ("正在扫描…", T("正在扫描…"), "Scanning…"):
             dev = ""
         sr = [0, 44100, 48000, 96000][max(0, self.rate.currentIndex())]
+        if t == "asio":
+            # ⚠ ASIO 的采样率是**驱动全局**的，改了会连带影响 VirtualDJ / DAW 那一边，
+            #   所以我们永远沿用驱动当前值（原生侧传 sr=0）⇒ 这里强制归零。
+            sr = 0
         mono = self.chk_mono.isChecked()
         # 按音源类型分别记住设备：切回该类型时能自动选中，
         # 且「设备掉线」提示不会把别的类型的设备名拿来误报。

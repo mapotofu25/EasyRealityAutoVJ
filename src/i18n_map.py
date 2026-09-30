@@ -903,6 +903,20 @@ ZH2EN = {
     "共 {} 首，已分析 {} 首（当前显示 {} 首）":
         "{} tracks, {} analysed (showing {})",
     "筛选后 {} / {} 首": "Filtered: {} / {}",
+    # ==================== ASIO 低延迟输入 ====================
+    "ASIO（低延迟）": "ASIO (low latency)",
+    "不可用：": "Unavailable: ",
+    "绕过系统混音器直连声卡驱动，延迟 1~10ms。"
+    "⚠ 同一驱动同时只允许一个程序使用 —— VirtualDJ / DAW 占着时会连不上，"
+    "此时会自动回退到系统声音。":
+        "Bypasses the system mixer and talks straight to the sound-card driver, "
+        "latency 1-10 ms. "
+        "⚠ A driver can only be used by one program at a time — if VirtualDJ or a DAW "
+        "holds it, ASIO cannot connect and the app falls back to system sound automatically.",
+    # ==================== 曲风映射编辑器 ====================
+    "让这个曲风不再映射到任何画面标签（保存后生效；自定义曲风同时从大类里移除）":
+        "Make this genre map to no visual tags (applies after saving; a custom genre "
+        "is also removed from its family)",
 }
 
 
