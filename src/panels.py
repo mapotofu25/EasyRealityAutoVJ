@@ -33,7 +33,10 @@ import theme
 CLIP_MIME = "application/x-autovj-media"
 HEADER_W = 456          # 图层头列宽
 LIB_THUMB_SIZES = [(96, 54, 112, 82), (160, 90, 178, 138), (240, 135, 262, 194)]
-COVER_ICON = 64         # 曲库列表每行左侧的歌曲封面边长（px）
+COVER_ICON = 64         # 曲库列表每行左侧的歌曲封面边长默认值（px）
+# 封面尺寸档位（右键「封面大小」里选）。⚠ 值要在下面的 COVER_SIZES 里唯一，
+#   因为它同时是配置里存的值 —— 改档位就是要让老的配置能对上（对不上回退默认）。
+COVER_SIZES = [("小", 40), ("中", 64), ("大", 96), ("特大", 128)]
 
 
 class I18nDialog(QDialog):
@@ -1218,7 +1221,9 @@ class MusicLibraryPanel(QWidget):
         self.list = QListWidget()
         # ★ 歌曲封面（用户要求 2026-10-01）：每行左侧显示封面，且给足尺寸。
         #   ⚠ 主线程只读缓存（`cover_cached`），缺图的交给后台 `CoverBackfillWorker`。
-        self.list.setIconSize(QSize(COVER_ICON, COVER_ICON))
+        # 封面尺寸：从配置恢复（老配置里没有/值不合法都回退默认档）
+        self.cover_size = self._load_cover_size()
+        self.list.setIconSize(QSize(self.cover_size, self.cover_size))
         self.list.setSpacing(1)
         self._cover_job = None
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1333,7 +1338,8 @@ class MusicLibraryPanel(QWidget):
                     bits.append(T("文件缺失"))
                 txt = "%s    →    %s    (%s)  ｜ %s" % (
                     os.path.basename(p), genres, src, " ｜ ".join(bits))
-                it = QListWidgetItem(cover_icon_for(m, p, COVER_ICON, need_cover), txt)
+                it = QListWidgetItem(
+                    cover_icon_for(m, p, self.cover_size, need_cover), txt)
                 it.setData(Qt.UserRole, p)
                 if not exists:
                     it.setForeground(QColor("#e06666"))
@@ -1379,6 +1385,38 @@ class MusicLibraryPanel(QWidget):
             pass
         super().closeEvent(ev)
 
+    # ---------------- 封面大小（右键菜单，用户 2026-10-01 要求）----------------
+    def _load_cover_size(self):
+        """从配置读封面尺寸；非法/缺失一律回退默认档。"""
+        try:
+            v = int(self.main.cfg["ui"].get("music_cover_size", COVER_ICON) or COVER_ICON)
+        except Exception:                                          # noqa: BLE001
+            v = COVER_ICON
+        allowed = [px for _lbl, px in COVER_SIZES]
+        return v if v in allowed else COVER_ICON
+
+    def set_cover_size(self, px):
+        """设置封面尺寸：立即生效 + 记住。⚠ 缩略图缓存按尺寸分文件（见 music_cover），
+        所以换尺寸只是换读哪一批缓存，**不会重新解码**（列表先显示占位图，
+        后台补图线程会按新尺寸补出来）。"""
+        try:
+            px = int(px)
+        except Exception:                                          # noqa: BLE001
+            return
+        if px == self.cover_size:
+            return
+        self.cover_size = px
+        try:
+            self.list.setIconSize(QSize(px, px))
+        except Exception:                                          # noqa: BLE001
+            pass
+        try:
+            self.main.cfg["ui"]["music_cover_size"] = px
+            self.main.cfg.save()
+        except Exception:                                          # noqa: BLE001
+            pass
+        self.refresh()
+
     def _ctx_menu(self, pos):
         it = self.list.itemAt(pos)
         if it is None:
@@ -1388,6 +1426,17 @@ class MusicLibraryPanel(QWidget):
         edit = menu.addAction(T("纠正曲风…"))
         rescan = menu.addAction(T("重新分析扫描此曲目"))
         info = menu.addAction(T("此曲目信息"))
+        menu.addSeparator()
+        # ★ 封面大小（用户要求）：放子菜单里，当前档位打勾。
+        #   为什么不做成"拖拽缩放"：曲库是**演出前整理**用的，这里要的是
+        #   "一次调好、记住"，不需要连续微调；子菜单也最不容易误触。
+        sub = menu.addMenu(T("封面大小"))
+        cur = self.cover_size
+        for lbl, px in COVER_SIZES:
+            act = sub.addAction("%s (%d px)" % (T(lbl), px))
+            act.setCheckable(True)
+            act.setChecked(px == cur)
+            act.triggered.connect(lambda _c=False, v=px: self.set_cover_size(v))
         menu.addSeparator()
         rm = menu.addAction(theme.danger_icon(), T("从曲库移除"))
         i18n_retranslate(menu)      # 临时菜单：弹出前刷语言
@@ -2768,6 +2817,7 @@ class AudioSourceDialog(I18nDialog):
         self.setMinimumWidth(460)
         self._devs = {"system": [], "mic": [], "asio": []}
         self._scanner = None
+        self._scanning = False      # 重入守卫：扫描进行中（结构上防止信号重入 ⇒ 栈溢出）
 
         lay = QVBoxLayout(self)
         g = QGridLayout()
@@ -2805,6 +2855,8 @@ class AudioSourceDialog(I18nDialog):
         self.btn_rescan = QPushButton("重新扫描")
         self.btn_rescan.clicked.connect(self.scan_devices)
         g.addWidget(self.btn_rescan, 1, 2)
+        # 换驱动 ⇒ 重新取该驱动的输入通道名（只有 ASIO 需要）
+        self.device.currentIndexChanged.connect(self._on_device_changed)
 
         g.addWidget(QLabel("采样率"), 2, 0)
         self.rate = QComboBox()
@@ -2815,6 +2867,26 @@ class AudioSourceDialog(I18nDialog):
         self.chk_mono = QCheckBox("单声道分析")
         self.chk_mono.setToolTip("只取左声道做分析。不省 CPU，作用是在左右声道反相时避免低频被平均抵消")
         g.addWidget(self.chk_mono, 3, 0, 1, 3)
+
+        # ★ ASIO 输入通道（用户问「ASIO 能采集指定输出吗」）——
+        #   事实：ASIO **没有 loopback 概念**，抓不到别的程序播出来的声音，
+        #   它能做的是选**硬件输入通道**。但有些驱动的输入里**自带 Loopback 通道**
+        #   （名字里带 Loopback 之类），把通道名列出来，用户才能选中那两路。
+        #   驱动被独占/装不上时列不出名字，就退回按**序号**选（照样能用）。
+        self.lbl_ch = QLabel("输入通道")
+        self.cb_ch0 = QComboBox()
+        self.cb_ch1 = QComboBox()
+        for cb in (self.cb_ch0, self.cb_ch1):
+            cb.setMinimumWidth(120)
+        g.addWidget(self.lbl_ch, 4, 0)
+        g.addWidget(self.cb_ch0, 4, 1)
+        g.addWidget(self.cb_ch1, 4, 2)
+
+        self.lbl_ch_hint = QLabel("")
+        self.lbl_ch_hint.setWordWrap(True)
+        self.lbl_ch_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
+        g.addWidget(self.lbl_ch_hint, 5, 0, 1, 3)
+        self._asio_ch = []          # 当前驱动的输入通道列表
         lay.addLayout(g)
 
         # 电平表（黑底电平槽在亮色下也保持深底——电平色条对比度需要）
@@ -2877,6 +2949,46 @@ class AudioSourceDialog(I18nDialog):
     def _src_key(self):
         return self.SOURCE_KEYS[max(0, min(3, self.source.currentIndex()))]
 
+    # ---------------- ASIO 输入通道 ----------------
+    def _ensure_ch_items(self, chs=None, err=""):
+        """填充「输入通道」两个下拉。
+
+        chs：`asio_engine.list_channels()` 的结果（可能为空 = 列不出名字）。
+        ⚠ 列不出名字**不是错误**（驱动被 VirtualDJ 占着就会这样）——
+          这时退回"按序号选"，ASIO 照样能用，只是用户不知道每路是什么。
+        """
+        chs = list(chs or [])
+        self._asio_ch = chs
+        cfg0 = int(self.main.cfg["audio"].get("asio_ch0", 0) or 0)
+        cfg1 = int(self.main.cfg["audio"].get("asio_ch1", 1) or 1)
+        for cb, cur in ((self.cb_ch0, cfg0), (self.cb_ch1, cfg1)):
+            cb.blockSignals(True)
+            cb.clear()
+            if chs:
+                for c in chs:
+                    label = "%d: %s" % (c["index"] + 1, c["name"] or ("输入 %d" % (c["index"] + 1)))
+                    cb.addItem(label, c["index"])
+            else:
+                for i in range(8):        # 退路：按序号，最多给 8 路
+                    cb.addItem("%d" % (i + 1), i)
+            idx = cb.findData(cur)
+            cb.setCurrentIndex(idx if idx >= 0 else min(cur, cb.count() - 1))
+            cb.blockSignals(False)
+        if chs:
+            names = "、".join(c["name"] or ("输入 %d" % (c["index"] + 1)) for c in chs[:4])
+            self.lbl_ch_hint.setText(Tf(
+                "该驱动有 {} 路输入：{}。选你要采的那两路。", len(chs), names))
+        else:
+            why = ("；" + err) if err else ""
+            self.lbl_ch_hint.setText(T("读不到通道名（驱动可能正被别的程序占用）"
+                                       "，这里按序号选即可。") + why)
+
+    def _sync_ch_visible(self):
+        """「输入通道」只在音源 = ASIO 时显示（其它音源固定双声道，没有可选的）。"""
+        is_asio = self._src_key() == "asio"
+        for w in (self.lbl_ch, self.cb_ch0, self.cb_ch1, self.lbl_ch_hint):
+            w.setVisible(is_asio)
+
     def _remembered_dev(self):
         """本音源类型上次使用的设备 → (设备名, 是否已被「应用」确认过)。
 
@@ -2911,31 +3023,78 @@ class AudioSourceDialog(I18nDialog):
         #   配置键 audio.gain 保留只为兼容旧配置，不再读取。
         self.chk_mono.setChecked(bool(a.get("mono", True)))
         self._want_dev = ""      # 由 _fill_devices 按当前音源类型去配置里取
+        self._sync_ch_visible()
+        try:
+            self._ensure_ch_items(None)     # 先按序号占位；扫描回来后会换成真名字
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def scan_devices(self):
         from PySide6.QtCore import QThread
-        if self._scanner and self._scanner.isRunning():
+        # ⚠ 重入守卫（结构性防御）：程序化重填下拉列表会在 Qt 里**同步**发信号，
+        #   若槽又回头调本方法就会无限递归 ⇒ 栈溢出（2026-10-01 真实阻断项）。
+        #   ① blockSignals 只堵住"当前这个"触发路径；这里再加显式标志，二者都要。
+        if self._scanning or (self._scanner is not None and self._scanner.isRunning()):
             return
-        self.device.clear()
-        self.device.addItem("正在扫描…")
+        self._scanning = True
+        try:
+            # ⚠ `clear()` / `addItem()` 会**同步**发 `currentIndexChanged` → 回
+            #   `_on_device_changed` → 音源==asio 时又调 `scan_devices()`；而此刻
+            #   `self._scanner` 还没重新赋值，旧的 `isRunning()` 守卫必然失效。
+            #   按 `_fill_devices` 的做法：列表重填期间 blockSignals。
+            _prev_blocked = self.device.blockSignals(True)
+            try:
+                self.device.clear()
+                # ★ 占位文本必须走 T()：否则英文界面下与 `apply()` 的守卫口径不一致，
+                #   扫描中误点「应用」会把"正在扫描…"当成设备名存进配置。
+                self.device.addItem(T("正在扫描…"))
+            finally:
+                self.device.blockSignals(_prev_blocked)
 
-        class _Scanner(QThread):
-            from PySide6.QtCore import Signal as _S
-            ready = _S(dict)
+            class _Scanner(QThread):
+                from PySide6.QtCore import Signal as _S
+                ready = _S(dict)
 
-            def __init__(self, audio, parent=None):
-                super().__init__(parent)
-                self.audio = audio
+                def __init__(self, audio, parent=None, kind="", driver=""):
+                    super().__init__(parent)
+                    self.audio = audio
+                    self.kind = kind
+                    self.driver = driver
 
-            def run(self):
-                try:
-                    self.ready.emit(self.audio.list_devices())
-                except Exception as e:
-                    self.ready.emit({"system": [], "mic": [], "error": str(e)})
+                def run(self):
+                    try:
+                        devs = self.audio.list_devices()
+                        # ★ 音源是 ASIO 时**顺带**把该驱动的输入通道名也取回来
+                        #   （跑在这条后台线程上，不卡界面；取不到就退回按序号选）
+                        if self.kind == "asio":
+                            try:
+                                import asio_engine
+                                chs, cerr = asio_engine.list_channels(self.driver)
+                                devs["asio_ch"] = chs
+                                devs["asio_ch_err"] = cerr
+                            except Exception as e:                     # noqa: BLE001
+                                devs["asio_ch"] = []
+                                devs["asio_ch_err"] = str(e)
+                        self.ready.emit(devs)
+                    except Exception as e:
+                        self.ready.emit({"system": [], "mic": [], "asio": [], "error": str(e)})
 
-        self._scanner = _Scanner(self.main.audio, self)
-        self._scanner.ready.connect(self._fill_devices)
-        self._scanner.start()
+            self._scanner = _Scanner(self.main.audio, self, self._src_key(),
+                                     (self.device.currentText() or "").strip())
+            self._scanner.ready.connect(self._fill_devices)
+            # ⚠ 兜底复位：线程结束就复位，绝不把 `_scanning` 留在 True（那会把之后
+            #   所有扫描永久挡死 ⇒ 界面永远停在"正在扫描…"，等于用一个新 bug 换旧的）。
+            #   `_fill_devices` 里还有一次复位（成功/失败都会走到）—— 两处独立出口，刻意冗余。
+            self._scanner.finished.connect(self._on_scan_finished)
+            self._scanner.start()
+        except Exception:
+            # 中途抛异常（含 start 失败）：复位后原样抛出，不留僵标志
+            self._scanning = False
+            raise
+
+    def _on_scan_finished(self):
+        """扫描线程结束（`finished` 信号）⇒ 兜底复位重入标志（见 `scan_devices`）。"""
+        self._scanning = False
 
     def _actual_dev(self):
         """当前**实际在用**的采集设备名（设备被拔掉后用它兜底选中）"""
@@ -2945,8 +3104,13 @@ class AudioSourceDialog(I18nDialog):
             return ""
 
     def _fill_devices(self, devs=None):
+        # 扫描结果回来了（成功/失败都会发 ready）⇒ 复位重入标志（`scan_devices` 的第二条出口）
+        self._scanning = False
         if devs is not None:
             self._devs = devs if "error" not in devs else {"system": [], "mic": [], "asio": []}
+        # ASIO 输入通道（只有 ASIO 音源才有这一步）
+        if self._src_key() == "asio" and devs is not None and "asio_ch" in devs:
+            self._ensure_ch_items(devs.get("asio_ch"), devs.get("asio_ch_err") or "")
         kind = self._src_key()
         items = self._devs.get(kind, [])
         self.device.blockSignals(True)
@@ -3008,7 +3172,14 @@ class AudioSourceDialog(I18nDialog):
             self.rate.setEnabled(self._src_key() != "asio")
         except Exception:                                          # noqa: BLE001
             pass
+        self._sync_ch_visible()
         self._fill_devices()
+        self.scan_devices()
+
+    def _on_device_changed(self, _i=0):
+        """换了设备/驱动 ⇒ ASIO 的话重新取一遍输入通道名。"""
+        if self._src_key() != "asio":
+            return
         self.scan_devices()
 
     def apply(self):
@@ -3030,7 +3201,16 @@ class AudioSourceDialog(I18nDialog):
         dbs[t] = dev
         a["device_by_source"] = dbs
         a["device_name"] = dev          # 与 source_type 配对，引擎启动时读它
-        self.main.apply_audio_settings(t, dev, sr, mono)
+        if t == "asio":
+            # ASIO 的"用哪两路输入"也存下来（默认 0/1 = 前两路）
+            try:
+                a["asio_ch0"] = int(self.cb_ch0.currentData() or 0)
+                a["asio_ch1"] = int(self.cb_ch1.currentData() or 1)
+            except Exception:                                      # noqa: BLE001
+                a["asio_ch0"], a["asio_ch1"] = 0, 1
+        self.main.apply_audio_settings(t, dev, sr, mono,
+                                        int(a.get("asio_ch0", 0) or 0),
+                                        int(a.get("asio_ch1", 1) or 1))
         self._want_dev = dev
         self.accept()
 

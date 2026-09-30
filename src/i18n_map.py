@@ -913,6 +913,19 @@ ZH2EN = {
         "latency 1-10 ms. "
         "⚠ A driver can only be used by one program at a time — if VirtualDJ or a DAW "
         "holds it, ASIO cannot connect and the app falls back to system sound automatically.",
+    # ==================== 曲库封面大小 ====================
+    "封面大小": "Cover size",
+    "小": "Small",
+    "中": "Medium",
+    "大": "Large",
+    "特大": "Extra large",
+    # ==================== ASIO 输入通道 ====================
+    "输入通道": "Input channels",
+    "该驱动有 {} 路输入：{}。选你要采的那两路。":
+        "This driver has {} input(s): {}. Pick the two you want to capture.",
+    "读不到通道名（驱动可能正被别的程序占用），这里按序号选即可。":
+        "Channel names are unavailable (the driver may be held by another program); "
+        "pick by number instead.",
     # ==================== 曲风映射编辑器 ====================
     "让这个曲风不再映射到任何画面标签（保存后生效；自定义曲风同时从大类里移除）":
         "Make this genre map to no visual tags (applies after saving; a custom genre "

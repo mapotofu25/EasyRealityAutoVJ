@@ -1260,7 +1260,8 @@ class AudioEngine:
         return result or {"system": [], "mic": [], "asio": []}
 
     # ---------------- 采集生命周期 ----------------
-    def start(self, source_type="system", device_name="", mono=True, sr=48000):
+    def start(self, source_type="system", device_name="", mono=True, sr=48000,
+              ch0=0, ch1=1):
         """切换设备/重启采集。用代际编号替代共享停止标志：
         旧实现 stop() 后立刻 clear()，采集循环（约21ms检查一次）可能没看到停止标志，
         导致新任务永远排队、设备切不过去（一直采集最初选的设备）。"""
@@ -1268,7 +1269,8 @@ class AudioEngine:
         gen = self._gen
         with self.state.lock:
             self.state.running = False
-        self._submit(lambda sc: self._run(sc, source_type, device_name, mono, sr, gen))
+        self._submit(lambda sc: self._run(sc, source_type, device_name, mono, sr, gen,
+                                          ch0, ch1))
 
     def stop(self):
         self._gen += 1                      # 当前采集在下次检查时退出
@@ -1401,7 +1403,7 @@ class AudioEngine:
                 pass
 
     # ---------------- 采集（运行在音频线程） ----------------
-    def _run_asio(self, st, device_name, mono, sr, gen):
+    def _run_asio(self, st, device_name, mono, sr, gen, ch0=0, ch1=1):
         """ASIO 采集。**跑完返回 None**；打不开则返回错误原因（由 `_run` 负责回退）。
 
         ★ 复用 `_capture_loop`：ASIO 侧只提供一个「soundcard recorder 形状」的适配器
@@ -1421,14 +1423,19 @@ class AudioEngine:
         drv = (device_name or "")
         if drv.startswith("ASIO: "):
             drv = drv[6:].strip()
-        cap = asio_engine.AsioCapture(drv or None, sr=0.0)
+        # 用哪两路输入（用户可在「音源 → 输入通道」里改；默认前两路）
+        try:
+            ch0, ch1 = int(ch0), int(ch1)
+        except Exception:                                          # noqa: BLE001
+            ch0, ch1 = 0, 1
+        cap = asio_engine.AsioCapture(drv or None, sr=0.0, ch0=ch0, ch1=ch1)
         ok, err = cap.open()
         if not ok:
             return err
         self._asio_cap = cap
         sr_use = cap.sample_rate or 48000
-        info = "%s ｜ %d Hz ｜ 缓冲 %d 帧(%.1f ms) ｜ 输入延迟 %.1f ms" % (
-            cap.driver, sr_use, cap.buffer_frames,
+        info = "%s ｜ 通道 %d/%d ｜ %d Hz ｜ 缓冲 %d 帧(%.1f ms) ｜ 输入延迟 %.1f ms" % (
+            cap.driver, ch0 + 1, ch1 + 1, sr_use, cap.buffer_frames,
             cap.buffer_frames * 1000.0 / sr_use, cap.latency_ms())
         with st.lock:
             st.asio_active = True
@@ -1454,7 +1461,7 @@ class AudioEngine:
                 st.asio_active = False
         return None
 
-    def _run(self, sc, source_type, device_name, mono, sr, gen):
+    def _run(self, sc, source_type, device_name, mono, sr, gen, ch0=0, ch1=1):
         st = self.state
         # ---- ASIO 低延迟输入：**独立分支**，不碰 soundcard ----
         # ⚠ 失败必须优雅回退：ASIO 是**单客户端独占**的，VirtualDJ / DAW 占着就一定开不了，
@@ -1462,7 +1469,7 @@ class AudioEngine:
         if source_type == "asio":
             err = None
             try:
-                err = self._run_asio(st, device_name, mono, sr, gen)
+                err = self._run_asio(st, device_name, mono, sr, gen, ch0, ch1)
             except Exception as e:                             # noqa: BLE001
                 err = "%s: %s" % (type(e).__name__, e)
             if err is None:

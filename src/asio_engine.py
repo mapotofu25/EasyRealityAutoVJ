@@ -108,6 +108,10 @@ def _load():
             d.avj_asio_close.restype = ctypes.c_int
             d.avj_asio_latency_frames.argtypes = [ctypes.POINTER(ctypes.c_int),
                                                   ctypes.POINTER(ctypes.c_int)]
+            d.avj_asio_channel_info.argtypes = [
+                ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+            d.avj_asio_channel_info.restype = ctypes.c_int
             d.avj_asio_debug.argtypes = [ctypes.c_char_p, ctypes.c_int]
             d.avj_asio_debug.restype = ctypes.c_int
             _dll = d
@@ -145,6 +149,49 @@ def list_drivers():
     except Exception:                                          # noqa: BLE001
         pass
     return out
+
+
+def list_channels(driver):
+    """列出某驱动可用的**输入通道**。
+
+    返回 (通道列表, 错误说明)。通道列表每项 `{"index": i, "name": str, "type": int}`；
+    失败（驱动被独占 / 装不上）返回 ([], 原因) —— 这时界面就让用户按**序号**选。
+
+    ★ 为什么要给用户看通道名（用户问「ASIO 能采集指定输出吗」）：
+      ASIO **抓不到别的程序播出来的声音**（没有 loopback 概念），它能做的是选**硬件输入**。
+      但有些驱动的输入里**自带 Loopback 通道**（名字里带 Loopback 之类），
+      把名字列出来，用户才能选中那两路 —— 这是"抓输出"在 ASIO 侧唯一可行的形式。
+    """
+    d = _load()
+    if not d:
+        return [], _dll_err
+    drv = driver or ""
+    if drv.startswith("ASIO: "):
+        drv = drv[6:].strip()
+    if not drv:
+        names = list_drivers()
+        if not names:
+            return [], "本机没有注册任何 ASIO 驱动"
+        drv = names[0]
+    nin = ctypes.c_int(0)
+    nout = ctypes.c_int(0)
+    buf = ctypes.create_string_buffer(16384)
+    rc = d.avj_asio_channel_info(drv.encode("mbcs"), ctypes.byref(nin),
+                                 ctypes.byref(nout), buf, 16384)
+    if rc != 0:
+        return [], (d.avj_asio_last_error() or b"").decode("utf-8", "replace") \
+            or ("错误码 %d" % rc)
+    out = []
+    # ⚠ 通道名是驱动给的 ANSI 原文 ⇒ 按 mbcs 解码（错误信息才是 UTF-8，两者不混）
+    for line in buf.value.decode("mbcs", "replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            out.append({"index": int(parts[0]), "name": parts[1], "type": int(parts[2])})
+        except Exception:                                          # noqa: BLE001
+            continue
+    return out, ""
 
 
 def debug_info():

@@ -2608,20 +2608,25 @@ class MainWindow(QMainWindow):
         if t == "linein":
             t = "mic"
         self.audio.start(t, dev, mono=bool(self.cfg["audio"].get("mono", True)),
-                         sr=int(self.cfg["audio"].get("sample_rate", 0) or 0))
+                         sr=int(self.cfg["audio"].get("sample_rate", 0) or 0),
+                         ch0=int(self.cfg["audio"].get("asio_ch0", 0) or 0),
+                         ch1=int(self.cfg["audio"].get("asio_ch1", 1) or 1))
         self.cfg["audio"].update({"source_type": t, "device_name": dev})
         self.cfg.save()
 
-    def apply_audio_settings(self, source_type, device, sr, mono):
+    def apply_audio_settings(self, source_type, device, sr, mono, ch0=0, ch1=1):
         """音源对话框应用：保存配置并重启采集
 
         ⚠ 原来的 `gain` 参数已去掉（2026-09-25）：那个滑块没接进分析链路，
         而且能量算法对整体增益免疫（实测 0.5~4x 完全无差别），留着只会误导。
         """
-        self.cfg["audio"].update({"source_type": source_type, "device_name": device,
-                                  "sample_rate": int(sr), "mono": bool(mono)})
+        upd = {"source_type": source_type, "device_name": device,
+               "sample_rate": int(sr), "mono": bool(mono)}
+        if source_type == "asio":
+            upd["asio_ch0"], upd["asio_ch1"] = int(ch0), int(ch1)
+        self.cfg["audio"].update(upd)
         self.cfg.save()
-        self.audio.start(source_type, device, mono=mono, sr=int(sr))
+        self.audio.start(source_type, device, mono=mono, sr=int(sr), ch0=ch0, ch1=ch1)
 
     def open_audio_dialog(self):
         AudioSourceDialog(self).exec()

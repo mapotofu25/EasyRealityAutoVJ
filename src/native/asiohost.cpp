@@ -579,6 +579,105 @@ extern "C" __declspec(dllexport) int avj_asio_close(void)
     return 0;
 }
 
+/* ---------------------------------------------------------------- 通道枚举 */
+/*
+ * 列出某驱动可用的**输入通道**（给界面选"用哪两路输入"用）。
+ *
+ * 为什么需要它（用户问「ASIO 能采集指定输出吗」）：
+ *   ASIO **没有 loopback 概念**，抓不到别的程序播出来的声音；它能做的是
+ *   **选硬件输入通道**。而有些驱动的输入里**自带 Loopback 通道**
+ *   （在通道名里体现，如 "Loopback 1/2"、RME 的 TotalMix 回环），
+ *   把名字列给用户看，他才能选中那两路 —— 这是"抓输出"唯一能在 ASIO 侧做到的形式。
+ *
+ * buf 每行一个通道：`序号\t名字\t类型码\n`（名字是驱动给的 **ANSI** 原文，
+ * 调用方按 mbcs 解码；错误信息另有 UTF-8 通道，两者不要混）。
+ * 返回 0 成功；负数见上面的错误码表（-2 找不到 / -3 装载失败 / -4 init 失败）。
+ */
+extern "C" __declspec(dllexport) int avj_asio_channel_info(const char* drv_name,
+                                                           int* out_nin, int* out_nout,
+                                                           char* buf, int cap)
+{
+    int i, n, found = -1, off = 0;
+    long nin = 0, nout = 0;
+    ASIODriverInfo info;
+    ASIOError e;
+    char names[AVJ_MAX_DRV][64];
+    char* ptrs[AVJ_MAX_DRV];
+    int com = 0;
+
+    if (buf && cap > 0) buf[0] = 0;
+    if (out_nin)  *out_nin = 0;
+    if (out_nout) *out_nout = 0;
+
+    if (!asioDrivers) asioDrivers = new AsioDrivers();
+    if (!asioDrivers) { set_err("无法创建 AsioDrivers"); return -3; }
+
+    {
+        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        com = (hr == S_OK || hr == S_FALSE) ? 1 : 0;
+    }
+
+    for (i = 0; i < AVJ_MAX_DRV; i++) ptrs[i] = names[i];
+    n = (int)asioDrivers->getDriverNames(ptrs, AVJ_MAX_DRV);
+    for (i = 0; i < n; i++) {
+        if (drv_name && strcmp(names[i], drv_name) == 0) { found = i; break; }
+    }
+    if (found < 0) {
+        set_err("找不到该 ASIO 驱动（本机共注册了 %d 个）", n);
+        if (com) CoUninitialize();
+        return -2;
+    }
+
+    if (!asioDrivers->loadDriver((char*)drv_name)) {
+        set_err("装载该 ASIO 驱动失败（多半被别的程序独占，此时列不出通道名）");
+        if (com) CoUninitialize();
+        return -3;
+    }
+
+    memset(&info, 0, sizeof(info));
+    e = ASIOInit(&info);
+    if (e != ASE_OK) {
+        set_err("ASIOInit 失败（码 %d）：%s", (int)e, info.errorMessage);
+        ASIOExit();
+        if (asioDrivers) asioDrivers->removeCurrentDriver();
+        if (com) CoUninitialize();
+        return -4;
+    }
+
+    ASIOGetChannels(&nin, &nout);
+    if (out_nin)  *out_nin = (int)nin;
+    if (out_nout) *out_nout = (int)nout;
+
+    if (buf && cap > 0) {
+        for (i = 0; i < nin; i++) {
+            ASIOChannelInfo ci;
+            int wrote;
+            memset(&ci, 0, sizeof(ci));
+            ci.channel = i;
+            ci.isInput = ASIOTrue;
+            ci.name[0] = 0;
+            ci.type = ASIOSTInt16LSB;
+            ASIOGetChannelInfo(&ci);
+            /* ci.name 是定长 char[32]，可能有未初始化尾巴 —— 先确保结尾有 0 */
+            ci.name[31] = 0;
+            wrote = snprintf(buf + off, (size_t)(cap - off), "%d\t%s\t%d\n",
+                             i, ci.name, (int)ci.type);
+            if (wrote <= 0 || wrote >= cap - off) break;
+            off += wrote;
+        }
+    }
+
+    ASIOExit();
+    asioDrivers->removeCurrentDriver();
+    if (com) CoUninitialize();
+    if (out_nin && *out_nin <= 0) {
+        set_err("该驱动没有输入通道");
+        return -5;
+    }
+    g_err[0] = 0;
+    return 0;
+}
+
 /* 打开驱动的控制面板（改缓冲大小等）。⚠ 播放中不能开 ⇒ 调用方要先 close。 */
 extern "C" __declspec(dllexport) int avj_asio_control_panel(void)
 {

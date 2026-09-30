@@ -77,6 +77,11 @@ DEFAULTS = {
         "mono": True,
         "sample_rate": 0,              # 0=自动（跟随设备原生采样率，避免重采样；推荐）
         "gain": 1.0,                # 已废弃（2026-09-25 移除增益滑块）：保留只为兼容旧配置
+        # ASIO 用哪两路**输入通道**（0 基）。⚠ ASIO 抓不到别的程序播出来的声音
+        # （没有 loopback 概念），只能选硬件输入；有些驱动的输入自带 Loopback 通道，
+        # 名字会在「音源 → 输入通道」里列出来供选（见 panels.AudioSourceDialog）。
+        "asio_ch0": 0,
+        "asio_ch1": 1,
     },
     "auto": {
         "intensity": 1,               # 0 低 / 1 中 / 2 高 / 3 极高（画面振幅强度，影响脉冲缩放）
@@ -157,6 +162,8 @@ DEFAULTS = {
     },
     "ui": {
         "thumb_size": 1,              # 素材库预览大小：0 小 / 1 中 / 2 大
+        # 曲库列表每行的歌曲封面边长（px）：右键「封面大小」里改，见 panels.COVER_SIZES
+        "music_cover_size": 64,
         "hud": True,                  # 预览区 HUD 浮层
         "next_preview": True,         # 预览区"下一个素材"预看
         # 主界面预览画面（**只影响主界面**，输出窗口 / Spout / NDI 完全不受影响）

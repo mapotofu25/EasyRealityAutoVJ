@@ -32,6 +32,18 @@ from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
 
 _LOCK_TIMEOUT = 2.0     # GUI 入口等引擎锁的上限（正常等一帧 <50ms，2 秒已极宽容）
 
+# 卡帧看门狗熔断参数（2026-10-01 现场卡死事故后加，见 `_heal_stalled`）：
+#   旧实现每个 tick 都可能同步重建解码器（开容器 = I/O + 起线程），一旦判据误判
+#   就是"重建风暴"⇒ tick 速率崩塌 ⇒ 卡死。下面三条是硬限流，宁可少救也不能失控。
+_HEAL_CLIP_COOLDOWN = 5.0     # 同一 (图层, 素材) 两次自动重建的最小间隔（秒）
+_HEAL_MAX_PER_CLIP = 3        # 同一素材累计自动重建次数上限（到顶后放弃，换素材重置）
+_HEAL_GLOBAL_INTERVAL = 2.0   # 全局：每这么久最多自动重建 1 次（秒）
+# 健康素材的看门狗**检查**节流：冷却闸门只在"重建过"后才闸得住，健康素材从不重建 ⇒
+# 旧实现每 tick 都会走到 `stalled()`（QA 实测 30s@20Hz = 600 次）。这里每图层最多每
+# `_HEAL_CHECK_INTERVAL` 秒检查一次（20Hz 下 ≈ 2Hz），把热路径代价压下来。它只限检查频率，
+# **不是**冷却 —— 换素材时**不需要**重置（重置只会让换素材瞬间多放行一次，无意义）。
+_HEAL_CHECK_INTERVAL = 0.5
+
 
 def _locked(fn):
     """GUI 线程入口调用与 worker 线程主循环串行化（引擎已 moveToThread）。
@@ -235,6 +247,12 @@ class Layer:
         self.last_switch_t = 0.0
         self.recent = []         # 防重复队列
         self.cache = {}          # path -> player（解码器复用缓存，LRU 上限 8）
+        # 卡帧看门狗熔断状态（挂在图层上，避免每 tick 构造 dict 做 key；见 `_heal_stalled`）
+        self._heal_path = None   # 当前冷却/计数对应的素材 path（换素材即重置）
+        self._heal_last_t = 0.0  # 上次自动重建该素材的时刻
+        self._heal_count = 0     # 该素材累计自动重建次数
+        self._heal_gave_up = False  # 已到上限：换素材前不再自动重建
+        self._heal_next_t = 0.0  # 下次允许"检查"（调 stalled()）的时刻（健康素材节流）
         # 预热（切素材零延迟）：切换后延迟一会儿把「下一个要用的素材」的容器打开+首帧解出来。
         # 不预热的话切换瞬间新解码器还要 70~690ms 才有首帧（= 用户看到的"卡几帧"）。
         self.pre_idx = -1        # 预选的下一个素材索引
@@ -368,6 +386,8 @@ class AutoVJEngine(QObject):
         self._flicker_latch = {}   # 「随机休眠」模式下当前素材的休眠决定（换素材才重掷）
         # 引擎主循环移入独立线程后，用锁串行化 GUI 线程的少量入口调用
         self._tick_lock = threading.RLock()
+        # 卡帧看门狗全局限流：上次自动重建的时刻（见 `_heal_stalled`）
+        self._heal_last_global_t = 0.0
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
@@ -1587,47 +1607,127 @@ class AutoVJEngine(QObject):
         ⚠ 三处不能误杀：
           ① 图层不可见；
           ② 播放器不在活跃状态（静音暂停 / 预热挂起本来就该不出帧）；
-          ③ 从未出过帧的对象由 `stalled()` 自身给 4 倍宽限（冷启动最坏 690ms）。
+          ③ **从未出过帧**（`_frames == 0`）的对象根本不是"冻在某一帧"。
+
+        ⚠⚠ 2026-10-01 现场卡死事故（本函数失控是根因）：
+          旧实现只要 `stalled()` 为真就**每个 tick 都同步重建**（在持有 `_tick_lock`
+          的渲染线程里开容器 + 探测 alpha/缩略图 ⇒ 持续 I/O 与线程创建风暴）。而旧判据
+          在 `_last_t == 0`（从未出帧）时只要对象创建超过 `_STALL_SECS*4`(=6s) 就返回真 ——
+          于是"一直解不出首帧"的素材被**无限重建**：现场日志 90 秒里重建 70+ 次、
+          同一个素材反复复现 ⇒ tick 速率崩塌 ⇒ 自动切换停摆、音频/界面饿死 ⇒ 卡死。
+          现在两道保险：
+            · 判据：只对**出过帧**（`_frames > 0`）的对象判卡帧；从未出帧的交给
+              `_ended` + `_get_player` 的健康校验处理；
+            · 熔断式硬限流：每 (图层, 素材) 冷却 `_HEAL_CLIP_COOLDOWN` 秒、同素材累计
+              `_HEAL_MAX_PER_CLIP` 次后彻底放弃（换素材重置）、全局每
+              `_HEAL_GLOBAL_INTERVAL` 秒最多重建 1 次、`running` 为假时绝不自动重建；
+            · 健康素材**检查**节流：每图层最多每 `_HEAL_CHECK_INTERVAL` 秒调一次
+              `stalled()`（QA 实测：旧实现健康素材每 tick 都调，20Hz 下 30s=600 次）；
+            · 廉价健康快路：最近 `_STALL_SECS` 内还产过帧的直接放过（连 `stalled()`
+              都不调）⇒ 真实健康素材热路径调用次数 = 0。
         """
         p = lay.player
         if p is None or not hasattr(p, "stalled"):
             return
+        # ★ 判据修正：从未出过帧 ⇔ 不是"冻在某帧"。这类对象交给 `_ended` / `_get_player`
+        #   健康校验处理，热路径**不**为它做任何事（省掉 stalled() 调用与后续重建 I/O）。
+        if getattr(p, "_frames", 0) <= 0:
+            return
+        # 预览/停止态（未点「开始」）不做自动重建：避免空跑时I/O抖动。
+        if not self.running:
+            return
+        now = time.perf_counter()
+        # ★ 廉价健康快路：走到这里必然出过帧（上面已排除 `_frames<=0`），若最近
+        #   `_STALL_SECS` 内还产过帧（`_mark_frame()` 会更新 `_last_t`）⇒ 明显健康，
+        #   直接放过，**连 stalled() 都不用调**（真实健康素材热路径调用次数 = 0）。
+        last = getattr(p, "_last_t", 0.0)
+        if last and (now - last) <= _STALL_SECS:
+            return
+        # ★ 健康素材的检查节流（QA 实测偏差）：冷却闸门只在"重建过"后才闸得住，
+        #   而健康素材从不重建 ⇒ `_heal_last_t` 恒为 0 ⇒ 每 tick 都会走到 stalled()。
+        #   这里每图层最多每 `_HEAL_CHECK_INTERVAL` 秒检查一次（20Hz ⇒ ≈2Hz）。
+        if now < float(getattr(lay, "_heal_next_t", 0.0) or 0.0):
+            return
+        lay._heal_next_t = now + _HEAL_CHECK_INTERVAL
         if not getattr(lay, "visible", True):
             return
         if not getattr(p, "_active", True):
             return
+        if not (0 <= lay.cur < len(lay.clips)):
+            return
+        clip = lay.clips[lay.cur]
+        path = getattr(clip, "path", "")
+        # 换素材 ⇒ 重置该图层的冷却与计数（计数语义是"同一素材累计"）。
+        # ⚠ 不重置 `_heal_next_t`：它只限检查频率、不是冷却，重置只会让换素材瞬间多放行一次。
+        if getattr(lay, "_heal_path", None) != path:
+            lay._heal_path = path
+            lay._heal_last_t = 0.0
+            lay._heal_count = 0
+            lay._heal_gave_up = False
+        # 已封顶：不再重建、也不再调用任何判据（放弃日志只写一次，见下面置位处）。
+        if getattr(lay, "_heal_gave_up", False):
+            return
+        # —— 硬限流（全部是时间戳/整数比较：无 dict、无 I/O、无锁）——
+        if now - getattr(lay, "_heal_last_t", 0.0) < _HEAL_CLIP_COOLDOWN:
+            return
+        if now - getattr(self, "_heal_last_global_t", 0.0) < _HEAL_GLOBAL_INTERVAL:
+            return
+        # 到这里才调用判据（相对贵；health() 只在真要重建时才调、且只调一次）。
         try:
             if not p.stalled(_STALL_SECS):
                 return
         except Exception:                                      # noqa: BLE001
             return
-        if not (0 <= lay.cur < len(lay.clips)):
-            return
-        clip = lay.clips[lay.cur]
-        reason = ""
+        # health() 只调一次，同时取 frames/age/reason 供日志诊断（下次现场取证用）：
+        # 现场日志能一眼区分"从未出帧"（新判据下不该出现）与"出过帧后卡住"。
+        h = {}
         try:
-            reason = (p.health().get("reason") or "")
+            h = p.health() or {}
         except Exception:                                      # noqa: BLE001
-            pass
+            h = {}
+        frames = h.get("frames", getattr(p, "_frames", 0))
+        age = h.get("age")
+        reason = h.get("reason") or ""
+        if age is None:
+            detail = "frames=%s, 无产帧时间戳" % frames
+        else:
+            detail = "frames=%s, %.1fs 无新帧" % (frames, age)
+        if reason:
+            detail += "；" + reason
+        # —— 通过全部限流：执行重建，并记账 ——
+        lay._heal_last_t = now
+        lay._heal_count = getattr(lay, "_heal_count", 0) + 1
+        self._heal_last_global_t = now
         try:
             p.close()
         except Exception:                                      # noqa: BLE001
             pass
         try:
-            lay.cache.pop(clip.path, None)      # ★ 关键：别把僵尸留在缓存里
+            lay.cache.pop(path, None)           # ★ 关键：别把僵尸留在缓存里
         except Exception:                                      # noqa: BLE001
             pass
         try:
             lay.player = self._get_player(lay, clip)
         except Exception:                                      # noqa: BLE001
             lay.player = None
+        capped = lay._heal_count >= _HEAL_MAX_PER_CLIP
         try:
             import stallwatch
-            stallwatch.log_line("!! 卡帧看门狗：重建解码器 %s（%s）"
-                                % (os.path.basename(getattr(clip, "path", "")),
-                                   reason or "超过 %.1fs 无新帧" % _STALL_SECS))
+            stallwatch.log_line("!! 卡帧看门狗：重建解码器 %s（第 %d/%d 次；%s）"
+                                % (os.path.basename(path), lay._heal_count,
+                                   _HEAL_MAX_PER_CLIP, detail))
         except Exception:                                      # noqa: BLE001
             pass
+        if capped:
+            # 到顶：只再写一条"放弃"日志，之后本素材不再自动重建（换素材重置计数）。
+            lay._heal_gave_up = True
+            try:
+                import stallwatch
+                stallwatch.log_line("!! 卡帧看门狗：放弃重建 %s（累计 %d 次，换素材前不再重建，"
+                                    "避免重建风暴卡死）"
+                                    % (os.path.basename(path), lay._heal_count))
+            except Exception:                                  # noqa: BLE001
+                pass
 
     def _get_player(self, lay, clip):
         """取该素材的解码器；缓存命中则复用（切换零开销）。LRU 上限 8。"""

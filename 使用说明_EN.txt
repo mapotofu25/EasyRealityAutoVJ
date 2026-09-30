@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.10.01.07
+Version 2026.10.01.08
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
