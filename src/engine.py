@@ -10,6 +10,7 @@
 自动模式：综合低频能量/瞬态密度/BPM 稳定性/节拍清晰度/频谱复杂度/
 段落标签/能量趋势/人声占比 每秒打分，选最高分模式；手动模式可强制固定。
 """
+import collections
 import math
 import os
 import random
@@ -43,6 +44,146 @@ _HEAL_GLOBAL_INTERVAL = 2.0   # 全局：每这么久最多自动重建 1 次（
 # `_HEAL_CHECK_INTERVAL` 秒检查一次（20Hz 下 ≈ 2Hz），把热路径代价压下来。它只限检查频率，
 # **不是**冷却 —— 换素材时**不需要**重置（重置只会让换素材瞬间多放行一次，无意义）。
 _HEAL_CHECK_INTERVAL = 0.5
+
+# 静默冻帧兜底（见 `_heal_silent`）：`_heal_stalled` 看不见的那几类故障
+#   （`lay.player` 不在缓存 ⇒ 永不被激活 / `lay.player is None` / 有帧前就 ended）。
+_SILENT_GRACE = 1.0          # player 缺失 / 未激活 持续超过这么久才动作（秒）
+_SILENT_ACTION_MIN = 2.0     # 同一图层两次"动作"（重建 / 激活）的最小间隔（秒）
+_SILENT_ENDED_EVERY = 5.0    # "有帧前就 ended" 这类：每这么久记一行日志（去重、不刷屏）
+
+# 每层健康快照日志（见 `_LayerHealthLog` / `AutoVJEngine._health_tick`）：
+#   2026-10-01 用户又实测到"画面卡住但 `ui_stall.log` 47 分钟一条没有"（看门狗完全盲）。
+#   看门狗只在"判定卡帧"时才写日志，判据没命中就永远沉默。这里改成**只要在跑就每秒留一行**
+#   每层状态——下次用户说"卡了"，直接回看那个时刻的 `layer_health.log` 就能一眼分辨是
+#   "播放器没了 / 不在缓存 / 不活跃 / 从未出帧 / age 在涨" 哪一种，不用再猜。
+_HEALTH_LOG_INTERVAL = 1.0    # 采样间隔：每秒 1 行（成本极低：只读属性 + 一次 append）
+_HEALTH_MAX_LINES = 600       # 环形上限（约 10 分钟）；超出就裁掉最老的
+_HEALTH_KEEP_LINES = 300      # 触发裁剪时保留的最新行数（=上限/2，摊薄重写频率，别每秒重写）
+
+
+def _health_log_path():
+    """每层健康快照日志路径：`%LOCALAPPDATA%\\AutoVJ\\layer_health.log`。"""
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ", "layer_health.log")
+
+
+class _LayerHealthLog:
+    """每层健康快照的**环形**日志文件（最多 `_HEALTH_MAX_LINES` 行，超出裁掉最老的）。
+
+    设计要点（都为了"取证绝不能反过来拖累演出"）：
+      · **只在 `self.running` 时**由引擎线程写，每秒 1 行；不做高频 open/close —— 持有句柄，
+        进程退出时 `close()`（即便不 close，因为每行都 flush，崩溃也不丢数据）。
+      · 达上限后**重写文件只保留最新 `_HEALTH_KEEP_LINES` 行**（摊薄：每 ~300 行才重写一次，
+        把文件大小控制在 300~600 行之间，而不是每秒整文件重写）。
+      · 任何异常一律吞掉：取证日志绝不能影响演出。
+    """
+
+    def __init__(self, path=None, max_lines=_HEALTH_MAX_LINES, keep=_HEALTH_KEEP_LINES):
+        self.path = path or _health_log_path()
+        self.max_lines = max(10, int(max_lines))
+        self.keep = max(5, min(int(keep), self.max_lines))
+        self.lines = collections.deque(maxlen=self.max_lines)
+        self.fh = None
+        self.n = 0          # 文件中当前行数
+        self._open()
+
+    def _open(self):
+        try:
+            d = os.path.dirname(self.path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            # 读入上次退出留下的内容（只留最新 max_lines 行），供裁剪与 append 续写
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path, "r", encoding="utf-8", errors="replace") as r:
+                        for ln in r:
+                            self.lines.append(ln.rstrip("\n"))
+                            self.n += 1
+                except Exception:                                      # noqa: BLE001
+                    self.lines.clear()
+                    self.n = 0
+            if self.n > self.max_lines:
+                self._rewrite(self.keep)     # 上次退出时留下的超长文件，启动先裁一次
+            self.fh = open(self.path, "a", encoding="utf-8")
+        except Exception:                                              # noqa: BLE001
+            self.fh = None
+
+    def _rewrite(self, nkeep):
+        """把文件重写为最新 `nkeep` 行（用同一句柄 seek+truncate，避免反复 open）。"""
+        try:
+            keep_lines = list(self.lines)[-nkeep:]
+            if self.fh is not None:
+                self.fh.seek(0)
+                self.fh.truncate()
+                for ln in keep_lines:
+                    self.fh.write(ln + "\n")
+                self.fh.flush()
+            else:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    for ln in keep_lines:
+                        f.write(ln + "\n")
+            self.n = len(keep_lines)
+        except Exception:                                              # noqa: BLE001
+            pass
+
+    def write(self, line):
+        if self.fh is None:
+            return
+        try:
+            self.fh.write(line + "\n")
+            self.fh.flush()          # 每秒才一次，flush 成本可忽略；好处是崩溃也不丢证据
+            self.lines.append(line)
+            self.n += 1
+            if self.n >= self.max_lines:
+                self._rewrite(self.keep)
+        except Exception:                                              # noqa: BLE001
+            pass
+
+    def close(self):
+        try:
+            if self.fh is not None:
+                self.fh.flush()
+                self.fh.close()
+        except Exception:                                              # noqa: BLE001
+            pass
+        self.fh = None
+
+
+# 输出侧（NDI / Spout）失败取证日志：`%LOCALAPPDATA%\AutoVJ\output_health.log`。
+#   2026-10-02（任务#14）：NDI/Spout 旧实现"一次失败就永久停"，导致**接收端永久冻在最后一帧**
+#   而本机预览/输出窗口/日志全正常（用户实测四轮"另一台机器冻住"的唯一自洽解释）。改成退避
+#   重试后，失败/恢复必须**留下可查证据**——别再只 `print`（打包后控制台无人可见）。
+_OUTPUT_BACKOFF_CAP = 30.0      # 退避上限（秒）：1→2→4→8→16→30→30…
+_OUTPUT_FAIL_LOG_MIN = 30.0     # 失败日志限流：退避中每这么久最多记一行（别刷屏）
+
+
+def _output_health_path():
+    """输出侧失败/恢复日志路径：`%LOCALAPPDATA%\\AutoVJ\\output_health.log`。"""
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ", "output_health.log")
+
+
+def _output_health_write(line):
+    """往输出侧取证日志追加一行（带时间戳）。任何异常一律吞掉：取证绝不能反过来影响演出。"""
+    p = _output_health_path()
+    try:
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write("[%s] %s\n" % (stamp, line))
+    except Exception:                                                  # noqa: BLE001
+        pass
+
+
+def _output_backoff(fails):
+    """连续失败 `fails` 次后的退避秒数：1→2→4→8→16→30（上限 `_OUTPUT_BACKOFF_CAP`）。"""
+    try:
+        n = int(fails)
+    except Exception:                                                  # noqa: BLE001
+        n = 1
+    if n <= 0:
+        return 0.0
+    return min(_OUTPUT_BACKOFF_CAP, float(2 ** (n - 1)))
 
 
 def _locked(fn):
@@ -253,6 +394,11 @@ class Layer:
         self._heal_count = 0     # 该素材累计自动重建次数
         self._heal_gave_up = False  # 已到上限：换素材前不再自动重建
         self._heal_next_t = 0.0  # 下次允许"检查"（调 stalled()）的时刻（健康素材节流）
+        # 静默冻帧兜底状态（见 `_heal_silent`）
+        self._silent_none_since = 0.0      # player 缺失的起始时刻
+        self._silent_inactive_since = 0.0  # 未激活的起始时刻
+        self._silent_last_action_t = 0.0   # 上次动作（重建 / 激活）时刻
+        self._silent_ended_last_t = 0.0    # 上次记录"ended 无帧"的时刻
         # 预热（切素材零延迟）：切换后延迟一会儿把「下一个要用的素材」的容器打开+首帧解出来。
         # 不预热的话切换瞬间新解码器还要 70~690ms 才有首帧（= 用户看到的"卡几帧"）。
         self.pre_idx = -1        # 预选的下一个素材索引
@@ -330,10 +476,20 @@ class AutoVJEngine(QObject):
         self._latest_frame = None      # 最新合成帧（frame_ready 只投序号，帧放这）
         self._frame_seq = 0            # 帧序号（绘制端用来去重）
         self._spout = None
-        self._spout_fail = False
+        self._spout_fail = False       # True=当前处于"失败退避"态（ui_main 置 False ⇒ 立即重试）
+        # Spout 退避重试状态（见 `_spout_send` / `_output_fail`）：1→2→4→8→…→30s，成功清零
+        self._spout_fails = 0          # 连续失败次数（决定退避长度）
+        self._spout_retry_at = 0.0     # 下次允许尝试的时刻（perf_counter）
+        self._spout_fail_since = 0.0   # 首次失败时刻（恢复时算中断时长）
+        self._spout_log_at = 0.0       # 上次写"失败"日志的时刻（30s 限流）
         # NDI 输出（懒加载，音画同步；缺 Runtime 时静默禁用）
         self._ndi = None
-        self._ndi_fail = False
+        self._ndi_fail = False         # True=当前处于"失败退避"态（ui_main 置 False ⇒ 立即重试）
+        # NDI 退避重试状态（见 `_ndi_send` / `_output_fail`）
+        self._ndi_fails = 0
+        self._ndi_retry_at = 0.0
+        self._ndi_fail_since = 0.0
+        self._ndi_log_at = 0.0
         # 行为模式
         self.mode = "normal"
         self.mode_scores = {}
@@ -388,6 +544,11 @@ class AutoVJEngine(QObject):
         self._tick_lock = threading.RLock()
         # 卡帧看门狗全局限流：上次自动重建的时刻（见 `_heal_stalled`）
         self._heal_last_global_t = 0.0
+        # 静默冻帧兜底日志去重：key=(图层名, 原因) → 上次记录时刻（见 `_heal_silent`）
+        self._silent_log_t = {}
+        # 每层健康快照日志（懒创建；见 `_health_tick` / `_LayerHealthLog`）
+        self._health_log = None
+        self._health_next_t = 0.0
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
@@ -913,7 +1074,17 @@ class AutoVJEngine(QObject):
         # 视频速度 + 活跃标记（缓存中未显示的解码器挂起省 CPU）
         silent_now = snap["silent_sec"] > 0.25 or snap["level"] < 0.03
         for lay in self.layers:
-            for p in lay.cache.values():
+            # ★★ 活跃标记必须按**身份**遍历 `cache ∪ {lay.player, lay.prev_player}`，
+            #   不能只遍历 `lay.cache`：`lay.player` 并不保证在缓存里（自动匹配换池、
+            #   `_get_player` 的 LRU 驱逐、预热/切换路径都可能让它脱离缓存）。
+            #   只遍历缓存 ⇒ 这样的 `lay.player` **永远不被置为活跃 ⇒ 永不解码 ⇒ 画面
+            #   冻在最后一帧**；而看门狗又跳过非活跃播放器 ⇒ **零日志的"静默冻帧"**。
+            #   这是用户实测"播放中仍卡在某一帧、且 ui_stall.log 一条都没有"的根因。
+            seen = set()
+            for p in list(lay.cache.values()) + [lay.player, lay.prev_player]:
+                if p is None or id(p) in seen:
+                    continue
+                seen.add(id(p))
                 active = p is lay.player or p is lay.prev_player
                 # 静音时暂停：保持当前画面不动（解码线程挂起，最后一帧仍在显示）
                 # 仅在 VJ 运行中生效；停止时预览要保持实时，不能挂起
@@ -932,6 +1103,12 @@ class AutoVJEngine(QObject):
         #   这是"素材解不出来也不会永久冻帧"的兜底，覆盖 R1/R2/R4/R6/R9。
         for lay in self.layers:
             self._heal_stalled(lay)
+            # ★ 静默冻帧兜底：`_heal_stalled` 看不见的那几类（player 不在缓存 ⇒ 永不被激活 /
+            #   player is None / 有帧前就 ended）在这里恢复并留下日志，避免"画面冻住而日志沉默"。
+            self._heal_silent(lay)
+
+        # ★ 每层健康快照（每秒 1 行，只在 running 时）—— 卡了能直接回看那一刻每层状态。
+        self._health_tick()
 
         # 合成
         self._compose(snap)
@@ -969,9 +1146,48 @@ class AutoVJEngine(QObject):
         """
         return self._latest_frame
 
+    def _output_fail(self, ch, now, exc):
+        """记录一次输出（NDI/Spout）发送失败：退避重试 + 30s 限流写 `output_health.log`。
+
+        ★ 2026-10-02（任务#14）：旧实现在这里把 `_ndi_fail/_spout_fail` 置成**永久**标志 ⇒
+        中途出一次错（接收端重连 / 网络抖动 / 分辨率变化 / Runtime 晚启动）发送端整场不再推帧
+        ⇒ **接收端永久冻在最后一帧**，而本机预览/输出窗口/日志全正常。现在改成退避重试：
+        失败只推迟到 `_retry_at` 再试，**永不永久放弃**；成功一次由 `_output_ok` 清零。
+        `ch`：`"NDI"` / `"Spout"`。退避 1→2→4→8→16→30s（上限 `_OUTPUT_BACKOFF_CAP`）。
+        """
+        prefix = "_ndi" if ch == "NDI" else "_spout"
+        fails = int(getattr(self, prefix + "_fails", 0)) + 1
+        setattr(self, prefix + "_fails", fails)
+        setattr(self, prefix + "_fail", True)
+        if not getattr(self, prefix + "_fail_since", 0.0):
+            setattr(self, prefix + "_fail_since", now)
+        backoff = _output_backoff(fails)
+        setattr(self, prefix + "_retry_at", now + backoff)
+        brief = ("%s: %s" % (type(exc).__name__, exc))[:120]
+        # 失败日志按 `_OUTPUT_FAIL_LOG_MIN`(=30s) 限流：退避中不刷屏；首次失败必记（log_at 起始 0）
+        if now - float(getattr(self, prefix + "_log_at", 0.0) or 0.0) >= _OUTPUT_FAIL_LOG_MIN:
+            setattr(self, prefix + "_log_at", now)
+            _output_health_write("%s 发送失败（连续第 %d 次，退避 %.0fs 后再试）：%s"
+                                 % (ch, fails, backoff, brief))
+            print("%s send failed (#%d):" % (ch, fails), exc)
+
+    def _output_ok(self, ch, now):
+        """一次成功发送：清零退避/计数；若此前处于失败态，写一行"恢复 + 中断时长"。"""
+        prefix = "_ndi" if ch == "NDI" else "_spout"
+        fails = int(getattr(self, prefix + "_fails", 0) or 0)
+        since = float(getattr(self, prefix + "_fail_since", 0.0) or 0.0)
+        setattr(self, prefix + "_fails", 0)
+        setattr(self, prefix + "_retry_at", 0.0)
+        setattr(self, prefix + "_log_at", 0.0)
+        setattr(self, prefix + "_fail", False)
+        if fails or since:
+            dur = (now - since) if since else 0.0
+            setattr(self, prefix + "_fail_since", 0.0)
+            _output_health_write("%s 发送恢复（中断 %.1fs）" % (ch, dur))
+
     def _spout_send(self):
         """Spout 输出：CPU 共享内存路径把画布帧发给本机其他程序（OBS/Resolume 等）。
-        懒加载 + 失败静默禁用（未装 SpoutGL 时输出功能不受影响）。"""
+        懒加载；失败走**退避重试**（不再永久停，见 `_output_fail`；未装 SpoutGL 时静默）。"""
         # ★ 2026-09-27 修（用户报：**没开始 VJ 时 NDI 也在输出**；Spout 同理，同一个坑）：
         #   没点「开始」一律**不喂帧** —— 与「输出设置」既有门控语义一致
         #   （显示输出窗口 / 重置窗口大小 / 输出显示器本来就要先开始）。
@@ -983,8 +1199,13 @@ class AutoVJEngine(QObject):
         oc = self.cfg["output"]
         if not oc.get("spout_enabled"):
             return
-        if self._spout_fail:
-            return
+        now = time.perf_counter()
+        # ui_main 在用户重新开启 Spout 时会把 `_spout_fail` 复位成 False ⇒ 视为"立即重试"
+        if not self._spout_fail:
+            self._spout_fails = 0
+            self._spout_retry_at = 0.0
+        elif now < self._spout_retry_at:
+            return                      # 退避窗口内：这一帧不尝试
         try:
             if self._spout is None:
                 from SpoutGL import SpoutSender
@@ -999,12 +1220,15 @@ class AutoVJEngine(QObject):
             bpl = self.canvas.bytesPerLine()
             buf = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
             s.sendImage(buf, h, w, glfmt, True, 0)
-        except Exception as e:
-            self._spout_fail = True
-            print("Spout send failed:", e)
+        except Exception as e:                                     # noqa: BLE001
+            # ⚠ 失败时**保留已有 `self._spout`**、不丢成 None 重建：源名反复消失/出现更难恢复
+            self._output_fail("Spout", now, e)
+            return
+        self._output_ok("Spout", now)
 
     def _ndi_send(self):
-        """NDI 输出：把画布帧喂给 NDI 发送器（音频由采集线程另行喂）。缺 Runtime 静默禁用。"""
+        """NDI 输出：把画布帧喂给 NDI 发送器（音频由采集线程另行喂）。缺 Runtime 静默禁用；
+        失败走**退避重试**（不再永久停，见 `_output_fail`）。"""
         # ★ 2026-09-27 修（用户报 bug：没开始 VJ 时 NDI 也在输出）：
         #   没点「开始」一律**不喂帧**（理由同 `_spout_send`：接收端可能已经在线，未就绪画面会直接上屏）。
         if not self.running:
@@ -1012,27 +1236,35 @@ class AutoVJEngine(QObject):
         oc = self.cfg["output"]
         if not oc.get("ndi_enabled"):
             return
-        if self._ndi_fail:
-            return
+        now = time.perf_counter()
+        # ui_main 在用户重新开启 NDI 时会把 `_ndi_fail` 复位成 False ⇒ 视为"立即重试"
+        if not self._ndi_fail:
+            self._ndi_fails = 0
+            self._ndi_retry_at = 0.0
+        elif now < self._ndi_retry_at:
+            return                      # 退避窗口内：这一帧不尝试
         try:
             from ndi_out import get_ndi
             import numpy as _np
             w, h = self.canvas.width(), self.canvas.height()
             if self._ndi is None:
                 self._ndi = get_ndi(oc.get("ndi_name") or "EasyRealityAutoVJ")
-                # ⚠ 必须带**真实分辨率**：发送端的 VideoSendFrame 只能在 open() 之前定死尺寸，
-                #   所以 sender 是按第一次发帧的尺寸建立的。旧代码这里不给尺寸 → 直接返回 False
-                #   → `_ndi_fail` 被永久置位 → NDI 输出再也不会尝试（静默失效）。
-                if not self._ndi._ensure(w, h):
-                    self._ndi_fail = True
-                    return
+            # ⚠ 必须带**真实分辨率**：发送端的 VideoSendFrame 只能在 open() 之前定死尺寸，
+            #   所以 sender 是按第一次发帧的尺寸建立的。旧代码这里不给尺寸 → 直接返回 False
+            #   → `_ndi_fail` 被永久置位 → NDI 输出再也不会尝试（静默失效）。
+            #   现在 `_ensure()` 失败 = 抛错走退避重试（分辨率变化 / Runtime 晚启动都能自愈）。
+            if not self._ndi._ensure(w, h):
+                raise RuntimeError("NDI _ensure(%dx%d) 返回 False" % (w, h))
             bpl = self.canvas.bytesPerLine()
             bgra = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
             # 传给 NDI 的是 BGRA 连续缓冲（画布 RGB32 = BGRA 内存序）
             self._ndi.send_video(bgra, w, h)
-        except Exception as e:
-            self._ndi_fail = True
-            print("NDI send failed:", e)
+        except Exception as e:                                     # noqa: BLE001
+            # ⚠ 失败时**保留已有 `self._ndi`**（不丢成 None 重建）：NDI 源名在接收端反复
+            #   消失/出现会让接收端更难恢复；复用同一 sender，故障消失后接着推同一源。
+            self._output_fail("NDI", now, e)
+            return
+        self._output_ok("NDI", now)
 
     # ---------------- 行为模式 ----------------
     @_locked
@@ -1732,6 +1964,171 @@ class AutoVJEngine(QObject):
                                     % (os.path.basename(path), lay._heal_count))
             except Exception:                                  # noqa: BLE001
                 pass
+
+    def _heal_silent(self, lay):
+        """静默冻帧兜底：处理 `_heal_stalled` 看不见、且**没有任何其它恢复者**的几类故障。
+
+        为什么需要它（2026-10-01 用户实测"播放中仍卡在某一帧、且 ui_stall.log 10 分钟
+        一条都没有"）：`_heal_stalled` 顶部两条提前返回把下面两类直接放过去了，而引擎里
+        没有别的地方负责恢复它们：
+          · `lay.player is None`（自动匹配置换池时池为空被清空，见 `_refresh_auto_layers`）；
+          · `lay.player` 存在但**长期不活跃**（不在缓存 ⇒ 活跃标记漏掉它）⇒ 永不解码 ⇒ 冻帧。
+        这里只做"恢复 + 取证"，**不重建**已经能自愈的情况，避免回到重建风暴。
+
+        热路径廉价：不需要动作的那一趟只做时间戳/属性比较，绝不调用 `stalled()`/`health()`。
+        """
+        if not self.running:
+            return
+        if not getattr(lay, "visible", True):
+            return
+        if not (0 <= lay.cur < len(lay.clips)):
+            return
+        now = time.perf_counter()
+        p = lay.player
+
+        # ---- 1) 当前没有播放器（自动池被清空 / 重建失败）⇒ 宽限后兜底重建 ----
+        if p is None:
+            lay._silent_inactive_since = 0.0
+            since = getattr(lay, "_silent_none_since", 0.0)
+            if not since:
+                lay._silent_none_since = now
+                return
+            if now - since <= _SILENT_GRACE:
+                return
+            if now - getattr(lay, "_silent_last_action_t", 0.0) < _SILENT_ACTION_MIN:
+                return
+            clip = lay.clips[lay.cur]
+            try:
+                lay.player = self._get_player(lay, clip)
+            except Exception:                                  # noqa: BLE001
+                lay.player = None
+            lay._silent_none_since = 0.0
+            lay._silent_last_action_t = now
+            self._silent_log(lay, "player缺失",
+                             "兜底重建 %s（player 缺失超过 %.1fs；此前只有下一个切换点才会重建）"
+                             % (os.path.basename(getattr(clip, "path", "")), _SILENT_GRACE))
+            return
+        lay._silent_none_since = 0.0
+
+        # 只对**真解码器**做静默兜底：图片 / GIF 播放器的 `set_active` 是空操作、也没有
+        # `_active`/`_frames`（静态素材本就"不活跃"且永远不会冻帧），若把它们当"未激活"
+        # 反复救+记日志，会给图片图层刷出无意义日志。判据同 `_heal_stalled`：有 `stalled`。
+        if not hasattr(p, "stalled"):
+            lay._silent_inactive_since = 0.0
+            return
+
+        # ---- 2) 从未出帧且解码已结束（素材解不出来）：**不重建**（避免风暴），每 5s 记一行 ----
+        if getattr(p, "_frames", 0) <= 0 and getattr(p, "_ended", False):
+            lay._silent_inactive_since = 0.0
+            if now - getattr(lay, "_silent_ended_last_t", 0.0) >= _SILENT_ENDED_EVERY:
+                lay._silent_ended_last_t = now
+                self._silent_log(lay, "ended无帧",
+                                 "从未出帧且解码已结束（%s）—— 该类不重建，仅持续记录"
+                                 % os.path.basename(getattr(lay.clips[lay.cur], "path", "")))
+            return
+
+        # ---- 3) 有播放器但长期不活跃（活跃标记漏掉了它）⇒ 补进缓存 + 激活，**不重建** ----
+        if not getattr(p, "_active", False):
+            # `pause_silent` 的"静音挂起"是**有意**不活跃，绝不能强激活它
+            if getattr(lay, "pause_silent", False):
+                return
+            since = getattr(lay, "_silent_inactive_since", 0.0)
+            if not since:
+                lay._silent_inactive_since = now
+                return
+            if now - since <= _SILENT_GRACE:
+                return
+            if now - getattr(lay, "_silent_last_action_t", 0.0) < _SILENT_ACTION_MIN:
+                return
+            path = getattr(lay.clips[lay.cur], "path", "")
+            if lay.cache.get(path) is not p:
+                lay.cache[path] = p          # 补回缓存：让它今后被 LRU/切换正常复用
+            try:
+                p.set_active(True)
+            except Exception:                                  # noqa: BLE001
+                pass
+            lay._silent_inactive_since = 0.0
+            lay._silent_last_action_t = now
+            self._silent_log(lay, "未激活", "补进缓存并激活 %s（不活跃超过 %.1fs）"
+                             % (os.path.basename(path), _SILENT_GRACE))
+            return
+        lay._silent_inactive_since = 0.0
+
+    def _silent_log(self, lay, reason, detail):
+        """静默冻帧兜底日志：按 (图层, 原因) 去重（`_SILENT_ACTION_MIN` 秒内只记一次）。"""
+        key = (getattr(lay, "name", "?"), reason)
+        now = time.perf_counter()
+        if now - self._silent_log_t.get(key, 0.0) < _SILENT_ACTION_MIN:
+            return
+        self._silent_log_t[key] = now
+        try:
+            import stallwatch
+            stallwatch.log_line("!! 静默冻帧兜底：图层「%s」%s：%s" % (key[0], reason, detail))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _health_tick(self):
+        """每秒给 `layer_health.log` 写一行「每层健康快照」。**只在 `self.running` 时**执行。
+
+        为什么做这个：看门狗（`_heal_stalled`）只在"判定卡帧"时才写 `ui_stall.log`，判据没
+        命中就永远沉默 —— 用户实测"画面卡住而 47 分钟一条日志都没有"。这里改成**常态留痕**：
+        只要在跑，每秒把每层的 player / 缓存 / 活跃 / 帧数 / 帧龄 / ended 落一行，卡了直接回看。
+
+        热路径廉价：一次 `perf_counter` 比较 + 每层几个只读 `getattr`，远低于每帧 `stalled()`。
+        """
+        if not self.running:
+            return
+        now = time.perf_counter()
+        if now < self._health_next_t:
+            return
+        self._health_next_t = now + _HEALTH_LOG_INTERVAL
+        try:
+            log = self._health_log
+            if log is None:
+                log = _LayerHealthLog()
+                self._health_log = log
+            log.write("[%s] %s" % (time.strftime("%H:%M:%S"), self._health_snapshot(now)))
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _health_snapshot(self, now):
+        """拼一行「每层健康快照」，形如：
+
+        `L0 Kv   vis=1 cur=0/1   p=id1234 incache=1 active=1 frames=4821 age=0.03 ended=0`
+
+        只读属性、不打印绝对路径（隐私 + 行长）；层名截断 12 字。
+        图片 / GIF 播放器没有 `_active`/`_frames`（"不活跃/0 帧"是正常的），标成 `p=img`
+        以免下次回看时把它们误读成"从未出帧的不活跃播放器"。"""
+        segs = []
+        for i, lay in enumerate(self.layers):
+            name = str(getattr(lay, "name", "?"))[:12]
+            vis = 1 if getattr(lay, "visible", True) else 0
+            clips = getattr(lay, "clips", None) or []
+            nclips = len(clips)
+            cur = getattr(lay, "cur", -1)
+            in_cache = 0
+            if 0 <= cur < nclips:
+                try:
+                    in_cache = 1 if lay.cache.get(clips[cur].path) is lay.player else 0
+                except Exception:                                  # noqa: BLE001
+                    in_cache = 0
+            p = getattr(lay, "player", None)
+            if p is None:
+                segs.append("L%d %s vis=%d cur=%d/%d p=none"
+                            % (i, name, vis, cur, nclips))
+                continue
+            if not hasattr(p, "stalled"):     # 图片 / GIF：静态素材，无 _active/_frames
+                segs.append("L%d %s vis=%d cur=%d/%d p=img incache=%d"
+                            % (i, name, vis, cur, nclips, in_cache))
+                continue
+            last = float(getattr(p, "_last_t", 0.0) or 0.0)
+            age = ("%.2f" % (now - last)) if last else "-"
+            segs.append("L%d %s vis=%d cur=%d/%d p=id%d incache=%d active=%d frames=%d age=%s ended=%d"
+                        % (i, name, vis, cur, nclips, id(p), in_cache,
+                           1 if getattr(p, "_active", False) else 0,
+                           int(getattr(p, "_frames", 0) or 0), age,
+                           1 if getattr(p, "_ended", False) else 0))
+        return " | ".join(segs)
 
     def _get_player(self, lay, clip):
         """取该素材的解码器；缓存命中则复用（切换零开销）。LRU 上限 8。"""
@@ -2567,6 +2964,13 @@ class AutoVJEngine(QObject):
         self.timer.stop()
         for lay in self.layers:
             lay.close_all()
+        # 关闭每层健康快照日志句柄（见 `_LayerHealthLog`；进程退出时收尾）
+        if self._health_log is not None:
+            try:
+                self._health_log.close()
+            except Exception:
+                pass
+            self._health_log = None
         if self._spout is not None:
             try:
                 self._spout[0].releaseSender()
