@@ -51,6 +51,15 @@ _SILENT_GRACE = 1.0          # player 缺失 / 未激活 持续超过这么久�
 _SILENT_ACTION_MIN = 2.0     # 同一图层两次"动作"（重建 / 激活）的最小间隔（秒）
 _SILENT_ENDED_EVERY = 5.0    # "有帧前就 ended" 这类：每这么久记一行日志（去重、不刷屏）
 
+# 「从未出帧」兜底（见 `_heal_silent` 第 2.5 类）：
+#   现场 2026-10-02：可见且当前素材的真解码器**长时间 `_frames==0`**（layer_health.log 里
+#   连续 8s `frames=0 age=-`），画面冻住而 `_heal_stalled` 因"从未出帧"提前返回、`_heal_silent`
+#   又没有覆盖这一类 ⇒ 无人恢复。这里给它一个兜底重建：宽限后重建解码器，且**限流**
+#   （每图层 ≥2s 一次、同素材累计 ≤3 次），到顶只记一行日志、不再重建（避免重建风暴）。
+_NOFRAME_GRACE = 2.2        # 可见 + 当前素材 + `_frames==0` 持续这么久 ⇒ 判定"解不出首帧"
+_SILENT_NOFRAME_COOLDOWN = _SILENT_ACTION_MIN   # 同图层两次重建的最小间隔（≥2s/图层）
+_SILENT_NOFRAME_MAX = 3     # 同素材累计重建上限（≤3 次/素材，换素材重置）
+
 # 每层健康快照日志（见 `_LayerHealthLog` / `AutoVJEngine._health_tick`）：
 #   2026-10-01 用户又实测到"画面卡住但 `ui_stall.log` 47 分钟一条没有"（看门狗完全盲）。
 #   看门狗只在"判定卡帧"时才写日志，判据没命中就永远沉默。这里改成**只要在跑就每秒留一行**
@@ -399,6 +408,12 @@ class Layer:
         self._silent_inactive_since = 0.0  # 未激活的起始时刻
         self._silent_last_action_t = 0.0   # 上次动作（重建 / 激活）时刻
         self._silent_ended_last_t = 0.0    # 上次记录"ended 无帧"的时刻
+        # 「从未出帧」兜底状态（见 `_heal_silent` 第 2.5 类）
+        self._silent_noframe_since = 0.0        # 连续 `_frames==0` 的起始时刻
+        self._silent_noframe_path = None        # 计数对应的素材 path（换素材即重置）
+        self._silent_noframe_count = 0          # 该素材累计"无帧重建"次数
+        self._silent_noframe_last_t = 0.0       # 上次"无帧重建"时刻（图层级冷却）
+        self._silent_noframe_capped_log_t = 0.0  # 上次记"重建到顶"日志的时刻
         # 预热（切素材零延迟）：切换后延迟一会儿把「下一个要用的素材」的容器打开+首帧解出来。
         # 不预热的话切换瞬间新解码器还要 70~690ms 才有首帧（= 用户看到的"卡几帧"）。
         self.pre_idx = -1        # 预选的下一个素材索引
@@ -549,6 +564,8 @@ class AutoVJEngine(QObject):
         # 每层健康快照日志（懒创建；见 `_health_tick` / `_LayerHealthLog`）
         self._health_log = None
         self._health_next_t = 0.0
+        # GPU 可用性状态（-1=未知 / 0=否 / 1=是）；状态变化时在 `_health_tick` 写醒目日志
+        self._gpu_state = -1
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
@@ -2020,12 +2037,70 @@ class AutoVJEngine(QObject):
         # ---- 2) 从未出帧且解码已结束（素材解不出来）：**不重建**（避免风暴），每 5s 记一行 ----
         if getattr(p, "_frames", 0) <= 0 and getattr(p, "_ended", False):
             lay._silent_inactive_since = 0.0
+            lay._silent_noframe_since = 0.0
             if now - getattr(lay, "_silent_ended_last_t", 0.0) >= _SILENT_ENDED_EVERY:
                 lay._silent_ended_last_t = now
                 self._silent_log(lay, "ended无帧",
                                  "从未出帧且解码已结束（%s）—— 该类不重建，仅持续记录"
                                  % os.path.basename(getattr(lay.clips[lay.cur], "path", "")))
             return
+
+        # ---- 2.5) 可见 + 当前素材的真解码器**长时间 `_frames==0`**（解不出首帧）⇒ 兜底重建 ----
+        #   现场证据（2026-10-02）：layer_health.log 里可见当前图层连续 8s `frames=0 age=-`、
+        #   画布冻住；而 `_heal_stalled` 因"从未出帧"提前返回、上面第 2 类又要求 `_ended`
+        #   ⇒ **无人恢复**。这里补一条恢复路径，并**限流**（每图层 ≥`_SILENT_NOFRAME_COOLDOWN`
+        #   秒一次、同素材累计 ≤`_SILENT_NOFRAME_MAX` 次；到顶只记一行日志、不再重建）。
+        if getattr(p, "_frames", 0) <= 0:
+            # `pause_silent` 的"静音挂起"是**有意**不出帧（且不活跃），绝不误重建它
+            if getattr(lay, "pause_silent", False) and not getattr(p, "_active", False):
+                return
+            since = getattr(lay, "_silent_noframe_since", 0.0)
+            if not since:
+                lay._silent_noframe_since = now
+                return
+            if now - since <= _NOFRAME_GRACE:
+                return
+            clip = lay.clips[lay.cur]
+            path = getattr(clip, "path", "")
+            # 换素材 ⇒ 重置该素材的"无帧重建"计数（计数语义是"同一素材累计"）
+            if getattr(lay, "_silent_noframe_path", None) != path:
+                lay._silent_noframe_path = path
+                lay._silent_noframe_count = 0
+                lay._silent_noframe_last_t = 0.0
+            # 图层级冷却（≥ `_SILENT_NOFRAME_COOLDOWN` 秒）—— 防同一图层连续重建风暴
+            if now - getattr(lay, "_silent_noframe_last_t", 0.0) < _SILENT_NOFRAME_COOLDOWN:
+                return
+            # 素材级上限（≤ `_SILENT_NOFRAME_MAX` 次）—— 到顶只记一行（去重），不再重建
+            if getattr(lay, "_silent_noframe_count", 0) >= _SILENT_NOFRAME_MAX:
+                if now - getattr(lay, "_silent_noframe_capped_log_t", 0.0) >= _SILENT_ENDED_EVERY:
+                    lay._silent_noframe_capped_log_t = now
+                    self._silent_log(lay, "无帧封顶",
+                                     "解不出首帧已 %.1fs、重建 %d 次达上限 —— 暂不再重建"
+                                     "（切走 / 换素材后自动重新计数）"
+                                     % (now - since, lay._silent_noframe_count))
+                return
+            # —— 执行重建（与 `_heal_stalled` 同款：先 close、再从缓存摘除、再重取）——
+            lay._silent_noframe_last_t = now
+            lay._silent_noframe_count = getattr(lay, "_silent_noframe_count", 0) + 1
+            try:
+                p.close()
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                lay.cache.pop(path, None)          # 别把"解不出首帧"的僵尸留在缓存里
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                lay.player = self._get_player(lay, clip)
+            except Exception:                                  # noqa: BLE001
+                lay.player = None
+            lay._silent_noframe_since = 0.0
+            self._silent_log(lay, "无帧重建",
+                             "解不出首帧已 %.1fs，重建解码器 %s（第 %d/%d 次）"
+                             % (now - since, os.path.basename(path),
+                                lay._silent_noframe_count, _SILENT_NOFRAME_MAX))
+            return
+        lay._silent_noframe_since = 0.0
 
         # ---- 3) 有播放器但长期不活跃（活跃标记漏掉了它）⇒ 补进缓存 + 激活，**不重建** ----
         if not getattr(p, "_active", False):
@@ -2091,15 +2166,49 @@ class AutoVJEngine(QObject):
         except Exception:                                          # noqa: BLE001
             pass
 
+    def _gpu_token(self):
+        """返回 `gpu=` 用的记号（'1' / '0' / '?'），并在**状态变化**时写一条醒目日志。
+
+        为什么放在快照里：用户报"预览 + 输出 + NDI 三者同时冻住"时，`ui_stall.log` 可能
+        一条没有；而 `gpu=0` 能立刻区分"是不是整场退回了软件解码（慢 → 首帧出不来 → 冻帧）"。
+        记号：`1`=可用；`0`=工作线程未就绪/已停用（含冷启动中）；`?`=glctx 不可导入。
+        变化时附带 `GLWorker.last_message()`，一眼看出原因（冷启动中 / 驱动挂死 / 崩溃…）。
+        """
+        try:
+            import glctx
+            wk = glctx.GLWorker.get()
+        except Exception:                                          # noqa: BLE001
+            tok, msg = "?", ""
+        else:
+            try:
+                ok = bool(wk.available())
+            except Exception:                                      # noqa: BLE001
+                ok = False
+            tok = "1" if ok else "0"
+            try:
+                msg = "" if ok else (wk.last_message() or "")
+            except Exception:                                      # noqa: BLE001
+                msg = ""
+        if tok != self._gpu_state:
+            self._gpu_state = tok
+            try:
+                import stallwatch
+                stallwatch.log_line("!! GPU 解码状态变化：gpu=%s%s"
+                                    % (tok, ("（%s）" % msg) if msg else ""))
+            except Exception:                                      # noqa: BLE001
+                pass
+        return tok
+
     def _health_snapshot(self, now):
         """拼一行「每层健康快照」，形如：
 
-        `L0 Kv   vis=1 cur=0/1   p=id1234 incache=1 active=1 frames=4821 age=0.03 ended=0`
+        `gpu=1 | L0 Kv   vis=1 cur=0/1   p=id1234 incache=1 active=1 frames=4821 age=0.03 ended=0`
 
         只读属性、不打印绝对路径（隐私 + 行长）；层名截断 12 字。
         图片 / GIF 播放器没有 `_active`/`_frames`（"不活跃/0 帧"是正常的），标成 `p=img`
-        以免下次回看时把它们误读成"从未出帧的不活跃播放器"。"""
-        segs = []
+        以免下次回看时把它们误读成"从未出帧的不活跃播放器"。
+        行首 `gpu=`（1/0/?）：全局 GPU 可用性，状态变化时另写一条醒目日志（见 `_gpu_token`）。"""
+        segs = ["gpu=" + self._gpu_token()]
         for i, lay in enumerate(self.layers):
             name = str(getattr(lay, "name", "?"))[:12]
             vis = 1 if getattr(lay, "visible", True) else 0

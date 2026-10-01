@@ -71,6 +71,8 @@ GL_CREATE_TIMEOUT = 2.0            # 建上下文等锁上限（比单帧操作�
 #      就判定「GL 驱动已挂死」，之后**所有 GL 操作直接失败**，逼上层降级软解 ——
 #      画面继续跑，只是这一轮没了 GPU 加速，**不会再永久卡死**。
 GL_LOCK_POISON_S = 5.0             # 锁被同一线程持有超过这么久 ⇒ 判定驱动挂死
+# 工作线程"首次建上下文"抢锁失败时的重试间隔（秒）：只是没抢到锁 ⇒ 稍后再试，**不置死**。
+_READY_RETRY_SECS = 0.5
 _LOCK_POISON = [False]             # 一旦 True：本次进程内不再碰 GL（全部走软解）
 _OWN = {"tid": None, "since": 0.0, "depth": 0}   # 持锁者（只在临界区内改，天然串行）
 
@@ -120,6 +122,15 @@ def _gl_exit():
         _OWN["tid"] = None
         _OWN["since"] = 0.0
     _CREATE_LOCK.release()
+
+
+class GLLockUnavailable(Exception):
+    """**抢 GL 全局锁超时**（`_gl_enter` 拿不到锁）。
+
+    与"真正的上下文创建失败"必须区分开：这**只是**"此刻锁被别的线程占用"，
+    线程本身好得很、锁一放开就能建成功 ⇒ 上层必须当作"尚未就绪、稍后重试"，
+    **绝不可**据此判定"工作线程崩溃"而永久置死 GPU（这正是今天咬了两次的模式）。
+    """
 
 
 def ctx_count():
@@ -265,9 +276,14 @@ class GLDecoder:
         self.last_readback = 0.0    # 最近一次回读耗时（秒），诊断用
         self._u_swizzle = -1      # uSwizzle 的 uniform 位置
         self._swizzle = -1        # 当前 swizzle 状态（-1 = 未设置）
+        self.lock_timeout = False  # ★ True = 仅"没抢到 GL 锁"（可重试，非崩溃）
         try:
             self._init()
             self.ok = True
+        except GLLockUnavailable as e:                          # ★ 可重试：不是崩溃
+            self.err = str(e)[:200]
+            self.ok = False
+            self.lock_timeout = True
         except Exception as e:                                  # noqa: BLE001
             self.err = str(e)[:200]
             self.ok = False
@@ -291,7 +307,11 @@ class GLDecoder:
             #    建 VAO-VBO 全在**锁外** —— 正是它们与另一线程持锁的 `glfwDestroyWindow`
             #    并发，才把 NVIDIA WGL 拖进死锁。现场日志的三个签名完全吻合。
             if not _gl_enter(GL_CREATE_TIMEOUT):
-                raise RuntimeError("GL 锁不可用（或驱动已挂死），转软解")
+                # ★ 只是"没抢到锁"（可达：另一线程正在持锁做 GL）——**不是崩溃**。
+                #   抛专用异常，让 `_run` 当作"尚未就绪、稍后重试"，绝不永久置死 GPU。
+                raise GLLockUnavailable(
+                    "GL 锁在 %.1fs 内未取得（另一线程正持锁）；本次未就绪，稍后重试"
+                    % GL_CREATE_TIMEOUT)
             try:
                 g.window_hint(g.VISIBLE, g.FALSE)
                 g.window_hint(g.CONTEXT_VERSION_MAJOR, 3)
@@ -661,19 +681,33 @@ class GLWorker:
     _inst = None
     _inst_lock = threading.Lock()
 
+    # 冷启动同步等待上限（秒）：**只有"首次启动工作线程"的那一次调用**会同步等这么久。
+    # 之后所有调用一律**非阻塞探测**（只读一次状态、立刻返回），绝不重复长等主线程。
+    # 为什么给到 12s：冷启动要建 glfw 窗口 + WGL 上下文（会在驱动里拉起 ~21 个线程）
+    # + 编译/链接着色器 + 建 VAO/VBO，这段 GL 工作**没有任何超时约束**，在冷机 / 驱动
+    # 初始化慢 / 系统繁忙时实测可以数秒；旧的 3s 太紧（现场命中 3 次）。
+    GL_READY_TIMEOUT = 12.0
+    # 若首次调用恰好发生在**主线程(GUI)**：只等这么短 —— 宁可先软解，也绝不冻界面；
+    # 非阻塞探测会在工作线程稍后就绪时自动把它接上（`available()` 变 True）。
+    GL_READY_TIMEOUT_UI = 3.0
+
     def __init__(self):
         self._cv = threading.Condition()      # 请求队列条件变量
         self._req = collections.deque()       # 待处理请求
         self._init_lock = threading.Lock()    # 保护启动
         self._ready_evt = threading.Event()   # 唯一上下文就绪
         self._started = False
-        self._dead = False                    # 一旦 True：本进程不再用 GPU
+        self._dead = False                    # ★ 只有工作线程**崩溃**（不可恢复）才会置真
         self._thread = None
         self._dec = None                      # 唯一的 GLDecoder（永不销毁）
         self.last_error = ""
         self.decode_timeout = 1.5             # 单次请求等待上限（秒）
         self.n_ok = 0                         # 诊断：成功解码次数
         self.n_timeout = 0                    # 诊断：超时次数
+        # ★ 冷启动等待策略状态（2026-10-02 现场：启动超时被永久置死 `_dead`，整场退回软解）
+        self._start_t = 0.0                   # 工作线程启动时刻（用于诊断"启动多久了"）
+        self._blocked_once = False            # 是否已做过"首次同步等待"（只有启动者做一次）
+        self._last_slow_log = 0.0             # "冷启动慢"诊断日志限频时刻
 
     @classmethod
     def get(cls):
@@ -683,31 +717,57 @@ class GLWorker:
             return cls._inst
 
     # ---------------------------------------------------------------- 生命周期
-    def ensure(self, ready_timeout=3.0):
+    def ensure(self, ready_timeout=None):
         """确保工作线程已启动、唯一 GL 上下文已就绪。True=可用。幂等、线程安全。
 
         glfw 的 `glfwInit` 在主线程（现状：ui_main 启动时已调 `preinit()`）；这里再调一次
         `preinit()` 只是**幂等 no-op**。真正建窗口发生在工作线程内（glfw 允许）。
+
+        ★ 等待策略（2026-10-02 现场修复：「启动超时 ⇒ 永久 `_dead` ⇒ 整场软解」）：
+          · **只有"首次启动工作线程"的那一次调用**会**同步等待**冷启动（最多
+            `GL_READY_TIMEOUT` 秒；若这次调用发生在主线程则收紧到 `GL_READY_TIMEOUT_UI`，
+            绝不冻界面）。这一次是必须的：冷启动的 GL 工作是异步的，起跑瞬间几乎必然没就绪。
+          · **之后所有调用一律非阻塞探测**：只读一次 `_ready_evt`、立即返回。
+            ⇒ 上层（解码线程 / GUI）**绝不可能被反复同步等十几秒**。
+          · **超时绝不置 `_dead`**：`_dead` 只由工作线程**崩溃**（`_run` 异常 / 上下文 `ok=False`）
+            置真。启动慢 ≠ 不可恢复 —— 工作线程稍后就绪后，非阻塞探测会立刻返回 True，
+            `available()` 变 True，解码线程的周期重探（`_soft_until_recover`）会自动切回 GPU。
         """
+        to = self.GL_READY_TIMEOUT if ready_timeout is None else float(ready_timeout)
         with self._init_lock:
             if self._ready_evt.is_set():
                 return not self._dead
-            if self._dead:
+            if self._dead:                    # 只可能是工作线程崩溃（不可恢复）
                 return False
-            if not self._started:
+            launcher = not self._started
+            if launcher:
                 preinit()                     # 幂等；通常主线程已 init 过
                 self._started = True
+                self._start_t = time.perf_counter()
                 self._thread = threading.Thread(target=self._run, name="gl-worker",
                                                 daemon=True)
                 self._thread.start()
-        if self._ready_evt.wait(ready_timeout):
+                self._blocked_once = True     # ★ 只有启动者会做这一次同步等待
+        if not launcher:
+            # ★ 非阻塞探测：只读一次状态、立刻返回（绝不重复同步等待）
+            return self._ready_evt.is_set() and not self._dead
+        # ---- 启动者：同步等一次冷启动 ----
+        if threading.current_thread() is threading.main_thread():
+            to = min(to, self.GL_READY_TIMEOUT_UI)   # 主线程：宁先软解也不冻界面
+        if self._ready_evt.wait(to):
             return not self._dead
-        if not self._dead:
-            self._dead = True
-            self.last_error = self.last_error or ("GL 工作线程启动超时（%.0fs）"
-                                                  % ready_timeout)
-            _log_line("!! GLWorker 启动超时：本进程不再使用 GPU 解码，全部转软解")
+        # ★ 超时**绝不**置 `_dead`：可能只是冷启动慢（驱动初始化 / 系统繁忙），稍后即就绪。
+        self._note_slow_start(to)
         return False
+
+    def _note_slow_start(self, to):
+        """冷启动超时只记一条**限频诊断**（不置死、不改 `last_error`，避免污染可用性判定）。"""
+        now = time.perf_counter()
+        if now - self._last_slow_log < 5.0:
+            return
+        self._last_slow_log = now
+        _log_line("GLWorker 冷启动超过 %.0fs 仍未就绪 —— **不置死**，"
+                  "稍后由非阻塞探测自动接入（期间该素材先软解，画面不停）" % to)
 
     def available(self):
         """唯一上下文**就绪、未挂死、未处于降级冷却中、且解码器本身仍健康**。
@@ -728,29 +788,52 @@ class GLWorker:
         dec = self._dec
         if dec is not None and not getattr(dec, "ok", False):
             return getattr(dec, "err", "") or "GL 上下文失效"
+        if self._started and not self._dead and not self._ready_evt.is_set():
+            # ★ 冷启动中（未就绪但**未**判死）：给上层一个可读原因，别显示成"未知停用"
+            return "GL 工作线程冷启动中（尚未就绪，稍后自动接入）"
         return ""
 
     def stats(self):
         return {"ready": self._ready_evt.is_set(), "dead": self._dead,
+                "started": self._started,
+                "since_start": (time.perf_counter() - self._start_t) if self._start_t else None,
                 "n_ok": self.n_ok, "n_timeout": self.n_timeout,
                 "err": self.last_error}
 
     def _run(self):
-        """工作线程主体：建唯一上下文 → 循环处理请求。永不返回 `destroy()`。"""
-        try:
-            preinit()
-            dec = GLDecoder()
-        except Exception as e:                                  # noqa: BLE001
-            self.last_error = "创建 GL 上下文异常：%s" % str(e)[:150]
-            self._dead = True
-            self._ready_evt.set()
-            return
-        self._dec = dec
-        if not dec.ok:
+        """工作线程主体：建唯一上下文 → 循环处理请求。永不返回 `destroy()`。
+
+        ★ 不变式（2026-10-02 收敛）：**只要本线程还活着，`_dead` 就必须保持 False。**
+        `_dead` 只表示"工作线程真的退出 / 彻底没救了"。因此：
+          · **抢锁超时**（`GLLockUnavailable`）：这只是"此刻锁被别的线程占用"，**不是崩溃**
+            —— 当作"尚未就绪"，睡 `_READY_RETRY_SECS` 后**重试**，绝不置 `_dead`；
+            锁一放开即建成（可恢复）。若期间驱动被判定挂死（`gl_poisoned()`），
+            则按"不可恢复"退出置 `_dead`（与全局污染策略一致）。
+          · **真正的创建失败**（`glfwCreateWindow` / 上下文 / 着色器 / `preinit` 抛异常）：
+            保持原样置 `_dead`。
+        """
+        while True:
+            try:
+                preinit()
+                dec = GLDecoder()
+            except Exception as e:                              # noqa: BLE001
+                self.last_error = "创建 GL 上下文异常：%s" % str(e)[:150]
+                self._dead = True
+                self._ready_evt.set()
+                return
+            if dec.ok:
+                break
+            if getattr(dec, "lock_timeout", False) and not gl_poisoned():
+                # ★ 只是没抢到锁 ⇒ "尚未就绪"，稍后重试；**绝不置死**（保持不变式）
+                self.last_error = dec.err or "GL 锁暂不可用（未就绪，稍后重试）"
+                time.sleep(_READY_RETRY_SECS)
+                continue
+            # 驱动已判定挂死，或真正的上下文创建失败 ⇒ 不可恢复
             self.last_error = dec.err or "GL 上下文不可用"
             self._dead = True
             self._ready_evt.set()
             return
+        self._dec = dec
         self._ready_evt.set()
         while True:
             with self._cv:
