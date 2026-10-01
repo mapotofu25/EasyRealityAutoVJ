@@ -1469,6 +1469,12 @@ class GpuDxvPlayer(_DecoderHealth):
         self.gpu_want = False      # ★ 素材允许走 GPU（即使此刻工作线程没就绪）
                                    #   ⇒ 用 `_gpu_frames()` 进自愈路径，别用 `_soft_frames`
         self.reason = "未探测"      # 诊断：走 / 不走 GPU 的原因
+        # ★ DXV 的 **YUV 变体**（`yuv420p`/`yuva420p`）PyAV 18.1.0 **无法转 numpy**
+        #   （`to_ndarray`/`reformat` 全部 OSError -129，native 也不支持 yuva420p），
+        #   软解必须改走 OpenCV（自带 FFmpeg，能正确解出并转 BGR）。
+        #   见 `tools/_probe_yuv_convert.py` / `tools/_probe_fix_options.py`。
+        self._soft_cv = False       # True = 软解用 `_cv_frames()`（OpenCV）
+        self._cap = None            # OpenCV 的 VideoCapture（只在解码线程内建/放）
         self._t = None                  # 不再持有 Thread 对象（见 _start_decoder_thread 的说明）
         self._init_health()             # 产帧计数 / 卡帧判据（见 _DecoderHealth）
         _start_decoder_thread(self._loop, name="autovj-dec")
@@ -1503,6 +1509,13 @@ class GpuDxvPlayer(_DecoderHealth):
         self._src_w, self._src_h = int(st.width), int(st.height)
         if not self._try_gpu(c, st):
             _cap_decode_threads(st)        # 软解路径才需要限制解码线程数
+            # ★ 软解后端选择：DXV 的 YUV 变体（pix_fmt 以 `yuv` 开头）PyAV 转换不了，
+            #   走 OpenCV；其余（含 DXT → `rgba`）仍走 PyAV 软解。
+            try:
+                pf = str(st.codec_context.pix_fmt or "")
+            except Exception:                                      # noqa: BLE001
+                pf = ""
+            self._soft_cv = bool(pf.startswith("yuv"))
         return c, st
 
     def _try_gpu(self, c, st):
@@ -1529,15 +1542,36 @@ class GpuDxvPlayer(_DecoderHealth):
                 _GPU_DISABLED = "dxvnative 不可用：%s" % (dxvnative.LAST_ERROR or "未知")
                 self.reason = _GPU_DISABLED
                 return False
-            # 取第一包解析 DXV 帧头（这一包被消费掉，循环播放无影响）
+            # 取第一包解析 DXV 帧头。⚠⚠ **必须用临时容器探测，绝不能动 `self.c` 的读状态**：
+            #   `demux()` 会**消费掉首包** —— 若在 `self.c` 上做，随后走软解路径的
+            #   `_soft_frames()` 调 `self.c.decode(video=0)` 就会从**第二帧**开始（丢一帧），
+            #   且违背"探测不该有副作用"的契约（用户"切几次突然一个素材就卡住"排查时，
+            #   这条"探测污染读状态"曾被怀疑为真因；虽被 `tools/_bench_demux_decode.py`
+            #   证明**不会**直接卡死，但仍应消除副作用）。临时容器读完即关，代价仅一次帧头读。
             pk = None
             try:
-                for p in c.demux(st):
-                    if p.size:
-                        pk = bytes(p)
-                        break
-            except Exception:
+                tc = self._av.open(self.path, metadata_errors="replace")
+                try:
+                    tst = tc.streams.video[0]
+                    for p in tc.demux(tst):
+                        if p.size:
+                            pk = bytes(p)
+                            break
+                finally:
+                    try:
+                        tc.close()
+                    except Exception:                          # noqa: BLE001
+                        pass
+            except Exception:                                      # noqa: BLE001
+                # 临时容器开不了（极少见）：退回主容器探测（有副作用但不致命）
                 pk = None
+                try:
+                    for p in c.demux(st):
+                        if p.size:
+                            pk = bytes(p)
+                            break
+                except Exception:                                  # noqa: BLE001
+                    pk = None
             hd = dxvnative.parse_header(pk) if pk else None
             if hd is None:
                 self.reason = "帧头不受支持（DXV2-LZF / YCG6 等）"
@@ -1720,18 +1754,31 @@ class GpuDxvPlayer(_DecoderHealth):
                 return True
 
     def _soft_frames(self):
-        """软解路径：与 AvAlphaPlayer 完全一致的 PyAV 解码（降级用）。
+        """软解路径：PyAV 解码（降级用），仅用于 PyAV **能**转换的素材（如 DXT → rgba）。
 
         ⚠ 必须有"空转退避"：见 `_SOFT_EMPTY_BACKOFF_AFTER` 的说明 —— 否则一个解不出来
           的素材会**占满一个核空转**，而且现场就是这样把 CPU 一点点拖到 100% 的。
+        ⚠⚠ 2026-10-02：`got += 1` **必须放在转换成功之后**。原来放在 `to_ndarray` 之前，
+          于是"帧解出来、但转换失败（DXV-YUV → OSError -129）"被误当成"出过帧"⇒
+          `empty` 永远为 0 ⇒ 空转退避/收工判据全部失效 ⇒ **无限忙等、画面永不前进**
+          （用户"切几次突然一个素材就卡住"的真凶之一，见 `tools/_probe_block_cause3.py`）。
         """
         empty = 0
         while True:
             got = 0
+            conv_fail = 0
             try:
                 for frame in self.c.decode(video=0):
-                    got += 1
-                    arr = frame.to_ndarray(format="bgra")
+                    try:
+                        arr = frame.to_ndarray(format="bgra")
+                    except Exception:                              # noqa: BLE001
+                        # 转换失败（PyAV 转不了的像素格式）**不算出帧**；连续失败就结束本趟，
+                        # 让 empty 累加、最终收工（绝不再无限空转）。
+                        conv_fail += 1
+                        if conv_fail >= 20:
+                            break
+                        continue
+                    conv_fail = 0
                     h, w = arr.shape[:2]
                     if self._max_w and self._max_h:
                         s = min(self._max_w / w, self._max_h / h)
@@ -1739,6 +1786,7 @@ class GpuDxvPlayer(_DecoderHealth):
                             arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))),
                                              interpolation=cv2.INTER_AREA)
                             h, w = arr.shape[:2]
+                    got += 1                       # ★ 只有真正要 yield 一帧才算"出帧"
                     yield QImage(arr.data, w, h, 4 * w, self._qfmt).copy()
             except Exception:                                      # noqa: BLE001
                 pass
@@ -1751,6 +1799,77 @@ class GpuDxvPlayer(_DecoderHealth):
                 _log_decoder_giveup(self.path, "软解连续 %d 趟无帧" % empty)
                 return
             if not self._rewind():
+                return
+
+    def _soft_gen(self):
+        """按 `_soft_cv` 选择软解生成器：DXV-YUV 用 OpenCV，其余用 PyAV。
+
+        ⚠ `getattr(..., False)` 兜底：测试用 `__new__` 直接构播放器（不走 `__init__`），
+          此时 `_soft_cv` 不存在，必须默认走 PyAV 软解而不是抛 AttributeError。
+        """
+        return self._cv_frames() if getattr(self, "_soft_cv", False) else self._soft_frames()
+
+    def _cv_frames(self):
+        """OpenCV 软解路径：给 **PyAV 转换不了**的 DXV-YUV（`yuv420p`/`yuva420p`）用。
+
+        为什么需要（2026-10-02 用户"切几次突然一个素材就卡住"的真凶）：
+          · 这些素材 `parse_header → None`，被 GPU 格式闸门拒绝 ⇒ 走软解；
+          · PyAV 解出的帧是 `yuv420p`/`yuva420p`，**无法 `to_ndarray`/`reformat`**
+            （OSError -129）⇒ `_soft_frames` 永远出不了帧；
+          · OpenCV（自带 FFmpeg）能正确解码并直接给出 BGR（实测三个素材全 OK）。
+        与 `_soft_frames` 同构：出帧、空转退避、收工、回卷片头；绝不忙等。
+        """
+        empty = 0
+        while not self._dead:
+            if self._cap is None:
+                try:
+                    cap = cv2.VideoCapture(self.path)
+                except Exception:                                  # noqa: BLE001
+                    cap = None
+                if cap is None or not cap.isOpened():
+                    try:
+                        if cap is not None:
+                            cap.release()
+                    except Exception:                              # noqa: BLE001
+                        pass
+                    self._ended = True
+                    self.gave_up_reason = "OpenCV 打不开容器"
+                    _log_decoder_giveup(self.path, self.gave_up_reason)
+                    return
+                self._cap = cap
+            got = 0
+            while not self._dead:
+                try:
+                    ok, bgr = self._cap.read()
+                except Exception:                                  # noqa: BLE001
+                    ok, bgr = False, None
+                if not ok or bgr is None:
+                    break
+                h, w = bgr.shape[:2]
+                if self._max_w and self._max_h:
+                    s = min(self._max_w / w, self._max_h / h)
+                    if s < 1.0:
+                        bgr = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))),
+                                         interpolation=cv2.INTER_AREA)
+                        h, w = bgr.shape[:2]
+                # cv2 给的是 BGR；QImage 的 Format_ARGB32/RGB32 在内存里都是 BGRA 字节序 ⇒ 补 alpha
+                bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+                got += 1
+                yield QImage(bgra.data, w, h, 4 * w, self._qfmt).copy()
+            if self._dead:
+                return
+            empty = 0 if got else empty + 1
+            if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
+                time.sleep(min(0.2, 0.02 * empty))
+            if empty >= _SOFT_EMPTY_GIVEUP:
+                self._ended = True
+                self.gave_up_reason = "OpenCV 连续 %d 趟无帧" % empty
+                _log_decoder_giveup(self.path, self.gave_up_reason)
+                return
+            # 到片尾 ⇒ 回卷到片头（循环播放）
+            try:
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            except Exception:                                      # noqa: BLE001
                 return
 
     def _loop(self):
@@ -1781,7 +1900,7 @@ class GpuDxvPlayer(_DecoderHealth):
                 break
             interval = 1.0 / max(self.fps, 1.0)
             gen_gpu = (self.gpu or self.gpu_want) and gpu_decode_enabled()
-            frames = self._gpu_frames() if gen_gpu else self._soft_frames()
+            frames = self._gpu_frames() if gen_gpu else self._soft_gen()
             produced = False
             fail = 0
             while not self._dead:
@@ -1790,7 +1909,7 @@ class GpuDxvPlayer(_DecoderHealth):
                 want = (self.gpu or self.gpu_want) and gpu_decode_enabled()
                 if want != gen_gpu:
                     gen_gpu = want
-                    frames = self._gpu_frames() if want else self._soft_frames()
+                    frames = self._gpu_frames() if want else self._soft_gen()
                 if not self._active:
                     if self._warm <= 0:
                         time.sleep(0.05)
@@ -1845,6 +1964,12 @@ class GpuDxvPlayer(_DecoderHealth):
             except Exception:
                 pass
             self.c = None
+        if self._cap is not None:          # OpenCV 软解路径的 VideoCapture
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
 
 
 def create_video_player(item):

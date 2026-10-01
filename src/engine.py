@@ -414,6 +414,7 @@ class Layer:
         self._silent_noframe_count = 0          # 该素材累计"无帧重建"次数
         self._silent_noframe_last_t = 0.0       # 上次"无帧重建"时刻（图层级冷却）
         self._silent_noframe_capped_log_t = 0.0  # 上次记"重建到顶"日志的时刻
+        self._silent_skip_log_t = 0.0           # 上次记"无帧跳过/单素材不可跳"日志的时刻
         # 预热（切素材零延迟）：切换后延迟一会儿把「下一个要用的素材」的容器打开+首帧解出来。
         # 不预热的话切换瞬间新解码器还要 70~690ms 才有首帧（= 用户看到的"卡几帧"）。
         self.pre_idx = -1        # 预选的下一个素材索引
@@ -1122,7 +1123,8 @@ class AutoVJEngine(QObject):
             self._heal_stalled(lay)
             # ★ 静默冻帧兜底：`_heal_stalled` 看不见的那几类（player 不在缓存 ⇒ 永不被激活 /
             #   player is None / 有帧前就 ended）在这里恢复并留下日志，避免"画面冻住而日志沉默"。
-            self._heal_silent(lay)
+            #   传 `snap` 供"无帧封顶后跳到下一个素材"复用 `_candidate_indices`。
+            self._heal_silent(lay, snap)
 
         # ★ 每层健康快照（每秒 1 行，只在 running 时）—— 卡了能直接回看那一刻每层状态。
         self._health_tick()
@@ -1982,7 +1984,7 @@ class AutoVJEngine(QObject):
             except Exception:                                  # noqa: BLE001
                 pass
 
-    def _heal_silent(self, lay):
+    def _heal_silent(self, lay, snap=None):
         """静默冻帧兜底：处理 `_heal_stalled` 看不见、且**没有任何其它恢复者**的几类故障。
 
         为什么需要它（2026-10-01 用户实测"播放中仍卡在某一帧、且 ui_stall.log 10 分钟
@@ -1993,6 +1995,7 @@ class AutoVJEngine(QObject):
         这里只做"恢复 + 取证"，**不重建**已经能自愈的情况，避免回到重建风暴。
 
         热路径廉价：不需要动作的那一趟只做时间戳/属性比较，绝不调用 `stalled()`/`health()`。
+        `snap`：音频快照（供"无帧封顶后跳到下一个素材"复用 `_candidate_indices`）。
         """
         if not self.running:
             return
@@ -2070,9 +2073,12 @@ class AutoVJEngine(QObject):
             # 图层级冷却（≥ `_SILENT_NOFRAME_COOLDOWN` 秒）—— 防同一图层连续重建风暴
             if now - getattr(lay, "_silent_noframe_last_t", 0.0) < _SILENT_NOFRAME_COOLDOWN:
                 return
-            # 素材级上限（≤ `_SILENT_NOFRAME_MAX` 次）—— 到顶只记一行（去重），不再重建
+            # 素材级上限（≤ `_SILENT_NOFRAME_MAX` 次）—— 到顶：不再重建这一帧，
+            # ★ 改为**尝试跳到该图层下一个候选素材**（避免整层一直停在这一帧）。
             if getattr(lay, "_silent_noframe_count", 0) >= _SILENT_NOFRAME_MAX:
-                if now - getattr(lay, "_silent_noframe_capped_log_t", 0.0) >= _SILENT_ENDED_EVERY:
+                switched = self._skip_no_frame_material(lay, now, since, snap)
+                if (not switched
+                        and now - getattr(lay, "_silent_noframe_capped_log_t", 0.0) >= _SILENT_ENDED_EVERY):
                     lay._silent_noframe_capped_log_t = now
                     self._silent_log(lay, "无帧封顶",
                                      "解不出首帧已 %.1fs、重建 %d 次达上限 —— 暂不再重建"
@@ -2128,6 +2134,59 @@ class AutoVJEngine(QObject):
                              % (os.path.basename(path), _SILENT_GRACE))
             return
         lay._silent_inactive_since = 0.0
+
+    def _skip_no_frame_material(self, lay, now, since, snap):
+        """无帧重建封顶后：**自动跳到该图层下一个候选素材**（避免整层一直停在这一帧）。
+
+        返回 True = 已切换；False = 本次没跳（单素材层 / 过渡中 / 无候选 / 未运行）。
+
+        复用引擎既有切换机制（`_candidate_indices` + `_switch_layer_to`），**不自造**。
+        安全约束：
+          · `running` 为假 ⇒ 绝不动作；
+          · 过渡进行中（`trans_active`）⇒ 不跳（下个 tick 再试），**绝不打断过渡**；
+          · 单素材层无可跳 ⇒ 只记日志（`_SILENT_ENDED_EVERY` 去重）；
+          · 被跳过的坏素材**临时**加入 `lay.recent`（**不永久拉黑** —— 用户可能只是暂时读不到文件）；
+          · 用正常过渡切换（非 hard-cut），与自动切换行为一致。
+        """
+        if not self.running:
+            return False
+        if getattr(lay, "trans_active", False):
+            return False                     # 过渡进行中：不安全，下个 tick 再试
+        if len(lay.clips) < 2:
+            if now - getattr(lay, "_silent_skip_log_t", 0.0) >= _SILENT_ENDED_EVERY:
+                lay._silent_skip_log_t = now
+                self._silent_log(lay, "无帧封顶",
+                                 "解不出首帧已 %.1fs，但图层仅 1 个素材，无法跳过（仅记录）"
+                                 % (now - since))
+            return False
+        try:
+            cands = self._candidate_indices(lay, snap or {"energy": 0.55})
+        except Exception:                                      # noqa: BLE001
+            cands = []
+        cands = [i for i in cands if i != lay.cur]
+        if not cands:                        # 兜底：候选被 recent/cooldown 过滤空时，任取一个非当前
+            cands = [i for i in range(len(lay.clips)) if i != lay.cur]
+        if not cands:
+            return False
+        bad_path = getattr(lay.clips[lay.cur], "path", "")
+        nxt = cands[0]
+        try:
+            if bad_path and bad_path not in lay.recent:
+                lay.recent.append(bad_path)      # 暂时避选（换素材后会自然滑出 recent）
+                if len(lay.recent) > max(3, len(lay.clips) // 2):
+                    lay.recent.pop(0)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            self._switch_layer_to(lay, nxt)      # 正常过渡切换（`_tick_lock` 可重入）
+        except Exception:                                      # noqa: BLE001
+            return False
+        self._silent_log(lay, "无帧跳过",
+                         "解不出首帧已 %.1fs、重建封顶 ⇒ 跳到下一个素材 %s（跳过 %s）"
+                         % (now - since,
+                            os.path.basename(getattr(lay.clips[nxt], "path", "")),
+                            os.path.basename(bad_path)))
+        return True
 
     def _silent_log(self, lay, reason, detail):
         """静默冻帧兜底日志：按 (图层, 原因) 去重（`_SILENT_ACTION_MIN` 秒内只记一次）。"""
