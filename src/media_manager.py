@@ -379,8 +379,31 @@ class MediaItem:
                 best_score, best = score, f
         return best if best is not None else fallback
 
+    def _eval_alpha_frame(self, arr, best, best_score):
+        """对一帧 bgra ndarray 打分，返回 (best, best_score)。抽成方法便于两处复用。"""
+        alpha = arr[..., 3]
+        al = float((alpha > 16).mean())          # 非透明像素占比
+        if al > 0:
+            std = float(arr[..., :3].std())      # RGB 内容丰富度
+            score = al * 100.0 + std             # alpha 覆盖率优先 + 内容
+            if score > best_score:
+                return np.ascontiguousarray(arr), score
+        return best, best_score
+
     def _make_av_thumb(self, avmod, png_path):
-        """带 alpha 视频：采样多个时间点，选 alpha 内容最丰富的一帧存 PNG（保留透明）"""
+        """带 alpha 视频：采样多个时间点，选 alpha 内容最丰富的一帧存 PNG（保留透明）。
+
+        ⚠⚠ **核心修复（qtrle alpha 误判根因）**：
+        1) PyAV 18.1.0 对 **qtrle** 素材在 `c.seek(..., any_frame=True)` 后解码会抛
+           `[Errno 1094995529] Invalid data found ... avcodec_send_packet()`（实测 12/12 采样点全废）。
+           故 seek 改 **`any_frame=False`**（实测 OK）。`any_frame=True` 会依赖「最近可解帧」
+           的近似 seek，对只含关键帧的 qtrle 会落到不可解位置。
+        2) **兜底**：若 seek 后取帧仍抛异常，**回退到「从头顺序解码到目标帧号」**
+           （实测 25/75/125 帧都能正常取到 bgra 带 alpha），而不是 `continue` 跳过整个采样点
+           —— 原来 12 个点全废导致整体返回 False、PNG 缩略图从未生成。
+           顺序解码**有上限**：最多推进到**最后一个采样点**就停，绝不把整片解完（大素材会慢）。
+           每个采样点顺序解码间**复用同一容器位置**（已过帧不再回头 seek），整体线性一遍。
+        """
         from fractions import Fraction
         c = avmod.open(self.path, metadata_errors="replace")
         try:
@@ -390,24 +413,43 @@ class MediaItem:
             self.duration = n / fps
             step = max(1.0, n / 12.0)
             mids = [int(step * (k + 0.5)) for k in range(12)]
+            last_mid = mids[-1] if mids else 0
             best, best_score = None, -1.0
+            # 顺序解码游标：记录「已经解到的帧号 + 容器当前是否停在可续解位置」。
+            seq_next = 0        # 下一次顺序解码应从第几帧开始
             for mid in mids:
+                got = False
+                # (A) 首选：seek 到采样点（any_frame=False，qtrle 可解）
                 try:
                     pts = int(Fraction(mid, 1) / Fraction(st.average_rate) / Fraction(st.time_base))
-                    c.seek(pts, stream=st, any_frame=True)
+                    c.seek(pts, stream=st, any_frame=False)
+                    for f in c.decode(video=0):
+                        arr = f.to_ndarray(format="bgra")
+                        best, best_score = self._eval_alpha_frame(arr, best, best_score)
+                        got = True
+                        break                    # 每个采样点只取一帧
                 except Exception:
+                    got = False
+                if got:
                     continue
-                for f in c.decode(video=0):
-                    arr = f.to_ndarray(format="bgra")
-                    alpha = arr[..., 3]
-                    al = float((alpha > 16).mean())     # 非透明像素占比
-                    if al > 0:
-                        std = float(arr[..., :3].std())  # RGB 内容丰富度
-                        score = al * 100.0 + std         # alpha 覆盖率优先 + 内容
-                        if score > best_score:
-                            best_score = score
-                            best = np.ascontiguousarray(arr)
-                    break                                # 每个采样点只取一帧
+                # (B) 兜底：从头（或上次顺序位置）顺序解码到目标帧号，最多推进到最后一个采样点。
+                try:
+                    if seq_next == 0:
+                        c.seek(0, stream=st)     # 回到开头再顺序推进
+                    k = seq_next
+                    for f in c.decode(video=0):
+                        if k >= mid:
+                            arr = f.to_ndarray(format="bgra")
+                            best, best_score = self._eval_alpha_frame(arr, best, best_score)
+                            k += 1
+                            break
+                        k += 1
+                        if k > last_mid:         # 已到最后采样点，别再解完整个片子
+                            break
+                    seq_next = k
+                except Exception:
+                    seq_next = mid + 1           # 兜底也失败 → 标记已过该点，避免死循环
+                    continue
             if best is None:
                 return False
             h, w = best.shape[:2]
@@ -2113,7 +2155,16 @@ def create_video_player(item):
     到两百毫秒，而本函数是在渲染线程里调的（切素材那一下）→ 直接卡几帧。
     判断 alpha 的免费依据：**缩略图是 PNG 就说明该素材带 alpha** —— 缩略图只在探测到 alpha
     时才存 PNG（要保透明通道），而缩略图在导入时就生成好了，等于把探测结果持久化在了磁盘上。
-    缩略图缺失时**也不等**（后台补探测，见 _probe_alpha_async）。
+
+    ⚠⚠ **本质修复（PNG 生成失败 → alpha 误判 → 黑底）**：
+    旧逻辑「无 PNG 缩略图 ⇒ 直接 has=False」是**错的** —— 只要 PNG 生成失败（曾是 qtrle seek
+    全废），即便 `_av_probe_alpha` 已明确说带 alpha，也会被误判为无 alpha → 走 OpenCV 丢透明
+    → 透明区画黑底。现在改为**三级判据，绝不在渲染线程 av.open**：
+      1) 有 PNG 缩略图 → True；有 JPG 缩略图 → False（磁盘上持久化的探测结果，最便宜）；
+      2) 无任何缩略图时，**回退用 `_av_probe_alpha` 的既有结论**（`item._has_alpha` /
+         `item._av_no_alpha` 实例缓存；两者都是后台 `_probe_alpha_async` /
+         `AlphaMigrationWorker` 填的，渲染线程只读）；
+      3) 仍未知 → 先按无 alpha 用起来（绝不卡切换），并触发后台补探测 `_probe_alpha_async`。
     """
     has = getattr(item, "_has_alpha", None)
     if has is None:
@@ -2123,7 +2174,14 @@ def create_video_player(item):
             elif os.path.exists(item._thumb_path(".jpg")):
                 has = False
             else:
-                has = False
+                # 无缩略图：不要直接判 False —— 优先用后台已探测出的结论
+                # （`_av_no_alpha` 为 True 表示后台已确认无 alpha；否则按未知处理）。
+                # 绝不在此 av.open；`_probe_alpha_async` 会把真结果回填 _has_alpha 并置
+                # _alpha_recheck，引擎下次切到它时重开解码器。
+                if getattr(item, "_av_no_alpha", False):
+                    has = False
+                else:
+                    has = bool(getattr(item, "_has_alpha", False))
                 _probe_alpha_async(item)             # 后台探测，绝不在渲染线程等
         except Exception:
             has = False

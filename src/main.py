@@ -116,6 +116,19 @@ def main():
         splash = None
     mark("启动画面", t)
 
+    # 临时副本回收（防磁盘泄漏）：**必须在单实例锁之前**！否则「已有实例在跑」时
+    # 走到下面的 `sys.exit(0)` 会**直接跳过清扫** —— 实测因此遗留 13GB 孤儿副本
+    # （第二实例从不清理、第一实例早就跑过清扫点了）。
+    # 清理是**纯删过期文件**（TTL 外），无副作用、不需要任何独占；被占用/太新的副本
+    # 优雅跳过。失败静默、绝不影响启动。
+    t = time.perf_counter()
+    try:
+        from media_manager import cleanup_stale_ascii_copies
+        _rm, _lk, _keep = cleanup_stale_ascii_copies(ttl_hours=24.0)
+    except Exception:
+        pass
+    mark("临时副本清理", t)
+
     # 单实例锁：启动加载模型需要十几秒，期间重复双击会开出一堆窗口。
     # 上次被强杀/崩溃后锁文件可能残留 → 先试一次，失败就把**残留锁**删掉再试，
     # 避免出现「有进程有锁、但永远起不来、也没有窗口」的死局。
@@ -134,17 +147,6 @@ def main():
                 "如确认没有窗口，可在任务管理器结束 EasyRealityAutoVJ.exe 后重试。")
             sys.exit(0)
     mark("单实例锁", t)
-
-    # 临时副本回收（防磁盘泄漏）：只在本实例独占启动时做，且**启动早期**
-    # （规范上此时无素材在播，删文件安全）。回收上次崩溃/强杀遗留的孤儿副本；
-    # 被占用/太新的副本会优雅跳过，绝不因清理影响播放。失败静默、绝不影响启动。
-    t = time.perf_counter()
-    try:
-        from media_manager import cleanup_stale_ascii_copies
-        _rm, _lk, _keep = cleanup_stale_ascii_copies(ttl_hours=24.0)
-    except Exception:
-        pass
-    mark("临时副本清理", t)
 
     # 启动阶段任何异常都不能「悄悄退出」：写日志 + 弹窗，否则用户只看到
     # 「任务管理器里有进程，但没有窗口，过一会儿自己关了」。
