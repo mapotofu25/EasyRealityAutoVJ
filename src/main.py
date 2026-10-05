@@ -135,6 +135,17 @@ def main():
             sys.exit(0)
     mark("单实例锁", t)
 
+    # 临时副本回收（防磁盘泄漏）：只在本实例独占启动时做，且**启动早期**
+    # （规范上此时无素材在播，删文件安全）。回收上次崩溃/强杀遗留的孤儿副本；
+    # 被占用/太新的副本会优雅跳过，绝不因清理影响播放。失败静默、绝不影响启动。
+    t = time.perf_counter()
+    try:
+        from media_manager import cleanup_stale_ascii_copies
+        _rm, _lk, _keep = cleanup_stale_ascii_copies(ttl_hours=24.0)
+    except Exception:
+        pass
+    mark("临时副本清理", t)
+
     # 启动阶段任何异常都不能「悄悄退出」：写日志 + 弹窗，否则用户只看到
     # 「任务管理器里有进程，但没有窗口，过一会儿自己关了」。
     t = time.perf_counter()

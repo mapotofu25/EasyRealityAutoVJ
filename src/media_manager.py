@@ -63,8 +63,116 @@ def tag_of(path: str) -> str:
     return os.path.basename(os.path.dirname(path))
 
 
+# ============================================================================
+# ASCCI 安全路径的临时副本管理（防泄漏）
+#
+# 背景：OpenCV 在 Windows 读不了非 ASCII 路径，非 ASCII 素材会被复制到 Temp 的
+# `autovj_*` 副本再读。旧实现**只写不删**——实测 Temp 里堆积 239 个 `.mov` 副本、
+# 共 35GB，是明确的磁盘泄漏。
+#
+# 本模块的三道防线（均为**演出安全**设计：清理只在「绝无素材在播」的时刻发生）：
+#   (d) 复用：副本名 = autovj_<md5(源路径)12>_<size>_<mtime>.ext —— 同源同内容
+#       命中即复用、不再复制（同时省掉重复的大文件拷贝开销，并避免「同名换内容」
+#       却命中旧副本的隐患）。
+#   (a) 退出删：本进程产生并被登记到 `_TMP_COPIES` 的副本，在进程正常退出时删除。
+#   (c) 启动清孤儿：崩溃/强杀（taskkill 不走 atexit）遗留的孤儿副本，由
+#       `cleanup_stale_ascii_copies()` 在下次启动时按 TTL + 「被占用则跳过」回收。
+# ============================================================================
+_TMP_COPIES = set()          # 本进程产生（或复用）的副本路径，供退出时清理
+_COPY_PREFIX = "autovj_"
+
+
+def _register_tmp_copy(p):
+    _TMP_COPIES.add(p)
+
+
+def _cleanup_registered_copies():
+    """进程退出时删除本进程登记过的副本。
+
+    ⚠ 只删「本进程登记表」里的路径 —— 绝不扫目录乱删（避免误删另一实例/上次遗留
+      仍在用的副本）。删除失败（文件被占用 / 已被删）一律**静默跳过**，绝不抛出、
+      绝不重试，保证退出路径永不因清理而崩。
+    """
+    for p in list(_TMP_COPIES):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    _TMP_COPIES.clear()
+
+
+def cleanup_stale_ascii_copies(ttl_hours=24.0, logger=None, directory=None):
+    """启动期回收「上次崩溃/强杀遗留」的孤儿 ASCII 副本。
+
+    只在**启动早期**调用（此时规范上无素材在播，删文件安全）。判定：
+      · 只处理 `<directory>/autovj_*` 且 **是文件**（跳过目录 —— 目录是测试残留，
+        不归本函数管，避免误删）。
+      · mtime 早于 `ttl_hours` 的才删（默认 24h；刚生成、可能正被别的实例/线程
+        使用的副本不动）。
+      · 删除用 try/except：Windows 下删除「被打开的文件」会抛 PermissionError，
+        此时**优雅跳过**（这其实是天然保护——正在被解码器读的副本不会被删掉）。
+      · 已在**本进程登记表**里的副本跳过（那是本次要用的，交给退出清理）。
+
+    Args:
+        ttl_hours: 副本 mtime 早于「现在 - ttl_hours」才视为孤儿。
+        logger: 可选 callable(str) 记日志；None 时静默。
+        directory: 扫描目录；None ⇒ `tempfile.gettempdir()`（生产用法）。
+                   显式传入主要为测试隔离（避免测试误扫真实 Temp）。
+
+    Returns:
+        (removed, skipped_locked, kept_recent) 三元组，便于测试断言。
+    """
+    import time as _time
+    removed = 0
+    skipped_locked = 0
+    kept_recent = 0
+    try:
+        import tempfile
+        import glob as _glob
+        now = _time.time()
+        cutoff = now - ttl_hours * 3600.0
+        base = directory if directory is not None else tempfile.gettempdir()
+        pattern = os.path.join(base, _COPY_PREFIX + "*")
+        for p in _glob.glob(pattern):
+            try:
+                if not os.path.isfile(p):        # 跳过目录（测试残留不归这里管）
+                    continue
+                if p in _TMP_COPIES:             # 本进程在用的，不碰
+                    continue
+                try:
+                    mtime = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if mtime > cutoff:
+                    kept_recent += 1             # 太新：可能是别的实例刚建的，保留
+                    continue
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    skipped_locked += 1          # 被占用/无权限：优雅跳过
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if logger is not None:
+        try:
+            logger("临时副本清理：删除 %d，跳过(占用) %d，保留(较新) %d"
+                   % (removed, skipped_locked, kept_recent))
+        except Exception:
+            pass
+    return removed, skipped_locked, kept_recent
+
+
 def _ascii_safe_path(path):
-    """OpenCV 在 Windows 读不了非 ASCII 路径：含中文等字符时复制到临时 ASCII 副本"""
+    """OpenCV 在 Windows 读不了非 ASCII 路径：含中文等字符时复制到临时 ASCII 副本。
+
+    ⚠ 防泄漏（见文件头说明）：副本名带「源路径哈希 + 文件大小 + mtime」——
+      命中即代表**同源同内容**，直接复用、不再复制；产生的副本登记到
+      `_TMP_COPIES`，进程退出时删除；崩溃遗留由 `cleanup_stale_ascii_copies` 兜底。
+    纯 ASCII 路径**不复制**，原样返回。
+    """
     try:
         path.encode("ascii")
         return path
@@ -76,12 +184,38 @@ def _ascii_safe_path(path):
         import shutil
         ext = os.path.splitext(path)[1]
         h = hashlib.md5(path.encode("utf-8")).hexdigest()[:12]
-        tmp = os.path.join(tempfile.gettempdir(), f"autovj_{h}{ext}")
-        if not os.path.exists(tmp):
-            shutil.copy2(path, tmp)
+        # 副本名带 size+mtime：命中即「同源 + 同内容」，既防「同名换内容」命中旧副本，
+        # 也让哈希碰撞在语义上无害（同 size+mtime 的异物复用副本内容等价）。
+        try:
+            st = os.stat(path)
+            sig = "%d_%d" % (st.st_size, int(st.st_mtime))
+        except OSError:
+            sig = "0_0"
+        tmp = os.path.join(tempfile.gettempdir(), f"{_COPY_PREFIX}{h}_{sig}{ext}")
+        _register_tmp_copy(tmp)
+        if os.path.exists(tmp):
+            return tmp                       # 复用已有副本（不复制）
+        # 原子写：先写唯一临时名再 rename，避免并发下读到「半个副本」。
+        # （rename 原子；若两线程竞争，先到者 rename 成功，后者 OSError 后走复用分支。）
+        tmp_w = tmp + ".tmp%d" % os.getpid()
+        try:
+            shutil.copy2(path, tmp_w)
+            os.replace(tmp_w, tmp)
+        except OSError:
+            try:
+                if os.path.exists(tmp_w):
+                    os.remove(tmp_w)
+            except OSError:
+                pass
+            if not os.path.exists(tmp):
+                raise
         return tmp
     except Exception:
         return path
+
+
+import atexit as _atexit                                          # noqa: E402
+_atexit.register(_cleanup_registered_copies)
 
 
 class MediaItem:

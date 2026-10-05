@@ -170,6 +170,7 @@ ZH2EN = {
     # ---- 标签编辑对话框 ----
     "自动:": "Auto:",
     "动态:": "Motion:",
+    "亮度:": "Brightness:",
     "额外:": "Extra:",
     "三选一（可全不选）；自动识别的会标蓝，改选后以手动为准":
         "Pick one (or none); auto-detected shown in blue, manual choice wins",
@@ -950,15 +951,22 @@ ZH2EN = {
 def _inject_tag_labels():
     try:
         from tags_def import (ALL_TAGS, TAG_CATEGORIES,
-                              DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER)
+                              DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
+                              COVERAGE_FULL, COVERAGE_PART,
+                              BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT)
     except Exception:
         return
     for zh, en, _cat in ALL_TAGS:
         ZH2EN.setdefault(zh, en.title())
     for cat, _items in TAG_CATEGORIES:
         ZH2EN.setdefault(cat, CATEGORY_EN.get(cat, cat))
+    # 动态词 + 亮度词 + 铺满度词都是「确定性产出、会显示在标签网格里」的数据型标签，与
+    # TAG_CATEGORIES 里的词一样需要显示名（显示名只影响 UI，数据层仍用中文原值，不影响匹配）。
     for zh, en in ((DYNAMIC_LOW, "Low Motion"), (DYNAMIC_MID, "Mid Motion"),
-                   (DYNAMIC_HIGH, "High Motion"), (DYNAMIC_FLICKER, "Flicker")):
+                   (DYNAMIC_HIGH, "High Motion"), (DYNAMIC_FLICKER, "Flicker"),
+                   (COVERAGE_FULL, "Full Frame"), (COVERAGE_PART, "Partial"),
+                   (BRIGHT_DARK, "Dark Tone"), (BRIGHT_MID, "Mid Brightness"),
+                   (BRIGHT_LIGHT, "Bright Tone")):
         ZH2EN.setdefault(zh, en)
 
 

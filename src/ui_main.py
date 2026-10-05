@@ -37,7 +37,11 @@ import i18n
 from i18n import tr, set_lang, T, Tf
 import theme
 from config import Config, CONFIG_FILE, exe_dir
-from tags_def import DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER, DYNAMIC_TAGS
+from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
+                      DYNAMIC_TAGS, COVERAGE_FULL, COVERAGE_PART, COVERAGE_TAGS,
+                      COVERAGE_FULL_THRESHOLD,
+                      BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT, BRIGHTNESS_TAGS,
+                      BRIGHTNESS_DARK_THRESHOLD, BRIGHTNESS_BRIGHT_THRESHOLD)
 from audio_engine import AudioEngine
 from media_manager import MediaItem, ThumbWorker, ThumbBackfillWorker, scan_folder
 from engine import AutoVJEngine, Layer, MODE_LABELS, BLEND_MODES, BLEND_LABELS
@@ -1269,12 +1273,25 @@ class TagScanThread(QThread):
                 if r:
                     tags = [z for z, _ in r["tags"][:6]]
                     tags += list(r.get("colors") or [])
-                    if r.get("bright"):
-                        tags.append(r["bright"])
+                    # ⚠ 不再 append r["bright"]（旧「明亮/昏暗/中等」已废除，恒 None）——
+                    #   亮度分档改由下方 brightness（全片中位数）承载。
                     if r.get("motion"):
                         tags.append(r["motion"])
                     if r.get("flicker"):
                         tags.append(DYNAMIC_FLICKER)
+                    # 铺满度标签落地（coverage 为 None 表示拿不到代表帧 → 不落词）：
+                    # 阈值与 auto_roles 共用 COVERAGE_FULL_THRESHOLD，杜绝两处阈值漂移。
+                    cov = r.get("coverage")
+                    if cov is not None:
+                        tags.append(COVERAGE_FULL if cov >= COVERAGE_FULL_THRESHOLD
+                                    else COVERAGE_PART)
+                    # 亮度分档落地（brightness=全片灰度中位数；None 表示未知 → 不落词）。
+                    # 阈值取自 tags_def 唯一常量，与验证脚本/重扫线程共用，无漂移。
+                    med = r.get("brightness")
+                    if med is not None:
+                        tags.append(BRIGHT_DARK if med < BRIGHTNESS_DARK_THRESHOLD
+                                    else (BRIGHT_LIGHT if med >= BRIGHTNESS_BRIGHT_THRESHOLD
+                                          else BRIGHT_MID))
                     m.tags = tags
                     self.main.cfg["clip_tags"][m.path] = tags
                     # 扫描自动分配角色：全量重扫(force)强制重算；增量只对未设角色的分配
@@ -1299,6 +1316,72 @@ class TagScanThread(QThread):
             pass
 
 
+def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
+                    motion, flicker, coverage, brightness):
+    """**纯函数**：把「快速重扫」检测出的动态/频闪/铺满度/亮度结果合并进自动标签。
+
+    从 `DynTagScanThread.run()` 里抽出来，便于单元测试（原实现与 cfg/线程/self 耦合，
+    只能靠起整个 GUI 才能验证）。**无任何副作用**：
+
+    - 绝不读取/写入 `cfg`、文件或 `self`；只按入参计算并返回**新的**列表。
+    - 绝不返回、绝不修改 `manual_tags` / `disabled_tags`（这两个是"用户意志"，重扫碰不得）。
+    - `existing_tags` 不被就地修改（内部先 `list(existing_tags)` 复制）。
+
+    Args:
+        existing_tags: 当前自动标签列表（`MediaItem.tags` 的快照）。
+        manual_tags:   用户手动标签（仅用于"不复活"语义的说明，本函数**不读也不用**它，
+                       保留参数是为了让调用点语义自明、并便于将来断言）。
+        disabled_tags: 被用户取消的自动标签 —— 命中者**不复活**。
+        motion:        三档动态词之一；`""`（打不开）⇒ **原样返回**，整个列表不动。
+        flicker:       是否频闪（True 时补 `DYNAMIC_FLICKER`）。
+        coverage:      铺满度 0~1；None ⇒ 保留原铺满度词不动。
+        brightness:    全片亮度中位数；None ⇒ 保留原亮度词不动。
+
+    Returns:
+        合并后的新标签列表。
+
+    语义（与旧内联实现逐条等价）：
+      1. `motion` 为空 → `return list(existing_tags)`（完全不变，含动态/铺满度/亮度词）。
+      2. 先剔除旧动态词，按新 `motion`/`flicker` 补词（命中 `disabled_tags` 的跳过）。
+      3. `brightness is not None` → 剔除旧亮度词（含已废弃的「明亮/昏暗/中等」）再补新词；
+         `brightness is None` → 亮度词原样保留。
+      4. `coverage is not None` → 剔除旧铺满度词，`>= COVERAGE_FULL_THRESHOLD` 补「铺满」
+         否则补「局部」（命中 `disabled_tags` 的跳过）；`coverage is None` → 原样保留。
+    """
+    # (1) 打不开：motion=""，保持原标签完全不动（含已有的铺满度/亮度词）。
+    if not motion:
+        return list(existing_tags)
+
+    dis = set(disabled_tags or [])
+    tags = [t for t in existing_tags if t not in DYNAMIC_TAGS]
+
+    # (2) 动态三档 + 频闪（被用户取消的不复活）
+    if motion not in dis:
+        tags.append(motion)
+    if flicker and DYNAMIC_FLICKER not in dis:
+        tags.append(DYNAMIC_FLICKER)
+
+    # (3) 亮度分档：剔除旧亮度词（含已废弃的「明亮/昏暗/中等」），按全片中位数补新词。
+    #     brightness 为 None（未知）⇒ 保留原亮度词不动（不剔除、不补词）。
+    if brightness is not None:
+        _old_bright = {BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT, "明亮", "昏暗", "中等"}
+        tags = [t for t in tags if t not in _old_bright]
+        bword = (BRIGHT_DARK if brightness < BRIGHTNESS_DARK_THRESHOLD
+                 else (BRIGHT_LIGHT if brightness >= BRIGHTNESS_BRIGHT_THRESHOLD
+                       else BRIGHT_MID))
+        if bword not in dis:
+            tags.append(bword)
+
+    # (4) 铺满度：只有真算出 coverage 才动标签；算不出则保留原铺满度词不动。
+    if coverage is not None:
+        tags = [t for t in tags if t not in COVERAGE_TAGS]
+        word = COVERAGE_FULL if coverage >= COVERAGE_FULL_THRESHOLD else COVERAGE_PART
+        if word not in dis:
+            tags.append(word)
+
+    return tags
+
+
 class DynTagScanThread(QThread):
     """动态标签快速重扫：只跑帧差/频闪检测（不跑 CLIP），给存量素材补三档动态标签，
     并做角色单向修正（铺满场景被误判前景 → 背景）。
@@ -1321,23 +1404,17 @@ class DynTagScanThread(QThread):
         for i, m in enumerate(items):
             try:
                 kind = "image" if m.kind in ("image", "gif") else "video"
-                motion, flicker, diff = Tagger.analyze_dynamic(m.path, kind)
-                if motion:  # 打不开时 motion=""，保持原标签不动
-                    # 替换旧动态词（含旧的「高动态」可能来自二值逻辑），再写入三档词；
-                    # 被用户取消的动态词（disabled_tags）不复活
-                    dis = set(m.disabled_tags or [])
-                    tags = [t for t in m.tags if t not in DYNAMIC_TAGS]
-                    if motion not in dis:
-                        tags.append(motion)
-                    if flicker and DYNAMIC_FLICKER not in dis:
-                        tags.append(DYNAMIC_FLICKER)
-                    m.tags = tags
-                    self.main.cfg["clip_tags"][m.path] = tags
-                # ---- 角色单向修正：铺满全屏(cov≥0.45)但被旧逻辑判成前景、且画面无明确
-                # 主体词（人物/舞者等）→ 改为背景。绝不反向（真前景是黑底，新 cov 必低）。
-                if (motion and m.roles.get("fg") and not m.roles.get("bg")
-                        and not (set(m.tags) & SUBJECT_TAGS)):
-                    cov = None
+                motion, flicker, diff, med = Tagger.analyze_dynamic(m.path, kind)
+                # ---- 铺满度：本线程**确实**能算 cov（开图/取帧算一次），供合并与角色修正共用。
+                #   只有「需要重算铺满度」时才算，避免对已带铺满度词且有明确角色定位的素材白开图。
+                #   角色单向修正：铺满全屏(cov≥阈值)但被旧逻辑判成前景、且画面无明确主体词
+                #   （人物/舞者等）→ 改为背景。绝不反向（真前景是黑底，新 cov 必低）。
+                need_cov = (motion
+                            and (set(m.tags) & set(COVERAGE_TAGS)
+                                 or (m.roles.get("fg") and not m.roles.get("bg")
+                                     and not (set(m.tags) & SUBJECT_TAGS))))
+                cov = None
+                if need_cov:
                     if kind == "image":
                         img = cv2.imread(_ascii_safe_path(m.path))
                         if img is not None:
@@ -1351,9 +1428,20 @@ class DynTagScanThread(QThread):
                             cap.release()
                             if ok:
                                 cov = Tagger.coverage_score(fr)
-                    if cov is not None and cov >= 0.45:
-                        m.roles = {"fg": False, "bg": True}
-                        self.main.cfg["clip_roles"][m.path] = dict(m.roles)
+                # ---- 合并动态/频闪/铺满度/亮度四类词（纯函数，UI 与此处互不耦合）。
+                #   ⚠ 只写自动标签（m.tags）；绝不写 manual_tags / disabled_tags。
+                tags = merge_scan_tags(m.tags, m.manual_tags, m.disabled_tags,
+                                       motion=motion, flicker=flicker,
+                                       coverage=cov, brightness=med)
+                if tags != m.tags:
+                    m.tags = tags
+                    self.main.cfg["clip_tags"][m.path] = tags
+                # ---- 角色单向修正：仅当铺满且画面无明确主体词时（绝不反向）。
+                if (cov is not None and cov >= COVERAGE_FULL_THRESHOLD
+                        and m.roles.get("fg") and not m.roles.get("bg")
+                        and not (set(m.tags) & SUBJECT_TAGS)):
+                    m.roles = {"fg": False, "bg": True}
+                    self.main.cfg["clip_roles"][m.path] = dict(m.roles)
             except Exception:
                 pass
             self.progress.emit(i + 1, total)
@@ -1366,7 +1454,7 @@ class DynTagScanThread(QThread):
                     self.main.cfg.save()
                 except Exception:
                     pass
-        self.main.cfg["dyn_tag_ver"] = 5
+        self.main.cfg["dyn_tag_ver"] = 6
         try:
             self.main.cfg.save()
         except Exception:
@@ -1962,9 +2050,10 @@ class MainWindow(QMainWindow):
         self._breath_timer.timeout.connect(self._breath_tick)
         self._breath_timer.start()              # 初始未运行，开始按钮即闪烁
 
-        # 动态标签升级：v4=三档动态+coverage v2；v5=顺序读全片修复 DXV seek 失效导致的动态误判
+        # 动态标签升级：v4=三档动态+coverage v2；v5=顺序读全片修复 DXV seek 失效导致的动态误判；
+        # v6=亮度分档（暗基调/中亮度/亮基调，全片中位数口径）+ 废止旧的「明亮/昏暗/中等」。
         # 启动时后台补扫一次（只跑帧差，不跑 CLIP）。悬浮提示卡让重扫进度可见，不再误以为卡死。
-        if int(self.cfg["dyn_tag_ver"] or 0) < 5:
+        if int(self.cfg["dyn_tag_ver"] or 0) < 6:
             self._dyn_scan = DynTagScanThread(self)
             self._dyn_scan.finished.connect(self._on_dyn_scan_done)
             self._scan_overlay = ScanOverlayWidget(self, "正在扫描素材库… 0/0")

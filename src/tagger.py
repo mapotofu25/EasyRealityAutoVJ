@@ -13,7 +13,31 @@ import numpy as np
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER, DYNAMIC_TAGS,
                       DIFF_MID_THRESHOLD, DIFF_HIGH_THRESHOLD,
-                      DIFF_HIGH_RATIO)
+                      DIFF_HIGH_RATIO,
+                      COVERAGE_TAGS, COVERAGE_FULL_THRESHOLD,
+                      COVERAGE_FULL_THRESHOLD_DYNAMIC,
+                      BRIGHTNESS_TAGS, BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT,
+                      BRIGHTNESS_DARK_THRESHOLD, BRIGHTNESS_BRIGHT_THRESHOLD)
+
+
+def _cv_imread(path, flags=None):
+    """cv2.imread 的**非 ASCII 安全**封装。
+
+    ⚠ OpenCV 在 Windows 上读不了含中文等非 ASCII 字符的路径（实测素材库 5 张图片
+      因 `Y:/.../素材库/xxx.png` 全部 cv2.imread 返回 None → 无 med/颜色/CLIP 标签）。
+      `imread` 内部走 C 层 narrow 字符 API，Python 层无法修复，须先经
+      `media_manager._ascii_safe_path()` 复制到临时 ASCII 副本再读。
+
+    ⚠ **仅图片分支使用**：`cv2.VideoCapture` 自己走 FFmpeg 宽字符通道，实测 157/157
+      视频用原始路径全部可读；给视频也套临时副本只会白白多拷一份大文件。
+    """
+    import cv2
+    try:
+        from media_manager import _ascii_safe_path
+        safe = _ascii_safe_path(path)
+    except Exception:                                          # noqa: BLE001
+        safe = path
+    return cv2.imread(safe, flags) if flags is not None else cv2.imread(safe)
 
 
 # 内容 tag → 图层角色（两角色制，v2）
@@ -40,7 +64,7 @@ def auto_roles(tags, kind="video", has_alpha=False, coverage=None, dynamic=False
     v3 裁决原则（治「全屏氛围场景被误判前景」）：
     ① alpha → 前景（透明叠加元素）；② 明确主体词（人物/舞者等）→ 前景；
     ③ 其余以铺满度为主裁决——烟雾/水墨/霓虹这类"氛围词"既可全屏也可局部，
-    CLIP 分数分不出铺满与否，铺满(coverage≥0.45)一律背景。"""
+    CLIP 分数分不出铺满与否，铺满(coverage≥COVERAGE_FULL_THRESHOLD)一律背景。"""
     ts = set(tags or [])
     roles = {"fg": False, "bg": False}
     cov = 0.5 if coverage is None else coverage
@@ -52,7 +76,7 @@ def auto_roles(tags, kind="video", has_alpha=False, coverage=None, dynamic=False
 
     # 0.5) 明确主体词：黑底局部 → 前景（人物特写/抠像素材）；
     #      画面铺满时不特判（人物剪影看星系这类"人在环境中"是背景），交给下面的铺满度裁决
-    if (ts & SUBJECT_TAGS) and cov < 0.45:
+    if (ts & SUBJECT_TAGS) and cov < COVERAGE_FULL_THRESHOLD:
         roles["fg"] = True
         return roles
 
@@ -75,21 +99,21 @@ def auto_roles(tags, kind="video", has_alpha=False, coverage=None, dynamic=False
             if len(cands) == 2:
                 fb, bs = cands
                 if abs(fb[1] - bs[1]) <= 0.008:
-                    roles["bg" if cov >= 0.45 else "fg"] = True   # 分差极小 → 铺满度裁决
-                elif cov >= 0.45:
+                    roles["bg" if cov >= COVERAGE_FULL_THRESHOLD else "fg"] = True   # 分差极小 → 铺满度裁决
+                elif cov >= COVERAGE_FULL_THRESHOLD:
                     roles["bg"] = True   # 铺满 → 背景（氛围词分数差不再一票定前景）
                 else:
                     roles[max(cands, key=lambda x: x[1])[0]] = True
             else:
                 c = cands[0][0]
-                if c == "fg" and cov >= 0.45:
+                if c == "fg" and cov >= COVERAGE_FULL_THRESHOLD:
                     roles["bg"] = True   # 只有模糊前景词命中但画面铺满 → 背景（水墨/烟雾全屏）
                 else:
                     roles[c] = True
             return roles
         if "neutral" in cat_best:
             # 只有中性词 → 按铺满度/动态分流
-            if cov >= 0.45 or (dynamic and cov >= 0.35):
+            if cov >= COVERAGE_FULL_THRESHOLD or (dynamic and cov >= COVERAGE_FULL_THRESHOLD_DYNAMIC):
                 roles["bg"] = True
             else:
                 roles["fg"] = True
@@ -101,7 +125,7 @@ def auto_roles(tags, kind="video", has_alpha=False, coverage=None, dynamic=False
     if hit_fg or hit_bg:
         if hit_bg:
             roles["bg"] = True          # 有明确环境词 → 背景
-        elif cov >= 0.45:
+        elif cov >= COVERAGE_FULL_THRESHOLD:
             roles["bg"] = True          # 只有氛围词但画面铺满 → 背景
         else:
             roles["fg"] = True          # 氛围词 + 黑底局部 → 前景
@@ -109,14 +133,14 @@ def auto_roles(tags, kind="video", has_alpha=False, coverage=None, dynamic=False
     # 3) 只有中性词命中（无明确词）→ 按铺满度 + 动态分流
     if not any(roles.values()) and (ts & NEUTRAL_TAGS):
         # 铺满 → 背景；局部 → 前景（高动态且铺满更偏向整屏流动环境）
-        if cov >= 0.45 or (dynamic and cov >= 0.35):
+        if cov >= COVERAGE_FULL_THRESHOLD or (dynamic and cov >= COVERAGE_FULL_THRESHOLD_DYNAMIC):
             roles["bg"] = True
         else:
             roles["fg"] = True
 
     # 4) 什么都没命中 → 铺满度分流，再退回透明度兜底
     if not any(roles.values()):
-        if cov >= 0.45:
+        if cov >= COVERAGE_FULL_THRESHOLD:
             roles["bg"] = True
         else:
             roles["fg"] = True
@@ -241,7 +265,14 @@ class Tagger:
     # ---------- 颜色 / 亮度启发（确定性） ----------
     @staticmethod
     def color_brightness(bgr):
-        """返回 {'colors':[颜色词...], 'bright':'明亮/昏暗/中等'}"""
+        """返回 {'colors':[颜色词...], 'bright':None}。
+
+        ⚠ 决策 1（2026-10-05）：**废除 bright 输出**（原「明亮/昏暗/中等」）。那三个词是
+          **单帧 + HSV-V>170** 口径，实测有双重缺陷（162 素材实测仅 3 个判「明亮」，而全片
+          中位数口径下 88 个可达"亮"；两者不一致 85/162），且会与新的「暗基调/中亮度/亮基调」
+          （全片中位数口径，见 analyze_dynamic）并存造成"同一素材既昏暗又亮基调"的自相矛盾。
+          `bright` 键**保留但恒为 None**（不再产出这三个词），消费点据此跳过。
+        """
         import cv2
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         h = hsv[:, :, 0].astype(np.float32)
@@ -262,8 +293,8 @@ class Tagger:
         else:
             mean_v = v.mean()
             colors.append("白色" if mean_v > 180 else ("黑色" if mean_v < 70 else "灰色"))
-        bright = "明亮" if v.mean() > 170 else ("昏暗" if v.mean() < 90 else "中等")
-        return {"colors": colors, "bright": bright}
+        # 决策 1：不再产出「明亮/昏暗/中等」——亮度分档改由 analyze_dynamic 的全片中位数口径给。
+        return {"colors": colors, "bright": None}
 
     @staticmethod
     def coverage_score(bgr):
@@ -297,9 +328,13 @@ class Tagger:
 
     @staticmethod
     def analyze_dynamic(path, kind):
-        """仅动态检测（不跑 CLIP，轻量）：返回 (motion, flicker, diff)。
+        """仅动态检测（不跑 CLIP，轻量）：返回 (motion, flicker, diff, med)。
 
-        motion ∈ {低动态, 中动态, 高动态}；图片天然低动态；打不开返回 ('', False, -1)。
+        motion ∈ {低动态, 中动态, 高动态}；图片天然低动态；打不开返回 ('', False, -1, None)。
+        med = **全片灰度均值序列的中位数**（0~255），供「暗基调/中亮度/亮基调」分档；
+        med 为 None 表示未知（打不开 / 帧数不足 / 图片拿不到图）⇒ 消费点不落亮度词。
+        ⚠ 用**中位数**而非均值：`2018.6.23-01.mov` 均值 41.7 但中位数 0.0（大部分黑+偶尔爆亮），
+          中位数正确判「暗」。
         供 analyze_media 复用，也供存量素材的「动态标签快速重扫」单独调用。
 
         算法 v2（顺序读全片，替代旧的 seek 分段采样）：
@@ -319,10 +354,23 @@ class Tagger:
         """
         import cv2
         if kind == "image":
-            return DYNAMIC_LOW, False, 0.0
+            # 图片：单帧即全片亮度。此处不重开图（analyze_media 已读过），拿不到则 med=None。
+            # ⚠ 走 _cv_imread（非 ASCII 路径安全），否则含中文路径的图片永远 imread=None ⇒ med=None。
+            med = None
+            try:
+                img = _cv_imread(path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    img = _cv_imread(path)
+                if img is not None:
+                    if img.ndim == 3 and img.shape[2] == 4:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                    med = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean())
+            except Exception:                                      # noqa: BLE001
+                med = None
+            return DYNAMIC_LOW, False, 0.0, med
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            return "", False, -1.0
+            return "", False, -1.0, None
         # 顺序读全片（不 seek），一次采集：全程相邻帧差 + 全程亮度
         diffs = []    # 全程相邻帧差（灰度 abs diff 均值）
         brights = []  # 全程每帧亮度
@@ -341,7 +389,7 @@ class Tagger:
             read += 1
         cap.release()
         if len(diffs) < 2:
-            return "", False, -1.0
+            return "", False, -1.0, None
 
         d = np.asarray(diffs, dtype=np.float64)
         diff = float(np.median(d))
@@ -361,19 +409,27 @@ class Tagger:
             # 频闪：明显亮度跳变(>15)占比 ≥0.35。真静止素材 1~12 次(占比<0.3)、
             # 明暗呼吸/逐帧闪 19~32 次(占比 0.5+)——0.35 卡在中间。
             flicker = float((bd > 15).mean()) >= 0.35
-        return motion, flicker, diff
+        # 全片亮度中位数（复用已采集的 brights，零额外 I/O）：供暗/中/亮分档。
+        med = float(np.median(brights)) if brights else None
+        return motion, flicker, diff, med
 
     def analyze_media(self, path, kind, top=8):
-        """统一入口：图片/视频 → {'tags':[(zh,score)], 'colors':[], 'bright':'', 'motion', 'flicker'}"""
+        """统一入口：图片/视频 → {'tags':[(zh,score)], 'colors':[], 'motion', 'flicker',
+        'coverage', 'brightness', 'dynamic'}。
+
+        ⚠ `bright`（旧「明亮/昏暗/中等」）已废除、恒为 None；亮度分档改由 `brightness`
+          （全片中位数 med）承载，见 analyze_dynamic。"""
         import cv2
-        motion, flicker, _diff = self.analyze_dynamic(path, kind)
+        motion, flicker, _diff, med = self.analyze_dynamic(path, kind)
         # ⚠ 显式初始化：视频分支不会赋值，以前靠 `locals().get("has_alpha", False)`
         #   反射当前帧的局部变量 —— 重构一次就错，且读代码的人根本看不出这里有赋值。
         has_alpha = False
         if kind == "image":
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            # ⚠ 走 _cv_imread（非 ASCII 路径安全），否则含中文路径的图片永远 imread=None ⇒
+            #    整张图 analyze_media 直接 return None（无标签/无颜色/无铺满度）。
+            img = _cv_imread(path, cv2.IMREAD_UNCHANGED)
             if img is None:
-                img = cv2.imread(path)
+                img = _cv_imread(path)
             if img is None:
                 return None
             has_alpha = img.ndim == 3 and img.shape[2] == 4
@@ -397,11 +453,16 @@ class Tagger:
         coverage = self.coverage_score(frame) if frame is not None else None
         dynamic = motion in (DYNAMIC_MID, DYNAMIC_HIGH)
         # 过滤 CLIP 误打的动态词：动态标签只应由帧差/频闪检测产出（DYNAMIC_TAGS 不进 CLIP 词表，
-        # 但「高动态」历史上在 tags.txt 里，CLIP 单帧可能误打，这里统一剔除，避免与三档词冲突）
-        tags = [(z, s) for z, s in tags if z not in DYNAMIC_TAGS]
+        # 但「高动态」历史上在 tags.txt 里，CLIP 单帧可能误打，这里统一剔除，避免与三档词冲突）。
+        # 同样过滤铺满度词（COVERAGE_TAGS）：它只由 coverage_score 确定性产出，绝不该来自 CLIP。
+        # 以及亮度词（BRIGHTNESS_TAGS）：只由全片亮度中位数产出，绝不该来自 CLIP。
+        # 防御性过滤——即便当前 tags.txt 里没有这些词（已实测确认没有），词表将来也可能变。
+        tags = [(z, s) for z, s in tags
+                if z not in DYNAMIC_TAGS and z not in COVERAGE_TAGS
+                and z not in BRIGHTNESS_TAGS]
         return {"tags": tags, "colors": cb["colors"], "bright": cb["bright"],
                 "alpha": alpha, "motion": motion, "flicker": flicker,
-                "coverage": coverage, "dynamic": dynamic}
+                "coverage": coverage, "brightness": med, "dynamic": dynamic}
 
 
 def get_tagger():

@@ -61,8 +61,11 @@ def main():
             self.audio = StubAudio()
             self.calls = []
 
-        def apply_audio_settings(self, t, dev, sr, mono):
-            self.calls.append((t, dev, sr, mono))
+        # ⚠ 对齐真实签名 ui_main.MainWindow.apply_audio_settings(self, source_type,
+        #   device, sr, mono, ch0=0, ch1=1)——panels.AudioSourceDialog.apply() 会传 6 个位置参数
+        #   （含 ASIO 的 ch0/ch1），旧桩只接 4 个会 TypeError。
+        def apply_audio_settings(self, t, dev, sr, mono, ch0=0, ch1=1):
+            self.calls.append((t, dev, sr, mono, ch0, ch1))
 
     print("\n[1] 控件里没有「增益」")
     cfg = StubCfg({"audio": {"source_type": "system", "device_name": "", "mono": True,
@@ -88,8 +91,10 @@ def main():
     dlg.apply()
     check("apply_audio_settings 被调用一次", len(m.calls) == 1, str(m.calls))
     if m.calls:
-        t, dev, sr, mono = m.calls[0]
-        check("参数是 4 个（不再有 gain）", True, "t=%s sr=%s mono=%s" % (t, sr, mono))
+        call = m.calls[0]
+        t, dev, sr, mono = call[0], call[1], call[2], call[3]
+        check("参数不含 gain（前 4 个仍是 t/dev/sr/mono）", len(call) >= 4,
+              "t=%s sr=%s mono=%s" % (t, sr, mono))
         check("采样率传对", sr == 48000, "sr=%s" % sr)
         check("单声道传对", mono is False, "mono=%s" % mono)
 

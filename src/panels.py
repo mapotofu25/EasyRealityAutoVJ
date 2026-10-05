@@ -11,7 +11,8 @@
 import os
 
 from tags_def import (TAG_CATEGORIES, DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
-                      DYNAMIC_FLICKER)
+                      DYNAMIC_FLICKER,
+                      BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT)
 from PySide6.QtCore import (Qt, QSize, Signal, QMimeData, QTimer, QPoint, QRectF,
                             QThread)
 from PySide6.QtGui import (QColor, QPixmap, QImage, QDrag, QAction, QPainter, QPen,
@@ -245,6 +246,24 @@ class TagEditDialog(I18nDialog):
         dyn_row.addStretch(1)
         lay.addLayout(dyn_row)
 
+        # 亮度行：三档互斥单选（暗基调/中亮度/亮基调），与「动态」行同款交互。
+        # 亮度词由 analyze_dynamic 的「全片灰度中位数」产出（不进内容分类），这里手动可改。
+        bright_row = QHBoxLayout()
+        bright_row.addWidget(QLabel("亮度:"))
+        self._bright_btns = {}
+        for zh in (BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT):
+            b = QPushButton(zh)
+            b.setCheckable(True)
+            b.setFixedHeight(26)
+            b.setChecked(zh in self._state)
+            b.setStyleSheet(self.STYLE_AUTO if zh in media.tags else self.STYLE_BASE)
+            b.setToolTip("三选一（可全不选）；自动识别的会标蓝，改选后以手动为准")
+            b.clicked.connect(lambda _c=False, z=zh: self._on_bright(z))
+            bright_row.addWidget(b)
+            self._bright_btns[zh] = b
+        bright_row.addStretch(1)
+        lay.addLayout(bright_row)
+
         # 额外标签行：实时汇总当前勾选的全部标签（点下面分类，这里同步增减）
         self.cat_btns = {}      # zh -> 分类网格按钮（额外行按钮不进此字典）
         self._order = list(media.all_tags())   # 稳定显示顺序
@@ -349,6 +368,23 @@ class TagEditDialog(I18nDialog):
             self._state.discard(zh)
         self._sync_extra()
 
+    def _on_bright(self, zh):
+        """亮度标签互斥：三档单选（可全不选）。状态走 _state，保存复用 _save 的
+        disabled/manual 拆分——取消自动识别的亮度词会进 disabled（重扫不复活），改选的进 manual。"""
+        b = self._bright_btns[zh]
+        if b.isChecked():
+            for other in (BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT):
+                if other != zh:
+                    ob = self._bright_btns[other]
+                    ob.blockSignals(True)
+                    ob.setChecked(False)
+                    ob.blockSignals(False)
+                    self._state.discard(other)
+            self._state.add(zh)
+        else:
+            self._state.discard(zh)
+        self._sync_extra()
+
     def _extra_add_btn(self, zh):
         b = QPushButton(zh)
         b.setCheckable(True)
@@ -371,7 +407,8 @@ class TagEditDialog(I18nDialog):
         self._sync_extra()
 
     def _sync_extra(self):
-        """额外行实时重建 = 当前勾选的全部标签（动态词除外——上面「动态」行已单独展示）"""
+        """额外行实时重建 = 当前勾选的全部标签（动态词/亮度词除外——上面「动态」「亮度」
+        行已单独展示，避免同一标签在额外行重复出现）"""
         while self.extra_grid.count():
             it = self.extra_grid.takeAt(0)
             w = it.widget()
@@ -380,7 +417,8 @@ class TagEditDialog(I18nDialog):
         self._extra_next = 0
         for zh in self._order:
             if zh in self._state and zh not in (DYNAMIC_LOW, DYNAMIC_MID,
-                                                DYNAMIC_HIGH, DYNAMIC_FLICKER):
+                                                DYNAMIC_HIGH, DYNAMIC_FLICKER,
+                                                BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT):
                 self._extra_add_btn(zh)
 
     def _add_extra(self):

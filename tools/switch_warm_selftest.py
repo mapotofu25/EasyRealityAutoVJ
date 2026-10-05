@@ -128,7 +128,10 @@ def main():
             p.close()
         except Exception:
             pass
-    open(r"P:\AutoVJ\_switch_warm_selftest.txt", "w", encoding="utf-8").write("\n".join(out))
+    # 报告写到项目根（旧硬编码 P:\AutoVJ 已随迁移失效）
+    _root = os.path.dirname(HERE)
+    open(os.path.join(_root, "_switch_warm_selftest.txt"), "w",
+         encoding="utf-8").write("\n".join(out))
 
 
 if __name__ == "__main__":

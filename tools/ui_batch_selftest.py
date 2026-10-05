@@ -295,7 +295,9 @@ def main():
     if FAIL:
         for f in FAIL:
             w("   ✗ " + f)
-    open(r"P:\AutoVJ\_ui_batch_selftest.txt", "w", encoding="utf-8").write("\n".join(out))
+    # 报告写到项目根（旧硬编码 P:\AutoVJ 已随迁移失效）
+    open(os.path.join(os.path.dirname(HERE), "_ui_batch_selftest.txt"), "w",
+         encoding="utf-8").write("\n".join(out))
 
 
 if __name__ == "__main__":
