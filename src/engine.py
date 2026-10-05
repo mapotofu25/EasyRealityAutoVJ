@@ -313,6 +313,18 @@ MODE_META = {
 AUTO_FX_RATIO = 0.6
 
 
+# 「无声音时隐藏本层」（hide_silent）的防抖秒数。
+# 需求：静音要**连续**达到该时长才隐藏，恢复有声也要**连续**达到该时长才显示。
+# 为什么要防抖：音频线程的 `silent_sec` 是**逐 block 累加/清零**的
+# （audio_engine.py: `st.silent_sec = st.silent_sec + block_sec if rms < 1e-4 else 0.0`）
+# —— 只要有**任何一个** block 的 rms >= 1e-4，silent_sec 立刻归零。音乐里的鼓点间隙、
+# 搓碟、EQ 抽低频都会让它反复归零 ⇒ 图层反复隐藏/显示闪烁。加 0.5s 连续判定即可消除。
+SILENT_HIDE_DEBOUNCE = 0.5
+# 原始「静音」判据阈值（保持既有语义不变，见 `_silent_hide_tick`）。
+_SILENT_SEC_RAW = 0.25
+_SILENT_LEVEL_RAW = 0.03
+
+
 def snap_energy(snap, default=0.5):
     """从 snapshot 取能量值（**唯一正确取法**）。
 
@@ -558,6 +570,14 @@ class AutoVJEngine(QObject):
         self._flicker_latch = {}   # 「随机休眠」模式下当前素材的休眠决定（换素材才重掷）
         # 引擎主循环移入独立线程后，用锁串行化 GUI 线程的少量入口调用
         self._tick_lock = threading.RLock()
+        # 「无声音时隐藏本层」0.5s 防抖状态（见 `_silent_hide_tick`）。
+        # 每帧在 `_tick_locked` 里算**一次**，`hide_silent`（合成）与 `pause_silent`（活跃标记）
+        # 两处都读同一个 `self._silent_now_debounced`，保证同帧一致。
+        self._silent_debounce_on = False   # 当前对外生效的「静音」状态（防抖后）
+        self._silent_since = 0.0           # 连续静音累计（秒）
+        self._loud_since = 0.0             # 连续有声累计（秒）
+        self._silent_last_t = 0.0          # 上次推进防抖计时的时刻（perf_counter）
+        self._silent_now_debounced = False  # 本帧对外暴露的防抖结果（两处判据唯一来源）
         # 卡帧看门狗全局限流：上次自动重建的时刻（见 `_heal_stalled`）
         self._heal_last_global_t = 0.0
         # 静默冻帧兜底日志去重：key=(图层名, 原因) → 上次记录时刻（见 `_heal_silent`）
@@ -1021,6 +1041,47 @@ class AutoVJEngine(QObject):
     # ---------------- 主循环 ----------------
     _err_log_n = 0
 
+    def _silent_hide_tick(self, snap):
+        """推进「无声音时隐藏本层」的 0.5s 防抖，写入 `self._silent_now_debounced`。
+
+        原始判据保持不变：`silent_sec > 0.25 or level < 0.03`（即"当前这一帧有没有声音"）。
+        防抖规则：静音要**连续**累计 ≥ `SILENT_HIDE_DEBOUNCE`(0.5s) 才置为静音；
+        恢复有声同样要**连续**累计 ≥ 0.5s 才解除 —— 这样音乐里的瞬时间隙（鼓点间隙、
+        搓碟、EQ 抽低频导致某几个 block 的 rms 回到有声）不会让图层闪烁。
+
+        初始值选择：`_silent_debounce_on` 起步为 False，静音状态**同样**要连续累计 ≥ 0.5s
+        才置为静音。理由：需求明确要求"静音要**连续**达到阈值才隐藏"——隐藏是破坏性动作
+        （画面上该图层整层消失），必须严格连续；而"不隐藏"（显示）是安全态，起步为 False
+        不会有副作用。若改成"首个静音帧立即隐藏"，一个单帧噪声毛刺就会隐藏图层 0.5s、
+        恢复又要 0.5s ⇒ 反而制造闪烁，违背本需求的初衷。
+
+        ⚠ 冷启动（曲库/音频还没出声、`level≈0`）：引擎启动后会有 0.5s 让 hide_silent 图层
+        参与显示，之后才隐藏 —— 这是可接受的（真实演出里引擎在音乐开始前就已经跑起来，
+        0.5s 后自然进入静音态）；反过来**不会**造成"该显示的被隐藏"。
+
+        ⚠ 冷却保护：暂停/卡帧后 dt 会巨大（冻结早退期间本函数不推进时间），若不钳位防抖
+        会被一个 dt 直接跨过去。这里照抄 `_kv_tick` 的 `dt = max(0.0, min(0.5, dt))`。
+        O(1) 纯浮点比较，无锁、无 I/O、无内存分配 —— 满足主线程/tick 热路径约束。
+        """
+        now = time.perf_counter()
+        dt = now - self._silent_last_t
+        dt = max(0.0, min(0.5, dt))     # 保护：卡帧/暂停后不累加巨大 dt（照抄 _kv_tick）
+        self._silent_last_t = now
+
+        raw_silent = (snap["silent_sec"] > _SILENT_SEC_RAW
+                      or snap["level"] < _SILENT_LEVEL_RAW)
+        if raw_silent:
+            self._silent_since += dt
+            self._loud_since = 0.0
+            if self._silent_since >= SILENT_HIDE_DEBOUNCE:
+                self._silent_debounce_on = True
+        else:
+            self._loud_since += dt
+            self._silent_since = 0.0
+            if self._loud_since >= SILENT_HIDE_DEBOUNCE:
+                self._silent_debounce_on = False
+        self._silent_now_debounced = self._silent_debounce_on
+
     def _tick(self):
         # 主循环已移入独立线程；与 GUI 线程的入口调用（rebuild/切换等）用锁串行化
         try:
@@ -1044,6 +1105,12 @@ class AutoVJEngine(QObject):
         snap = self.audio.snapshot()
         if self.freeze:
             return  # 冻结：画面完全不变
+        # ★ 「无声音时隐藏本层」0.5s 防抖：**必须在本帧任何读取 silent 的代码之前**算一次，
+        #   写入 `self._silent_now_debounced`；`hide_silent`（合成 `_compose`）与
+        #   `pause_silent`（下方活跃标记）两处都读它，保证同帧判据一致。
+        #   冻结时早退（上面）⇒ 不推进防抖计时；解冻后 dt 被 `_silent_hide_tick` 钳到 0.5，
+        #   状态不会被一个巨大 dt 瞬间跨过去（与 `_kv_tick` 同策略）。
+        self._silent_hide_tick(snap)
         # 注意：输出/预览始终实时渲染（不受开始-停止影响）；停止只停止"自动切换"
 
         beat_event = snap["beat_count"] != self._last_beat_count
@@ -1090,7 +1157,9 @@ class AutoVJEngine(QObject):
             self._kv_tick(snap)
 
         # 视频速度 + 活跃标记（缓存中未显示的解码器挂起省 CPU）
-        silent_now = snap["silent_sec"] > 0.25 or snap["level"] < 0.03
+        # ★ 静音判据统一读防抖结果（`_tick_locked` 开头 `_silent_hide_tick` 已算好）：
+        #   与 `_compose` 里的 `hide_silent` 同帧同值，避免 hide 和 pause 的时机不一致。
+        silent_now = self._silent_now_debounced
         for lay in self.layers:
             # ★★ 活跃标记必须按**身份**遍历 `cache ∪ {lay.player, lay.prev_player}`，
             #   不能只遍历 `lay.cache`：`lay.player` 并不保证在缓存里（自动匹配换池、
@@ -2871,7 +2940,9 @@ class AutoVJEngine(QObject):
         pulse = 1.0 + snap["bass"] * 0.08 * inten
         drift_x = drift_y = 0.0
 
-        silent = snap["silent_sec"] > 0.25 or snap["level"] < 0.03
+        # ★ 静音判据统一读防抖结果（见 `_tick_locked` 开头的 `_silent_hide_tick`）：
+        #   与 `pause_silent` 活跃标记同帧同值，保证 hide 与 pause 的时机一致。
+        silent = self._silent_now_debounced
         solo_on = any(getattr(l, "solo", False) for l in self.layers)
         subtract_jobs = []  # 需要逐像素"减少"混合的图层
 

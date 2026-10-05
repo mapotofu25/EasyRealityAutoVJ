@@ -4821,6 +4821,15 @@ class MainWindow(QMainWindow):
         lay.auto_mode = auto
         lay.is_kv = is_kv
         lay.role = role
+        # 「自动图层应该跟着音乐走」：新建**自动**图层默认勾选「无声音时隐藏本层」。
+        # 仅限自动图层；手动图层保持现有默认（不勾选）；Kv 待机层本就有独立的静音逻辑
+        # （无声音切入），不能叠加 hide_silent，故排除。
+        # ⚠ 取舍说明：用户原话「添加两个自动图层时自动勾选」也可能指"只有当已存在 ≥1 个
+        #   自动图层时再添加才勾选"。这里按**更符合常理**的理解实现——只要新建的是自动图层
+        #   就默认勾选（自动图层本就应随音乐静音而隐藏）。若要改成"第二条自动图层才勾选"，
+        #   只需在此处加 `and any(getattr(l, "auto_mode", False) for l in self.engine.layers)`。
+        if auto and not is_kv:
+            lay.hide_silent = True
         if role == "fg" and not is_kv:
             lay.blend = "add"   # 前景（特效/覆盖）默认用"添加"混合，叠加发光才正常
         if is_kv:
