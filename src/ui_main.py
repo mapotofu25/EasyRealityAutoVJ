@@ -3219,7 +3219,10 @@ class MainWindow(QMainWindow):
         ⚠ 默认关是有意的：采集的是**系统回环**，接收端若本来就在监听同一路声音，
           再发一遍会变成**双声/回声**。只有接收端需要单独取声音时才打开。
         """
-        s = bool(s) and bool(self.cfg["output"].get("ndi_enabled"))
+        # 先保留**原始入参**（用户真实意图），再按"NDI 输出是否启用"改写生效值。
+        # 注意：本槽由 stateChanged 调用，入参可能是复选框状态 int/enum，先转 bool。
+        s_raw = bool(s)
+        s = s_raw and bool(self.cfg["output"].get("ndi_enabled"))
         self.cfg["output"]["ndi_audio"] = s
         self.cfg.save()
         # ★ 把「真实生效值」回写勾选框：杜绝「看起来勾了、其实没开」
@@ -3239,14 +3242,55 @@ class MainWindow(QMainWindow):
         # 现场可查：这三个值必须永远一致
         print("[NDI] ndi_audio=%r  cfg.ndi_enabled=%r  ndi_audio_on=%r"
               % (s, bool(self.cfg["output"].get("ndi_enabled")), s))
+        # 追加原因说明：用户勾了音频但 NDI 输出没开 → 勾选被改写为 False，必须讲清原因，
+        # 否则现场只看到 ndi_audio=False 却不知道是"没开 NDI 输出"导致的（Bug 2 的观感来源）。
+        if s_raw and not s:
+            print("[NDI] NDI 输出未启用，音频勾选未生效（已自动取消，请先勾选'启用 NDI 输出'）")
 
     def _ndi_audio_feed(self, pcm, sr):
-        ndi = self.engine._ndi
-        if ndi is not None and self.cfg["output"].get("ndi_enabled"):
+        """把采集到的 PCM 投递给 NDI 发送端（运行在**音频转发线程**里）。
+
+        ⚠ 本方法每秒被调用约 47 次，**绝不能每块都打日志**，因此门控原因用一个
+          实例级的一次性去重标志 `self._ndi_audio_gate_logged`：
+          只在「门控原因发生变化时」打一次，正常发送时复位。
+
+        ⚠ 历史 BUG（现场"有画面没声音、日志空白"）：原来这里是**静默 return**，
+          `ndi is None` 或 `cfg["output"]["ndi_enabled"]` 为假时一个日志都不打，
+          导致用户完全无法判断音频到底卡在哪一环。现改为分情况打一次性诊断日志。
+        """
+        # lazy 初始化一次性去重标志（不依赖 __init__，避免遗漏初始化分支）
+        if not hasattr(self, "_ndi_audio_gate_logged"):
+            self._ndi_audio_gate_logged = None
+        try:
+            ndi = self.engine._ndi
+        except Exception:                                      # noqa: BLE001
+            # engine 尚未就绪：按"发送端未建立"处理，且**不能**让异常冒泡
+            ndi = None
+        enabled = False
+        try:
+            enabled = bool(self.cfg["output"].get("ndi_enabled"))
+        except Exception:                                      # noqa: BLE001
+            enabled = False
+        # 正常路径
+        if ndi is not None and enabled:
             # ⚠ 这里**不再**调 `set_audio_rate()`：帧的采样率在 open() 时就被冻结，
             #   现在帧固定 48k、非 48k 的数据由 `feed_audio()` 自己重采样
             #   （原来每块告诉它一次采样率既无效又误导，见 _NDI音频诊断.md §1.3）。
             ndi.feed_audio(pcm, sr)
+            # 恢复正常发送 → 复位去重标志，这样下次再被门控会重新报一次
+            self._ndi_audio_gate_logged = None
+            return
+        # —— 门控分支：只在原因变化时打一次一次性日志（每秒 ~47 次调用，不能刷屏）——
+        reason = "sender_missing" if ndi is None else "output_disabled"
+        if self._ndi_audio_gate_logged != reason:
+            self._ndi_audio_gate_logged = reason
+            try:
+                if reason == "sender_missing":
+                    print("[NDI] 音频门控：发送端尚未建立（engine._ndi is None），音频暂不发送")
+                else:
+                    print("[NDI] 音频门控：NDI 输出未启用，音频暂不发送")
+            except Exception:                                  # noqa: BLE001
+                pass
 
     def apply_output_screen(self):
         idx = int(self.cfg["output"].get("screen", -1))
@@ -3448,6 +3492,23 @@ class MainWindow(QMainWindow):
                     self.output_panel.chk_ndi.blockSignals(True)
                     self.output_panel.chk_ndi.setChecked(False)
                     self.output_panel.chk_ndi.blockSignals(False)
+                    # ⚠ 同步回滚音频侧，避免"勾选框显示开着、实际被静默丢弃"（Bug 2）：
+                    #   NDI 输出都没开，音频勾选既无意义也会误导用户（采集侧投递被门控拦下、
+                    #   一个字节都不发，而且现场无任何日志）。这里必须和 chk_ndi 一起回滚。
+                    try:
+                        self.audio.state.ndi_audio_on = False
+                    except Exception:                          # noqa: BLE001
+                        pass
+                    try:
+                        _wa = self.output_panel.chk_ndi_audio
+                        _wa.blockSignals(True)
+                        _wa.setChecked(False)
+                        _wa.blockSignals(False)
+                        _wa.setEnabled(False)
+                    except Exception:                          # noqa: BLE001
+                        pass
+                    print("[NDI] NDI 运行时不可用 → 已同步关闭 NDI 音频"
+                          "（避免'勾选框显示开着但实际不发声'）")
         except Exception as _e:                                    # noqa: BLE001
             print("[NDI] 启动恢复 NDI 失败：%s" % _e)
         # Kv 主视觉图层设置区显隐（按当前是否已存在 Kv 图层）
