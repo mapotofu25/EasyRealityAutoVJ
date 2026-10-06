@@ -3489,6 +3489,10 @@ class MainWindow(QMainWindow):
                 else:
                     print("[NDI] 启动时运行时不可用，NDI 输出未启用：%s" % _detail)
                     self.cfg["output"]["ndi_enabled"] = False
+                    # ⚠ 同步把 ndi_audio 配置也落回 False：否则 config 里仍是 True，
+                    #   下次启动回填时勾选框又会显示成"勾选态"（虽被置灰、也不发声），
+                    #   属于让用户困惑的脑裂残留。与下面的 UI/运行时状态回滚保持一致。
+                    self.cfg["output"]["ndi_audio"] = False
                     self.output_panel.chk_ndi.blockSignals(True)
                     self.output_panel.chk_ndi.setChecked(False)
                     self.output_panel.chk_ndi.blockSignals(False)
