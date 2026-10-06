@@ -49,6 +49,36 @@ def _sc():
     return sc
 
 
+def _match_device(cands, device_name):
+    """在候选设备里按名字挑一个，返回 (设备, 告警文案或 "")。
+
+    ⚠ 2026-10-07 修「线路输入用不了」：旧写法是
+        mic = cands[0]
+        if device_name:
+            for m in cands:
+                if device_name in m.name:
+                    mic = m; break
+      —— 名字匹配不上时**静默保留 cands[0]**（很可能是板载麦克风），
+      用户配的是声卡线路输入，实际采的却是别的东西，而界面只显示实际设备名、
+      没有任何提示 ⇒ 用户以为"线路输入用不了"。实测现实名字（换 USB 口 /
+      驱动改名 / 中英文界面差异）落空率约一半。
+
+    这里保留"没指定设备 → 用第一个"的合法语义（device_name 为空时不告警），
+    但**指定了却匹配不到**必须让用户看得见：返回一段明确的告警文案。
+    匹配语义（严格子串 `in`）与旧实现一致，不改判据、只补可见性。
+    """
+    if not cands:
+        return None, ""
+    if not device_name:
+        return cands[0], ""
+    for m in cands:
+        if device_name in m.name:
+            return m, ""
+    # 匹配不到：用第一个兜底（现场不能停），但把差异说清楚
+    return cands[0], ("配置的音频设备「%s」未找到，已改用「%s」。"
+                      "请到「音源」重新选择设备后点应用。" % (device_name, cands[0].name))
+
+
 def _native_samplerate(mic):
     """读设备的 WASAPI 原生混音采样率（PKEY_AudioEngine_DeviceFormat）。
 
@@ -1495,33 +1525,27 @@ class AudioEngine:
         try:
             mics = sc.all_microphones(include_loopback=True)
             mic = None
+            dev_warn = ""
             if source_type == "system":
                 loop = [m for m in mics if m.isloopback]
                 if not loop:
                     raise RuntimeError("找不到可采集的系统声音（Loopback）设备")
-                mic = loop[0]
-                if device_name:
-                    for m in loop:
-                        if device_name in m.name:
-                            mic = m
-                            break
+                mic, dev_warn = _match_device(loop, device_name)
             else:
                 cands = [m for m in mics if not m.isloopback]
                 if not cands:
                     raise RuntimeError("找不到麦克风/线路输入设备")
-                mic = cands[0]
-                if device_name:
-                    for m in cands:
-                        if device_name in m.name:
-                            mic = m
-                            break
+                mic, dev_warn = _match_device(cands, device_name)
             if self._gen != gen:
                 return   # 打开设备期间又被切换
+            if dev_warn:
+                # ★ 设备名匹配不到：显式告警（旧实现静默回退 cands[0]，用户完全看不见）
+                print("[音频] %s" % dev_warn)
             if not sr:   # 0 = 自动：跟随设备原生采样率，避免 WASAPI 重采样抹平瞬态
                 sr = _native_samplerate(mic) or 48000
             with st.lock:
                 st.device_desc = mic.name
-                st.error = ""
+                st.error = dev_warn   # 空串 = 正常；非空 = 让主界面 lbl_warn 显示出来
                 st.running = True
             self._capture_loop(mic, mono, sr, gen)
         except Exception as e:
@@ -1537,6 +1561,16 @@ class AudioEngine:
         # 后续「切换设备」的任务永远排在它后面 → 表现为改音源毫无反应。
         # 连续失败若干次就主动退出循环，让 worker 空出来接手切换请求。
         err_streak = 0
+        # ★ 2026-10-07 修「线路输入用不了」之「mono 只取左声道 ⇒ 能量恒 0」：
+        #   勾了「单声道分析」时旧写法硬取 data[:, :1]（左声道）。但线路输入常用
+        #   单声道/RCA **只插一根**，右声道有信号、左声道恒 0 ⇒ rms 恒 0 ⇒
+        #   用户看到"插上线毫无反应"，主界面还只说「没有检测到声音」。
+        #   这里加**按块计数的死零兜底**：左声道连续若干块全零而右声道有信号时，
+        #   自动改取右声道。用块计数而非计时（本循环无 tick），判据简单、零分配。
+        #   ⚠ 健康路径（左声道有信号）只做一次 max 比较，不改变任何行为。
+        _DEAD_BLOCKS = 8          # 连续 8 块（≈0.17s @48k/BLOCK=1024）才认为左声道真死
+        dead_left = 0
+        use_right = False         # True = 兜底改取右声道
         with mic.recorder(samplerate=sr, channels=2) as rec:
             with self._genre_lock:
                 self._genre_sr = sr
@@ -1555,7 +1589,26 @@ class AudioEngine:
                         continue
                     err_streak = 0
                     if mono:
-                        analyzer.feed(data[:, :1], st)
+                        # ---- 左声道死零兜底（仅在 mono 且立体声时）----
+                        if data.ndim == 2 and data.shape[1] >= 2:
+                            lpk = float(np.abs(data[:, 0]).max())
+                            rpk = float(np.abs(data[:, 1]).max())
+                            if lpk >= 1e-4:
+                                # 健康路径：左声道有信号 ⇒ 立刻回到正常分支（防抖复位）
+                                dead_left = 0
+                                use_right = False
+                            elif rpk >= 1e-4:
+                                # 左死右活 ⇒ 累计；连续够多块才切换（不横跳）
+                                dead_left += 1
+                                if dead_left >= _DEAD_BLOCKS:
+                                    use_right = True
+                            else:
+                                # 左右都静音 = 真的没声音，不复位也不切换
+                                pass
+                        if use_right:
+                            analyzer.feed(data[:, 1:2], st)
+                        else:
+                            analyzer.feed(data[:, :1], st)
                     else:
                         analyzer.feed(data, st)
                     # NDI 音频（音画同步）：把采集到的立体声 PCM **入队**给独立转发线程
