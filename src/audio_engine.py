@@ -1565,12 +1565,26 @@ class AudioEngine:
         #   勾了「单声道分析」时旧写法硬取 data[:, :1]（左声道）。但线路输入常用
         #   单声道/RCA **只插一根**，右声道有信号、左声道恒 0 ⇒ rms 恒 0 ⇒
         #   用户看到"插上线毫无反应"，主界面还只说「没有检测到声音」。
-        #   这里加**按块计数的死零兜底**：左声道连续若干块全零而右声道有信号时，
-        #   自动改取右声道。用块计数而非计时（本循环无 tick），判据简单、零分配。
-        #   ⚠ 健康路径（左声道有信号）只做一次 max 比较，不改变任何行为。
-        _DEAD_BLOCKS = 8          # 连续 8 块（≈0.17s @48k/BLOCK=1024）才认为左声道真死
-        dead_left = 0
+        #   这里加**滑动窗口统计**的死零兜底：最近 N 块里绝大多数是「左弱右强」时
+        #   自动改取右声道。
+        #   ⚠ 为什么不用「连续 N 块」：实测左声道**间歇性**噪声（接触不良 / RCA 半插 /
+        #     工频串扰）时，只要每 ≤8 块冒一次 ≥1e-4，连续计数就被复位、永远切不过去
+        #     —— 而定线现场恰恰就是这种接触不良的线。滑动窗口对间歇噪声免疫。
+        #   ⚠ 为什么用**非对称阈值**：左声道"多小才算没接信号"和右声道"多大才算有信号"
+        #     不是一回事。若用同一个阈值，间歇噪声块会被当成"左声道健康"而清空窗口，
+        #     导致永远攒不满（实测每 6/7/8 块冒一次 1e-3 噪声 ⇒ 永不切换）。
+        #     故：左「健康」要求明显更高（_LIVE_L），右「有信号」门槛更低（_LIVE_R）。
+        _WIN = 32                 # 窗口 = 32 块（≈0.68s @48k/BLOCK=1024）
+        _WIN_DEAD = 24            # 窗口内 ≥24 块「左弱右强」（75%）才认为左声道接错
+        _LIVE_L = 0.05            # 左声道「真接了信号」：-26dBFS，远高于噪底/串扰
+        _LIVE_R = 1e-3            # 右声道「有信号」：-60dBFS
+        _dead_win = deque(maxlen=_WIN)
+        _live_streak = 0          # 左声道连续"健康"块数（防单块噪声清窗）
         use_right = False         # True = 兜底改取右声道
+        # 一次性告警（设备未找到等）在界面上的保留时长：≈6s 后自动清空。
+        # 太短 = 用户看不见；永久 = 顶掉「没有检测到声音」提示。
+        _WARN_HOLD = 288          # ≈6.1s @48k/BLOCK=1024
+        _warn_hold = 0
         with mic.recorder(samplerate=sr, channels=2) as rec:
             with self._genre_lock:
                 self._genre_sr = sr
@@ -1593,24 +1607,50 @@ class AudioEngine:
                         if data.ndim == 2 and data.shape[1] >= 2:
                             lpk = float(np.abs(data[:, 0]).max())
                             rpk = float(np.abs(data[:, 1]).max())
-                            if lpk >= 1e-4:
-                                # 健康路径：左声道有信号 ⇒ 立刻回到正常分支（防抖复位）
-                                dead_left = 0
-                                use_right = False
-                            elif rpk >= 1e-4:
-                                # 左死右活 ⇒ 累计；连续够多块才切换（不横跳）
-                                dead_left += 1
-                                if dead_left >= _DEAD_BLOCKS:
-                                    use_right = True
+                            if use_right:
+                                # 已在右声道：左声道**连续**恢复真实信号才切回
+                                # （单块噪声不算，防来回横跳）
+                                if lpk >= _LIVE_L:
+                                    _live_streak += 1
+                                    if _live_streak >= 8:
+                                        _dead_win.clear()
+                                        use_right = False
+                                        _live_streak = 0
+                                else:
+                                    _live_streak = 0
+                            elif lpk >= _LIVE_L:
+                                # 左声道健康：**连续**若干块才清窗（单块噪声不清）
+                                _live_streak += 1
+                                if _live_streak >= 8:
+                                    if _dead_win:
+                                        _dead_win.clear()
+                                    _live_streak = 0
                             else:
-                                # 左右都静音 = 真的没声音，不复位也不切换
-                                pass
+                                # 左弱。右强才算"左接错"的证据。
+                                _live_streak = 0
+                                _dead_win.append(1 if rpk >= _LIVE_R else 0)
+                                if (not use_right) and len(_dead_win) >= _WIN \
+                                        and sum(_dead_win) >= _WIN_DEAD:
+                                    use_right = True
                         if use_right:
                             analyzer.feed(data[:, 1:2], st)
                         else:
                             analyzer.feed(data[:, :1], st)
                     else:
                         analyzer.feed(data, st)
+                    # ★ 一次性告警（如"设备未找到，已改用 X"）的收尾：
+                    #   既不能永久挂着（会顶掉后续「没有检测到声音」提示 ——
+                    #   ui_main 是 if error / elif silent>5 互斥），
+                    #   也不能刚写就立刻清掉（那样用户根本来不及看见）。
+                    #   折中：显示满 _WARN_HOLD 块（≈6s，够看清）后清空。
+                    if st.error:
+                        _warn_hold += 1
+                        if _warn_hold >= _WARN_HOLD:
+                            with st.lock:
+                                st.error = ""
+                            _warn_hold = 0
+                    else:
+                        _warn_hold = 0
                     # NDI 音频（音画同步）：把采集到的立体声 PCM **入队**给独立转发线程
                     # ★ 2026-09-28 改：不再在本线程直接调 `ndi.feed_audio()` —— 它会写
                     #   cyndilib 缓冲并 send_audio，接收端一慢就把采集线程拖住，
