@@ -1597,6 +1597,11 @@ class AudioEngine:
         _WARN_HOLD = 288          # ≈6.1s @48k/BLOCK=1024
         _warn_hold = 0
         _ndi_diag_last = None     # ★ 上一次记录的「采集门控」二元组（见循环内，值变化才写一行）
+        _blk_ok = 0               # ★ 采集心跳：成功取到的音频块数
+        _blk_empty = 0            # ★ 采集心跳：record() 返回空/None 的次数
+        _push_ok = 0              # ★ 采集心跳：成功入队给 NDI 的次数
+        _push_err = ""            # ★ 采集心跳：最近一次投递异常（诊断）
+        _hb_t0 = time.perf_counter()   # ★ 采集心跳计时起点
         with mic.recorder(samplerate=sr, channels=2) as rec:
             with self._genre_lock:
                 self._genre_sr = sr
@@ -1632,8 +1637,10 @@ class AudioEngine:
                     analyzer.energy_scale = self.energy_scale
                     data = rec.record(numframes=BLOCK)
                     if data is None or len(data) == 0:
+                        _blk_empty += 1
                         continue
                     err_streak = 0
+                    _blk_ok += 1
                     if mono:
                         # ---- 左声道死零兜底（仅在 mono 且立体声时）----
                         if data.ndim == 2 and data.shape[1] >= 2:
@@ -1696,8 +1703,26 @@ class AudioEngine:
                             elif arr.shape[1] == 1:
                                 arr = _np.repeat(arr, 2, axis=1)
                             self.push_ndi_audio(arr.reshape(-1).copy(), sr)
-                    except Exception:
-                        pass
+                            _push_ok += 1
+                    except Exception as _pe:
+                        _push_err = "%s: %s" % (type(_pe).__name__, str(_pe)[:80])
+                    # ★ 采集侧心跳（每 10s 一行）：现场"到底有没有在投递音频"的**唯一硬证据**。
+                    #   blk=采集到的块数 / push=成功入队次数 / 队列当前长度 / 错误。
+                    #   若 push 恒为 0 而 blk 在涨 ⇒ 门控或异常吞掉了投递；
+                    #   若 push 在涨但下游无「首次取到 PCM」⇒ 转发线程/队列出问题。
+                    if time.perf_counter() - _hb_t0 >= 10.0:
+                        _hb_t0 = time.perf_counter()
+                        try:
+                            from ndi_out import _health_write
+                            _health_write(
+                                "采集心跳：blk=%d push=%d empty=%d qlen=%d "
+                                "ndi_audio_on=%r ndi_feed=%s err=%s"
+                                % (_blk_ok, _push_ok, _blk_empty,
+                                   len(self._ndi_q), bool(st.ndi_audio_on),
+                                   "已接" if st.ndi_feed is not None else "None",
+                                   _push_err or "-"))
+                        except Exception:                          # noqa: BLE001
+                            pass
                     # 喂曲风环形缓冲（左声道 float32）——numpy 环形缓冲，零对象分配
                     try:
                         mono_sig = data[:, 0] if data.ndim == 2 else data
