@@ -13,8 +13,15 @@
 
 ⚠ 默认模式会 `taskkill` 掉**所有** EasyRealityAutoVJ.exe（含用户正在跑的实例）。
   如果用户正在使用软件（例如演出中），**必须加 `--isolated`**：
-  它把新实例的 `LOCALAPPDATA` 指到一个临时目录 —— 既绕开单实例锁、又不动用户数据，
-  结束时也只关掉自己启动的那个进程。（顺带等于测了一遍「全新用户首次启动」。）
+  它把新实例的 `LOCALAPPDATA` **和 `TEMP`/`TMP`** 都指到临时目录 ——
+  既绕开单实例锁、又不动用户数据，结束时也只关掉自己启动的那个进程。
+  （顺带等于测了一遍「全新用户首次启动」。）
+
+⚠⚠ 为什么必须连 `TEMP` 一起隔离（2026-10-07 实测踩到）：单实例锁文件
+  `EasyRealityAutoVJ.lock` 落在 `tempfile.gettempdir()`（= `TEMP`），**不在 LOCALAPPDATA**。
+  只隔离 LOCALAPPDATA 时，用户开着软件（或从源码跑 main.py）就会占着这把锁，
+  新 exe 一启动就判定「已在运行」→ 立刻 exit 0 ⇒ 冒烟被误报成「结果不可信」，
+  而真实产物其实是好的。隔离 TEMP 才真正绕开锁。
 """
 
 import os
@@ -109,13 +116,20 @@ def main():
 
     env = None
     if isolated:
-        data_root = os.path.join(tempfile.gettempdir(), "autovj_smoke_%d" % os.getpid())
+        # ⚠ 隔离目录落在**真实** TEMP 下（用户那里一定可写），用真实 TEMP 路径建目录。
+        _real_tmp = tempfile.gettempdir()
+        data_root = os.path.join(_real_tmp, "autovj_smoke_%d" % os.getpid())
         os.makedirs(data_root, exist_ok=True)
         env = os.environ.copy()
         env["LOCALAPPDATA"] = data_root
+        # ★★ 关键：单实例锁在 `tempfile.gettempdir()`（= TEMP/TMP）里，不在 LOCALAPPDATA。
+        #   不隔离它，用户正开着的实例就会挡住冒烟 ⇒ 进程秒退、误报「结果不可信」。
+        env["TEMP"] = data_root
+        env["TMP"] = data_root
         log = os.path.join(data_root, "AutoVJ", "startup_error.log")
         print("隔离模式：临时数据目录 = %s" % data_root)
         print("  ★ 不结束你正在运行的实例；结束时只关本次启动的进程")
+        print("  ★ 已隔离 TEMP/TMP ⇒ 单实例锁不与用户实例冲突")
     else:
         log = _default_log()
         # 先确认没有残留进程占着 dist
@@ -132,7 +146,9 @@ def main():
     # ★ 单实例锁：从源码跑的实例（python main.py）也占这把锁，而它**不叫**
     #   EasyRealityAutoVJ.exe ⇒ 上面的 taskkill 清不掉它 ⇒ 新 exe 会以为"已在运行"
     #   直接退出，冒烟就误报失败。这里先探一下，让结论别被误读。
-    _lock = os.path.join(tempfile.gettempdir(), "EasyRealityAutoVJ.lock")
+    # ★ 隔离模式下锁也被隔离 ⇒ 探测路径必须跟着走，否则会误报「锁已存在」。
+    _lock_root = (env or {}).get("TEMP") or tempfile.gettempdir()
+    _lock = os.path.join(_lock_root, "EasyRealityAutoVJ.lock")
     lock_held = os.path.exists(_lock)
     if lock_held:
         print("⚠ 单实例锁已存在（%s）" % _lock)
