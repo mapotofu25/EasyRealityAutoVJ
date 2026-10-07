@@ -96,6 +96,11 @@ _AUDIO_SR = 48000
 #   3 槽 = 300ms 储备，抖动被完全吸收。
 _FRAME_SAMPLES = 4800
 
+# ★★ 2026-10-07 定稿（砍掉时钟驱动后的全部发送参数，就这一个）。
+#   `feed_audio` 一次调用最多发几帧 —— 只为防止极端积压时长时间霸占锁。
+#   正常每块（1024 样本 ≈21ms）远攒不满一帧，恒为 0 或 1。
+_MAX_FRAMES_PER_CALL = 4
+
 
 def _mbi_readable(addr, size=8):
     """该地址是否落在已提交、可读的内存页里（探测野指针用）。"""
@@ -236,6 +241,7 @@ class NDIOutput:
         self._pend_sr = 0        # 累积缓冲对应的采样率（变了就丢弃重来）
         self._audio_frames_sent = 0   # 真正发出的「整帧」数（诊断）
         self._audio_short = 0         # 退出时残留的不足一帧样本数（诊断）
+        self._audio_start_logged = False   # 「已开始发送」只写一次（见 feed_audio）
         self._err_logged = None         # 视频侧同样只记第一条
         self._opened_at = 0.0           # sender 的 open() 时刻（算静默期用）
 
@@ -443,27 +449,58 @@ class NDIOutput:
                     buf = new
                 else:
                     buf = _np.concatenate([self._pend, new], axis=0)
+                # ★★ 2026-10-07 定稿：回归 **NDI 官方立场** —— 发送端原样送样本。
+                #
+                #   为什么砍掉之前那套「时钟驱动 + 线性外推 + 追赶丢弃」（用户质问
+                #   「市面上没有成熟方案吗？」后重新查证的结论）：
+                #
+                #   **NDI 官方明确不做 PTP 时钟同步。** 发送端只该「原样送样本」，
+                #   收发两端那点时钟差（本机实测采集比实时慢 ~0.9%）由**接收端**
+                #   用高质量重采样器吃掉 —— NDI SDK 文档原话：
+                #       "they will be resampled with high quality to adjust for
+                #        small clock rate differences"
+                #   接收端（OBS / vMix / Resolume）内部都有这个重采样器；我们
+                #   在发送端手写一个，等于把接收端的活塞进发送端，而且是用线性
+                #   外推这种最差的方式（实测把正弦放大 23 倍 ⇒ 更响的爆音）。
+                #
+                #   现在只做两件事，都有明确依据：
+                #     ① **定长累积到 _FRAME_SAMPLES 再发** —— 修「断续/短促高频/爆音」
+                #        （cyndilib 音频发送环只有 3 槽，按 21ms 小块发会让环容量只剩
+                #         ~64ms，采集一抖动就排空；攒到 100ms ⇒ 3 槽 = 300ms 储备）。
+                #     ② **缓冲满就跳过这一帧，绝不补零、绝不外推、绝不伪造样本**
+                #        —— 那 0.9% 的时钟差交给接收端；伪造出来的样本是**错误波形**，
+                #        比少一小段更糟（少一小段接收端会平滑掉，错误波形会直接响）。
+                #
+                #   ⚠ 本函数现在**没有任何跨调用的时钟状态**（无 _t0 / _frames_clock /
+                #     _last_tail / _extrapolate）—— 状态越少，现场越不会出玄学。
                 sent_any = False
-                while len(buf) >= _FRAME_SAMPLES:
+                # 一次调用里最多发多少帧：正常 1 帧（每块 21ms，攒满 100ms 才够），
+                # 上限只是防止极端积压时长时间霸占锁。
+                for _ in range(_MAX_FRAMES_PER_CALL):
+                    if len(buf) < _FRAME_SAMPLES:
+                        break
                     chunk = buf[:_FRAME_SAMPLES]
                     buf = buf[_FRAME_SAMPLES:]
                     # 交错 (n, ch) → 平面 (ch, n)，并保证 C 连续（cyndilib 直接按缓冲读）
                     planar = _np.ascontiguousarray(chunk.T)
-                    # 与视频同样的坑：缓冲没空出来时 write_data 会抛 —— 这一帧直接丢，不关输出
+                    # ★ 缓冲没空出来（接收端慢/抖动）⇒ **跳过这一帧**，样本塞回 buf 头部
+                    #   等下一轮。不补零、不造样本，宁可晚 20ms 也不出错误波形。
                     if hasattr(a, "get_write_available") and not a.get_write_available():
+                        buf = _np.concatenate([chunk, buf], axis=0)
                         self._audio_dropped += 1
-                        continue
+                        break
                     try:
                         a.write_data(planar)
-                    except Exception as _we:                   # noqa: BLE001
+                    except Exception as _we:
+                        buf = _np.concatenate([chunk, buf], axis=0)
                         self._audio_dropped += 1
                         self._audio_err = "%s: %s" % (type(_we).__name__, str(_we)[:120])
-                        continue
+                        break
                     ok1 = True
                     try:
                         if hasattr(self._sender, "send_audio"):
                             ok1 = bool(self._sender.send_audio())
-                    except Exception as e:                     # noqa: BLE001
+                    except Exception as e:
                         ok1 = False
                         self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
                     if ok1:
@@ -485,7 +522,15 @@ class NDIOutput:
                 #   而 `get_num_connections()` 在「接收端刚连上、计数还没上报」的窗口返回 0，
                 #   门控会把那一段音频**整块丢掉且毫无日志** —— 正是"没有声音"的隐形帮凶。
                 #   现在改成：发不出去就丢这一帧，并计数 + 周期性打日志（见上面的发送循环）。
-                if self._audio_ok and self._audio_ok == 1:
+                # ★★ 2026-10-07 修「已开始发送」反复刷屏：原判据 `_audio_ok == 1`
+                #   看似"只打一次"，实则只要中间出现过写失败（_audio_ok 不变但
+                #   下面会走到 else 分支... 更准确地说：`_audio_ok` 只增不减，
+                #   所以 ==1 确实是瞬态）—— 但现场日志里它**每 20 秒重复一次**，
+                #   说明 `_audio_ok` 被重置过（重建会话/开关切换）。
+                #   改用**一次性布尔标志**：整个会话生命周期里只写一行，
+                #   不依赖任何计数的瞬态值。
+                if not self._audio_start_logged:
+                    self._audio_start_logged = True
                     _log("音频已开始发送（%.1f kHz → %.1f kHz / 2ch）"
                          % ((sr or _AUDIO_SR) / 1000.0, _AUDIO_SR / 1000.0), key="audio-start")
                 # 每 ~10 秒给一行心跳，现场据此就能判断"到底有没有在发"
@@ -498,9 +543,15 @@ class NDIOutput:
                     #   之后再想从日志看"音频还在不在发"就完全看不到。
                     #   现改成**按 60 秒时间桶**做 key：每分钟一行，既不刷屏又能看出走势。
                     bucket = int(now) // 60
-                    _log("audio: src=%d -> %d, ok=%d dropped=%d resampled=%d conns=%d err=%s"
+                    # ★ 诊断量只剩 pend（当前积压样本）。**持续单调增长**说明发送跟不上
+                    #   （接收端慢 / 环满），是「破音」现场唯一需要看的量；
+                    #   正常应在 0 ~ 1 帧之间小幅波动。
+                    _log("audio: src=%d -> %d, ok=%d dropped=%d resampled=%d conns=%d "
+                         "pend=%d err=%s"
                          % (int(sr or 0), _AUDIO_SR, self._audio_ok, self._audio_dropped,
-                            self._audio_resampled, self._conns(), self._audio_err or "-"),
+                            self._audio_resampled, self._conns(),
+                            0 if self._pend is None else len(self._pend),
+                            self._audio_err or "-"),
                          key="audio-hb-%d" % bucket)
         except Exception as e:                                     # noqa: BLE001
             self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
@@ -532,6 +583,9 @@ class NDIOutput:
         self._opened_at = 0.0
         self._inited = False        # ★ 必须重置：否则换分辨率后无法重建（见 _ensure 注释）
         self.enabled = False
+        # ★ 累积缓冲一并清空：重开输出时若有残留样本，会拼进新会话的第一帧
+        #   ⇒ 开头多出几十毫秒的旧声音（且采样率可能已变）。
+        self._pend = None
 
 
 # 全局单例（引擎线程 + 采集线程共享）

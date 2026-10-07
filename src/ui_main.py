@@ -2742,6 +2742,15 @@ class MainWindow(QMainWindow):
         if not self.audio.state.running:
             self.start_audio()
         running = self.engine.toggle_run()
+        # ★★ 2026-10-07：NDI 音频跟「开始自动 VJ」绑定（用户要求）。
+        #   未开始时一个样本都不推（连静音都不推）。这里同步给采集侧 +
+        #   转发线程侧（两处都读同一个 `audio.state.ndi_running`）。
+        #   ⚠ 必须在 `toggle_run()` **之后**同步：`engine.toggle_run` 是幂等翻转，
+        #     用它的返回值（= 翻转后的真实状态）而不是 `not running`。
+        try:
+            self.audio.state.ndi_running = bool(running)
+        except Exception:                                      # noqa: BLE001
+            pass
         self.btn_run.setText("■ " + tr("stop") if running else "▶ " + tr("start"))
         self.btn_run.setStyleSheet("background:#2e7d32;color:#fff;" if running else "")
         # 「开始自动VJ」按钮：未运行时慢速呼吸闪烁（一闪一闪，周期 2.2s；亮暗主题两套色），
@@ -3271,8 +3280,19 @@ class MainWindow(QMainWindow):
             enabled = bool(self.cfg["output"].get("ndi_enabled"))
         except Exception:                                      # noqa: BLE001
             enabled = False
-        # 正常路径
-        if ndi is not None and enabled:
+        # ★★ 2026-10-07 新增门控：NDI 音频只在「开始自动 VJ」后才推流。
+        #   用户要求：「ndi音频输出没有和开始自动vj绑定，没开始时也有输出」。
+        #   未开始时**一个样本都不发**（不推静音、不推数据）—— 静音也是一条流，
+        #   接收端会以为"有声音只是很轻"，反而更难判断。彻底不发最干净：
+        #   接收端连不上音频就不显示音频电平表，语义明确。
+        #   ⚠ 用 `getattr` 兜底：早期版本没有 `running` 属性时按"未运行"处理，
+        #     但那种情况只可能是引擎还没建好（此时也不该发音频）。
+        try:
+            vj_running = bool(getattr(self.engine, "running", False))
+        except Exception:                                      # noqa: BLE001
+            vj_running = False
+        # 正常路径（三个条件全真才发）
+        if ndi is not None and enabled and vj_running:
             # ⚠ 这里**不再**调 `set_audio_rate()`：帧的采样率在 open() 时就被冻结，
             #   现在帧固定 48k、非 48k 的数据由 `feed_audio()` 自己重采样
             #   （原来每块告诉它一次采样率既无效又误导，见 _NDI音频诊断.md §1.3）。
@@ -3289,12 +3309,19 @@ class MainWindow(QMainWindow):
             self._ndi_audio_gate_logged = None
             return
         # —— 门控分支：只在原因变化时打一次一次性日志（每秒 ~47 次调用，不能刷屏）——
-        reason = "sender_missing" if ndi is None else "output_disabled"
+        if ndi is None:
+            reason = "sender_missing"
+        elif not enabled:
+            reason = "output_disabled"
+        else:
+            reason = "auto_not_running"
         if self._ndi_audio_gate_logged != reason:
             self._ndi_audio_gate_logged = reason
             _txt = ("[NDI] 音频门控：发送端尚未建立（engine._ndi is None），音频暂不发送"
                     if reason == "sender_missing" else
-                    "[NDI] 音频门控：NDI 输出未启用，音频暂不发送")
+                    "[NDI] 音频门控：NDI 输出未启用，音频暂不发送"
+                    if reason == "output_disabled" else
+                    "[NDI] 音频门控：尚未「开始自动VJ」，音频暂不发送（开始后自动恢复）")
             # ⚠⚠ 必须**同时落盘**：打包后是 --windowed，没有控制台，只 print 等于没记
             #   （现场"有画面没声音、日志空白"能拖这么多轮，根因就是诊断全丢了）。
             #   复用 ndi_out 的落盘通道，保证 NDI 两侧取证写进同一个 output_health.log。

@@ -235,6 +235,10 @@ class AudioState:
         self.ndi_audio_on = False   # NDI 音频是否启用：False 时采集循环**不做任何拷贝**，
                                     # 直接把 PCM 丢掉（原实现不管有没有开 NDI，每块都要
                                     # np.asarray + reshape(-1) + copy() 一次）
+        # ★★ 2026-10-07：NDI 音频还要**跟「开始自动 VJ」绑定**（用户要求）。
+        #   未开始时不推音频（连静音都不推），因此采集循环在未开始时也跳过投递。
+        #   由 `engine.toggle_run()` 同步；转发线程侧另有一道同样的门控兜底。
+        self.ndi_running = False
         # ---- ASIO 低延迟输入（见 src/asio_engine.py + src/native/asiohost.cpp）----
         # ⚠ 硬要求：ASIO 打不开（多半是被 VirtualDJ/DAW 独占）时**必须自动回退 WASAPI**，
         #   演出不能因为换个音源就没声音。
@@ -1621,16 +1625,18 @@ class AudioEngine:
                     #   这里记录「值发生变化时」的一行，三者立刻可辨。
                     #   ⚠ 代价只有每块一次 bool 比较 + 元组比较（~10ns），不进热路径；
                     #     不能用「只写一次」—— 万一是启动后才被回滚成 False，只写一次就漏了。
-                    _gate_now = (bool(st.ndi_audio_on), st.ndi_feed is not None)
+                    _gate_now = (bool(st.ndi_audio_on), st.ndi_feed is not None,
+                                 bool(getattr(st, "ndi_running", False)))
                     if _gate_now != _ndi_diag_last:
                         _ndi_diag_last = _gate_now
                         try:
                             from ndi_out import _health_write
                             _health_write(
-                                "采集门控快照：ndi_audio_on=%r  ndi_feed=%s  sr=%s  mono=%r"
+                                "采集门控快照：ndi_audio_on=%r  ndi_feed=%s  "
+                                "ndi_running=%r  sr=%s  mono=%r"
                                 % (_gate_now[0],
                                    "已接" if _gate_now[1] else "None(未接)",
-                                   sr, bool(mono)))
+                                   _gate_now[2], sr, bool(mono)))
                         except Exception:                          # noqa: BLE001
                             pass
                     # 实时透传能量伽马校正（用户调滑块后下一块立即生效，不能在启动时只拷贝一次）
@@ -1707,7 +1713,9 @@ class AudioEngine:
                     #   且因为**没有任何日志**（旧代码连异常都吞）而拖了很多轮才抓到。
                     #   ⚠ 修复要点：统一用模块级别的 `np`（不是 `_np`）。
                     try:
-                        if st.ndi_audio_on and st.ndi_feed is not None:
+                        # ★ 加 st.ndi_running：「未开始自动VJ」时连拷贝都省掉，
+                        #   与 NDI 音频门控语义一致（见 AudioState.ndi_running）。
+                        if st.ndi_audio_on and st.ndi_running and st.ndi_feed is not None:
                             arr = np.asarray(data, dtype=np.float32)
                             if arr.ndim == 1:
                                 arr = np.column_stack([arr, arr])
@@ -1727,9 +1735,10 @@ class AudioEngine:
                             from ndi_out import _health_write
                             _health_write(
                                 "采集心跳：blk=%d push=%d empty=%d qlen=%d "
-                                "ndi_audio_on=%r ndi_feed=%s err=%s"
+                                "ndi_audio_on=%r ndi_running=%r ndi_feed=%s err=%s"
                                 % (_blk_ok, _push_ok, _blk_empty,
                                    len(self._ndi_q), bool(st.ndi_audio_on),
+                                   bool(getattr(st, "ndi_running", False)),
                                    "已接" if st.ndi_feed is not None else "None",
                                    _push_err or "-"))
                         except Exception:                          # noqa: BLE001
