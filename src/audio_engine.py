@@ -1181,6 +1181,7 @@ class AudioEngine:
         self._ndi_q = deque(maxlen=_NDI_Q_MAX)
         self._ndi_cv = threading.Condition()
         self._ndi_stop = False
+        self._ndi_fwd_logged = False   # ★ 首次转发写一行取证日志（见 _ndi_audio_loop）
         self._ndi_thread = threading.Thread(
             target=self._ndi_audio_loop, daemon=True, name="autovj-ndi-audio")
         self._ndi_thread.start()
@@ -1222,6 +1223,16 @@ class AudioEngine:
             fn = self.state.ndi_feed
             if fn is None:
                 continue
+            # ★ 首次真正转发：写一行取证日志。与「采集门控快照」配合可精确定位：
+            #   有快照无本行 ⇒ 采集线程没投递（门控为假 / push 异常被吞）；
+            #   有本行无 ndi_out 的「音频链路已通」⇒ feed_audio 被 _ensure() 挡下。
+            if not self._ndi_fwd_logged:
+                self._ndi_fwd_logged = True
+                try:
+                    from ndi_out import _health_write
+                    _health_write("NDI 音频转发线程首次取到 PCM（队列非空）：开始投递 feed_audio")
+                except Exception:                             # noqa: BLE001
+                    pass
             try:
                 fn(item[0], item[1])
             except Exception:                                 # noqa: BLE001
@@ -1585,6 +1596,7 @@ class AudioEngine:
         # 太短 = 用户看不见；永久 = 顶掉「没有检测到声音」提示。
         _WARN_HOLD = 288          # ≈6.1s @48k/BLOCK=1024
         _warn_hold = 0
+        _ndi_diag_last = None     # ★ 上一次记录的「采集门控」二元组（见循环内，值变化才写一行）
         with mic.recorder(samplerate=sr, channels=2) as rec:
             with self._genre_lock:
                 self._genre_sr = sr
@@ -1596,6 +1608,26 @@ class AudioEngine:
                     self._genre_buf = _AudioRing(need)
             while self._gen == gen:   # 只在自己这一代有效；切换设备后立即退出
                 try:
+                    # ★★ 变化触发诊断（2026-10-07）：把 NDI 音频门控两个量写进取证日志。
+                    #   现场"有画面没声音"最难的一步就是**分不清**是
+                    #   ① ndi_audio_on=False（界面开关没生效）
+                    #   ② ndi_feed=None（回调没接上）
+                    #   ③ 两个都 True 但发送侧失败（去 ndi_out 看）
+                    #   这里记录「值发生变化时」的一行，三者立刻可辨。
+                    #   ⚠ 代价只有每块一次 bool 比较 + 元组比较（~10ns），不进热路径；
+                    #     不能用「只写一次」—— 万一是启动后才被回滚成 False，只写一次就漏了。
+                    _gate_now = (bool(st.ndi_audio_on), st.ndi_feed is not None)
+                    if _gate_now != _ndi_diag_last:
+                        _ndi_diag_last = _gate_now
+                        try:
+                            from ndi_out import _health_write
+                            _health_write(
+                                "采集门控快照：ndi_audio_on=%r  ndi_feed=%s  sr=%s  mono=%r"
+                                % (_gate_now[0],
+                                   "已接" if _gate_now[1] else "None(未接)",
+                                   sr, bool(mono)))
+                        except Exception:                          # noqa: BLE001
+                            pass
                     # 实时透传能量伽马校正（用户调滑块后下一块立即生效，不能在启动时只拷贝一次）
                     analyzer.energy_scale = self.energy_scale
                     data = rec.record(numframes=BLOCK)
