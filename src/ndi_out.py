@@ -88,6 +88,14 @@ def _log(msg, key=None):
 # 我们只能固定 48k，并在喂数据时自己重采样（见 feed_audio）。
 _AUDIO_SR = 48000
 
+# ★★ 2026-10-07：每一「帧」发出的样本数（= AudioSendFrame 的 max_num_samples）。
+#   100ms @48k。**必须与 _ensure() 里 `a.set_max_num_samples(_FRAME_SAMPLES)` 一致。**
+#   定长发送是修「声音断续/短促高频/爆音」的关键：cyndilib 的音频发送环只有 3 个槽
+#   （MAX_FRAME_BUFFERS=3），若按采集块（1024 帧 ≈21ms）逐块发，环总容量仅 ~64ms，
+#   采集循环一抖动就排空/溢出 ⇒ 接收端听到一簇簇短音。攒满 100ms 再发，
+#   3 槽 = 300ms 储备，抖动被完全吸收。
+_FRAME_SAMPLES = 4800
+
 
 def _mbi_readable(addr, size=8):
     """该地址是否落在已提交、可读的内存页里（探测野指针用）。"""
@@ -212,6 +220,22 @@ class NDIOutput:
         self._audio_last_log = 0.0  # 上次打心跳日志的时刻（每 ~10 秒一行）
         self._audio_err = ""     # 最近一次发送错误（诊断）
         self._audio_err_logged = None   # 只把**第一条**错误写日志，避免刷屏
+        # ---- ★★ 2026-10-07 定长累积发送（修「声音断续/短促高频/爆音」）----
+        #   根因：cyndilib 的音频发送环 **只有 3 个槽**（MAX_FRAME_BUFFERS=3，见
+        #   send_frame_status.pxd），而采集侧每块只有 BLOCK=1024 帧 ≈21ms
+        #   ⇒ 环总容量仅 ~64ms。采集循环任一次抖动（能量/拍钟/指纹分析、GC、调度）
+        #   超过 64ms，环就被排空；缓过来后又连灌数块 ⇒ 环满、后面的块被
+        #   `get_write_available()` 拦下直接丢（现场 `dropped` 持续增长即此）。
+        #   更致命的是**节奏被拉得忽快忽慢**：接收端按每块自带的时间戳回放，
+        #   块间隔被拖大 ⇒ 听感就是「一簇短音 → 停顿 → 一簇短音」，
+        #   且音调被拉高（短促高频）、块边界爆音。
+        #   修法：在发送端**自己攒够一整帧**（默认 100ms = 4800 样本 @48k，
+        #   正好等于 `set_max_num_samples(4800)`）再 `write_data + send_audio`。
+        #   这样发送节奏恒定、每块长度恒定，3 槽环 = 300ms 储备，抖动完全被吸收。
+        self._pend = None        # 累积中的 (N, 2) float32 未发送样本
+        self._pend_sr = 0        # 累积缓冲对应的采样率（变了就丢弃重来）
+        self._audio_frames_sent = 0   # 真正发出的「整帧」数（诊断）
+        self._audio_short = 0         # 退出时残留的不足一帧样本数（诊断）
         self._err_logged = None         # 视频侧同样只记第一条
         self._opened_at = 0.0           # sender 的 open() 时刻（算静默期用）
 
@@ -267,7 +291,7 @@ class NDIOutput:
             try:
                 a.sample_rate = _AUDIO_SR
                 a.num_channels = 2
-                a.set_max_num_samples(4800)
+                a.set_max_num_samples(_FRAME_SAMPLES)
             except Exception:
                 pass
             s.set_audio_frame(a)
@@ -390,6 +414,11 @@ class NDIOutput:
                     pcm = pcm[:n].reshape(-1, ch)
                 elif pcm.shape[0] == ch and pcm.shape[1] != ch:
                     pcm = pcm.T                 # 已经是平面 (ch, n) → 转成 (n, ch) 统一处理
+                if ch < 2:
+                    # 单声道兜底：复制成双声道（NDI 帧固定 2ch，写单声道会报
+                    # "number of channels must match"）
+                    pcm = _np.repeat(pcm, 2, axis=1)
+                    ch = 2
                 # ★ 重采样到 48k（NDI 只认 48k，而帧的采样率在 open() 时就被冻结，
                 #   之后 `a.sample_rate = sr` 不报错但**完全无效** —— 实测确认）。
                 #   不重采样的话：若设备是 44.1k，接收端会按 48k 播 ⇒ 快 8.8%、音调升高。
@@ -403,30 +432,59 @@ class NDIOutput:
                             [_np.interp(x_out, x_in, pcm[:, c].astype(_np.float64))
                              for c in range(pcm.shape[1])], axis=1).astype(_np.float32)
                         self._audio_resampled += 1
-                # 交错 (n, ch) → 平面 (ch, n)，并保证 C 连续（cyndilib 直接按缓冲读）
-                planar = _np.ascontiguousarray(pcm.T)
-                # 与视频同样的坑：缓冲没空出来时 write_data 会抛 —— 这一块直接丢，不关输出
-                if hasattr(a, "get_write_available") and not a.get_write_available():
-                    self._audio_dropped += 1
-                    return
-                a.write_data(planar)
+                # ★★ 定长累积（见 __init__ 字段注释）：攒够 _FRAME_SAMPLES 才发一块。
+                #   未满则留在 self._pend，绝不半帧发送 —— 半帧会让接收端时间轴抖动。
+                if sr and int(sr) != self._pend_sr:
+                    # 采样率变了（换设备）⇒ 旧累积作废，避免拼出错误时长
+                    self._pend = None
+                    self._pend_sr = int(sr) if sr else _AUDIO_SR
+                new = pcm if pcm.shape[1] == 2 else _np.repeat(pcm, 2, axis=1)
+                if self._pend is None or len(self._pend) == 0:
+                    buf = new
+                else:
+                    buf = _np.concatenate([self._pend, new], axis=0)
+                sent_any = False
+                while len(buf) >= _FRAME_SAMPLES:
+                    chunk = buf[:_FRAME_SAMPLES]
+                    buf = buf[_FRAME_SAMPLES:]
+                    # 交错 (n, ch) → 平面 (ch, n)，并保证 C 连续（cyndilib 直接按缓冲读）
+                    planar = _np.ascontiguousarray(chunk.T)
+                    # 与视频同样的坑：缓冲没空出来时 write_data 会抛 —— 这一帧直接丢，不关输出
+                    if hasattr(a, "get_write_available") and not a.get_write_available():
+                        self._audio_dropped += 1
+                        continue
+                    try:
+                        a.write_data(planar)
+                    except Exception as _we:                   # noqa: BLE001
+                        self._audio_dropped += 1
+                        self._audio_err = "%s: %s" % (type(_we).__name__, str(_we)[:120])
+                        continue
+                    ok1 = True
+                    try:
+                        if hasattr(self._sender, "send_audio"):
+                            ok1 = bool(self._sender.send_audio())
+                    except Exception as e:                     # noqa: BLE001
+                        ok1 = False
+                        self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
+                    if ok1:
+                        self._audio_ok += 1
+                        self._audio_frames_sent += 1
+                        sent_any = True
+                    else:
+                        self._audio_dropped += 1
+                # 剩余的不足一帧，留到下次
+                self._pend = buf if len(buf) else None
+                # 累积缓冲兜底上限：万一下游一直发不出去（连不上接收端），
+                # 不能让 _pend 无限增长 ⇒ 超过 1 秒就只留最新 1 秒。
+                if self._pend is not None and len(self._pend) > _AUDIO_SR:
+                    self._pend = self._pend[-_AUDIO_SR:]
+                    self._audio_short += 1
                 # ⚠ 不再用「连接数门控」（2026-10-01 实测修正）：
                 #   原来以为"没有接收端时 send_audio() 会段错误"，实测**不成立**
                 #   （无接收端时它只是返回 False，真正会崩的是 p_metadata 野指针，已修）。
                 #   而 `get_num_connections()` 在「接收端刚连上、计数还没上报」的窗口返回 0，
                 #   门控会把那一段音频**整块丢掉且毫无日志** —— 正是"没有声音"的隐形帮凶。
-                #   现在改成：发不出去就丢这一块，并计数 + 周期性打日志。
-                ok = True
-                try:
-                    if hasattr(self._sender, "send_audio"):
-                        ok = bool(self._sender.send_audio())
-                except Exception as e:                             # noqa: BLE001
-                    ok = False
-                    self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
-                if ok:
-                    self._audio_ok += 1
-                else:
-                    self._audio_dropped += 1
+                #   现在改成：发不出去就丢这一帧，并计数 + 周期性打日志（见上面的发送循环）。
                 if self._audio_ok and self._audio_ok == 1:
                     _log("音频已开始发送（%.1f kHz → %.1f kHz / 2ch）"
                          % ((sr or _AUDIO_SR) / 1000.0, _AUDIO_SR / 1000.0), key="audio-start")
