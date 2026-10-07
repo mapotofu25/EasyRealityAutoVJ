@@ -1695,13 +1695,24 @@ class AudioEngine:
                     #   cyndilib 缓冲并 send_audio，接收端一慢就把采集线程拖住，
                     #   连带能量/拍位/指纹全停（现场掉拍）。现在只投递，队列满丢帧。
                     #   未启用时**直接跳过**，省掉每块的 asarray/reshape/copy。
+                    # ★★ 2026-10-07 修（NDI 音频从来没响过的**真正根因**）：
+                    #   这里原写 `_np.asarray(...)`，但 `_capture_loop` 里**没有** `_np` 这个名字
+                    #   —— 模块顶部是 `import numpy as np`（第 19 行）；`_np` 只在一个**别的
+                    #   函数内部**做了局部 import（`_recognize_loop`，第 1375 行），
+                    #   作用域完全不覆盖这里。
+                    #   ⇒ 每一块都抛 `NameError: name '_np' is not defined`，
+                    #     被下面的 `except Exception` 静静吞掉 ⇒ push 次数恒为 0、
+                    #     队列永远空、"采集在跑但一个字节都没喂给 NDI"。
+                    #   这个 bug 从 1c9ac6e 引入起就存在（`git log -S` 可查），
+                    #   且因为**没有任何日志**（旧代码连异常都吞）而拖了很多轮才抓到。
+                    #   ⚠ 修复要点：统一用模块级别的 `np`（不是 `_np`）。
                     try:
                         if st.ndi_audio_on and st.ndi_feed is not None:
-                            arr = _np.asarray(data, dtype=_np.float32)
+                            arr = np.asarray(data, dtype=np.float32)
                             if arr.ndim == 1:
-                                arr = _np.column_stack([arr, arr])
+                                arr = np.column_stack([arr, arr])
                             elif arr.shape[1] == 1:
-                                arr = _np.repeat(arr, 2, axis=1)
+                                arr = np.repeat(arr, 2, axis=1)
                             self.push_ndi_audio(arr.reshape(-1).copy(), sr)
                             _push_ok += 1
                     except Exception as _pe:
