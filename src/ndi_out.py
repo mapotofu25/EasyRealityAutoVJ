@@ -13,6 +13,7 @@ Runtime 未安装时：import 成功但 Sender.open() 会失败 → 静默禁用
 视频从引擎线程喂帧，音频从采集线程喂 PCM（内部加锁）。
 """
 import ctypes
+import os
 import threading
 import time
 
@@ -24,9 +25,53 @@ import time
 #   现在：同一条 key 只打一次，不同 key 互不干扰。
 _LOGGED = set()
 _LOG_LOCK = threading.Lock()
+# ⚠⚠ 写盘**必须用另一把锁**（2026-10-07 自检抓到的死锁）：
+#   `threading.Lock` **不可重入**。若 `_health_write` 复用 `_LOG_LOCK`，
+#   而 `_log` 已经持有它 → 第一次打印就**自锁死**，整个 NDI 线程卡住
+#   （比"没日志"恶劣得多：会直接冻住输出）。两把锁各管各的。
+_FILE_LOCK = threading.Lock()
+
+
+def _health_path():
+    """NDI 取证日志路径：`%LOCALAPPDATA%\\AutoVJ\\output_health.log`。
+
+    ⚠⚠ 2026-10-07 修（现场"另一台电脑收不到声音"查不到原因的本质）：
+    本模块原先把 100% 的诊断**只走 `print()`** —— 而打包后是 `--windowed`，
+    **控制台根本不存在，stdout 被丢弃**。于是「音频有没有在发、发失败没有、
+    门控把哪一段拦下了」在现场**一个字都看不到**，只能靠猜。
+    而 `engine._output_health_write` 早就把视频侧失败写进了这个文件 ——
+    NDI 音频侧却从来没写进去过。这里补上，让两条链共用同一份取证日志。
+    """
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
+                        "output_health.log")
+
+
+def _health_write(line):
+    """把一行诊断追加到 `output_health.log`（带时间戳）。
+
+    任何异常一律吞掉：取证绝不能反过来影响演出（与 engine 侧同口径）。
+    ⚠ 本函数会被**多线程**调用（视频引擎线程 / 采集转发线程），用独立的
+      `_FILE_LOCK` 串行化写入（**不能复用 `_LOG_LOCK`**，否则与 `_log` 构成自锁）。
+    """
+    try:
+        p = _health_path()
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with _FILE_LOCK:
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write("[%s] NDI %s\n" % (stamp, line))
+    except Exception:                                          # noqa: BLE001
+        pass
 
 
 def _log(msg, key=None):
+    """NDI 诊断：**同时**打控制台与 `output_health.log`（按 key 去重）。
+
+    ⚠⚠ 必须落盘：打包后 `--windowed` 没有控制台，只 `print` 等于没记（见 `_health_path`）。
+    去重仍在 `print`/写盘**之前**判定，保证同一条 key 只出现一次；不同 key 互不干扰。
+    """
     k = key if key is not None else msg
     if k in _LOGGED:
         return
@@ -35,6 +80,7 @@ def _log(msg, key=None):
             return
         _LOGGED.add(k)
     print("[NDI]", msg)
+    _health_write(msg)
 
 
 # NDI 规范：音频固定 48 kHz。⚠ 帧的采样率在 `open()` 那一刻就被**冻结**进每个
@@ -388,10 +434,16 @@ class NDIOutput:
                 now = time.perf_counter()
                 if now - getattr(self, "_audio_last_log", 0.0) >= 10.0:
                     self._audio_last_log = now
+                    # ⚠⚠ 2026-10-07 修：原 key 是 `"audio-hb-%d" % (self._audio_ok // max(1, self._audio_ok))`
+                    #   —— 当 `_audio_ok >= 1` 时它恒等于 `audio_ok // audio_ok = 1`
+                    #   ⇒ key 永远是 `audio-hb-1` ⇒ **心跳这辈子只写一次**，
+                    #   之后再想从日志看"音频还在不在发"就完全看不到。
+                    #   现改成**按 60 秒时间桶**做 key：每分钟一行，既不刷屏又能看出走势。
+                    bucket = int(now) // 60
                     _log("audio: src=%d -> %d, ok=%d dropped=%d resampled=%d conns=%d err=%s"
                          % (int(sr or 0), _AUDIO_SR, self._audio_ok, self._audio_dropped,
                             self._audio_resampled, self._conns(), self._audio_err or "-"),
-                         key="audio-hb-%d" % (self._audio_ok // max(1, self._audio_ok)))
+                         key="audio-hb-%d" % bucket)
         except Exception as e:                                     # noqa: BLE001
             self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
             if self._audio_err_logged is None:

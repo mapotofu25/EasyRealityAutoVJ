@@ -3276,6 +3276,14 @@ class MainWindow(QMainWindow):
             # ⚠ 这里**不再**调 `set_audio_rate()`：帧的采样率在 open() 时就被冻结，
             #   现在帧固定 48k、非 48k 的数据由 `feed_audio()` 自己重采样
             #   （原来每块告诉它一次采样率既无效又误导，见 _NDI音频诊断.md §1.3）。
+            # ★ 首次喂入时把"开始真正发送"写进取证日志（现场可据此确认音频链路已通）
+            if not getattr(self, "_ndi_audio_start_logged", False):
+                self._ndi_audio_start_logged = True
+                try:
+                    from ndi_out import _health_write
+                    _health_write("音频链路已通：开始把采集 PCM 投给 NDI（sr=%s）" % (sr,))
+                except Exception:                              # noqa: BLE001
+                    pass
             ndi.feed_audio(pcm, sr)
             # 恢复正常发送 → 复位去重标志，这样下次再被门控会重新报一次
             self._ndi_audio_gate_logged = None
@@ -3284,11 +3292,19 @@ class MainWindow(QMainWindow):
         reason = "sender_missing" if ndi is None else "output_disabled"
         if self._ndi_audio_gate_logged != reason:
             self._ndi_audio_gate_logged = reason
+            _txt = ("[NDI] 音频门控：发送端尚未建立（engine._ndi is None），音频暂不发送"
+                    if reason == "sender_missing" else
+                    "[NDI] 音频门控：NDI 输出未启用，音频暂不发送")
+            # ⚠⚠ 必须**同时落盘**：打包后是 --windowed，没有控制台，只 print 等于没记
+            #   （现场"有画面没声音、日志空白"能拖这么多轮，根因就是诊断全丢了）。
+            #   复用 ndi_out 的落盘通道，保证 NDI 两侧取证写进同一个 output_health.log。
             try:
-                if reason == "sender_missing":
-                    print("[NDI] 音频门控：发送端尚未建立（engine._ndi is None），音频暂不发送")
-                else:
-                    print("[NDI] 音频门控：NDI 输出未启用，音频暂不发送")
+                print(_txt)
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                from ndi_out import _health_write
+                _health_write(_txt.replace("[NDI] ", ""))
             except Exception:                                  # noqa: BLE001
                 pass
 
