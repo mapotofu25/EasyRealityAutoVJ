@@ -8,6 +8,10 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
+# 可通过环境变量切换 PyInstaller 工作目录，避开被占用的旧 build 目录。
+# 默认仍保持历史路径，便于常规本地打包。
+BUILD_ROOT = os.environ.get("AUTOVJ_BUILD", os.path.join(ROOT, "build"))
+DIST_ROOT = os.environ.get("AUTOVJ_DIST", os.path.join(ROOT, "dist"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_version          # noqa: E402  同目录的版本号工具
@@ -25,9 +29,9 @@ cmd = [
     "--noconfirm",
     "--windowed",
     "--name", "EasyRealityAutoVJ",
-    "--workpath", os.path.join(ROOT, "build"),
-    "--distpath", os.environ.get("AUTOVJ_DIST", os.path.join(ROOT, "dist")),
-    "--specpath", os.path.join(ROOT, "build"),
+    "--workpath", BUILD_ROOT,
+    "--distpath", DIST_ROOT,
+    "--specpath", BUILD_ROOT,
     "--collect-all", "soundcard",
     "--collect-all", "onnxruntime",
     "--collect-all", "mutagen",
@@ -51,6 +55,24 @@ cmd = [
     "--hidden-import", "ndi_out",
     "--hidden-import", "dxvnative",
     "--hidden-import", "asio_engine",
+    "--hidden-import", "wasapi_capture",
+    # ★ 局域网音频（自研轻量协议）：audio_engine 静态 import 了它们，
+    #   正常情况下 PyInstaller 能自动发现；显式列出是为了防止
+    #   "某个 import 被挪进 try 里" 之后打包静默漏掉（这类坑本项目踩过多次）。
+    "--hidden-import", "lan_audio",
+    "--hidden-import", "lan_audio_recv",
+    # ★★ 2026-10-08（erlib 第二步）：导入曲库分析包（.eravjlib）。
+    #   ⚠ `erlib` 是**包**，必须逐个列子模块 —— PyInstaller 不会自己跟进去。
+    #   ⚠ `import erlib.transfer` 会先执行 `erlib/__init__.py`，而它又 import 了
+    #     `scanner` / `format` ⇒ 一并列上。scanner 的依赖（fp / beatgrid /
+    #     music_meta / music_cover / audio_genre）主程序本来就有，不用重复加。
+    #   ⚠ **不列 `erlib.app`** —— 那是 erlib 自己的界面，主程序用不上。
+    "--hidden-import", "erlib",
+    "--hidden-import", "erlib.format",
+    "--hidden-import", "erlib.scanner",
+    "--hidden-import", "erlib.transfer",
+    "--hidden-import", "imported_lib",
+    "--hidden-import", "lan_audio_send",
     "--hidden-import", "glctx",
     "--hidden-import", "SpoutGL",
     "--hidden-import", "SpoutGL.enums",
@@ -92,8 +114,7 @@ rc = subprocess.call(cmd)
 #   Processing.NDI.Lib.UWP.dll        24MB    UWP/微软商店应用专用，Python 用不了
 # 另有 .cpp/.pyx/Linux 占位文件，运行时全用不上 → 共省约 80MB。
 if rc == 0:
-    internal = os.path.join(os.environ.get("AUTOVJ_DIST", os.path.join(ROOT, "dist")),
-                            "EasyRealityAutoVJ", "_internal", "cyndilib")
+    internal = os.path.join(DIST_ROOT, "EasyRealityAutoVJ", "_internal", "cyndilib")
     removed = 0
     try:
         if os.path.isdir(internal):

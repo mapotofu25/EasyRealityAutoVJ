@@ -1531,6 +1531,35 @@ class _ModalDialogTopFilter(QObject):
         return False
 
 
+class ErlibImportThread(QThread):
+    """导入 erlib 分析包（`.eravjlib`）—— **后台跑**，大包几万条指纹别卡界面。
+
+    ⚠ 导入是"并进本机"（幂等：同一首重导会覆盖），不碰本机自己扫的曲库。
+    ⚠ 指纹直接写进主库 `fingerprints.db` ⇒ **识别链路一行都不用改**；
+      但必须由 `erlib.transfer._import_fingerprints` 负责对齐 `user_version`，
+      否则主程序下次打开会把整张表当成"旧版本"清空（已加测试守这一条）。
+    """
+    progress = Signal(int, int, str)
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, pkg, parent=None):
+        super().__init__(parent)
+        self.pkg = pkg
+
+    def run(self):
+        try:
+            from config import app_base_dir
+            from erlib.transfer import import_into
+
+            def _p(a, b, s):
+                self.progress.emit(a, b, s)
+            st = import_into(self.pkg, app_base_dir(), on_progress=_p)
+            self.finished_ok.emit(st)
+        except Exception as e:                                   # noqa: BLE001
+            self.failed.emit("%s: %s" % (type(e).__name__, e))
+
+
 class MusicScanThread(QThread):
     """后台音乐分析：逐首建指纹 + 查曲风，progress 增量更新"""
 
@@ -3624,6 +3653,22 @@ class MainWindow(QMainWindow):
                         # `grid_flip`），否则重扫重建 grid 时会被覆盖掉。
                         "flip": 4.0 if m.get("grid_flip") else 0.0}
             self._grid_path_by_sid[sid] = p
+        # ★★ 2026-10-08（erlib 第二步）：合并「导入的曲库分析包」里的离线网格。
+        #   导入的歌在本机**没有文件**，所以不可能出现在 `cfg["music_meta"]` 里；
+        #   它们单独存在 `imported_lib`（按 song_id 索引）。
+        #   ⚠ 本机曲库**优先**：同一个 song_id 两边都有时以本机为准
+        #     （本机扫的是真实文件，DJ 那边可能扫的是另一个版本）。
+        try:
+            from config import app_base_dir
+            import imported_lib as _IL
+            _imp = _IL.lookup_grids(app_base_dir())
+            for _sid, _g in _imp.items():
+                if _sid not in out:
+                    out[_sid] = _g
+            if _imp:
+                print("[曲库] 合并导入包：+%d 条离线网格" % len(_imp))
+        except Exception:                                        # noqa: BLE001
+            pass
         try:
             self.engine.set_song_grids(out)
         except Exception:
@@ -3651,6 +3696,21 @@ class MainWindow(QMainWindow):
                     "artist": m.get("artist") or "",
                     "genres": m.get("genres") or [],
                 }
+        # ★★ 2026-10-08（erlib 第二步）：合并「导入的曲库分析包」的曲风。
+        #   识别到导入包里的歌时，引擎据此取**精确曲风**（而不是实时 AI 猜的），
+        #   自动配画面就能用对素材池。⚠ 本机曲库优先（同 id 以本机为准）。
+        try:
+            from config import app_base_dir
+            import imported_lib as _IL
+            _added = 0
+            for _sid, _mm in _IL.lookup_genres(app_base_dir()).items():
+                if _sid not in self._song_meta_by_id:
+                    self._song_meta_by_id[_sid] = _mm
+                    _added += 1
+            if _added:
+                print("[曲库] 合并导入包：+%d 首曲风" % _added)
+        except Exception:                                        # noqa: BLE001
+            pass
         if not self._song_meta_by_id:
             return
         # 注入 song_id → 曲风映射给 engine（自动匹配优先用指纹识别歌的精确曲风）
@@ -3680,6 +3740,72 @@ class MainWindow(QMainWindow):
         """曲风→画面标签 映射编辑器（保存后自动图层按新映射重匹配）"""
         from panels import GenreVisualEditDialog
         GenreVisualEditDialog(self).exec()
+
+    def import_erlib_package(self):
+        """导入 erlib 导出的曲库分析包（`.eravjlib`）——
+        别的机器（DJ 机）扫好的**曲风 / 封面 / 指纹 / 离线节拍网格**。
+
+        ⚠ 包**不含音频**：演出机不需要有这些歌的文件 —— 靠**指纹**认出来即可。
+        ⚠ 导入是"并进本机"（幂等覆盖），**不碰**本机自己扫的曲库。
+        """
+        p, _ = QFileDialog.getOpenFileName(
+            self, "选择曲库分析包（.eravjlib）", "",
+            "erlib 分析包 (*.eravjlib);;所有文件 (*)")
+        if not p:
+            return
+        th = getattr(self, "_erlib_imp", None)
+        if th is not None and th.isRunning():
+            return
+        try:
+            from config import app_base_dir
+            import imported_lib as _IL
+            n_old = _IL.count(app_base_dir())
+        except Exception:                                        # noqa: BLE001
+            n_old = 0
+        print("[曲库] 开始导入曲库分析包：%s（本机原有导入 %d 首）" % (p, n_old))
+        self._erlib_imp = ErlibImportThread(p, self)
+        self._erlib_imp.progress.connect(
+            lambda a, b, s: print("[曲库] 导入中：%s %d/%d" % (s, a, b or 0)))
+        self._erlib_imp.finished_ok.connect(
+            lambda st: self._on_erlib_imported(st, n_old))
+        self._erlib_imp.failed.connect(self._on_erlib_failed)
+        self._erlib_imp.start()
+
+    def _on_erlib_imported(self, st, n_old):
+        """导入完成：**立刻刷新查表 + 曲库列表**（否则要重启才生效）+ 给用户结果。"""
+        try:
+            self._inject_song_grids()      # 离线网格（内部会合并导入的）
+            self._init_recognizer()        # song_id → 曲风映射（同上）
+        except Exception as e:                                   # noqa: BLE001
+            print("[曲库] 导入后刷新查表失败：%s" % e)
+        try:
+            # 曲库列表立刻显示导入的歌（它们以 "@imported:<sid>" 伪路径列出，
+            # 带 📦 前缀、蓝色显示；见 panels.MusicLibraryPanel.refresh）。
+            if getattr(self, "music_panel", None) is not None:
+                self.music_panel.refresh()
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            from config import app_base_dir
+            import imported_lib as _IL
+            n_now = _IL.count(app_base_dir())
+        except Exception:                                        # noqa: BLE001
+            n_now = 0
+        QMessageBox.information(
+            self, "导入曲库分析包",
+            "导入完成：\n"
+            "· 本包：%d 首 / 指纹 %d 条 / 封面 %d 张\n"
+            "· 本机累计导入：%d 首\n\n"
+            "之后 DJ 放这些歌时，本机会自动认出并套用曲风、封面与离线八拍网格。"
+            % (st.get("songs", 0), st.get("fingerprints", 0),
+               st.get("covers", 0), n_now))
+
+    def _on_erlib_failed(self, msg):
+        print("[曲库] 导入失败：%s" % msg)
+        QMessageBox.warning(self, "导入曲库分析包",
+                            "导入失败：\n%s\n\n"
+                            "常见原因：包的指纹/网格算法版本与本机不一致"
+                            "（用新版 erlib 重新导出即可）。" % msg)
 
     def import_music_dir(self):
         d = QFileDialog.getExistingDirectory(self, "导入音乐文件夹")
@@ -3824,13 +3950,37 @@ class MainWindow(QMainWindow):
                 pass
 
     def remove_music(self, path):
-        if path in self.cfg["music_library"]:
-            self.cfg["music_library"].remove(path)
-        self.cfg["music_meta"].pop(path, None)
-        self.cfg.save()
+        """从曲库移除单首（曲库面板的右键走批量版 `remove_music_many`）。"""
+        return self.remove_music_many([path])
+
+    def remove_music_many(self, paths):
+        """批量从曲库移除：**一次 save + 一次 refresh**（N 首别刷 N 次界面）。
+
+        ⚠ 只删曲库**条目**（`music_library` + `music_meta`）——
+          **音频文件与指纹不动**（指纹是扫描产物；要连指纹一起清是
+          "清除分析数据"那条路，见 `show_clear_music_analysis`）。
+        """
+        paths = [p for p in (paths or []) if p]
+        if not paths:
+            return 0
+        lib = self.cfg["music_library"]
+        n = 0
+        for p in paths:
+            try:
+                if p in lib:
+                    lib.remove(p)
+                    n += 1
+            except Exception:                                    # noqa: BLE001
+                pass
+            self.cfg["music_meta"].pop(p, None)
+        try:
+            self.cfg.save()
+        except Exception:                                        # noqa: BLE001
+            pass
         dlg = getattr(self, "music_dialog", None)
         if dlg:
             dlg.refresh()
+        return n
 
     def _migrate_library_paths(self):
         """便携式路径迁移：软件换了目录/盘符后，config 里的旧素材绝对路径会失效
@@ -5168,7 +5318,17 @@ class MainWindow(QMainWindow):
         self.btn_audio.setToolTip(T("音源设置\n当前：") + (snap.get("device_desc") or T("未采集")))
 
         m = self.engine.mode
-        tag = T("手动") if self.engine.manual_mode() else T("自动")
+        # ★★ 这里**必须走无锁快照**（`modes_snapshot`），不能调 `manual_mode()`：
+        #   本函数挂在 500ms 的 QTimer 上，而 `manual_mode()` 是 `@_locked` ⇒
+        #   每 0.5 秒主线程去抢引擎渲染锁，一帧慢就卡 2 秒 ⇒ 界面"卡成幻灯片"
+        #   （2026-10-08 用户报「软件非常卡」的直接原因之一）。
+        #   `modes_snapshot()` 只读 cfg/mode/mode_scores，GIL 下原子，零等待。
+        try:
+            snap_mode = self.engine.modes_snapshot()
+            is_manual = bool(snap_mode.get("manual"))
+        except Exception:                                        # noqa: BLE001
+            is_manual = False
+        tag = T("手动") if is_manual else T("自动")
         self.settings.lbl_cur_mode.setText(
             Tf("当前节奏: {}（{}）", T(MODE_LABELS.get(m, m)), tag))
 
@@ -5232,6 +5392,13 @@ class MainWindow(QMainWindow):
 
         if snap["error"]:
             self.lbl_warn.setText(snap["error"])
+        elif snap.get("lan_failed"):
+            # 局域网音源失败：**不自动回退**系统声音，必须显式告诉用户当前没声
+            self.lbl_warn.setText(snap["lan_failed"])
+        elif snap.get("lan_info"):
+            # ★ 局域网音源已连上：常显对端 IP（用户要求"能看见源的 IP"）。
+            #   关掉设置对话框也能一眼确认连的是哪台机器 / 延迟是否正常。
+            self.lbl_warn.setText(snap["lan_info"])
         elif self.engine.running and snap["silent_sec"] > 5:
             self.lbl_warn.setText(tr("no_sound_hint"))
         else:

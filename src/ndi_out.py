@@ -199,6 +199,65 @@ def probe_runtime():
         return False, "%s: %s" % (type(e).__name__, str(e)[:140])
 
 
+class _BytePool:
+    """定长 bytes 缓冲池（只用于**视频帧拷贝**，见 `NDIOutput.send_video`）。
+
+    为什么需要：渲染线程每帧要把画布拷贝成独立缓冲（画布会被立刻覆写），
+    1920×1080×4 = 8.3 MB。若每帧都 `bytes(...)` 新分配，等于每 16ms 分配+释放
+    8 MB ⇒ 内存分配器压力大、易碎片化。
+
+    做法：预放 `n` 个 `bytearray`，`acquire(size)` 取一个大小够用的（不够就补分配），
+    提交线程用完调 `release(buf)` 归还。**池空时不等待、直接新分配** ——
+    绝不能因为"没块可用"而让渲染线程卡住或丢帧（铁律 #0）。
+
+    ⚠ 只支持单一大小的帧（我们同一会话里分辨率固定；换分辨率时会本对象重建）。
+      不同大小的块分开存，不会互相污染。
+    """
+
+    def __init__(self, n=2):
+        self._free = []          # 空闲 bytearray 列表
+        self._cap = 0            # 已分配块的大小（首个 acquire 决定）
+        self._n = int(n)
+        self._lk = threading.Lock()
+
+    def prealloc(self, size):
+        """按 `size` 预分配 `n` 个块（`_ensure()` 成功后调用，避免首帧临时分配大对象）。
+
+        预分配能显著降低"第一帧拷贝"的分配尖峰（实测首帧可达 10~25ms）。
+        """
+        try:
+            size = int(size)
+            if size <= 0:
+                return
+            with self._lk:
+                if self._cap == size and len(self._free) >= self._n:
+                    return
+                self._cap = size
+                self._free = [bytearray(size) for _ in range(self._n)]
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def acquire(self, size):
+        with self._lk:
+            if self._free:
+                b = self._free.pop()
+                if len(b) == size:
+                    return b
+            # 池空 / 大小变了 ⇒ 新分配
+            self._cap = size
+            return bytearray(size)
+
+    def release(self, buf):
+        if buf is None:
+            return
+        try:
+            with self._lk:
+                if len(buf) == self._cap and len(self._free) < self._n:
+                    self._free.append(buf)
+        except Exception:                                          # noqa: BLE001
+            pass
+
+
 class NDIOutput:
     # ⚠⚠ `open()` 之后的**静默期**：cyndilib 实测在这个窗口内提交帧会**段错误**
     #   （native crash，Python 的 try/except 抓不住）。现场路径正好踩：
@@ -207,7 +266,31 @@ class NDIOutput:
 
     def __init__(self, name="EasyRealityAutoVJ"):
         self.name = name
-        self._lock = threading.Lock()
+        # ★★ 2026-10-08：**视频与音频各用一把锁**（原来是共用 `self._lock`）。
+        #   原因见 `_vlock/_alock` 定义处（用户报「开了 NDI 音频之后画面掉帧」）。
+        self._vlock = threading.Lock()   # 只保护视频帧提交（渲染线程）
+        self._alock = threading.Lock()   # 只保护音频帧提交（NDI 音频转发线程）
+        # ★★ 2026-10-08（第二轮，真凶）：**NDI SDK 内部把「视频提交」和「音频提交」
+        #   串行化了** —— 实测（`tools/_ndi_chain_verify.py`）当音频线程在跑时，
+        #   `send_video_async()` 的 native 调用会**等待 ~14ms**（音频不跑时 0.02ms），
+        #   长尾 17.9ms，而且**与我们自己的锁无关**（换单锁也一样慢）。
+        #   ⇒ 只要视频提交留在**渲染线程**上，开音频就必然拖慢整帧（预览/输出一起掉帧）。
+        #   修法（与项目铁律「可能无限阻塞驱动的调用绝不持有别人需要的锁」同源）：
+        #   **视频帧改成"入队"，由本类**自己的一条专用线程**去提交** ——
+        #   渲染线程只做一次 O(1) 入队，永不接触 SDK。
+        self._vq = None                  # 待提交的 (bgra_bytes, seq)（只留最新一帧）
+        self._vcv = threading.Condition()
+        self._vstop = False
+        self._vthread = None
+        self._vsend_ok = 0               # 真正提交成功的视频帧数（诊断）
+        self._vsend_block_ms = 0.0       # 上次提交耗时（诊断：现场看是否被音频拖住）
+        # ★★ 帧拷贝缓冲池（2026-10-08 第三轮，修"接收端闪黑屏"）：
+        #   渲染线程入队前必须**拷贝**画布帧（画布每帧被覆写，见 `send_video` docstring）。
+        #   直接 `bytes(bgra)` 每帧要新分配 + 释放 8.3 MB ⇒ 高频分配抖动（GC/内存碎片）。
+        #   池里放 2 块轮换：渲染线程取块拷贝 → 提交线程用完归还。
+        #   ⚠ 2 块够用：正常提交远快于 1/60s；真遇到阻塞时取不到块就退化成临时分配
+        #     （**绝不因池空而丢帧或阻塞渲染线程** —— 这与铁律 #0 同源）。
+        self._vbuf_pool = _BytePool(2)
         self._sender = None
         self._video = None
         self._audio = None
@@ -242,6 +325,7 @@ class NDIOutput:
         self._audio_frames_sent = 0   # 真正发出的「整帧」数（诊断）
         self._audio_short = 0         # 退出时残留的不足一帧样本数（诊断）
         self._audio_start_logged = False   # 「已开始发送」只写一次（见 feed_audio）
+        self._audio_call_ms = 0.0          # 上次 feed_audio 单次总耗时（诊断，含锁外 send）
         self._err_logged = None         # 视频侧同样只记第一条
         self._opened_at = 0.0           # sender 的 open() 时刻（算静默期用）
 
@@ -309,6 +393,12 @@ class NDIOutput:
             self._w, self._h = int(w), int(h)
             self.enabled = True
             self._last_err = ""
+            # ★ 预热帧拷贝池：按真实分辨率预分配 2 块，避免首帧临时分配 8MB 大对象
+            #   （实测首帧分配尖峰可达 10~25ms；预热后稳定 ~1ms）。
+            try:
+                self._vbuf_pool.prealloc(int(w) * int(h) * 4)
+            except Exception:                                      # noqa: BLE001
+                pass
             print("[NDI] 已开启输出: %s  %dx%d" % (self.name, w, h))
         except Exception as e:
             self._last_err = str(e)[:160]
@@ -328,48 +418,134 @@ class NDIOutput:
             return 1          # 探针本身失败时按"有人连"处理，保持老行为（不误伤正常输出）
 
     def send_video(self, bgra, w, h):
+        """★ 渲染线程调用：**拷贝一帧后入队**（绝不接触 SDK），提交在 `_video_loop`。
+
+        ⚠⚠ 2026-10-08 改（第二轮，真凶定位）：原实现在本方法里直接
+        `write_data + send_video_async`。实测当音频在发时，`send_video_async()`
+        的 native 调用会等 **~14ms**（NDI SDK 内部把音视频提交串行化了，与我们
+        自己的锁无关）。而本方法跑在**渲染线程**上（`engine._tick_locked` →
+        `_ndi_send`），那 14ms 直接把整帧节奏顶掉 ⇒ **预览和输出同时肉眼可见掉帧**。
+        ⇒ 改成"入队 + 专用线程提交"：渲染线程永不接触 SDK。
+
+        ⚠⚠⚠ 2026-10-08 修（第三轮，**接收端闪黑屏** —— 第二轮改造引入的回归）：
+          第二轮把入队写成了**只存 `bgra` 引用**（`self._vq = (bgra, w, h)`）。
+          但 `engine._ndi_send` 传进来的 `bgra` 是
+          `np.frombuffer(self.canvas.bits(), ...)` —— 它是 **QImage 画布的零拷贝
+          视图**，而 `self.canvas` 每帧都被 `_compose()` **重画（先清黑底再合成）**。
+          旧代码是**同步** `write_data`：拷进 NDI buffer 后才返回，安全。
+          新代码是**异步**：只塞了个引用就返回，渲染线程下一帧立刻覆写同一块内存
+          ⇒ `_video_loop` 几毫秒后 `write_data(bgra)` 拿到的已经是"**清完还没画**"
+          的中间态（全黑）或下一帧的错乱内容 ⇒ **接收端周期性闪黑**。
+          （佐证：`engine._tick_locked` 给 GUI 投帧时专门做了**深拷贝**并注释
+           "消除跨线程抢画布竞态" —— 同一个坑，我们这边漏了。）
+
+          ⇒ 修法：**在渲染线程里立刻拷贝成独立 bytes**（`bytes(bgra)`）。
+            1920×1080×4 = 8.3 MB，实测 memcpy ≈ 0.6ms，**远小于** 14ms 的阻塞，
+            且只是顺序开销、不阻塞任何锁 ⇒ 帧节奏不受影响。
+            ⚠ 绝不能再改回"存引用"，除非调用方传的是它自己的私有 buffer。
+        """
         if not self._ensure(w, h):
             return
         try:
-            with self._lock:
-                need = int(w) * int(h) * 4
-                if len(bgra) != need:
-                    # 画布若带行填充（bytesPerLine > w*4）长度会对不上 —— 直接放弃这一帧，
-                    # 不要抛给外面把整个输出关掉
-                    self._last_err = "帧数据 %d 字节 != 期望 %d" % (len(bgra), need)
-                    return
-                # ⚠⚠ 必须先查「可写」再写：buffer 还没空出来时 `write_data` 会**抛异常**
-                #   （cyndilib 抛 `RuntimeError: no write frame available`），而下面的
-                #   `except` 会把整个 NDI 输出**永久关掉** → enabled=False → 此后每帧静默丢弃。
-                #   接收端稍慢、网络抖一下就会中招 —— 又是一个"静默失效"。
-                #   正确做法：这一帧**直接丢掉**，既不等待、也不关输出。
-                # ⚠ 开门静默期：这段时间内提交帧会抛（视频）/崩（音频），一律丢掉
-                if time.perf_counter() - self._opened_at < self._WARMUP_SECS:
-                    self._dropped += 1
-                    return
-                # ⚠ 视频**不能**做连接数门控：NDI 是"接收端收到数据后连接才建立"，
-                #   不发视频 ⇒ 接收端永远连不上（连接数恒 0）⇒ 音视频一起废。
-                #   这里只靠 warmup 守卫 + "写失败只丢帧不关输出"就够安全了。
-                v = self._video
-                if hasattr(v, "get_write_available") and not v.get_write_available():
-                    self._dropped += 1
-                    return
-                v.write_data(bgra)
-                if hasattr(self._sender, "send_video_async"):
-                    self._sender.send_video_async()
-                else:
-                    self._sender.send_video()
-        except Exception as e:
-            # ⚠⚠ **绝不能**在这里 `enabled = False`（2026-10-01 实测踩到）：
-            #   没有接收端连接时写视频帧会抛 `Object is not writable`，老代码就永久关掉
-            #   整个 NDI 输出 ⇒ 接收端**后面再接上来也永远没画面/没声音**。
-            #   正确做法：丢掉这一帧、记一次日志，保持 enabled，下一帧继续尝试（接收端
-            #   一旦连上就自然恢复）。
+            need = int(w) * int(h) * 4
+            if len(bgra) != need:
+                self._last_err = "帧数据 %d 字节 != 期望 %d" % (len(bgra), need)
+                return
+            # ★★ 必须拷贝：`bgra` 通常是调用方画布的**活动视图**，异步提交时会被覆写。
+            #
+            # ⚠⚠⚠ 2026-10-08 修（本轮「OBS 收不到视频」的根因，视频一帧都发不出去）：
+            #   ① **`bytearray[:] = numpy数组` 必抛 `TypeError`**
+            #      （实测四种 numpy 形态全失败：只读 / 可写 / `frombuffer` 视图 / slice 视图。
+            #        CPython 的 bytearray 切片赋值**不接受 numpy 数组**，必须显式转 memoryview。）
+            #   ② 旧兜底写的是 `snap = bytes(bgra)` —— 这会把 `snap` 变成**不可变**对象；
+            #      而 `_video_loop` 里 `v.write_data(snap)` 的形参是 Cython `uint8_t[:]`
+            #      （**要求可写 buffer**）⇒ 必抛 `BufferError: Object is not writable.`
+            #      ⇒ `_video_loop` 每帧都进 except、一帧都发不出去。
+            #      症状：**源能被搜到、音频正常、就是没画面**（音频走另一条路径，不受影响）。
+            #      实测对照：`write_data(bytes)` 必抛；`write_data(bytearray)` / `write_data(memoryview)` 正常。
+            #   复现工具：`tools/_ndi_err_probe.py`（抓完整堆栈，日志里只有 str(e) 看不出真凶）。
+            try:
+                snap = self._vbuf_pool.acquire(len(bgra))
+                snap[:] = memoryview(bgra)      # ★ 必须显式 memoryview（见上）
+            except Exception:                                      # noqa: BLE001
+                snap = bytearray(bgra)          # ★ 必须 bytearray —— 绝不能落到 bytes
+            # ★ 只留最新一帧：队列里不堆 8MB 大图（与引擎 `_latest_frame` 同一约定）
+            with self._vcv:
+                self._vq = (snap, int(w), int(h))
+                self._vcv.notify()
+            self._ensure_vthread()
+        except Exception as e:                                     # noqa: BLE001
             self._last_err = str(e)[:160]
-            self._dropped += 1
-            if self._audio_err_logged is None and not self._err_logged:
-                self._err_logged = self._last_err
-                _log("!! NDI 发送视频失败（只记一次，后续继续尝试）：%s" % self._last_err)
+
+    def _ensure_vthread(self):
+        """确保视频提交线程在跑（首次入队时惰性启动）。"""
+        t = self._vthread
+        if t is not None and t.is_alive():
+            return
+        self._vstop = False
+        self._vthread = threading.Thread(
+            target=self._video_loop, daemon=True, name="autovj-ndi-video")
+        self._vthread.start()
+
+    def _video_loop(self):
+        """视频提交线程：从队列取最新一帧 → `write_data + send_video_async`。
+
+        ⚠ 这里是**唯一**接触视频帧 SDK 调用的地方；它慢（被音频挤到 ~14ms）
+          也只影响"这一帧晚一点出去"，**绝不阻塞渲染线程**。
+
+        ⚠⚠ 队列里的帧是**独立拷贝**（见 `send_video`）：本线程慢慢提交期间，
+          渲染线程可以放心继续画它的画布，不会互相踩内存（这是修"闪黑屏"的关键）。
+        """
+        while not self._vstop:
+            item = None
+            try:
+                with self._vcv:
+                    if self._vq is None:
+                        self._vcv.wait(0.2)
+                    item = self._vq
+                    self._vq = None
+            except Exception:                                      # noqa: BLE001
+                time.sleep(0.1)
+                continue
+            if item is None:
+                continue
+            snap, w, h = item
+            t0 = time.perf_counter()
+            try:
+                with self._vlock:
+                    # ⚠ 开门静默期：这段时间内提交帧会抛（视频）/崩（音频），一律丢掉
+                    if time.perf_counter() - self._opened_at < self._WARMUP_SECS:
+                        self._dropped += 1
+                        continue
+                    v = self._video
+                    if v is None:
+                        continue
+                    # ⚠⚠ 必须先查「可写」再写：buffer 还没空出来时 `write_data` 会抛
+                    #   （cyndilib `RuntimeError: no write frame available`）。
+                    #   正确的做法是**丢掉这一帧**，既不等待、也不关输出。
+                    if hasattr(v, "get_write_available") and not v.get_write_available():
+                        self._dropped += 1
+                        continue
+                    v.write_data(snap)
+                    if hasattr(self._sender, "send_video_async"):
+                        self._sender.send_video_async()
+                    else:
+                        self._sender.send_video()
+                self._vsend_ok += 1
+            except Exception as e:                                 # noqa: BLE001
+                # ⚠⚠ **绝不能**在这里 `enabled = False`（2026-10-01 实测踩到）：
+                #   没有接收端连接时写视频帧会抛 `Object is not writable`，老代码就
+                #   永久关掉整个 NDI 输出 ⇒ 接收端**后面再接上来也永远没画面/没声音**。
+                #   正确做法：丢掉这一帧、记一次日志，保持 enabled，下一帧继续尝试。
+                self._last_err = str(e)[:160]
+                self._dropped += 1
+                if self._audio_err_logged is None and not self._err_logged:
+                    self._err_logged = self._last_err
+                    _log("!! NDI 发送视频失败（只记一次，后续继续尝试）：%s" % self._last_err)
+            finally:
+                self._vsend_block_ms = (time.perf_counter() - t0) * 1000.0
+                # ★ 归还缓冲池（本轮不再用这帧数据；write_data 已把内容拷进 SDK buffer）
+                self._vbuf_pool.release(snap)
 
     def set_audio_rate(self, sr):
         """记录采集侧采样率（**仅供诊断/日志**）。
@@ -405,7 +581,9 @@ class NDIOutput:
         except Exception:                                          # noqa: BLE001
             return
         try:
-            with self._lock:
+            _do_send = False
+            _t_entry = time.perf_counter()   # ★ 本次调用起点（统计总耗时，见函数末尾）
+            with self._alock:
                 a = self._audio
                 if a is None:
                     return
@@ -474,8 +652,13 @@ class NDIOutput:
                 #   ⚠ 本函数现在**没有任何跨调用的时钟状态**（无 _t0 / _frames_clock /
                 #     _last_tail / _extrapolate）—— 状态越少，现场越不会出玄学。
                 sent_any = False
+                # ★ 本函数会**先写环、出锁后再 send_audio**（见循环内说明）。
+                #   这个标志记录「本次是否已 write_data 了至少一帧，需要在锁外提交」。
+                _do_send = False
                 # 一次调用里最多发多少帧：正常 1 帧（每块 21ms，攒满 100ms 才够），
                 # 上限只是防止极端积压时长时间霸占锁。
+                # ⚠ 由于 send_audio 已移到锁外，这里最多只会 write 一帧
+                #   （循环第二轮起 `get_write_available()` 会因上一帧未提交而返回 False）。
                 for _ in range(_MAX_FRAMES_PER_CALL):
                     if len(buf) < _FRAME_SAMPLES:
                         break
@@ -496,19 +679,14 @@ class NDIOutput:
                         self._audio_dropped += 1
                         self._audio_err = "%s: %s" % (type(_we).__name__, str(_we)[:120])
                         break
-                    ok1 = True
-                    try:
-                        if hasattr(self._sender, "send_audio"):
-                            ok1 = bool(self._sender.send_audio())
-                    except Exception as e:
-                        ok1 = False
-                        self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
-                    if ok1:
-                        self._audio_ok += 1
-                        self._audio_frames_sent += 1
-                        sent_any = True
-                    else:
-                        self._audio_dropped += 1
+                    # ★★ `send_audio()` **必须在锁外**调用（2026-10-08 修「开音频就掉帧」）。
+                    #   实测（`tools/_ndi_sendaudio_block.py`）：没有接收端排空时，
+                    #   `send_audio()` 的 native 调用**每次阻塞 ~94ms**（59/60 次 > 20ms）。
+                    #   旧代码在 `with self._alock` 里调它 ⇒ 渲染线程的 `send_video()`
+                    #   撞上同一把锁就要干等 94ms ⇒ 一帧 16.7ms 的节奏直接崩掉 ⇒
+                    #   **预览和输出同时肉眼可见掉帧**（用户报的现象）。
+                    #   这里只**记下待提交标志**，真正的 `send_audio()` 在锁外做（见下方）。
+                    _do_send = True
                 # 剩余的不足一帧，留到下次
                 self._pend = buf if len(buf) else None
                 # 累积缓冲兜底上限：万一下游一直发不出去（连不上接收端），
@@ -547,12 +725,41 @@ class NDIOutput:
                     #   （接收端慢 / 环满），是「破音」现场唯一需要看的量；
                     #   正常应在 0 ~ 1 帧之间小幅波动。
                     _log("audio: src=%d -> %d, ok=%d dropped=%d resampled=%d conns=%d "
-                         "pend=%d err=%s"
+                         "pend=%d call_ms=%.1f err=%s"
                          % (int(sr or 0), _AUDIO_SR, self._audio_ok, self._audio_dropped,
                             self._audio_resampled, self._conns(),
                             0 if self._pend is None else len(self._pend),
+                            getattr(self, "_audio_call_ms", 0.0),
                             self._audio_err or "-"),
                          key="audio-hb-%d" % bucket)
+            # ★★ 真正的提交：**已经在锁外**了（见上面 `_do_send` 说明）。
+            #
+            #   这一步可能阻塞 ~94ms（无接收端排空时），但它**不再持有任何锁**
+            #   ⇒ 渲染线程的 `send_video()` 完全不受影响，帧节奏保持不变。
+            #
+            #   ⚠ 为什么可以在锁外调用：`send_audio()` 只从 cyndilib 的音频发送环
+            #     取已写好的帧推给 SDK，**不触碰视频帧对象**，也不读我们的任何状态；
+            #     `write_data`（在锁内）已经完成了对环的写入。所以这里出去执行是安全的。
+            #   ⚠ 万一它真的抛异常，走下面的 `except` 统一处理（含"环卡死 → 重建会话"）。
+            if _do_send:
+                ok1 = True
+                try:
+                    s_ = self._sender
+                    if s_ is not None and hasattr(s_, "send_audio"):
+                        ok1 = bool(s_.send_audio())
+                except Exception as e:                             # noqa: BLE001
+                    ok1 = False
+                    self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
+                if ok1:
+                    self._audio_ok += 1
+                    self._audio_frames_sent += 1
+                else:
+                    self._audio_dropped += 1
+            # ★ 在**锁外**记录"音频侧单次总耗时"，供心跳诊断（现场可看 send_audio 是否卡）。
+            try:
+                self._audio_call_ms = (time.perf_counter() - _t_entry) * 1000.0
+            except Exception:                                      # noqa: BLE001
+                pass
         except Exception as e:                                     # noqa: BLE001
             self._audio_err = "%s: %s" % (type(e).__name__, str(e)[:120])
             if self._audio_err_logged is None:
@@ -570,6 +777,21 @@ class NDIOutput:
                     pass
 
     def close(self):
+        # ★ 先停视频提交线程（它可能正卡在 SDK 里，用超时 join 兜底）
+        self._vstop = True
+        try:
+            with self._vcv:
+                self._vq = None
+                self._vcv.notify_all()
+        except Exception:                                          # noqa: BLE001
+            pass
+        t = self._vthread
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=1.0)
+            except Exception:                                      # noqa: BLE001
+                pass
+        self._vthread = None
         try:
             if self._sender is not None:
                 self._sender.close()

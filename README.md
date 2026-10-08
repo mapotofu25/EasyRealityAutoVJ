@@ -1,10 +1,27 @@
 # Easy Reality AutoVJ
 
-**面向现场演出的 Windows 自动 VJ 软件** —— 实时分析正在播放的音乐，自动完成多图层素材切换、过渡与实时特效，并通过 **Spout / NDI / 窗口捕获**输出给 OBS 等导播软件。
+**ERAVJ** ｜ 面向现场演出的 **Windows 自动 VJ（Auto VJ）** 软件 —— 实时分析正在播放的音乐，自动完成多图层素材切换、过渡与实时特效，并通过 **Spout / NDI / 窗口捕获**输出给 OBS 等导播软件。
 
-> **Realtime auto-VJ for live shows (Windows).** It analyses the music as it plays and
-> drives multi-layer clip switching, transitions and live effects, then outputs via
-> Spout / NDI / window capture.
+关键词：AutoVJ · 自动VJ · 现场VJ · VJ软件 · VirtualDJ 联动 · 音乐可视化 ·
+NDI 输出 · Spout 输出 · OBS 直播 · 音频指纹认歌 · 曲库分析 · 节拍网格 · BPM 实时分析 ·
+DXV 素材 · GPU 解码 · 局域网音频传输。
+
+> **ERAVJ / Easy Reality AutoVJ — realtime auto-VJ for live shows (Windows).**
+> It analyses the music as it plays and drives multi-layer clip switching, transitions
+> and live effects, then outputs via Spout / NDI / window capture.
+> Keywords: auto VJ, live VJ software, music visualizer, VirtualDJ, OBS, NDI, Spout,
+> audio fingerprinting, beat grid, realtime BPM analysis.
+
+## 配套的 3 个软件（都在 Releases 里）
+
+| 软件 | 跑在哪台机器 | 用途 |
+|---|---|---|
+| **EasyRealityAutoVJ.exe** | 演出机（B 机） | 主程序：音乐分析 → 自动切素材 → 输出给 OBS |
+| **EasyReality_音频发送端.exe** | 放歌机（A 机） | 把 A 机的系统声音实时发给 B 机（配合「局域网音频」音源） |
+| **ERLIB曲库分析.exe** | DJ 机 | 扫曲库、导出 `.eravjlib` 曲库包（带封面 / 指纹 / 节拍网格 / 曲风），给演出机做「认歌」用 |
+| **NDI接收自检.exe** | 任一台 | 排查用：确认能不能收到 NDI 画面，连上后存一张截图 |
+
+> **演出机不需要有歌文件** —— 靠指纹就能认出 DJ 那边正在放的是哪首。
 
 ---
 
@@ -43,7 +60,19 @@ CC BY-NC-SA 4.0，仅限非商业使用**。个人演出 / 学习使用完全没
   ≈ **11 ms** 输入延迟。⚠ ASIO 驱动**同时只允许一个程序使用**：VirtualDJ / DAW 占着时
   会连不上，此时软件会**自动回退到系统声音**并提示（演出不会因此没声音）。
   ⚠ ASIO 的采样率是驱动全局的，本软件一律沿用驱动当前值、不去改它。
+- **局域网音频（另一台电脑）** —— 接收 A 机（跑 VirtualDJ 那台）通过
+  `EasyReality_音频发送端.exe` 发来的系统声音。零第三方协议依赖（自研 UDP），
+  支持**自动发现**（填端口即可）和**直接填对端 IP**（`192.168.31.96` 或
+  `192.168.31.96:47811`，自动发现连不上时 / 多机环境下用）。
 - 设备选择、电平表、静音提示
+
+### 曲库分析包（跨机认歌）
+- 在 DJ 机上用 **`ERLIB曲库分析.exe`** 扫曲库 → 导出 `.eravjlib` 包
+  （**不含音频文件**，只带封面、音频指纹、节拍网格、曲风）
+- 在演出机「曲库」面板点 **「导入曲库分析包」** → 后台导入，大包不卡界面
+- 导入后演出机**不需要有歌文件**也能认出 DJ 正在放的是哪首，并按它的节拍网格 / 曲风驱动画面
+- 曲库面板支持**复选框多选 / 全选**、按**来源**筛选（全部 / 仅本机 / 某个导入包）、
+  批量删除（二次确认）
 
 ### 实时分析
 - **BPM**（众数投票 + 锁定；界面显示值驱动拍钟的取值解耦）
@@ -147,7 +176,12 @@ venv\Scripts\python.exe tools\make_zip.py       :: 生成发行压缩包
 │   ├─ glctx.py         OpenGL 上下文（GPU 解码）
 │   ├─ panels.py        设置面板与子面板
 │   ├─ output_window.py 独立输出窗口
-│   └─ ndi_out.py       NDI 输出
+│   ├─ ndi_out.py       NDI 输出
+│   ├─ lan_audio*.py    局域网音频（自研 UDP 协议：发送 / 接收 / 发现）
+│   ├─ wasapi_capture.py WASAPI 回环采集
+│   ├─ imported_lib.py  导入的曲库包在演出机上的落地存储
+│   └─ erlib/           曲库分析包（`.eravjlib` 格式层 + 扫描核心，两端共用）
+├─ lan_audio_sender.pyw A 机音频发送端入口（打包成独立小 exe）
 ├─ tools/               构建脚本与自检工具
 ├─ assets/              UI 资源；模型放 assets/models（不入库）
 ├─ CONTRIBUTING.md      贡献指南（**提 PR 前请先读**）

@@ -560,11 +560,14 @@ class GLDecoder:
         # GL 调用：全局串行（同 decode 的理由）。拿不到锁就跳过删除 ——
         # 上下文配额由 destroy() 归还，漏删纹理只影响显存，不会拖住线程。
         if not _gl_enter():
-            self._tex = self._fbo = None
+            self._tex = self._fbo = self._fbo_tex = None
             return
         try:
             if self._tex is not None:
                 t = ctypes.c_uint(self._tex)
+                gl("glDeleteTextures", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))(1, ctypes.byref(t))
+            if self._fbo_tex is not None:
+                t = ctypes.c_uint(self._fbo_tex)
                 gl("glDeleteTextures", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))(1, ctypes.byref(t))
             if self._fbo is not None:
                 f = ctypes.c_uint(self._fbo)
@@ -573,7 +576,7 @@ class GLDecoder:
             pass
         finally:
             _gl_exit()
-        self._tex = self._fbo = None
+        self._tex = self._fbo = self._fbo_tex = None
         # 注意：这里**不销毁窗口**（窗口要用 destroy()）。只调 close() 会漏上下文。
 
     def destroy(self):
@@ -847,6 +850,12 @@ class GLWorker:
                     self._req.clear()
                     return
                 req = self._req.popleft()
+            # 请求方超时后会把尚未执行的请求标记为 cancelled 并清空队列。
+            # worker 可能已经取到其中一项；此时必须在进入 GL/native 调用前丢弃它，
+            # 否则恢复后仍会白做一整帧，挤占后续请求并放大切换卡顿。
+            if req.cancelled:
+                req.event.set()
+                continue
             try:
                 arr = dec.decode(req.blocks, req.src_w, req.src_h, req.fmt,
                                  req.dst_w, req.dst_h, req.bgra)

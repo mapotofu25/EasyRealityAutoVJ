@@ -1147,12 +1147,27 @@ class AvAlphaPlayer(_DecoderHealth):
         self._warm = 1
 
     def _iter_frames(self):
-        while True:
+        # 正常素材每趟 demux 都应产出帧；连续空趟通常意味着容器/句柄已失效。
+        # 不能无条件 decode→seek，否则坏素材会在解码线程里无限忙转，绕过外层自愈。
+        empty = 0
+        while not self._dead:
+            produced = 0
             try:
                 for frame in self.c.decode(video=0):
+                    if self._dead:
+                        return
+                    produced += 1
                     yield frame
             except Exception:
                 pass
+            if self._dead:
+                return
+            empty = 0 if produced else empty + 1
+            if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
+                time.sleep(min(0.2, 0.02 * empty))
+            if empty >= _SOFT_EMPTY_GIVEUP:
+                _log_decoder_giveup(self.path, "Alpha 连续 %d 趟无帧" % empty)
+                return
             # 循环：回到开头（seek 失败则重开容器）
             try:
                 self.c.seek(0)
@@ -1895,11 +1910,42 @@ class GpuDxvPlayer(_DecoderHealth):
         next_probe = time.perf_counter() + self._GPU_REPROBE_SECS
         empty = 0
         while True:
+            # DXV-YUV（yuv420p/yuva420p）不能交给 PyAV 转 BGRA；必须复用
+            # OpenCV 路径，否则 GPU 暂停/超时后会在这里持续 OSError(-129) 空转。
+            if getattr(self, "_soft_cv", False):
+                got = 0
+                try:
+                    for img in self._cv_frames():
+                        got += 1
+                        yield img
+                        now = time.perf_counter()
+                        if now >= next_probe:
+                            next_probe = now + self._GPU_REPROBE_SECS
+                            if worker.available():
+                                return True
+                        if self._dead:
+                            return False
+                except Exception:
+                    pass
+                if self._dead:
+                    return False
+                empty = 0 if got else empty + 1
+                if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
+                    time.sleep(min(0.2, 0.02 * empty))
+                if empty >= _SOFT_EMPTY_GIVEUP:
+                    _log_decoder_giveup(self.path, "YUV 软解连续 %d 趟无帧" % empty)
+                    return False
+                continue
             got = 0
             try:
                 for frame in self.c.decode(video=0):
+                    try:
+                        arr = frame.to_ndarray(format="bgra")
+                    except Exception:
+                        # 转换失败不算出帧；否则 YUV 的 OSError(-129) 会把
+                        # empty 清零，绕过退避/收工判据并持续空转。
+                        continue
                     got += 1
-                    arr = frame.to_ndarray(format="bgra")
                     h, w = arr.shape[:2]
                     if self._max_w and self._max_h:
                         s = min(self._max_w / w, self._max_h / h)

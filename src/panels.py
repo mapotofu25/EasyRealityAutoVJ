@@ -1209,6 +1209,15 @@ class MusicLibraryPanel(QWidget):
         self.cb_dur.currentIndexChanged.connect(lambda _i: self.refresh())
         lv.addWidget(self.cb_dur)
 
+        # ★ 2026-10-09（用户要求②）：按**来源**筛选 —— 本机 / 具体导入包。
+        #   选项在每次 refresh 前重建（用户可能刚导入新包）⇒ 程序化重填必须
+        #   blockSignals（否则 setCurrentIndex 会触发 cascade refresh）。
+        lv.addWidget(QLabel(T("来源")))
+        self.cb_src = QComboBox()
+        self.cb_src.addItem(T("全部"))
+        self.cb_src.currentIndexChanged.connect(lambda _i: self.refresh())
+        lv.addWidget(self.cb_src)
+
         self.chk_missing = QCheckBox(T("只看文件缺失"))
         self.chk_missing.setToolTip(T("换盘 / 改名之后找不到文件的曲目（修复清单）"))
         self.chk_missing.toggled.connect(lambda _s: self.refresh())
@@ -1217,6 +1226,18 @@ class MusicLibraryPanel(QWidget):
         b_reset = QPushButton(T("重置筛选"))
         b_reset.clicked.connect(self.reset_filters)
         lv.addWidget(b_reset)
+
+        # ★ 2026-10-09（用户要求①）：复选框多选的「全选 / 全不选」——
+        #   作用于**当前显示**的行（被筛选隐藏的不受影响）。
+        row_sel = QHBoxLayout()
+        row_sel.setSpacing(6)
+        b_all = QPushButton(T("全选"))
+        b_none = QPushButton(T("全不选"))
+        b_all.clicked.connect(self.select_all)
+        b_none.clicked.connect(self.clear_all)
+        row_sel.addWidget(b_all)
+        row_sel.addWidget(b_none)
+        lv.addLayout(row_sel)
 
         hint = QLabel(T("BPM / 时长来自曲库扫描时建的节拍网格；「无节拍网格」的曲目"
                         "八拍乐句对齐用不了，是需要处理的清单。"))
@@ -1242,12 +1263,18 @@ class MusicLibraryPanel(QWidget):
         b_rescan.setToolTip(T("忽略已有结果，重新分析全部"))
         b_clear = QPushButton(T("清除分析数据"))
         b_clear.setToolTip(T("删除全部指纹与自动识别的曲风（可选保留手动设置）"))
+        # ★★ 2026-10-08（erlib 第二步）：导入 DJ 那边扫好的曲库分析包。
+        #   包 = 曲风 + 封面 + 指纹 + 离线节拍网格（**不含音频**）。
+        #   导入后：DJ 放歌时本机能认出是哪首，自动套用曲风和八拍网格。
+        b_imp = QPushButton(T("导入曲库分析包"))
+        b_imp.setToolTip(T("导入 erlib 导出的 .eravjlib（DJ 机扫好的曲风/封面/指纹/节拍网格）"))
         b_dir.clicked.connect(self.main.import_music_dir)
         b_file.clicked.connect(self.main.import_music_files)
         self.btn_scan.clicked.connect(lambda: self.main.scan_music(force=False))
         b_rescan.clicked.connect(lambda: self.main.scan_music(force=True))
         b_clear.clicked.connect(self.main.show_clear_music_analysis)
-        for b in (b_dir, b_file, self.btn_scan, b_rescan, b_clear):
+        b_imp.clicked.connect(self.main.import_erlib_package)
+        for b in (b_dir, b_file, self.btn_scan, b_rescan, b_clear, b_imp):
             row.addWidget(b)
         row.addStretch(1)
         right.addLayout(row)
@@ -1257,6 +1284,10 @@ class MusicLibraryPanel(QWidget):
         right.addWidget(self.progress)
 
         self.list = QListWidget()
+        # ★ 2026-10-09（用户要求）：支持**多选**批量删除（Ctrl/Shift 点选）。
+        #   ⚠ 这里可以安全用 ExtendedSelection：曲库面板的列表**没有拖拽**
+        #     （素材库那边不行 —— 拖拽会被拉框多选抢掉点击，见 LibraryGrid）。
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         # ★ 歌曲封面（用户要求 2026-10-01）：每行左侧显示封面，且给足尺寸。
         #   ⚠ 主线程只读缓存（`cover_cached`），缺图的交给后台 `CoverBackfillWorker`。
         # 封面尺寸：从配置恢复（老配置里没有/值不合法都回退默认档）
@@ -1264,8 +1295,16 @@ class MusicLibraryPanel(QWidget):
         self.list.setIconSize(QSize(self.cover_size, self.cover_size))
         self.list.setSpacing(1)
         self._cover_job = None
+        # ★ 2026-10-09（用户要求①）：复选框多选的状态位。
+        #   `_building`：refresh 重建列表期间置 True —— 逐行 setCheckState /
+        #   itemChanged 会刷屏，重建时忽略它们，结束后统一更新计数。
+        #   `_stat`：底部计数的基数（在 refresh 里填），供 _update_lbl 组装。
+        self._building = False
+        self._stat = {}
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
+        # 勾选状态变化 → 刷新底部「已勾选 N 首」（不整表重建）
+        self.list.itemChanged.connect(self._on_item_changed)
         right.addWidget(self.list, 1)
 
         self.lbl = QLabel("")
@@ -1314,6 +1353,10 @@ class MusicLibraryPanel(QWidget):
             cb.blockSignals(True)
             cb.setCurrentIndex(0)
             cb.blockSignals(False)
+        # 来源下拉是动态重建的 ⇒ 重置只需设回第 0 项（「全部」），同样 blockSignals
+        self.cb_src.blockSignals(True)
+        self.cb_src.setCurrentIndex(0)
+        self.cb_src.blockSignals(False)
         self.chk_missing.setChecked(False)
         self.refresh()
 
@@ -1337,59 +1380,258 @@ class MusicLibraryPanel(QWidget):
         return k
 
     def refresh(self):
-        """按左栏的排序/筛选重建列表（廉价操作，几百首毫秒级）。"""
+        """按左栏的排序/筛选重建列表（廉价操作，几百首毫秒级）。
+
+        ★ 2026-10-09（用户要求①）：每行带**复选框**；列表重建时按「键」恢复勾选
+          （键：本机=文件路径，导入=`@imported:<sid>`）—— 切排序/筛选/导入后刷新
+          都不会丢用户的勾选。
+        ★ 2026-10-09（用户要求②）：按**来源**（本机 / 具体导入包）筛选。
+        ★ 2026-10-09（用户要求③）：导入歌行尾显示**包名**而非笼统的「导入包」。
+        """
         try:
+            # ① 先收集**重建前**的勾选键（列表即将 clear，必须先记下来）
+            checked_keys = self._checked_keys()
             meta = self.main.cfg["music_meta"] or {}
             lib = list(self.main.cfg["music_library"] or [])
+            # ★★ 2026-10-08（erlib 第二步）：把「导入的曲库分析包」也列进来。
+            #   这些歌**本机没有音频文件**，用伪路径 `@imported:<song_id>` 作行标识；
+            #   数据合并进一份**视图 meta**（不动 `cfg["music_meta"]`，
+            #   避免污染"按文件路径索引"的曲库数据，也避免被扫描逻辑当成曲目）。
+            imp_lib = self._imported_lib()
+            view_meta = meta
+            if imp_lib:
+                view_meta = dict(meta)
+                for _fp, _r in imp_lib.items():
+                    view_meta[_fp] = {
+                        "grid": {"bpm": _r["bpm"], "dur": _r["dur"]},
+                        "genres": _r["genres"], "artist": _r["artist"],
+                        "title": _r["title"], "source": "", "cover": _r["cover"],
+                        "song_id": _r["sid"], "_imported": True,
+                        # ★ 包名（用于来源筛选 + 行尾显示）——空串 = 早期导入
+                        "pack": _r.get("pack", ""),
+                    }
+                lib = lib + list(imp_lib)
+            # ★ 来源下拉在**过滤前**重建（用户可能刚导入新包 ⇒ 包名要实时更新）；
+            #   程序化重填内部 blockSignals，绝不触发 cascade refresh。
+            self._refresh_source_combo(imp_lib)
+            src_key = self.cb_src.currentData(Qt.UserRole) or "__all__"
             bpm_b = self.BPM_FILTERS[self.cb_bpm.currentIndex()][1]
             dur_b = self.DUR_FILTERS[self.cb_dur.currentIndex()][1]
             only_miss = self.chk_missing.isChecked()
             rows = []
             for p in lib:
-                bpm, dur, exists = self._info(meta, p)
+                imp = p in imp_lib
+                # ★ 来源筛选（②）：全部 / 仅本机 / 某导入包
+                if not self._src_ok(p, imp, imp_lib, src_key):
+                    continue
+                bpm, dur, exists = self._info(view_meta, p)
                 if not self._in_bucket(bpm, bpm_b):
                     continue
                 if not self._in_bucket(dur, dur_b):
                     continue
-                if only_miss and exists:
+                # ⚠ 导入的歌**不算**"文件缺失"：它们本来就没有本机文件，
+                #   混进来会让"只看文件缺失"（那是"换盘/改名后找不到文件"的
+                #   修复清单）语义混乱。
+                if only_miss and (exists or imp):
                     continue
                 rows.append((p, bpm, dur, exists))
             sk = self.SORTS[self.cb_sort.currentIndex()][1]
             if sk != "orig":
                 order = {p: i for i, p in enumerate(lib)}
-                rows.sort(key=lambda r: (self._sort_key(sk, meta)(r[0]),
+                rows.sort(key=lambda r: (self._sort_key(sk, view_meta)(r[0]),
                                          order.get(r[0], 0)))
-            self.list.clear()
-            need_cover = []
-            for p, bpm, dur, exists in rows:
-                m = meta.get(p) or {}
-                genres = "、".join(m.get("genres") or []) or T("未分析")
-                src = m.get("source") or ""
-                bits = []
-                if bpm:
-                    bits.append("BPM %.0f" % bpm)
-                else:
-                    bits.append(T("无网格"))
-                if dur:
-                    bits.append("%d:%02d" % (int(dur) // 60, int(dur) % 60))
-                if not exists:
-                    bits.append(T("文件缺失"))
-                txt = "%s    →    %s    (%s)  ｜ %s" % (
-                    os.path.basename(p), genres, src, " ｜ ".join(bits))
-                it = QListWidgetItem(
-                    cover_icon_for(m, p, self.cover_size, need_cover), txt)
-                it.setData(Qt.UserRole, p)
-                if not exists:
-                    it.setForeground(QColor("#e06666"))
-                self.list.addItem(it)
-            done = sum(1 for p in lib if p in meta)
-            self.lbl.setText(Tf("共 {} 首，已分析 {} 首（当前显示 {} 首）",
-                                len(lib), done, len(rows)))
+            self._building = True
+            try:
+                self.list.clear()
+                need_cover = []
+                for p, bpm, dur, exists in rows:
+                    m = view_meta.get(p) or {}
+                    imp = bool(m.get("_imported"))
+                    genres = "、".join(m.get("genres") or []) or T("未分析")
+                    src = m.get("source") or ""
+                    bits = []
+                    if bpm:
+                        bits.append("BPM %.0f" % bpm)
+                    else:
+                        bits.append(T("无网格"))
+                    if dur:
+                        bits.append("%d:%02d" % (int(dur) // 60, int(dur) % 60))
+                    if imp:
+                        name = (m.get("title") or m.get("file_name")
+                                or ("#%s" % m.get("song_id")))
+                        artist = m.get("artist") or ""
+                        disp = ("%s - %s" % (artist, name)) if artist else name
+                        disp = "📦 " + disp
+                        # ★（③）行尾显示**包名**；空串 = 加列之前的旧数据
+                        src = (m.get("pack") or "") or T("早期导入")
+                    else:
+                        disp = os.path.basename(p)
+                        if not exists:
+                            bits.append(T("文件缺失"))
+                    txt = "%s    →    %s    (%s)  ｜ %s" % (
+                        disp, genres, src, " ｜ ".join(bits))
+                    it = QListWidgetItem(
+                        cover_icon_for(m, p, self.cover_size, need_cover), txt)
+                    it.setData(Qt.UserRole, p)
+                    # ★ 复选框（①）：默认未勾选；按重建前的勾选键恢复勾选
+                    it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    it.setCheckState(
+                        Qt.CheckState.Checked if p in checked_keys
+                        else Qt.CheckState.Unchecked)
+                    if imp:
+                        # 来自导入包：用**蓝**区分（红色是"文件缺失"，别混用语义）
+                        it.setForeground(QColor("#7aa2f7"))
+                    elif not exists:
+                        it.setForeground(QColor("#e06666"))
+                    self.list.addItem(it)
+            finally:
+                self._building = False
+            done = sum(1 for p in lib if p in view_meta)
+            # 底部统计：勾选数由 _update_lbl 追加（勾选变化时不必整表重建）
+            self._stat = {"lib": len(lib), "done": done,
+                          "rows": len(rows), "imp": len(imp_lib)}
+            self._update_lbl()
             self.lbl_filter.setText(Tf("筛选后 {} / {} 首", len(rows), len(lib)))
             # 缺封面 ⇒ 起一次后台补图，补完再刷一遍（不阻塞、不重复起）
             self._start_cover_backfill(need_cover)
         except Exception:                                          # noqa: BLE001
             pass
+
+    # ---------------- 复选框多选（用户要求①）----------------
+    def _checked_keys(self):
+        """当前列表里**已勾选**行的键集合（本机=路径，导入=`@imported:<sid>`）。"""
+        out = set()
+        try:
+            for i in range(self.list.count()):
+                it = self.list.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    out.add(it.data(Qt.UserRole))
+        except Exception:                                          # noqa: BLE001
+            pass
+        return out
+
+    def _checked_items(self):
+        """当前列表里已勾选的 QListWidgetItem 列表（顺序 = 列表顺序）。"""
+        out = []
+        try:
+            for i in range(self.list.count()):
+                it = self.list.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    out.append(it)
+        except Exception:                                          # noqa: BLE001
+            pass
+        return out
+
+    def _set_all_checked(self, on):
+        """把**当前显示**的所有行设为勾选/未勾选（被筛选隐藏的不受影响）。
+
+        ⚠ 期间置 `_building` ⇒ 逐行 setCheckState 触发的 itemChanged 被忽略，
+          结束后统一 `_update_lbl()`（避免 N 次重算 + 无谓刷新）。
+        """
+        st = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
+        self._building = True
+        try:
+            for i in range(self.list.count()):
+                self.list.item(i).setCheckState(st)
+        finally:
+            self._building = False
+        self._update_lbl()
+
+    def select_all(self):
+        self._set_all_checked(True)
+
+    def clear_all(self):
+        self._set_all_checked(False)
+
+    def _on_item_changed(self, _it):
+        """勾选状态变化 → 只更新底部计数（不整表重建，保留滚动/焦点）。"""
+        if getattr(self, "_building", False):
+            return
+        self._update_lbl()
+
+    def _update_lbl(self):
+        """重建底部计数标签（含「已勾选 N 首」，仅 N>0 时显示）。"""
+        s = getattr(self, "_stat", None)
+        if not s:
+            return
+        lbl = Tf("共 {} 首，已分析 {} 首（当前显示 {} 首）",
+                 s["lib"], s["done"], s["rows"])
+        if s["imp"]:
+            lbl += Tf("   ｜ 含导入包 {} 首", s["imp"])
+        n = len(self._checked_items())
+        if n > 0:
+            lbl += Tf("   ｜ 已勾选 {} 首", n)
+        self.lbl.setText(lbl)
+
+    # ---------------- 来源筛选（用户要求②）----------------
+    def _refresh_source_combo(self, imp_lib):
+        """重建「来源」下拉：全部 / 仅本机 / <包名>…（按需保留当前选择）。
+
+        选项值（`Qt.UserRole` 数据）用**稳定键**而非显示文本：
+          `"__all__"` / `"__local__"` / `"pack:<包名>"`（包名可为空串=早期导入）。
+        这样切换语言后文本变了也不会选错；包名是**用户数据**，不走词表翻译
+        （只 `i18n_retranslate` 会把固定的「全部/仅本机/早期导入」翻成当前语言）。
+
+        ⚠ 程序化重填**必须** blockSignals —— 否则 clear/addItem/setCurrentIndex
+          会一路触发 currentIndexChanged → cascade refresh（项目铁律）。
+        """
+        cb = self.cb_src
+        try:
+            cur = cb.currentData(Qt.UserRole)
+        except Exception:                                          # noqa: BLE001
+            cur = None
+        # 收集包名（去重 + 排序；空串=早期导入，单独排在最后）
+        packs = sorted({(r.get("pack") or "") for r in imp_lib.values()})
+        named = [p for p in packs if p]
+        has_early = "" in packs
+        cb.blockSignals(True)
+        try:
+            cb.clear()
+            cb.addItem("全部", "__all__")
+            cb.addItem("仅本机", "__local__")
+            for pk in named:
+                cb.addItem(pk, "pack:" + pk)
+            if has_early:
+                cb.addItem("早期导入", "pack:")
+            # 按稳定键恢复之前的选择；找不到（如那个包刚被删空）就回「全部」
+            idx = cb.findData(cur, Qt.UserRole) if cur else -1
+            cb.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            cb.blockSignals(False)
+        # 把「全部/仅本机/早期导入」翻成当前语言（包名不在词表 ⇒ 原样保留）
+        try:
+            i18n_retranslate(cb)
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _src_ok(path, imp, imp_lib, key):
+        """来源筛选判据：`全部` → 恒真；`仅本机` → 排除导入；`pack:X` → 只要该包。"""
+        if key in (None, "", "__all__"):
+            return True
+        if key == "__local__":
+            return not imp
+        if isinstance(key, str) and key.startswith("pack:"):
+            if not imp:
+                return False
+            return (imp_lib.get(path) or {}).get("pack", "") == key[5:]
+        return True
+
+    def _imported_lib(self):
+        """导入包里的歌：`{"@imported:<sid>": 行数据}`。读不到时 `{}`（绝不抛）。
+
+        ⚠ 每次 refresh 都读一次 `imported_meta.db`（几十行，毫秒级）。
+          大库（几千首手工导入）也不值得为它加缓存 —— 加了反而要考虑失效。
+        """
+        try:
+            from config import app_base_dir
+            import imported_lib as _IL
+            out = {}
+            for r in _IL.display_rows(app_base_dir()):
+                out["@imported:%d" % int(r["sid"])] = r
+            return out
+        except Exception:                                          # noqa: BLE001
+            return {}
 
     def _start_cover_backfill(self, paths):
         """后台补封面（串行、可中断）。⚠ 已经在跑就不重复起。"""
@@ -1455,38 +1697,172 @@ class MusicLibraryPanel(QWidget):
             pass
         self.refresh()
 
+    @staticmethod
+    def _resolve_targets(path, checked, selected):
+        """决定右键**批量操作对象**（纯函数，便于单测）。
+
+        规则（用户要求①）：
+          · **有勾选** ⇒ 一律以**勾选集**为操作对象（`checked_mode=True`）；
+          · 无勾选 ⇒ 退回旧行为：右键项在选中集里就用整个选中集，否则只用它自己。
+        返回 `(loc, imp, checked_mode)`：loc=本机路径、imp=导入伪路径。
+        """
+        if checked:
+            src = list(checked)
+            mode = True
+        else:
+            src = list(selected or ())
+            if path not in src:
+                src = [path]
+            mode = False
+        loc = [p for p in src if not str(p).startswith("@imported:")]
+        imp = [p for p in src if str(p).startswith("@imported:")]
+        return loc, imp, mode
+
     def _ctx_menu(self, pos):
         it = self.list.itemAt(pos)
         if it is None:
             return
         path = it.data(Qt.UserRole)
+        # ★ 2026-10-09：右键项若**在选中集里** ⇒ 对整个选中集操作（支持批量删除）；
+        #   否则只对它自己（并让它成为唯一选中，行为与旧版一致）。
+        # ★ 2026-10-09（用户要求①）：**只要有勾选**，删除一律针对勾选集。
+        checked = [x.data(Qt.UserRole) for x in self._checked_items()]
+        selected = [x.data(Qt.UserRole) for x in self.list.selectedItems()]
+        loc, imp, checked_mode = self._resolve_targets(path, checked, selected)
+        if not checked_mode and path not in selected:
+            self.list.setCurrentItem(it)
+        solo_loc = (not checked_mode) and (len(loc) == 1 and not imp)  # 单首本机歌=旧版完整菜单
         menu = QMenu(self)
-        edit = menu.addAction(T("纠正曲风…"))
-        rescan = menu.addAction(T("重新分析扫描此曲目"))
-        info = menu.addAction(T("此曲目信息"))
-        menu.addSeparator()
-        # ★ 封面大小（用户要求）：放子菜单里，当前档位打勾。
-        #   为什么不做成"拖拽缩放"：曲库是**演出前整理**用的，这里要的是
-        #   "一次调好、记住"，不需要连续微调；子菜单也最不容易误触。
-        sub = menu.addMenu(T("封面大小"))
-        cur = self.cover_size
-        for lbl, px in COVER_SIZES:
-            act = sub.addAction("%s (%d px)" % (T(lbl), px))
-            act.setCheckable(True)
-            act.setChecked(px == cur)
-            act.triggered.connect(lambda _c=False, v=px: self.set_cover_size(v))
-        menu.addSeparator()
-        rm = menu.addAction(theme.danger_icon(), T("从曲库移除"))
+        edit = rescan = info = None
+        if solo_loc:
+            edit = menu.addAction(T("纠正曲风…"))
+            rescan = menu.addAction(T("重新分析扫描此曲目"))
+            info = menu.addAction(T("此曲目信息"))
+            menu.addSeparator()
+            # ★ 封面大小（用户要求）：放子菜单里，当前档位打勾。
+            #   为什么不做成"拖拽缩放"：曲库是**演出前整理**用的，这里要的是
+            #   "一次调好、记住"，不需要连续微调；子菜单也最不容易误触。
+            sub = menu.addMenu(T("封面大小"))
+            cur = self.cover_size
+            for lbl, px in COVER_SIZES:
+                act = sub.addAction("%s (%d px)" % (T(lbl), px))
+                act.setCheckable(True)
+                act.setChecked(px == cur)
+                act.triggered.connect(lambda _c=False, v=px: self.set_cover_size(v))
+        elif len(imp) == 1 and not loc and str(path).startswith("@imported:"):
+            # 导入包的歌：本机没有文件 ⇒ 只给「查看信息」与删除
+            # （⚠ 必须是**右键的那一项本身**是导入歌，否则信息框会拿本机路径去解析 sid）
+            info = menu.addAction(T("查看信息"))
+        rm_loc = rm_imp = None
+        if loc:
+            if solo_loc:
+                menu.addSeparator()
+            if checked_mode:
+                rm_loc = menu.addAction(
+                    theme.danger_icon(),
+                    Tf("从曲库移除勾选的 {} 首", len(loc)))
+            else:
+                rm_loc = menu.addAction(
+                    theme.danger_icon(),
+                    T("从曲库移除") if len(loc) == 1
+                    else Tf("从曲库移除（{} 首）", len(loc)))
+        if imp:
+            if checked_mode:
+                rm_imp = menu.addAction(
+                    theme.danger_icon(),
+                    Tf("从导入库移除勾选的 {} 首", len(imp)))
+            else:
+                rm_imp = menu.addAction(
+                    theme.danger_icon(),
+                    T("从导入库移除") if len(imp) == 1
+                    else Tf("从导入库移除（{} 首）", len(imp)))
         i18n_retranslate(menu)      # 临时菜单：弹出前刷语言
         act = menu.exec(self.list.mapToGlobal(pos))
+        if act is None:
+            return
         if act == edit:
             self.main.edit_music_genre(path)
         elif act == rescan:
             self.main.rescan_music(path)
         elif act == info:
-            self.main.show_music_info(path)
-        elif act == rm:
-            self.main.remove_music(path)
+            if solo_loc:
+                self.main.show_music_info(path)
+            else:
+                try:
+                    self._show_imported_info(int(str(path).split(":", 1)[1]))
+                except Exception:                                  # noqa: BLE001
+                    pass
+        elif act == rm_loc:
+            self._remove_local(loc)
+        elif act == rm_imp:
+            self._remove_imported(imp)
+
+    def _remove_local(self, paths):
+        """从本机曲库移除（**二次确认**；批量 = 一次 save + 一次 refresh）。"""
+        paths = [p for p in (paths or []) if p]
+        if not paths:
+            return
+        names = "\n".join(os.path.basename(str(p)) for p in paths[:6])
+        if len(paths) > 6:
+            names += Tf("\n…等共 {} 首", len(paths))
+        ret = QMessageBox.question(
+            self, T("从曲库移除"),
+            Tf("从曲库移除这 {} 首？\n\n{}\n\n"
+               "只从曲库列表移除（连同曲风/网格等分析数据）；"
+               "音频文件本身不会被删除。", len(paths), names),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.main.remove_music_many(paths)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _remove_imported(self, fake_paths):
+        """从导入库移除（**二次确认**；曲风/封面/指纹一起删 —— 删完就不再认得这些歌）。"""
+        sids = []
+        for p in (fake_paths or []):
+            try:
+                sids.append(int(str(p).split(":", 1)[1]))
+            except Exception:                                    # noqa: BLE001
+                pass
+        if not sids:
+            return
+        ret = QMessageBox.question(
+            self, T("从导入库移除"),
+            Tf("从导入库移除这 {} 首？\n\n"
+               "它们的曲风、封面与指纹会一起删除 —— "
+               "删除后就不再认得这些歌；本机自己扫描的曲目不受影响。", len(sids)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from config import app_base_dir
+            import imported_lib as _IL
+            _IL.remove_songs(app_base_dir(), sids)
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.refresh()
+
+    def _show_imported_info(self, sid):
+        """导入歌的信息框（本机没有该音频文件，只能看分析数据）。"""
+        r = self._imported_lib().get("@imported:%d" % int(sid))
+        if not r:
+            return
+        lines = [
+            "%s: %s" % (T("曲名"), r["title"] or r["file_name"] or "-"),
+            "%s: %s" % (T("艺人"), r["artist"] or "-"),
+            "%s: %s" % (T("曲风"), "、".join(r["genres"]) or "-"),
+        ]
+        if r["bpm"]:
+            lines.append("BPM: %.0f" % r["bpm"])
+        if r["dur"]:
+            lines.append("%d:%02d" % (int(r["dur"]) // 60, int(r["dur"]) % 60))
+        lines.append("")
+        lines.append(T("来自导入曲库分析包（本机没有该音频文件，靠指纹识别）"))
+        QMessageBox.information(self, T("导入包曲目"), "\n".join(lines))
 
 
 class LibraryGrid(MediaGrid):
@@ -2884,9 +3260,21 @@ class AudioSourceDialog(I18nDialog):
                 "绕过系统混音器直连声卡驱动，延迟 1~10ms。"
                 "⚠ 同一驱动同时只允许一个程序使用 —— VirtualDJ / DAW 占着时会连不上，"
                 "此时会自动回退到系统声音。"), Qt.ToolTipRole)
+
+        # ★ 局域网音频（自研轻量协议，2026-10-08 新增）：
+        #   A 机跑独立采集发送小 exe，B 机选这一项接收。
+        #   「设备」下拉里填的是**端口号**（默认 47811，一般不用改）。
+        self.source.addItem("局域网音频（另一台电脑）")
+        self._lan_idx = 4
+        self.source.setItemData(self._lan_idx, T(
+            "接收另一台电脑通过局域网发来的音频（需在 A 机运行"
+            "「EasyReality 音频发送端」）。零第三方依赖，两机需在同一局域网，"
+            "防火墙放行 UDP。下方「设备」填端口（默认 47811），"
+            "或直接填 A 机的 IP（如 192.168.31.96）以跳过自动发现。"), Qt.ToolTipRole)
         g.addWidget(self.source, 0, 1, 1, 2)
 
-        g.addWidget(QLabel("设备"), 1, 0)
+        self.lbl_device = QLabel("设备")
+        g.addWidget(self.lbl_device, 1, 0)
         self.device = QComboBox()
         self.device.setMinimumWidth(260)
         g.addWidget(self.device, 1, 1)
@@ -2958,6 +3346,17 @@ class AudioSourceDialog(I18nDialog):
         self.lbl_dev.setStyleSheet("color:#888;")
         self.lbl_dev.setWordWrap(True)
         lay.addWidget(self.lbl_dev)
+
+        # ★ 局域网音频专用状态行（2026-10-08）：显示**对端 IP**、深度、丢包。
+        #   用户明确要求"能看见对方的 IP" —— 现场排查时这是第一手信息：
+        #   连上了但不知道连的是谁，就无法判断是不是连到了错误的一台机器。
+        self.lbl_lan = QLabel("")
+        self.lbl_lan.setWordWrap(True)
+        self.lbl_lan.setStyleSheet("color:#4fc3f7;font-size:11px;")
+        self.lbl_lan.setProperty("_i18nDynamic", True)
+        self.lbl_lan.hide()          # 只有音源 = 局域网时才显示
+        lay.addWidget(self.lbl_lan)
+
         self.lbl_hint = QLabel("")
         self.lbl_hint.setWordWrap(True)
         self.lbl_hint.setStyleSheet("color:#e0a030;font-size:11px;")
@@ -2982,10 +3381,36 @@ class AudioSourceDialog(I18nDialog):
         self.scan_devices()
 
     # ---- 配置载入/应用 ----
-    SOURCE_KEYS = ("system", "mic", "mic", "asio")   # 下拉索引 → 设备类别（线路输入并入 mic；索引 3 = ASIO）
+    #                   下拉索引 → 设备类别（线路输入并入 mic；索引 3 = ASIO；索引 4 = 局域网）
+    SOURCE_KEYS = ("system", "mic", "mic", "asio", "lan")
 
     def _src_key(self):
-        return self.SOURCE_KEYS[max(0, min(3, self.source.currentIndex()))]
+        return self.SOURCE_KEYS[max(0, min(4, self.source.currentIndex()))]
+
+    @staticmethod
+    def _looks_like_lan_target(s):
+        """`s` 看起来像「端口 / 对端IP」吗？（用于回填局域网那栏的下拉框）
+
+        接受：
+          · 纯数字端口（`47811`）
+          · IP（`192.168.31.96`）
+          · IP:端口（`192.168.31.96:47811`）
+        拒绝：其它任意字符串（尤其是**别的音源的设备名**）——
+          可编辑下拉的 `setCurrentText()` 会原样显示任何字符串，
+          若把残留的设备名填进去，用户会以为"这栏坏了 / 扫不到网络输入"。
+        """
+        t = (s or "").strip()
+        if not t:
+            return False
+        if t.isdigit():
+            return True
+        host, _, tail = t.rpartition(":")
+        if host and tail.isdigit():
+            t = host
+        parts = t.split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            return True
+        return False
 
     # ---------------- ASIO 输入通道 ----------------
     def _ensure_ch_items(self, chs=None, err=""):
@@ -3043,14 +3468,16 @@ class AudioSourceDialog(I18nDialog):
         legacy = a.get("device_name") or ""
         if not legacy:
             return "", False
-        cfg_idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3}.get(a.get("source_type", "system"), 0)
+        cfg_idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3, "lan": 4}.get(
+            a.get("source_type", "system"), 0)
         if self.SOURCE_KEYS[cfg_idx] == kind:
             return legacy, False     # 可能是本类型，但没确认过 → 静默处理
         return "", False
 
     def _load_from_cfg(self):
         a = self.main.cfg["audio"]
-        idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3}.get(a.get("source_type", "system"), 0)
+        idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3, "lan": 4}.get(
+            a.get("source_type", "system"), 0)
         self.source.blockSignals(True)      # 载入配置不触发「类型变化 → 重扫」
         self.source.setCurrentIndex(idx)
         self.source.blockSignals(False)
@@ -3146,6 +3573,57 @@ class AudioSourceDialog(I18nDialog):
         self._scanning = False
         if devs is not None:
             self._devs = devs if "error" not in devs else {"system": [], "mic": [], "asio": []}
+        # ★ 局域网音频：没有"设备"可扫，这里放的是**端口 / 对端 IP**。
+        #   用可编辑下拉，用户既能选默认值也能自己敲。
+        #   ★★ 2026-10-08 新增「手动输入 IP」（用户要求）：
+        #     自动发现依赖广播，在有代理 TUN（Clash 等）/ 跨 VLAN / 交换机隔离的
+        #     现场经常收不到 ⇒ 允许直接填 A 机 IP（`1.2.3.4` 或 `1.2.3.4:47811`）。
+        if self._src_key() == "lan":
+            if not self.device.isEditable():
+                self.device.setEditable(True)
+            # 标签跟着变，让用户知道这里可以填 IP
+            try:
+                self.lbl_device.setText(T("端口 / 对端IP"))
+            except Exception:                                      # noqa: BLE001
+                pass
+            self.device.blockSignals(True)
+            self.device.clear()
+            self.device.addItems(["47811"])
+            a = self.main.cfg["audio"]
+            want = (a.get("device_by_source") or {}).get("lan") or a.get("device_name") or ""
+            # ★★ 2026-10-08 修（用户报「扫不到网络输入了」）：
+            #   这里只在 want **看起来像端口或 IP** 时才回填 —— 否则回落到默认值。
+            #   原因：可编辑下拉框的 `setCurrentText()` 会**原样显示**任意字符串，
+            #   而 `device_by_source["lan"]` / `device_name` 里可能残留**其它音源的
+            #   设备名**（切换音源、旧配置迁移都会留下）⇒ 下拉框会显示
+            #   「扬声器 (Realtek …)」这种一看就"不是端口"的内容，
+            #   用户看到的正是"**扫不到网络输入**"（以为这一栏坏了/空了）。
+            #   旧代码是 `want.isdigit()`（只认端口，最保守）；现在放宽到
+            #   「数字」或「形如 IP / IP:端口」，其它一律丢弃。
+            if self._looks_like_lan_target(want):
+                self.device.setCurrentText(want.strip())
+            else:
+                self.device.setCurrentIndex(0)
+            self.device.blockSignals(False)
+            # ★ 局域网音频推荐「自动」采样率（跟随对端，避免一次无谓的重采样）。
+            #   只在配置里没存过用户选择时才动，不覆盖用户的显式设置。
+            try:
+                if not int(a.get("sample_rate", 0) or 0):
+                    self.rate.setCurrentIndex(0)
+            except Exception:                                      # noqa: BLE001
+                pass
+            self.lbl_hint.setText(T("在 A 机运行「EasyReality 音频发送端」，"
+                                    "两台电脑需在同一局域网。\n"
+                                    "• 默认自动发现（填端口 47811 即可）\n"
+                                    "• 自动发现连不上时，在这里直接填 A 机的 IP，"
+                                    "如 192.168.31.96（也可写 192.168.31.96:47811）"))
+            return
+        if self.device.isEditable():
+            self.device.setEditable(False)   # 其它音源：下拉不可编辑
+        try:
+            self.lbl_device.setText(T("设备"))     # 从「局域网」切回来 ⇒ 标签复位
+        except Exception:                                      # noqa: BLE001
+            pass
         # ASIO 输入通道（只有 ASIO 音源才有这一步）
         if self._src_key() == "asio" and devs is not None and "asio_ch" in devs:
             self._ensure_ch_items(devs.get("asio_ch"), devs.get("asio_ch_err") or "")
@@ -3212,7 +3690,10 @@ class AudioSourceDialog(I18nDialog):
             pass
         self._sync_ch_visible()
         self._fill_devices()
-        self.scan_devices()
+        # ★ 局域网音频没有"设备"可扫（下拉里是端口号）⇒ 不触发设备扫描，
+        #   省一次无意义的枚举（而且要枚举的是别人电脑上的设备，本就扫不到）。
+        if self._src_key() != "lan":
+            self.scan_devices()
 
     def _on_device_changed(self, _i=0):
         """换了设备/驱动 ⇒ ASIO 的话重新取一遍输入通道名。"""
@@ -3221,7 +3702,7 @@ class AudioSourceDialog(I18nDialog):
         self.scan_devices()
 
     def apply(self):
-        t = self.SOURCE_KEYS[max(0, min(3, self.source.currentIndex()))]
+        t = self.SOURCE_KEYS[max(0, min(4, self.source.currentIndex()))]
         dev = (self.device.currentText() or "").strip()
         # 占位文本（扫描中／未找到设备）不能当设备名保存
         if dev.startswith(("（", "(")) or dev in ("正在扫描…", T("正在扫描…"), "Scanning…"):
@@ -3257,6 +3738,24 @@ class AudioSourceDialog(I18nDialog):
         for k, b in self.bars.items():
             b.setValue(int(max(0.0, min(1.0, snap.get(k, 0.0))) * 100))
         self.lbl_dev.setText(T("当前采集设备: ") + (snap.get("device_desc") or "-"))
+        # ★ 局域网音频状态行：对端 IP + 缓冲深度 + 抖动 + 丢包
+        if self._src_key() == "lan":
+            self.lbl_lan.show()
+            info = snap.get("lan_info") or ""
+            fail = snap.get("lan_failed") or ""
+            if fail:
+                self.lbl_lan.setText("⚠ " + fail)
+                self.lbl_lan.setStyleSheet("color:#e0a030;font-size:11px;")
+            elif info:
+                self.lbl_lan.setText("局域网：" + info)
+                self.lbl_lan.setStyleSheet("color:#4fc3f7;font-size:11px;")
+            else:
+                # 还没拿到状态：可能是还没点「应用」，或正在等待对端首包
+                self.lbl_lan.setText(T("局域网：等待对端…（点「应用」后开始连接，"
+                                       "最多等 5 秒）"))
+                self.lbl_lan.setStyleSheet("color:#888;font-size:11px;")
+        else:
+            self.lbl_lan.hide()
 
 
 class ImageAdjustDialog(I18nDialog):

@@ -1345,7 +1345,8 @@ class AutoVJEngine(QObject):
                 raise RuntimeError("NDI _ensure(%dx%d) 返回 False" % (w, h))
             bpl = self.canvas.bytesPerLine()
             bgra = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
-            # 传给 NDI 的是 BGRA 连续缓冲（画布 RGB32 = BGRA 内存序）
+            # 传给 NDI 的是 BGRA 连续缓冲（画布 RGB32 = BGRA 内存序）。
+            # send_video 自己返回真实提交结果；这里仅用于诊断，不把单帧丢弃当成异常。
             self._ndi.send_video(bgra, w, h)
         except Exception as e:                                     # noqa: BLE001
             # ⚠ 失败时**保留已有 `self._ndi`**（不丢成 None 重建）：NDI 源名在接收端反复
@@ -1355,6 +1356,44 @@ class AutoVJEngine(QObject):
         self._output_ok("NDI", now)
 
     # ---------------- 行为模式 ----------------
+    def modes_snapshot(self):
+        """★ 无锁读取「模式状态」——**专供 GUI 高频轮询**（见下方说明）。
+
+        ## ⚠⚠ 为什么不能直接用 `manual_mode()`（2026-10-08 现场事故）
+
+        用户报「**软件非常卡**」。`ui_main._update_status()` 挂在 **500ms 的
+        `QTimer`** 上，里面调 `self.engine.manual_mode()`；而 `manual_mode` 是
+        `@_locked` ⇒ 主线程每 0.5 秒都要去抢 `_tick_lock`。
+        这把锁由引擎线程**在整帧渲染期间持有**（`_tick` → `with self._tick_lock`），
+        一旦那一帧慢（例如 `colorfx.apply` 这种逐像素活），主线程就**等到超时**
+        （`_LOCK_TIMEOUT=2.0s`）⇒ 界面一秒一顿，看起来就是"卡成幻灯片"。
+
+        ⇒ 状态栏轮询是**只读展示**，**绝不该**为了一个 int/字符串去等渲染锁。
+           （与 `latest_frame()` 同一条原则：GUI 每帧路径绝不碰引擎锁。）
+
+        ## 为什么这样是安全的
+        本函数只读 `self.cfg` / `self.mode` / `self.mode_scores`：
+          - `self.cfg["mode"]` 是个普通 dict，`.get()` 在 GIL 下是**原子**的；
+          - `self.mode` 是 str、`self.mode_scores` 是 dict —— 读到的要么是旧值
+            要么是新值，**绝不会读到半成品**（引用替换是原子的）。
+        最坏情况：界面比渲染线程晚 1 帧（16ms）显示新模式 —— 对状态栏无影响。
+
+        ⚠ 本函数**故意不加 `@_locked`**（与 `latest_frame` 一样属于白名单），
+          已在 `tools/_scan_locks.py` 里显式豁免，别"顺手修"成加锁版本。
+        """
+        manual = None
+        try:
+            m = self.cfg["mode"].get("manual", "auto")
+            if m not in (None, "auto") and m in MODES:
+                manual = m
+        except Exception:                                        # noqa: BLE001
+            manual = None
+        return {
+            "mode": manual or self.mode,
+            "manual": manual,
+            "scores": dict(self.mode_scores or {}),
+        }
+
     @_locked
     def manual_mode(self):
         m = self.cfg["mode"].get("manual", "auto")

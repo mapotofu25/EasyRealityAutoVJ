@@ -194,6 +194,18 @@ ZH2EN = {
     "系统声音": "System Sound",
     "麦克风": "Microphone",
     "线路输入/声卡": "Line-In / Sound Card",
+    "局域网音频（另一台电脑）": "LAN Audio (another PC)",
+    "接收另一台电脑通过局域网发来的音频（需在 A 机运行"
+    "「EasyReality 音频发送端」）。零第三方依赖，两机需在同一局域网，"
+    "防火墙放行 UDP。下方「设备」填端口，默认 47811。":
+        "Receive audio from another PC over the LAN (run \"EasyReality Audio Sender\" "
+        "on PC A). No third-party dependencies. Both PCs must be on the same LAN and "
+        "the firewall must allow UDP. The \"Device\" field below is the port (default 47811).",
+    "在 A 机运行「EasyReality 音频发送端」，"
+    "两台电脑需在同一局域网。端口保持默认即可，"
+    "改过 A 机端口这里要跟着改。":
+        "Run \"EasyReality Audio Sender\" on PC A. Both PCs must be on the same LAN. "
+        "Keep the default port unless you changed it on PC A.",
     "设备": "Device",
     "重新扫描": "Rescan",
     "采样率": "Sample Rate",
@@ -938,6 +950,61 @@ ZH2EN = {
     # NDI 音频输出勾选框（ui_main.OutputPanel.chk_ndi_audio）。
     "NDI 传输音频（48 kHz 立体声 · 未完成）":
         "Send NDI audio (48 kHz stereo · not finished)",
+    "局域网：":
+        "LAN: ",
+    "局域网：等待对端…（点「应用」后开始连接，最多等 5 秒）":
+        "LAN: waiting for remote… (click Apply to connect, up to 5s)",
+    "⚠ 局域网对端未找到 —— 请确认 B 机已选「局域网音频」，端口一致，防火墙放行 UDP":
+        "LAN peer not found — check that the other PC selected LAN Audio, ports match, and the firewall allows UDP",
+    "端口 / 对端IP":
+        "Port / Remote IP",
+    "接收另一台电脑通过局域网发来的音频（需在 A 机运行「EasyReality 音频发送端」）。零第三方依赖，两机需在同一局域网，防火墙放行 UDP。下方「设备」填端口（默认 47811），或直接填 A 机的 IP（如 192.168.31.96）以跳过自动发现。":
+        "Receive audio sent over LAN from another PC (run the EasyReality audio sender on PC A). "
+        "No third-party dependencies; both PCs must be on the same LAN with UDP allowed. "
+        "In the field below enter the port (default 47811) or the IP of PC A "
+        "(e.g. 192.168.31.96) to skip auto-discovery.",
+    "在 A 机运行「EasyReality 音频发送端」，两台电脑需在同一局域网。\n• 默认自动发现（填端口 47811 即可）\n• 自动发现连不上时，在这里直接填 A 机的 IP，如 192.168.31.96（也可写 192.168.31.96:47811）":
+        "Run the EasyReality audio sender on PC A; both PCs must be on the same LAN.\n"
+        "• Auto-discovery by default (just enter port 47811)\n"
+        "• If auto-discovery fails, enter PC A's IP here, e.g. 192.168.31.96 "
+        "(or 192.168.31.96:47811)",
+    # ★ 2026-10-08（erlib 第二步）：导入曲库分析包（DJ 机扫好的曲风/封面/指纹/网格）
+    "导入曲库分析包": "Import analysis package",
+    "导入 erlib 导出的 .eravjlib（DJ 机扫好的曲风/封面/指纹/节拍网格）":
+        "Import .eravjlib exported by erlib "
+        "(genre / cover / fingerprint / grid scanned on the DJ machine)",
+    # ---- 曲库列表里的「导入包」展示（2026-10-08）----
+    "导入包": "Import",
+    "   ｜ 含导入包 {} 首": "   | incl. {} imported",
+    "查看信息": "View Info",
+    "曲名": "Title",
+    "艺人": "Artist",
+    "来自导入曲库分析包（本机没有该音频文件，靠指纹识别）":
+        "From an imported library analysis package "
+        "(no audio file on this machine; identified by fingerprint)",
+    "导入包曲目": "Imported Track",
+    # ---- 曲库删除 / 批量删除（2026-10-09）----
+    "从曲库移除（{} 首）": "Remove from library ({} tracks)",
+    "从导入库移除": "Remove from imported library",
+    "从导入库移除（{} 首）": "Remove from imported library ({} tracks)",
+    "\n…等共 {} 首": "\n…{} tracks in total",
+    "从曲库移除这 {} 首？\n\n{}\n\n只从曲库列表移除（连同曲风/网格等分析数据）；音频文件本身不会被删除。":
+        "Remove these {} tracks from the library?\n\n{}\n\n"
+        "This only removes them from the library list (together with the "
+        "genre/grid analysis data); the audio files themselves are not deleted.",
+    "从导入库移除这 {} 首？\n\n它们的曲风、封面与指纹会一起删除 —— 删除后就不再认得这些歌；本机自己扫描的曲目不受影响。":
+        "Remove these {} tracks from the imported library?\n\n"
+        "Their genre, cover and fingerprints are deleted as well — they will "
+        "no longer be recognized; tracks scanned on this machine are unaffected.",
+    # ---- 曲库面板三项增强（2026-10-09）：复选框多选 / 来源筛选 / 行尾包名 ----
+    "来源": "Source",
+    "仅本机": "Local only",
+    "早期导入": "Early import",
+    "全不选": "Deselect All",
+    "   ｜ 已勾选 {} 首": "   | {} checked",
+    "从曲库移除勾选的 {} 首": "Remove checked from library ({} tracks)",
+    "从导入库移除勾选的 {} 首":
+        "Remove checked from imported library ({} tracks)",
 }
 
 

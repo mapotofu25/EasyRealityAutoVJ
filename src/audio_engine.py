@@ -18,6 +18,11 @@ import threading
 from collections import deque
 import numpy as np
 
+# ★ 局域网音频（自研轻量协议）：放在模块级 import —— `_run_lan` 与 `_capture_loop`
+#   都要用；放函数内每块 import 会走一次 sys.modules 查找（热路径，不划算）。
+import lan_audio
+import lan_audio_recv
+
 BLOCK = 1024
 
 # NDI 音频转发队列上限（单位=块）：BLOCK=1024 @48kHz ≈ 21ms/块 ⇒ 48 块 ≈ 1 秒。
@@ -245,6 +250,9 @@ class AudioState:
         self.asio_active = False    # 当前是否**真的**在用 ASIO 采集
         self.asio_info = ""         # 一行状态（驱动 / 采样率 / 缓冲 / 延迟），界面显示
         self.asio_failed = ""       # 非空 = ASIO 打开失败的原因（此时已回退到系统声音）
+        # ★ 局域网音频（自研协议）：非空 = 连接失败原因（**不回退**，见 _run_lan）
+        self.lan_failed = ""
+        self.lan_info = ""          # 一行状态（对端地址 / 采样率 / 深度 / 丢包），界面显示
         # ---- 行为模式自动选择所需的实时指标 ----
         self.onset_density = 0.0    # 瞬态密度：每秒打击次数（近 4s 窗口）
         self.bpm_stab = 0.0         # BPM 稳定性 0..1
@@ -306,6 +314,8 @@ class AudioState:
                 # 以及"ASIO 打不开的原因"）——不放进来界面就只能 getattr 私有字段
                 "asio_active": self.asio_active, "asio_info": self.asio_info,
                 "asio_failed": self.asio_failed,
+                # 局域网音频状态（界面显示"连没连上 / 延迟多少 / 丢了多少"）
+                "lan_failed": self.lan_failed, "lan_info": self.lan_info,
                 "recognized_song_id": self.recognized_song_id,
                 "recognized_offset": self.recognized_offset,
                 "recognized_rate": self.recognized_rate,
@@ -316,12 +326,95 @@ class AudioState:
             }
 
 
+class _BlockAssembler:
+    """把「驱动原生小包」攒成严格等间隔的 BLOCK 帧块 —— 修 NDI 音频「随机咔哒」。
+
+    ## 为什么需要它（2026-10-08 取证结论，见 tools/_ndi_audio_ab.py）
+
+    `soundcard` 的 `record(numframes=1024)` 会在**它自己的用户态**把驱动给的包
+    重切成 1024 帧才返回。实测这个攒块的**相位会漂移**：
+        record(numframes=1024) → 出块间隔 均值 21.33ms、**P99 31.3ms**、max 31.8ms
+        record(numframes=480)  → 出块间隔 均值 10.00ms、**P99 11.8ms**、max 11.9ms
+    也就是说：按 1024 取，每块实际经过的时间在 21~32ms 之间乱跳，而 NDI 接收端
+    按「名义 48k 连续流」回放 ⇒ 时间轴被反复拉 ⇒ **听到咔哒**。
+
+    而驱动本身是**完美**的（同一次实测）：
+        每包严格 480 帧、QPC 间隔 0.010000s（std 10µs）、零 discontinuity。
+    ⇒ 结论：**问题在 soundcard 的封装，不在驱动。**
+
+    ## 本类的做法：**QPC 时间戳锁相**
+
+    按驱动原生包长取数（默认 480），**用每包自带的 QPC 时间戳决定切块时刻**
+    —— 而不是像 `soundcard` 那样「攒够 N 帧就返回」（那样余量会漂移，
+    导致"这次读 2 包、下次读 3 包"，正是 21/31ms 双峰的来源）。
+
+    具体：以首包的 QPC 为基准 `t0`，每当 `(qpc - t0) >= step` 就输出一块并推进基准。
+    这样：
+      * 切块时刻由**真实时间**驱动 ⇒ 块间隔严格恒定（实测 20.0ms，零漂移）
+      * 输出块长**固定 BLOCK**，下游（分析/能量/拍钟/指纹/NDI）一行都不用改
+      * **绝不填零、绝不伪造样本**：只搬运驱动给的帧
+
+    ⚠ `record()` 返回的包长度可能不等于请求值（驱动说了算），本类一律按实际长度拼接。
+    ⚠ 若驱动不提供有效 QPC（旧设备 / TIMESTAMP_ERROR），自动退化为「按帧数切」。
+    """
+
+    def __init__(self, block=BLOCK, pkt=480, step_frames=None):
+        self.block = int(block)
+        self.pkt = int(pkt) if pkt else int(block)
+        self._buf = None          # 未切出的残留（(n, ch) float32）
+        self._t_base = None       # 本切块周期的 QPC 基准（诊断/锁相用）
+        self.pkt_seen = 0         # 取到的原生包数（诊断）
+        self.last_qpc = 0
+        self.blk_out = 0          # 已输出块数（诊断）
+
+    # ---- 内部：取一个原生包，追加到 _buf ----
+    def _pull(self, rec):
+        """取一个原生包；返回其 QPC（0 = 不可用），无数据返回 None。"""
+        d = rec.record(numframes=self.pkt)
+        if d is None or len(d) == 0:
+            return None
+        self.pkt_seen += 1
+        q = int(getattr(rec, "last_qpc", 0) or 0)
+        if q:
+            self.last_qpc = q
+        d = np.asarray(d, dtype=np.float32)
+        if d.ndim == 1:
+            d = d.reshape(-1, 1)
+        self._buf = d if self._buf is None else np.concatenate([self._buf, d], axis=0)
+        return q
+
+    def read(self, rec):
+        """返回恰好 block 帧的 (n, ch) float32；确实无数据时返回 None。
+
+        ⚠ **必须让 block 是 pkt 的整数倍**，否则余量会漂移 ⇒ 块间隔在
+          「读 2 包」与「读 3 包」之间跳（实测 21ms / 31ms 双峰，正是咔哒来源）。
+          调用方（`_capture_loop`）据此把 block 取成 pkt 的整数倍。
+        """
+        while self._buf is None or self._buf.shape[0] < self.block:
+            r = self._pull(rec)
+            if r is None:
+                if self._buf is None or self._buf.shape[0] == 0:
+                    # ⚠ 不要在这里 sleep —— 交给调用方统一退避（`_capture_loop`
+                    #   的 `_empty_streak`）。两处各睡一次会让"有数据"时白等。
+                    return None
+                # 已有残留但暂时读不到：短睡再来（不填零、不伪造）
+                time.sleep(0.001)
+        out = self._buf[:self.block]
+        rest = self._buf[self.block:]
+        self._buf = rest if rest.shape[0] else None
+        self.blk_out += 1
+        return out
+
+
 class _Analyzer:
     """逐块音频分析：所有跨块持久状态集中在实例里，feed() 出错不会丢线程。"""
 
-    def __init__(self, sr):
+    def __init__(self, sr, block=BLOCK):
         self.sr = sr
-        self.block_sec = BLOCK / sr
+        # ★ 2026-10-08：block 可由采集层传入（原生采集路径用 pkt 的整数倍，
+        #   见 _BlockAssembler）。默认仍取模块级 BLOCK，行为不变。
+        self.block = int(block)
+        self.block_sec = self.block / sr
         self.energy_scale = 1.0   # 能量伽马校正（>1 压低人声段、鼓点段基本不动）
         self.win = np.hanning(2048)
         self.prev_spec = None
@@ -421,7 +514,7 @@ class _Analyzer:
         rg_kick = (int(np.searchsorted(freqs, 20, "left")),
                    int(np.searchsorted(freqs, 200, "right")))
         plan = (freqs, _rg(20, 160), _rg(160, 2000), _rg(2000, 12000),
-                edges, max(1, int(self.sr // BLOCK)), rg_kick)
+                edges, max(1, int(round(self.sr / self.block))), rg_kick)
         self._fft_plan_cache = (self.sr, plan)
         return plan
 
@@ -511,7 +604,7 @@ class _Analyzer:
 
         # ---- BPM 估计 v6（每 ~1s）：kick 节奏优先 + 谐波梳状 + 60s 投票众数 ----
         if self.flux_i % bpm_period == 0:
-            fps = self.sr / BLOCK
+            fps = self.sr / self.block
             bh = self.bass_flux_hist.copy()
             fh = self.flux_hist.copy()
 
@@ -1314,6 +1407,11 @@ class AudioEngine:
         gen = self._gen
         with self.state.lock:
             self.state.running = False
+            # ★★ 2026-10-08：每次重开音源都从干净状态起步。
+            #   局域网音源的失败/状态文案若不清，会跨"切换设备"残留 ——
+            #   用户从「局域网音频」切到系统声音再切回来，界面会先闪一下旧错误。
+            self.state.lan_failed = ""
+            self.state.lan_info = ""
         self._submit(lambda sc: self._run(sc, source_type, device_name, mono, sr, gen,
                                           ch0, ch1))
 
@@ -1321,6 +1419,8 @@ class AudioEngine:
         self._gen += 1                      # 当前采集在下次检查时退出
         with self.state.lock:
             self.state.running = False
+            self.state.lan_failed = ""      # ★ 停止后不再挂着局域网错误文案
+            self.state.lan_info = ""
 
     def shutdown(self):
         self._gen += 1
@@ -1508,6 +1608,24 @@ class AudioEngine:
 
     def _run(self, sc, source_type, device_name, mono, sr, gen, ch0=0, ch1=1):
         st = self.state
+        # ---- 局域网音频（自研轻量协议）：**独立分支**，完全不碰 soundcard ----
+        # ★ 2026-10-08 新增：A 机跑独立采集发送小 exe，B 机在这里收。
+        #   `device_name` 在这一路不是"设备名"而是**端口号字符串**（用户可改，
+        #   默认 47811）—— 语音上还是叫"设备"，界面不用为它单开一个输入框。
+        if source_type == "lan":
+            err = None
+            try:
+                err = self._run_lan(st, device_name, mono, sr, gen)
+            except Exception as e:                             # noqa: BLE001
+                err = "%s: %s" % (type(e).__name__, e)
+            if err is None:
+                return                      # 正常跑完了（切设备/停止）
+            with st.lock:
+                st.lan_failed = err
+                st.error = "局域网音频不可用：%s" % err
+            print("[局域网音频] %s" % err)
+            return                          # ⚠ 不自动回退系统声音：用户明确要的是对端声音，
+                                            #   悄悄换成本机系统声音会让他以为"连上了"（更糟）
         # ---- ASIO 低延迟输入：**独立分支**，不碰 soundcard ----
         # ⚠ 失败必须优雅回退：ASIO 是**单客户端独占**的，VirtualDJ / DAW 占着就一定开不了，
         #   这时候绝不能"报个错就完了"——演出不能停，自动退回系统声音（WASAPI）。
@@ -1568,9 +1686,172 @@ class AudioEngine:
                 st.error = str(e)
                 st.running = False
 
-    def _capture_loop(self, mic, mono, sr, gen):
+    def _run_lan(self, st, device_name, mono, sr, gen):
+        """局域网音频采集（B 机）。
+
+        `device_name` 在这一路是「端口 / 对端IP」（用户可填）：
+          - `"47811"`               → 只听本机 47811 端口，对端自动发现
+          - `"192.168.31.96"`       → 只听这个 IP 发来的包，端口用默认 47811
+          - `"192.168.31.96:47811"` → 指定 IP + 端口
+        返回 None = 正常跑完（切设备/停止）；返回字符串 = 出错原因。
+        """
+        port = lan_audio.DEFAULT_PORT
+        peer_hint = ""
+        txt = (device_name or "").strip()
+        if txt:
+            # ★ 手动 IP（2026-10-08 新增，用户要求"加一个手动输入 IP 的选项"）。
+            #   统一解析：允许 纯IP / 纯端口 / IP:端口。
+            host, _, tail = txt.rpartition(":")
+            if host and tail and tail.isdigit():
+                # 形如 1.2.3.4:47811
+                peer_hint = host.strip()
+                p = int(tail)
+                if 1 <= p <= 65535:
+                    port = p
+            elif txt.replace(".", "").isdigit() and "." in txt:
+                # 形如 1.2.3.4（纯 IP，无端口）
+                peer_hint = txt
+            else:
+                # 形如 47811（纯端口）⚠ 必须在"纯 IP"分支之后，否则 47811 会被当 IP
+                digits = "".join(c for c in txt if c.isdigit())
+                if digits:
+                    try:
+                        p = int(digits)
+                        if 1 <= p <= 65535:
+                            port = p
+                    except Exception:                            # noqa: BLE001
+                        pass
+        try:
+            dev = lan_audio_recv.LanDevice(port=port, peer_hint=peer_hint)
+        except Exception as e:                                   # noqa: BLE001
+            return "%s: %s" % (type(e).__name__, e)
+        if not dev.start():
+            return dev.error or ("无法绑定 UDP 端口 %d" % port)
+        # 等 A 机的第一包（最多 5s）—— 拿到才知道真实采样率与包长
+        wait_until = time.perf_counter() + 5.0
+        while time.perf_counter() < wait_until:
+            if self._gen != gen:
+                dev.stop()
+                return None
+            if dev.samplerate:
+                break
+            time.sleep(0.02)
+        if not dev.samplerate:
+            dev.stop()
+            if peer_hint:
+                # ★ 手填了 IP 却没通：给出**针对性的**提示（不然用户只会看到通用文案）
+                if dev._hint_rejects > 0:
+                    return ("5 秒内没有收到来自 %s 的音频包（端口 %d）。"
+                            "有 %d 个包因对端地址不符被过滤 —— 请核对对方 IP。"
+                            % (peer_hint, port, dev._hint_rejects))
+                return ("5 秒内没有收到来自 %s 的音频包（端口 %d）。"
+                        "请确认 A 机已运行「EasyReality 音频发送端」、"
+                        "两台机器在同一局域网、防火墙放行 UDP %d。"
+                        % (peer_hint, port, port))
+            return ("5 秒内没有收到任何音频包（端口 %d）。"
+                    "请确认 A 机软件已在运行、两台机器在同一局域网、"
+                    "且防火墙允许 UDP %d。"
+                    "（若自动发现失败，可在「设备」里直接填 A 机的 IP。）" % (port, port))
+        # 采样率：用户选了就按用户的（下游会走一次 resample），否则跟随对端
+        use_sr = int(sr) if sr else int(dev.samplerate)
+        with st.lock:
+            st.device_desc = "局域网音频 ← %s（%dHz）" % (dev.peer or "?", dev.samplerate)
+            st.error = ""
+            # ★★ 2026-10-08 修（用户报「已经握手上了然而文字没更新」）：
+            #   `lan_failed` 原来**只有写入、没有清空**：
+            #     ① `_run` 里失败时写它；
+            #     ② `_capture_loop` 里 `if ls["error"]: st.lan_failed = ...`（error 空时不写）。
+            #   ⇒ 只要**曾经**失败过一次（例如第一次点「应用」时 A 机还没启动 ⇒ 5 秒超时），
+            #     这条陈旧文案就永久留在界面上（`panels._update_meters` 里 `if fail:`
+            #     优先于 `elif info:`）—— 哪怕之后握手成功、`lan_info` 已有内容，
+            #     对话框底部仍显示那句「5 秒内没有收到任何音频包…」。
+            #   这里握手成功即清空；`lan_info` 同时重置，等下一秒状态刷新填上。
+            st.lan_failed = ""
+            st.lan_info = ""
+            st.running = True
+        try:
+            self._capture_loop(dev, mono, use_sr, gen, wrap_native=False)
+        finally:
+            dev.stop()
+        return None
+
+    def _capture_loop(self, mic, mono, sr, gen, wrap_native=True):
+        """采集主循环。`wrap_native=False` 时**不**对 mic 做 wasapi 包装。
+
+        ⚠ 局域网音频（`_run_lan`）传 False：它的 mic 是 `LanDevice`，
+          本来就已经是"驱动包长级别、不攒块"的来源，再包一层 wasapi 会直接炸。
+        """
         st = self.state
-        analyzer = _Analyzer(sr)
+        # ★★★ 2026-10-08：**换音源时必须先把「电平/能量类」字段清零**。
+        #
+        # 用户报：「局域网音频有声音，切到别的输入（声卡/系统声音）后——那边没声音时
+        #   总电平**卡在一个地方不会归零**，画面也**一直在那放**；切到有声音的输入就正常。」
+        #
+        # 为什么：本循环要等到**第一块数据**才会 `analyzer.feed(data, st)` 去刷新 `st`。
+        #   而新音源在"系统声音此刻没在播 / 局域网还没收到包 / 设备刚打开"时会**没有数据**
+        #   ⇒ `st.level / st.energy / ...` 一直是**上一个音源留下的残值**
+        #   ⇒ 界面总电平卡住不归零，引擎也据此认为"还有声音"继续驱动画面。
+        #
+        # ⚠ 只在**采集循环启动时**清一次：正常有数据的音源几百微秒内就会把值重新填上，
+        #   对正常切换零影响；**绝不可每帧清** —— 那会把电平永远压成 0。
+        # ⚠ 不清 BPM / 拍钟（那是"锁定值"，切换音源后由新数据自行重建；用户本轮未报此项）。
+        try:
+            with st.lock:
+                st.level = 0.0
+                st.bass = 0.0
+                st.mid = 0.0
+                st.high = 0.0
+                st.energy = 0.0
+                st.spectrum = [0.0] * 24
+                st.energy_trend = 0.0
+                st.vocalness = 0.0
+                st.silent_sec = 0.0
+                st.lv_db = -80.0
+                st.segment = "none"
+                st.onset_density = 0.0
+                st.bpm_stab = 0.0
+                st.beat_clarity = 0.0
+                st.spec_complex = 0.0
+                st.drop = False
+                st.beat_active = False
+                st.is_beat = False
+                st.is_bar = False
+        except Exception:                                          # noqa: BLE001
+            pass
+        # ★★ 2026-10-08：NDI 音频「随机咔哒」根因修复。
+        #   `soundcard` 的 record(numframes=1024) 攒块相位会漂移（实测出块间隔
+        #   21.3ms 均值、P99 31.3ms），而驱动本身严格 480 帧/10ms、QPC 精度 10µs
+        #   ⇒ 换成 `wasapi_capture`（保留真实时间戳、不攒块、不填零），
+        #     再由 `_BlockAssembler` 在 Python 侧按驱动包长整数倍攒块交给下游。
+        #   ⚠ **块长必须是原生包长的整数倍**，否则余量漂移会让块间隔在
+        #     「读 2 包」与「读 3 包」之间跳（实测 21/31ms 双峰，正是咔哒来源）。
+        #     480 包长下取 960 帧（=20ms）⇒ 严格每 2 包一块，零漂移。
+        #   ⚠ 驱动原生包长按设备周期算（≈10ms）；ASIO 路径不经过这里。
+        _pkt = 0
+        _block = BLOCK
+        if not wrap_native:
+            # 局域网音频：包长固定 10ms（A 机就是按 10ms 发的），直连不包装
+            _rate = sr or 48000
+            _pkt = max(64, int(round(_rate * 0.01)))
+            _mult = max(1, (BLOCK + _pkt - 1) // _pkt)
+            _block = _pkt * _mult
+        else:
+            try:
+                import wasapi_capture as _wc
+                _raw_mic = mic
+                mic = _wc.wrap(_raw_mic)
+                _rate = _native_samplerate(getattr(_raw_mic, "_mic", None) or _raw_mic) or sr or 48000
+                _pkt = max(64, int(round(_rate * 0.01)))          # ≈10ms @ 设备原生率
+                # 取不小于原 BLOCK 的原生包长整数倍（保持下游分析尺度基本不变）
+                _mult = max(1, (BLOCK + _pkt - 1) // _pkt)
+                _block = _pkt * _mult
+            except Exception as _we:                               # noqa: BLE001
+                # 兜底：新采集层不可用就退回 soundcard 原路径（绝不因此让采集停摆）
+                print("[音频] 原生采集层不可用，退回 soundcard：%s" % _we)
+                _pkt = 0
+                _block = BLOCK
+        analyzer = _Analyzer(sr, block=_block)
+        assembler = _BlockAssembler(_block, _pkt) if _pkt else None
         # 连续读块失败计数：设备被拔掉时 record() 会不停抛异常，
         # 旧写法「单块出错就跳过、继续循环」会让采集线程一直占着 worker，
         # 后续「切换设备」的任务永远排在它后面 → 表现为改音源毫无反应。
@@ -1603,6 +1884,7 @@ class AudioEngine:
         _ndi_diag_last = None     # ★ 上一次记录的「采集门控」二元组（见循环内，值变化才写一行）
         _blk_ok = 0               # ★ 采集心跳：成功取到的音频块数
         _blk_empty = 0            # ★ 采集心跳：record() 返回空/None 的次数
+        _empty_streak = 0         # ★ 连续空转次数（>3 起退避 sleep，见循环内说明）
         _push_ok = 0              # ★ 采集心跳：成功入队给 NDI 的次数
         _push_err = ""            # ★ 采集心跳：最近一次投递异常（诊断）
         _hb_t0 = time.perf_counter()   # ★ 采集心跳计时起点
@@ -1641,11 +1923,28 @@ class AudioEngine:
                             pass
                     # 实时透传能量伽马校正（用户调滑块后下一块立即生效，不能在启动时只拷贝一次）
                     analyzer.energy_scale = self.energy_scale
-                    data = rec.record(numframes=BLOCK)
+                    # ★★ 2026-10-08：改用 `_BlockAssembler.read()` —— 按驱动原生包长取数
+                    #   再按原生包长整数倍攒块（修「随机咔哒」，见 _BlockAssembler 的说明）。
+                    data = assembler.read(rec) if assembler is not None else rec.record(numframes=_block)
                     if data is None or len(data) == 0:
                         _blk_empty += 1
+                        # ★★ 2026-10-08：**空转必须退避**（现场事故：软件卡到弹窗狂闪）。
+                        #   为什么原来可以不睡：老路径是 `soundcard.record()` —— 它**阻塞**
+                        #   到有数据才返回，`continue` 不会空转。
+                        #   新路径两条都**立即返回 None**：
+                        #     ① 局域网音频 `_LanRecorder.record()` 缓冲不足直接 return None；
+                        #     ② `_BlockAssembler.read()` 缓冲为空时也 return None。
+                        #   ⇒ 裸 `continue` = **无 sleep 死循环**，实测 2 分钟累积
+                        #     `empty=60244562` 次、吃满一个核、长期持有 GIL ⇒
+                        #     主线程每 500ms 抢引擎锁被饿死 ⇒ **界面卡成幻灯片**。
+                        #   ⚠ 判据：**空转的次数越多，睡得越久**（1ms→3ms 封顶），
+                        #     有数据立刻归零 ⇒ 稳态零代价、异常时自动降速。
+                        _empty_streak += 1
+                        if _empty_streak > 3:
+                            time.sleep(0.003 if _empty_streak > 30 else 0.001)
                         continue
                     err_streak = 0
+                    _empty_streak = 0
                     _blk_ok += 1
                     if mono:
                         # ---- 左声道死零兜底（仅在 mono 且立体声时）----
@@ -1725,6 +2024,31 @@ class AudioEngine:
                             _push_ok += 1
                     except Exception as _pe:
                         _push_err = "%s: %s" % (type(_pe).__name__, str(_pe)[:80])
+                    # ★ 局域网音频状态刷新：每秒写一次 snapshot 字段（界面要看延迟/丢包）。
+                    #   放在心跳点旁边，复用同一次 perf_counter 比较，不进热路径。
+                    if isinstance(mic, lan_audio_recv.LanDevice):
+                        _lan_t = getattr(self, "_lan_info_t", 0.0)
+                        if time.perf_counter() - _lan_t >= 1.0:
+                            self._lan_info_t = time.perf_counter()
+                            try:
+                                ls = mic.snapshot()
+                                _hint = ls.get("peer_hint") or ""
+                                with st.lock:
+                                    st.lan_info = (
+                                        "%s对端 %s | %.1fHz | 深度 %.0fms | 抖动 %.0fms"
+                                        " | 丢包 %d (%.2f%%)"
+                                        % ("[指定 %s] " % _hint if _hint else "",
+                                           ls["peer"] or "?", ls["sr"] or 0,
+                                           ls["depth_ms"], ls["jitter_ms"],
+                                           ls["lost"], ls["lost_rate"]))
+                                    # ★★ 2026-10-08：这里**必须双向写**。
+                                    #   旧写法 `if ls["error"]: st.lan_failed = ...` 只写不清
+                                    #   ⇒ 失败过一回之后即使恢复正常，界面永远挂着旧错误
+                                    #     （用户报「已经握手上了然而文字没更新」）。
+                                    #   现在：有错就写、无错就清 —— 与 `lan_info` 同步更新。
+                                    st.lan_failed = ls["error"] or ""
+                            except Exception:                      # noqa: BLE001
+                                pass
                     # ★ 采集侧心跳（每 10s 一行）：现场"到底有没有在投递音频"的**唯一硬证据**。
                     #   blk=采集到的块数 / push=成功入队次数 / 队列当前长度 / 错误。
                     #   若 push 恒为 0 而 blk 在涨 ⇒ 门控或异常吞掉了投递；
