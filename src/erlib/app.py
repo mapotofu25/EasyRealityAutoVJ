@@ -222,6 +222,7 @@ class ErlibWindow(QMainWindow):
         self.scan_th = None
         self.exp_th = None
         self.on_th = None        # 联网补跑线程
+        self._work_busy = False  # ★ 修复2：工作库写任务互斥（扫描/联网补跑/删除）
         self._n_checked = 0
         self._t0 = 0.0           # 本轮扫描起点（算"剩余约 X 分钟"用）
         self._build()
@@ -390,6 +391,35 @@ class ErlibWindow(QMainWindow):
         self.lbl.setText("共 %d 首 · 已勾选 %d 首 · 工作库：%s"
                          % (self.tbl.rowCount(), n, os.path.basename(self.work)))
 
+    # ---------------- 工作库写任务互斥（修复 2） ----------------
+    def _set_work_busy(self, on):
+        """置/清「会写工作库的长任务」忙状态（扫描 / 联网补跑 / 删除）。
+
+        ★ 2026-10-10（T7 审计修复 2）：三个入口各自 new 一个 `LibWriter` 写**同一个**
+          `erlib_scan.eravjlib`，此前互不检查 ⇒ 扫描大库（~1 小时）时点「联网补跑」或
+          「删除勾选」，会让两个写库并发 ⇒ `database is locked` 被 `except` 吞掉
+          （表现为"失败 N 首" / "补跑 0 首"），或 `update_genres` 的曲风更新被扫描阶段的
+          整条 `INSERT OR REPLACE` 覆盖。这里用一个共享标志 + 按钮互斥把它们**串行化**：
+            忙 ⇒ 三个写工作库按钮全部禁用；空闲 ⇒ 恢复。
+        ⚠ **不改线程模型**：扫描 / 补跑仍是各自的 `QThread`，只是不允许同时启动。
+        """
+        self._work_busy = bool(on)
+        for b in (self.btn_scan, self.btn_online, self.btn_del):
+            try:
+                b.setEnabled(not self._work_busy)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    def _work_busy_guard(self):
+        """若有别的写工作库任务在跑，提示用户并返回 True（调用方据此早退）。"""
+        if self._work_busy:
+            QMessageBox.information(
+                self, APP_TITLE,
+                "已有任务正在进行（扫描 / 联网补跑曲风 / 删除），"
+                "请等它结束后再操作。")
+            return True
+        return False
+
     # ---------------- 动作 ----------------
     def _pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择曲库文件夹", self.root or "")
@@ -402,6 +432,8 @@ class ErlibWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "先选一个曲库文件夹。")
             return
         if self.scan_th is not None and self.scan_th.isRunning():
+            return
+        if self._work_busy_guard():                              # ★ 修复2：互斥
             return
         self.tbl.setUpdatesEnabled(False)
         try:
@@ -426,13 +458,23 @@ class ErlibWindow(QMainWindow):
 
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self._set_work_busy(True)                                # ★ 修复2：置忙（禁用另两个）
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
-        self.scan_th = ScanThread(self.root, w, use_online=False, parent=self)
-        self.scan_th.progress.connect(self._on_prog)
-        self.scan_th.finished_ok.connect(self._on_scan_done)
-        self.scan_th.failed.connect(self._on_scan_fail)
-        self.scan_th.start()
+        # ★★ 回归修复（QA 实测）：`start()` 可能抛异常（线程资源不足等）。此时**必须回滚**
+        #   忙标志，否则三个写工作库按钮会**永久禁用、只能重启软件**
+        #   （旧代码最多只 disable 1 个按钮）。照 `_on_delete` 的 try/finally 精神处理。
+        try:
+            self.scan_th = ScanThread(self.root, w, use_online=False, parent=self)
+            self.scan_th.progress.connect(self._on_prog)
+            self.scan_th.finished_ok.connect(self._on_scan_done)
+            self.scan_th.failed.connect(self._on_scan_fail)
+            self.scan_th.start()
+        except Exception as e:                                   # noqa: BLE001
+            self._set_work_busy(False)                           # ★ 异常路径回滚
+            self.btn_stop.setEnabled(False)
+            QMessageBox.warning(self, APP_TITLE, "扫描启动失败：%s" % e)
+            return
 
     def _on_stop(self):
         if self.scan_th is not None:
@@ -458,6 +500,7 @@ class ErlibWindow(QMainWindow):
     def _on_scan_done(self, st):
         self.btn_scan.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._set_work_busy(False)                               # ★ 修复2：解除互斥
         self.bar.setRange(0, 100)
         self.bar.setValue(100)
         self.tbl.setRowCount(0)
@@ -486,11 +529,14 @@ class ErlibWindow(QMainWindow):
     def _on_scan_fail(self, msg):
         self.btn_scan.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._set_work_busy(False)                               # ★ 修复2：解除互斥
         QMessageBox.warning(self, APP_TITLE, "扫描出错：%s" % msg)
 
     def _on_online(self):
         """联网补跑曲风：对工作库里还没有精确在线结果的歌重跑（见 OnlineThread）。"""
         if self.on_th is not None and self.on_th.isRunning():
+            return
+        if self._work_busy_guard():                              # ★ 修复2：互斥
             return
         if not os.path.isfile(self.work):
             QMessageBox.information(self, APP_TITLE, "还没有工作库，先「开始扫描」。")
@@ -511,14 +557,23 @@ class ErlibWindow(QMainWindow):
             return
         self.btn_online.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self._set_work_busy(True)                                # ★ 修复2：置忙（禁用另两个）
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
         self.lbl.setText("联网补跑：准备中…")
-        self.on_th = OnlineThread(self.work, self.root, parent=self)
-        self.on_th.progress.connect(self._on_on_prog)
-        self.on_th.finished_ok.connect(self._on_online_done)
-        self.on_th.failed.connect(self._on_online_fail)
-        self.on_th.start()
+        # ★★ 回归修复（QA 实测）：同 `_on_scan` —— `start()` 失败必须回滚忙标志，
+        #   否则按钮永久禁用。
+        try:
+            self.on_th = OnlineThread(self.work, self.root, parent=self)
+            self.on_th.progress.connect(self._on_on_prog)
+            self.on_th.finished_ok.connect(self._on_online_done)
+            self.on_th.failed.connect(self._on_online_fail)
+            self.on_th.start()
+        except Exception as e:                                   # noqa: BLE001
+            self._set_work_busy(False)                           # ★ 异常路径回滚
+            self.btn_stop.setEnabled(False)
+            QMessageBox.warning(self, APP_TITLE, "联网补跑启动失败：%s" % e)
+            return
 
     def _on_on_prog(self, done, total, name):
         if total > 0:
@@ -529,6 +584,7 @@ class ErlibWindow(QMainWindow):
     def _on_online_done(self, fixed, tried):
         self.btn_online.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._set_work_busy(False)                               # ★ 修复2：解除互斥
         self.bar.setRange(0, 100)
         self.bar.setValue(100 if tried else 0)
         try:
@@ -554,6 +610,7 @@ class ErlibWindow(QMainWindow):
     def _on_online_fail(self, msg):
         self.btn_online.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._set_work_busy(False)                               # ★ 修复2：解除互斥
         QMessageBox.warning(self, APP_TITLE, "联网补跑出错：%s" % msg)
 
     def _on_delete(self):
@@ -561,6 +618,8 @@ class ErlibWindow(QMainWindow):
         sids = self._checked_sids()
         if not sids:
             QMessageBox.information(self, APP_TITLE, "还没勾选任何歌。")
+            return
+        if self._work_busy_guard():                              # ★ 修复2：互斥
             return
         ret = QMessageBox.question(
             self, APP_TITLE,
@@ -572,15 +631,19 @@ class ErlibWindow(QMainWindow):
             QMessageBox.StandardButton.No)
         if ret != QMessageBox.StandardButton.Yes:
             return
+        self._set_work_busy(True)                                # ★ 修复2：置忙
         try:
-            w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
             try:
-                n = w.delete_songs(sids)
-            finally:
-                w.close()
-        except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, APP_TITLE, "删除失败：%s" % e)
-            return
+                w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
+                try:
+                    n = w.delete_songs(sids)
+                finally:
+                    w.close()
+            except Exception as e:                               # noqa: BLE001
+                QMessageBox.warning(self, APP_TITLE, "删除失败：%s" % e)
+                return
+        finally:
+            self._set_work_busy(False)                           # ★ 修复2：解除互斥
         self._reload_table()
         self.lbl.setText("已删除 %d 首（工作库剩 %d 首）"
                          % (n, self.tbl.rowCount()))

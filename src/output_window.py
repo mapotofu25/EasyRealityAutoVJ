@@ -255,18 +255,27 @@ class OutputWindow(QWidget):
             if scr is not None:
                 self._reassert_fullscreen_later(scr)
 
-    def set_borderless(self, on: bool):
-        flags = Qt.FramelessWindowHint | Qt.Window if on else Qt.Window
+    def _set_flags_keep_state(self, apply_flags):
+        """改窗口标志时**保持「全屏 / 可见」状态不变**。
+
+        ⚠ Qt 在可见窗口（尤其全屏）上改 window flags 会隐藏并重建原生窗口 ⇒ 全屏会被踢掉
+        （表现为「全屏下改边框/置顶，画面缩回窗口」）。这里记下改前状态、改完恢复回去；
+        **非全屏行为与改动前逐值一致**（原来就是 `if visible: self.show()`）。
+        """
+        was_fullscreen = self.isFullScreen()
         visible = self.isVisible()
-        self.setWindowFlags(flags)
-        if visible:
+        apply_flags()
+        if was_fullscreen:
+            self.showFullScreen()
+        elif visible:
             self.show()
 
+    def set_borderless(self, on: bool):
+        flags = Qt.FramelessWindowHint | Qt.Window if on else Qt.Window
+        self._set_flags_keep_state(lambda: self.setWindowFlags(flags))
+
     def set_always_top(self, on: bool):
-        visible = self.isVisible()
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
-        if visible:
-            self.show()
+        self._set_flags_keep_state(lambda: self.setWindowFlag(Qt.WindowStaysOnTopHint, on))
 
     def set_mouse_hidden(self, on: bool):
         self._mouse_hidden = on

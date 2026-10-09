@@ -54,6 +54,41 @@ class SendStats:
         return (self.bytes * 8 / 1e6 / dt) if dt > 0 else 0.0
 
 
+def _subnet_broadcasts(port=LA.DEFAULT_PORT):
+    """每张真实网卡的**子网定向广播**地址列表（如 `192.168.31.255`）。
+
+    **不含**受限广播 `255.255.255.255`，**不含** arp（纯计算、零 I/O）。
+
+    ★ 2026-10-10（T7 审计修复 4）：发送端原来直接用 `LA.broadcast_targets()`，
+      其**首项**就是 `255.255.255.255`。而接收端（`lan_audio_recv._announce`）
+      早已把它剔除 —— 两边策略不对称。受限广播正是**唯一**会被穿透/代理虚拟网卡
+      抢走源地址的那条（详见 `lan_audio.announce_targets` docstring：源变成不可达地址
+      ⇒ 对端把 peer 学死）。
+
+    这里**复用** `lan_audio` 已有的地址构造逻辑（`_local_ipv4_with_prefix()` +
+    `_subnet_broadcast()`，不新增第二套子网换算实现）；只是**不**带上
+    `announce_targets()` 里那段 arp（`lan_hosts()`，实测 ~152ms）——因为本函数在
+    发送**热路径**上被每个 DATA 包调用（未握手时 ~100 次/秒），绝不能做 I/O
+    （铁律 8）。对端与发送端在同一子网时，子网定向广播可达全网段，发现能力与接收端等价。
+    """
+    out = []
+    try:
+        nics = LA._local_ipv4_with_prefix()                      # noqa: SLF001
+    except Exception:                                            # noqa: BLE001
+        return out
+    for ip, prefix in nics:
+        try:
+            b = LA._subnet_broadcast(ip, prefix)                 # noqa: SLF001
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not b:
+            continue
+        t = (b, int(port))
+        if t not in out:
+            out.append(t)
+    return out
+
+
 class Sender:
     """A 机：从 WASAPI 采集 → UDP 广播/单播给 B 机。
 
@@ -145,10 +180,11 @@ class Sender:
     def _targets(self):
         """发到哪里。
 
-        策略（2026-10-08 定稿）：
+        策略（2026-10-08 定稿；2026-10-10 修复 4 补充）：
         1. **学到 peer** ⇒ 只发 peer（最省带宽、最准）。
         2. 否则 **有用户填的 dest** ⇒ 发 dest。
-        3. 否则广播。
+        3. 否则广播 —— **仅每张真实网卡的子网定向广播**（`_subnet_broadcasts`），
+           **不含**受限广播 `255.255.255.255`（与接收端策略对齐）。
 
         ⚠⚠ 千万不要"peer + 广播同时发"（我一开始就是这么写的，被回归测试当场打回）：
           B 机同时从**单播**和**广播**两条路收到**同一个 seq 的包**，
@@ -174,10 +210,13 @@ class Sender:
                 return [self._peer]
         if self.dest:
             return [self.dest]
-        try:
-            return list(LA.broadcast_targets(self.port))
-        except Exception:                                        # noqa: BLE001
-            return []
+        # ★★ 2026-10-10（T7 审计修复 4）：广播发现**绝不发受限广播 255.255.255.255**
+        #   —— 与接收端 `lan_audio.announce_targets()` 的策略对齐。
+        #   ⚠ 此处**不能**直接调 `LA.announce_targets()`：它内部会跑 `lan_hosts()`
+        #     （arp -a 实测 ~152ms），而本函数在**热路径**上被每个 DATA 包调用
+        #     （未握手时 ~100 次/秒）⇒ 会把发送线程拖死（正是铁律 8 禁止的
+        #     "发送/采集线程做 I/O"）。故只复用它的**纯计算部分**（网卡枚举 → 子网定向广播）。
+        return _subnet_broadcasts(self.port)
 
     def _send(self, kind, seq, ch, sr, n, qpc, payload):
         pkt = LA.pack(kind, seq, ch, sr, n, qpc, payload)

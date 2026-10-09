@@ -1591,7 +1591,15 @@ class AudioEngine:
             st.running = True
         print("[ASIO] 已开始采集：%s" % info)
         try:
-            self._capture_loop(asio_engine.AsioDevice(cap), mono, sr_use, gen)
+            # ★★ 2026-10-10 修（ASIO 输入 100% 失效）：ASIO 必须走「不包装」路径
+            #   （wrap_native=False）。`AsioDevice` 本身就是「原生包长级别、不攒块」的
+            #   来源，形状已兼容 `_capture_loop` 的下游；若被 `wasapi_capture.wrap()`
+            #   再包一层 `TimedDevice`，其 `recorder()` 会按 soundcard 约定访问
+            #   `self._mic._audio_client()` —— 而 `AsioDevice` 没有该属性
+            #   ⇒ 每块抛 AttributeError ⇒ 被 `_run` 当成「ASIO 不可用」恒回退系统声音。
+            #   包长用驱动上报的 `buffer_frames`（实测 Realtek 528@48k ≈11ms）。
+            self._capture_loop(asio_engine.AsioDevice(cap), mono, sr_use, gen,
+                               wrap_native=False, native_pkt=cap.buffer_frames)
             ov = cap.overflows()
             if ov > 0:
                 # 环形缓冲被读得太慢（通常意味着主线程/分析线程被别的东西拖住）
@@ -1775,11 +1783,15 @@ class AudioEngine:
             dev.stop()
         return None
 
-    def _capture_loop(self, mic, mono, sr, gen, wrap_native=True):
+    def _capture_loop(self, mic, mono, sr, gen, wrap_native=True, native_pkt=None):
         """采集主循环。`wrap_native=False` 时**不**对 mic 做 wasapi 包装。
 
-        ⚠ 局域网音频（`_run_lan`）传 False：它的 mic 是 `LanDevice`，
-          本来就已经是"驱动包长级别、不攒块"的来源，再包一层 wasapi 会直接炸。
+        ⚠ **两个音源必须传 `wrap_native=False`**（它们的 mic 已经是「原生包长级别、
+          不攒块」的形状，再包一层 wasapi 会炸）：
+            · 局域网音频（`_run_lan`）：mic 是 `LanDevice`，包长固定 10ms；
+            · ASIO（`_run_asio`）：mic 是 `AsioDevice`，包长＝驱动 `buffer_frames`。
+          `native_pkt`：不包装路径的原生包长（帧）。给定时优先用它（ASIO 传
+          `cap.buffer_frames`）；None 时回退「≈10ms @ sr」（局域网默认）。
         """
         st = self.state
         # ★★★ 2026-10-08：**换音源时必须先把「电平/能量类」字段清零**。
@@ -1825,14 +1837,17 @@ class AudioEngine:
         #     再由 `_BlockAssembler` 在 Python 侧按驱动包长整数倍攒块交给下游。
         #   ⚠ **块长必须是原生包长的整数倍**，否则余量漂移会让块间隔在
         #     「读 2 包」与「读 3 包」之间跳（实测 21/31ms 双峰，正是咔哒来源）。
-        #     480 包长下取 960 帧（=20ms）⇒ 严格每 2 包一块，零漂移。
-        #   ⚠ 驱动原生包长按设备周期算（≈10ms）；ASIO 路径不经过这里。
+        #   ⚠ 实际取值（2026-10-10 更正注释，旧写「960 帧/2 包」是 960 方案的残留、
+        #     与实现不符）：BLOCK=1024、480 包长 ⇒ `_mult=ceil(1024/480)=3`
+        #     ⇒ `_block=1440`（30ms，严格每 3 包一块、余量零漂移）。
         _pkt = 0
         _block = BLOCK
         if not wrap_native:
-            # 局域网音频：包长固定 10ms（A 机就是按 10ms 发的），直连不包装
+            # 不包装路径：局域网按 A 机固定 10ms 包长直连；
+            # ASIO 用驱动上报的 buffer_frames（实测 Realtek 528@48k ≈11ms）作原生包长。
             _rate = sr or 48000
-            _pkt = max(64, int(round(_rate * 0.01)))
+            _pkt = int(native_pkt) if native_pkt and int(native_pkt) > 0 \
+                else max(64, int(round(_rate * 0.01)))
             _mult = max(1, (BLOCK + _pkt - 1) // _pkt)
             _block = _pkt * _mult
         else:
@@ -1946,6 +1961,26 @@ class AudioEngine:
                     err_streak = 0
                     _empty_streak = 0
                     _blk_ok += 1
+                except Exception as e:
+                    # ---- 采集段异常（设备 I/O）----
+                    # 只有这里才累加 err_streak、连续 5 次才停采集（设备真断开时停止 +
+                    # 提示是正确的产品行为：连续读块失败 = 设备不可用，停掉让 worker
+                    # 空出来接手「切换设备」任务，否则旧实现会把 worker 永久占住）。
+                    err_streak += 1
+                    with st.lock:
+                        if err_streak >= 5:
+                            st.error = ("音频设备可能已断开或不可用，已停止采集。"
+                                        "请到「音源」重新选择设备后点应用。")
+                            st.running = False
+                        else:
+                            st.error = f"读取块错误（已跳过）: {e}"
+                    if err_streak >= 5:
+                        break   # 主动退出，把 worker 让给「切换设备」的任务
+                    time.sleep(0.02)
+                    continue
+                try:
+                    # ---- 分析/转发段 ----
+                    # ★★ 2026-10-10：本段异常**绝不停止采集**（见段尾 except 注释）。
                     if mono:
                         # ---- 左声道死零兜底（仅在 mono 且立体声时）----
                         if data.ndim == 2 and data.shape[1] >= 2:
@@ -2075,18 +2110,15 @@ class AudioEngine:
                     except Exception:
                         pass
                 except Exception as e:
-                    # 单块出错不杀死采集线程：记录并继续；但连续失败要放弃
-                    err_streak += 1
+                    # ★★ 2026-10-10：分析段异常**绝不能因分析代码的 bug 停止采集**。
+                    #   历史真实踩过：分析代码里一个局部变量改名导致每块抛 NameError，
+                    #   旧实现把它算作「连续失败」，5 块后直接停采集 ⇒ 用户"没声音"。
+                    #   这里只记录 + 跳过本块，采集继续跑；设备层错误由上面的「采集段」
+                    #   （err_streak）负责 —— 分析代码出问题不该让整条采集链陪葬。
                     with st.lock:
-                        if err_streak >= 5:
-                            st.error = ("音频设备可能已断开或不可用，已停止采集。"
-                                        "请到「音源」重新选择设备后点应用。")
-                            st.running = False
-                        else:
-                            st.error = f"分析块错误（已跳过）: {e}"
-                    if err_streak >= 5:
-                        break   # 主动退出，把 worker 让给「切换设备」的任务
+                        st.error = f"分析块错误（已跳过）: {e}"
                     time.sleep(0.02)
+                    continue
         # 采集结束（切换设备/停止）：复位运行标志
         with st.lock:
             if self._gen != gen:

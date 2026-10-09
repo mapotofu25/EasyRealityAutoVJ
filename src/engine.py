@@ -45,6 +45,16 @@ _HEAL_GLOBAL_INTERVAL = 2.0   # 全局：每这么久最多自动重建 1 次（
 # **不是**冷却 —— 换素材时**不需要**重置（重置只会让换素材瞬间多放行一次，无意义）。
 _HEAL_CHECK_INTERVAL = 0.5
 
+# 渲染主循环异常日志（`_tick` 的 except）的限流间隔（秒）：首次必记，之后每这么久最多记一次。
+#   原实现是 `if _err_log_n <= 5` —— 第 6 次起**永久静默**；而持久异常会让 `_tick_locked`
+#   中途退出 ⇒ 预览 / NDI / Spout 静默冻结，且日志里再没有任何线索（FINAL_REPORT P2）。
+_ERR_LOG_MIN_INTERVAL = 30.0
+
+# GUI 无锁状态快照里 `next_clips`（每图层「下一个素材预看」）的重算间隔（秒）。
+#   `next_clip_for` 内部本就「每 2 秒才换一次预估」（见其注释），所以 0.25s 刷新与每帧刷新
+#   **结果完全相同**，却省掉每帧对所有图层跑 `_candidate_indices`（大基数素材库下不便宜）。
+_UI_NEXT_CLIP_INTERVAL = 0.25
+
 # 静默冻帧兜底（见 `_heal_silent`）：`_heal_stalled` 看不见的那几类故障
 #   （`lay.player` 不在缓存 ⇒ 永不被激活 / `lay.player is None` / 有帧前就 ended）。
 _SILENT_GRACE = 1.0          # player 缺失 / 未激活 持续超过这么久才动作（秒）
@@ -587,6 +597,12 @@ class AutoVJEngine(QObject):
         self._health_next_t = 0.0
         # GPU 可用性状态（-1=未知 / 0=否 / 1=是）；状态变化时在 `_health_tick` 写醒目日志
         self._gpu_state = -1
+        # ★ GUI 无锁状态快照（见 `ui_snapshot` / `_tick_locked` 尾部）：
+        #   引擎每 tick 把 switch_cd / phrase_cd / grid_view / next_clips 算好放这，
+        #   GUI 不再直接调那 4 个 @_locked 方法去抢渲染锁（FINAL_REPORT P1-1）。
+        self._ui_snap = {}
+        self._ui_next_t = 0.0        # next_clips 上次重算时刻（按 _UI_NEXT_CLIP_INTERVAL 节流）
+        self._ui_next_clips = {}     # 缓存的上一次 next_clips（节流期间沿用）
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
@@ -1040,6 +1056,7 @@ class AutoVJEngine(QObject):
 
     # ---------------- 主循环 ----------------
     _err_log_n = 0
+    _err_log_t = 0.0        # 上次写 engine_error.log 的时刻（异常日志限流，见 `_tick`）
 
     def _silent_hide_tick(self, snap):
         """推进「无声音时隐藏本层」的 0.5s 防抖，写入 `self._silent_now_debounced`。
@@ -1088,16 +1105,23 @@ class AutoVJEngine(QObject):
             with self._tick_lock:
                 self._tick_locked()
         except Exception:
-            # worker 线程异常在 windowed exe 下不可见：写日志文件便于排查黑屏类问题
+            # worker 线程异常在 windowed exe 下不可见：写日志文件便于排查黑屏类问题。
+            # ★ 限流而非截断（原 `<= 5` 会在第 6 次后**永久静默**，而持久异常会让
+            #   `_tick_locked` 中途退出 ⇒ 预览/NDI/Spout 静默冻结且再无线索）：
+            #   首次必记，之后每 `_ERR_LOG_MIN_INTERVAL` 秒最多记一次，并带上累计次数。
             import traceback
             from config import app_base_dir
             AutoVJEngine._err_log_n += 1
-            if AutoVJEngine._err_log_n <= 5:
+            _now = time.time()
+            if (AutoVJEngine._err_log_n == 1
+                    or (_now - AutoVJEngine._err_log_t) >= _ERR_LOG_MIN_INTERVAL):
+                AutoVJEngine._err_log_t = _now
                 try:
                     with open(os.path.join(app_base_dir(), "engine_error.log"),
                               "a", encoding="utf-8") as f:
-                        f.write("[%s]\n%s\n" % (time.strftime("%H:%M:%S"),
-                                                traceback.format_exc()))
+                        f.write("[%s] (累计第 %d 次)\n%s\n"
+                                % (time.strftime("%H:%M:%S"),
+                                   AutoVJEngine._err_log_n, traceback.format_exc()))
                 except Exception:
                     pass
 
@@ -1219,6 +1243,29 @@ class AutoVJEngine(QObject):
         self.frame_ready.emit(self._frame_seq)
         self._spout_send()
         self._ndi_send()
+        # ★ 算好「GUI 状态快照」放 `self._ui_snap`，供 GUI 无锁读取（`ui_snapshot`）。
+        #   见 FINAL_REPORT P1-1：GUI 的 `_update_status`（500ms）原先把 4 个 @_locked 方法全调
+        #   一遍 ⇒ 每 500ms 抢一次渲染锁，慢帧时会等满超时、界面一秒一顿。现改为引擎线程算好、
+        #   GUI 只读快照。本函数此刻已持 `_tick_lock`（RLock，**可重入**）⇒ 这里再调那几个
+        #   @_locked 方法不会死锁；`_beat_pos` 按时间戳重算且幂等（见其注释），额外调用不改行为。
+        try:
+            _ui = {"switch_cd": self.switch_countdown(snap),
+                   "phrase_cd": self.phrase_countdown(snap),
+                   "grid_view": self.beat_grid_view(snap)}
+            _now_ui = time.perf_counter()
+            if (_now_ui - getattr(self, "_ui_next_t", 0.0)) >= _UI_NEXT_CLIP_INTERVAL:
+                self._ui_next_t = _now_ui
+                _nxt = {}
+                for _i, _ly in enumerate(self.layers):
+                    try:
+                        _nxt[_i] = self.next_clip_for(_ly)
+                    except Exception:
+                        pass
+                self._ui_next_clips = _nxt
+            _ui["next_clips"] = getattr(self, "_ui_next_clips", {})
+            self._ui_snap = _ui          # 整体赋值（GIL 下原子）
+        except Exception:
+            pass
 
     # ⚠⚠ 这里**故意不加 @_locked**：它是 GUI 每帧都要调的取帧入口，
     #   而引擎线程在整帧渲染期间一直握着 _tick_lock ⇒ 加锁等于让 GUI 每帧都
@@ -1233,6 +1280,19 @@ class AutoVJEngine(QObject):
         所以绘制端拿到的是当时的快照，引擎随后替换不会影响它 —— 无需加锁。
         """
         return self._latest_frame
+
+    # ⚠⚠ 这里也**故意不加 @_locked**（与 `latest_frame` / `modes_snapshot` 同类，已在
+    #   `tools/_scan_locks.py` 白名单登记）：它是 GUI 高频读取的只读快照，加锁就等于让 GUI
+    #   去抢渲染锁（正是本次要修的病）。安全性：`self._ui_snap = _ui` 是**整体引用赋值**
+    #   （GIL 下原子），GUI 拿到的要么是上一份、要么是当前份，绝不会读到半成品 —— 引擎之后
+    #   只会把它整个换掉、绝不原地改它。
+    def ui_snapshot(self):
+        """GUI 无锁只读状态快照（每 tick 由引擎线程算好，见 `_tick_locked` 尾部）。
+
+        返回 dict：`{"switch_cd", "phrase_cd", "grid_view", "next_clips"}`。GUI 用它替代原先
+        直接调用 `switch_countdown` / `phrase_countdown` / `beat_grid_view` / `next_clip_for`
+        这四个 `@_locked` 方法（那会每 500ms 抢一次渲染锁，慢帧时卡界面）。⚠ 勿"顺手修"成加锁版本。"""
+        return self._ui_snap
 
     def _output_fail(self, ch, now, exc):
         """记录一次输出（NDI/Spout）发送失败：退避重试 + 30s 限流写 `output_health.log`。
@@ -1307,7 +1367,9 @@ class AutoVJEngine(QObject):
             w, h = self.canvas.width(), self.canvas.height()
             bpl = self.canvas.bytesPerLine()
             buf = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
-            s.sendImage(buf, h, w, glfmt, True, 0)
+            # ★ 参数顺序是 (buffer, width, height, …)：之前误写成 (buf, h, w, …) ⇒ 发送端宣告
+            #   尺寸转置（1920×1080 → 1080×1920），画面错乱且不报错。此处为 (w, h)，勿再写反。
+            s.sendImage(buf, w, h, glfmt, True, 0)
         except Exception as e:                                     # noqa: BLE001
             # ⚠ 失败时**保留已有 `self._spout`**、不丢成 None 重建：源名反复消失/出现更难恢复
             self._output_fail("Spout", now, e)

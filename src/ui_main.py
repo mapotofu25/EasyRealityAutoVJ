@@ -976,8 +976,37 @@ class HotkeyDialog(I18nDialog):
         return out
 
     def _apply(self):
-        """写进配置并让快捷键立即生效"""
+        """写进配置并让快捷键立即生效。
+
+        ⚠ 2026-10-10 审计修复：把「重复键校验」提到**写盘之前** —— 本次要写入的快捷键里
+          若存在「同一个键配给多个启用动作」，先弹「仍然保存？」确认框（默认按钮 = 否），
+          用户可选**取消**（不写配置、不 `apply()`、不清脏标记）。旧流程是「先 save 再
+          由 hotkeys.apply() 告知」，用户无法反悔。
+        """
         table = self._collect()
+
+        # ---- 写盘前：检测本次 table 内的重复键 ----
+        # 只比**本次要写入的 table**（cfg 里的旧值马上要被这批值覆盖，比它没有意义）。
+        # 逐 key 归组，命中「同一 key ≥2 个 enabled 动作」即为冲突。
+        _key_users = {}
+        for _name, _spec in table.items():
+            if not _spec.get("enabled", True):
+                continue
+            _k = (_spec.get("key") or "").strip()
+            if not _k:
+                continue
+            _key_users.setdefault(_k, []).append(_name)
+        _dups = [k for k, ns in _key_users.items() if len(ns) > 1]
+        if _dups:
+            # 文案复用 D 组已加进 i18n 的冲突词条（标题 T("快捷键冲突") + 正文 Tf(...)）。
+            _ret = QMessageBox.question(
+                self, T("快捷键冲突"),
+                Tf("检测到 {} 组重复快捷键（{}）；只有先配置的那个会生效，"
+                   "请在快捷键设置里改成不同的键。", len(_dups), "、".join(_dups)),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)   # 默认按钮 = 否
+            if _ret != QMessageBox.Yes:
+                return          # ★ 取消：不写配置、不调 hotkeys.apply()、不改 self._dirty
+
         hk = self.main.cfg["hotkeys"]
         for name, spec in table.items():
             cur = hk.get(name)
@@ -986,10 +1015,22 @@ class HotkeyDialog(I18nDialog):
                 hk[name] = cur
             cur.update(spec)
         self.main.cfg.save()
+        # ★ 修复 8：写盘前已弹过「可取消」的冲突窗（见上方校验），这里**不要再弹第二次**
+        #   告知窗。D 组的 `hotkeys.apply()` 在 `interactive=True` 时会再弹一次冲突告知
+        #   （`self.interactive` 是**实例标志**，HotkeyDialog 路径调 apply() 必然命中）
+        #   ⇒ 会变成"双弹窗"。这里在调用前后**临时**切掉标志，用完必须还原（try/finally）：
+        #   保留 `hotkeys.py` 给 `panic_reset` 等其它路径的告知能力（不改 hotkeys.py）。
+        #   ⚠ 原有「异常不阻断后续流程」的语义保持（内层 `except Exception: pass`）。
+        _hk = self.main.hotkeys
+        _inter_bak = getattr(_hk, "interactive", True)
+        _hk.interactive = False
         try:
-            self.main.hotkeys.apply()
-        except Exception:
-            pass
+            try:
+                _hk.apply()
+            except Exception:
+                pass
+        finally:
+            _hk.interactive = _inter_bak
         self._dirty = False
         # 全局热键可能被别的程序占用（无修饰键的字母/方向键尤其容易被抢）→ 明确告知，
         # 否则用户会以为「按了没反应」。用表格里的中文标签报出来。
@@ -1248,6 +1289,19 @@ class TagScanThread(QThread):
         self.force = force
         self._cancel = False
 
+    def cancel(self):
+        """请求中止扫描（`_cancel` + `requestInterruption()` 双保险）。
+
+        ⚠ 2026-10-10 审计：`_cancel` 原来**只写 False、从不置 True** ⇒ 死标志，扫描无法中止。
+        界面目前没有取消按钮（不改界面需求），入口只有窗口关闭路径（`MainWindow.closeEvent`）。
+        线程会在每个素材的循环检查点退出。
+        """
+        self._cancel = True
+        try:
+            self.requestInterruption()
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def run(self):
         from tagger import get_tagger
         try:
@@ -1265,7 +1319,7 @@ class TagScanThread(QThread):
         total = len(items)
         from tagger import auto_roles
         for i, m in enumerate(items):
-            if self._cancel:
+            if self._cancel or self.isInterruptionRequested():
                 break
             try:
                 kind = "image" if m.kind in ("image", "gif") else "video"
@@ -1402,6 +1456,10 @@ class DynTagScanThread(QThread):
                  if m.kind in ("image", "video", "gif") and not getattr(m, "excluded", False)]
         total = len(items)
         for i, m in enumerate(items):
+            # 支持中途中止（关闭窗口时由 closeEvent 发 requestInterruption）：
+            # 每个素材一次检查点，退出后不再对新素材解码。
+            if self.isInterruptionRequested():
+                break
             try:
                 kind = "image" if m.kind in ("image", "gif") else "video"
                 motion, flicker, diff, med = Tagger.analyze_dynamic(m.path, kind)
@@ -2856,12 +2914,32 @@ class MainWindow(QMainWindow):
         self.setVisible(not self.isVisible())
 
     def panic_reset(self):
+        """紧急恢复：把配置与**运行时**一起复位到默认（Ctrl+Shift+R）。
+
+        ⚠ 2026-10-10 审计：旧实现只 `cfg.reset()`（清空配置里的 library/layers/clip_tags…），
+          但内存里的 `self.library` / `engine.layers` 原样保留 ⇒「界面显示」与「配置」不一致：
+          之后任意一次 save 会把内存里的旧曲库又写回配置（"恢复默认"形同虚设），或反之
+          重启后素材库/图层列表整体消失。这里选「**两者都复位**」，以"界面显示与配置一致"为准。
+        """
         self.cfg.reset()
+        # 运行时一并复位。⚠ `engine.library` 与 `self.library` 是**同一个 dict 对象**
+        #   （见 engine.__init__ `self.library = media_library`），必须**原地 clear**，
+        #   不能 `self.library = {}` 重新赋值（那样引擎还指着旧 dict ⇒ 又对不上）。
+        try:
+            self.library.clear()
+        except Exception:                                        # noqa: BLE001
+            self.library = {}
+        self._cur_layer = 0
         self.engine.rebuild_from_cfg()
+        self.refresh_grid()            # 素材库网格清空，与 cfg["library"] == [] 一致
+        self._fill_tag_combo()
         self.layers_panel.rebuild()
         self.hotkeys.apply()
         self.lbl_warn.setText("")
-        QMessageBox.information(self, tr("app_name"), T("已恢复默认"))
+        QMessageBox.information(
+            self, tr("app_name"),
+            T("已恢复默认")
+            + "（设置、图层与素材库列表均已复位；素材文件仍保留在磁盘上）")
 
     # ================= 设置同步 =================
     def engine_cfg(self, sec, key, val):
@@ -3724,8 +3802,30 @@ class MainWindow(QMainWindow):
                     pass
             self._fp_db = FingerprintDB(db_path)
             self.audio.set_recognizer(self._fp_db)
-        except Exception:
-            pass
+        except Exception as e:                                   # noqa: BLE001
+            # ⚠ 2026-10-10 审计：以前这里是 `pass` —— 指纹库打不开（损坏/被占用/路径异常）时
+            #   现场识别**静默失效**（认不出歌 → 拿不到精确曲风与离线八拍网格），
+            #   而且零线索、无从排查。现在补：① 控制台 ② engine_error.log（本文件已有先例）
+            #   ③ 复用 audio.state.error 给出用户可见提示（lbl_warn 会显示）。
+            print("[识别] 指纹库初始化失败：%s" % e)
+            try:
+                import traceback
+                from config import app_base_dir as _abd
+                with open(os.path.join(_abd(), "engine_error.log"),
+                          "a", encoding="utf-8") as _f:
+                    _f.write("[%s] 指纹库初始化失败：%s\n%s\n"
+                             % (time.strftime("%Y-%m-%d %H:%M:%S"), e,
+                                traceback.format_exc()))
+            except Exception:                                    # noqa: BLE001
+                pass
+            # 用户可见提示：复用**已有**的 `audio.state.error` 字段（不新造字段）。
+            # 它在 `_update_status` 里经 `snap["error"]` 显示到 `lbl_warn`。
+            try:
+                self.audio.state.error = "指纹库不可用，现场识别已关闭"
+            except Exception:                                    # noqa: BLE001
+                pass
+            # 与旧实现行为一致：识别器未绑定 ⇒ 现场识别不启用。
+            self._fp_db = None
 
     def open_music_library(self):
         """打开音乐曲库 —— 它现在是**第 3 页**（曲库·曲风）里的整页面板，不再是弹窗。"""
@@ -5348,10 +5448,28 @@ class MainWindow(QMainWindow):
                 txt = T(txt)
             self.settings.lbl_color_state.setText(Tf("当前能量：{}　{}", tier, txt))
 
+        # ★★ 本函数所有"引擎取值"**一律走无锁只读快照**，绝不调 `@_locked` 方法：
+        #   `_update_status` 挂在 500ms 的 QTimer 上，而 `@_locked` 会 `acquire(timeout=2.0)`
+        #   去抢引擎渲染锁（`_tick` 整帧持有）⇒ 主线程每 0.5 秒被卡一次，一帧慢就等 2 秒，
+        #   表现就是"软件非常卡"（2026-10-08 事故）。
+        #   本函数涉及的引擎取值共 4 个，全部必须走快照，别改回带锁版本：
+        #     ① `modes_snapshot()`（上面已用，替代 `manual_mode()`）
+        #     ②③④ `ui_snapshot()`（下面取一次，含 switch_cd / phrase_cd / grid_view）
+        #   ⚠ 第 4 类 `next_clip_for`（每图层的"下一个素材"）由
+        #     `preview_panel.update_layer_thumbs` 内部改读 `ui_snapshot()["next_clips"]`，
+        #     同样不得再调 `@_locked` 的 `next_clip_for`。
+        #   ⚠ 别再改回 `manual_mode()` / `switch_countdown()` / `phrase_countdown()` /
+        #     `beat_grid_view()` —— 它们都是 `@_locked`，会重新引入卡顿。
+        _us = {}
+        try:
+            _us = self.engine.ui_snapshot() or {}
+        except Exception:                                        # noqa: BLE001
+            _us = {}
+
         # HUD：第一行 模式+倒计时+BPM+能量；第二行 歌名+曲风（避免单行过长显示不全）
         # 段落显示已移除（用户反馈：段落判断不准，预览里不再显示）
         hud = f"{T(MODE_LABELS.get(m, m))}"
-        remain_n = self.engine.switch_countdown(snap)
+        remain_n = _us.get("switch_cd")
         if remain_n is not None:
             # 倒计时从「间隔-1」开始数（刚切完显示 15 / 快切 7），数到 0 就是下一个切换点；
             # 实际间隔仍是完整 16 / 8 拍并踩小节线（计算在 engine.switch_countdown 里）。
@@ -5360,7 +5478,7 @@ class MainWindow(QMainWindow):
         # 跟音乐合不合。仅在全局开关「节拍网格」打开且认出的歌有网格时才有值
         # （phrase_countdown 内部走同一个 _grid_state 门控，关闭/无网格/未识别返回 None）。
         # 复用本 HUD 的刷新节奏，不新增定时器、不新增每帧重活。
-        pc = self.engine.phrase_countdown(snap)
+        pc = _us.get("phrase_cd")
         if pc is not None:
             pb, ps = pc
             hud += Tf("  |  距八拍头 {} 拍（{} 秒）", "%.1f" % pb, "%.1f" % ps)
@@ -5383,7 +5501,7 @@ class MainWindow(QMainWindow):
         self.preview_panel.update_hud(hud)
         # 「节拍网格线」浮层（贴在 HUD 下方）：与切换对齐共用同一相位，
         # 所以看到的那条乐句头线就是切换实际踩的线。无拍位时自动隐藏。
-        bgv = self.engine.beat_grid_view(snap)
+        bgv = _us.get("grid_view")
         self.preview_panel.update_grid(bgv[0] if bgv else None,
                                       bgv[1] if bgv else None)
 
@@ -5405,14 +5523,53 @@ class MainWindow(QMainWindow):
             self.lbl_warn.setText("")
 
     def closeEvent(self, ev):
-        self.save_layers()
-        # 缩略图补扫线程要主动中断，否则退出时它还在解码大素材、拖慢关闭
-        for attr in ("thumb_worker", "thumb_backfill"):
+        # ★ 2026-10-10 审计修复：**先把所有后台线程停下来，最后再落盘**。
+        #   原来只停了 thumb_worker/thumb_backfill，其余后台扫描线程（dyn/tag/music/
+        #   import/erlib/codec/alpha）未停未 join —— 退出时它们仍可能与主线程并发
+        #   调 cfg.save()（退出瞬间最容易撞上）。
+        # 1) 先给所有后台线程发停止信号（并发进行、不阻塞）：有 cancel() 的先 cancel()，
+        #    有 stop() 的再调 stop()，最后统一 requestInterruption()。
+        _bg_threads = ("_dyn_scan", "_tag_scan", "_music_scan", "_erlib_imp",
+                       "_import_worker", "codec_probe", "alpha_mig",
+                       "thumb_worker", "thumb_backfill")
+        for attr in _bg_threads:
             w = getattr(self, attr, None)
-            if w is not None and w.isRunning():
+            if w is None:
+                continue
+            try:
+                if hasattr(w, "cancel"):
+                    w.cancel()
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                if hasattr(w, "stop"):
+                    w.stop()
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
                 w.requestInterruption()
-                w.wait(1500)
-        # 先停引擎线程，再关音频，避免退出时 worker 仍在合成
+            except Exception:                                    # noqa: BLE001
+                pass
+        # 2) 再逐个带超时等它们退出（**绝不无限等**；任一线程不可停也不影响关闭）
+        for attr in _bg_threads:
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                if w.isRunning():
+                    w.wait(1500)
+            except Exception:                                    # noqa: BLE001
+                pass
+        # 3) 心跳看门狗（普通守护线程）：停掉，免得退出时它还在抓栈写日志
+        try:
+            wd = getattr(self, "_watchdog", None)
+            if wd is not None and hasattr(wd, "stop"):
+                wd.stop()
+        except Exception:                                        # noqa: BLE001
+            pass
+        # 4) 线程都停了，再落盘（此时后台线程已不会再并发写 config）
+        self.save_layers()
+        # 5) 先停引擎线程，再关音频，避免退出时 worker 仍在合成
         from PySide6.QtCore import QMetaObject, Qt as _Qt, QThread as _QThread
         QMetaObject.invokeMethod(self.engine, "stop", _Qt.QueuedConnection)
         if hasattr(self, "engine_thread"):

@@ -72,6 +72,15 @@ def _run_refreshers():
             fn()
         except RuntimeError:
             dead.append((ref, fn))   # C++ 对象已删
+        except Exception:            # ⚠ 2026-10-10（审计 P3）：其它异常不许中断整轮刷新
+            # 旧实现只 catch RuntimeError：某个控件刷新抛别的异常会一路冒泡穿过
+            # theme.apply()，导致「palette/QSS 已换、后续控件样式没换」的半应用状态，
+            # 并使 ui_main.toggle_theme 的 cfg 写盘与按钮同步被跳过。这里兜底并留痕。
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:                                      # noqa: BLE001
+                pass
     for d in dead:
         try:
             _refreshers.remove(d)

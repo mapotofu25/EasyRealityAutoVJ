@@ -32,7 +32,11 @@ import sqlite3
 import time
 
 FORMAT_VERSION = 1          # .eravjlib 自身的结构版本
-COVER_SIZE = 200            # 封面边长（像素），与主程序 music_cover.COVER_SIZE 一致
+# 封面边长（像素）。⚠ 这是 erlib **自用**的值，与主程序 `music_cover.COVER_SIZE`(=144)
+# **不同** —— 旧注释误称"与主程序一致"（2026-10-10 T7 审计订正）。两边产物都是
+# "居中裁方 + 缩到 N×N 的 JPEG"，显示端（列表/面板）还会再缩到 56~72px，
+# 故无需一致；真要一致请改这里的值。
+COVER_SIZE = 200
 
 
 def song_id_of(path):
@@ -115,6 +119,21 @@ class LibWriter:
         for stmt in _SCHEMA:
             self.conn.execute(stmt)
         self.conn.commit()
+        # ★★ 2026-10-10（T7 审计修复 1）：`resume=False` = "要一个干净的包"。
+        #   导出时目标文件名可能已存在（用户覆盖同名导出），此时**必须清空三张数据表**，
+        #   否则 `CREATE TABLE IF NOT EXISTS` + `INSERT OR REPLACE` 只会覆盖本次真正写到
+        #   的 song_id —— 上一次导出残留的歌会留在包里（QA 端到端复现：
+        #   导出子集 {3} 后 count=3 而非 1，且 stats 虚报）。
+        #   ⚠ 只清 songs/fingerprints/covers，**保留 meta 表**（紧接着会写入本次版本信息）。
+        #   ⚠ 与 `resume=True`（工作库续扫）互斥：续扫**绝不**走这里（否则会删掉已扫成果）。
+        if not resume:
+            try:
+                self.conn.execute("DELETE FROM fingerprints")
+                self.conn.execute("DELETE FROM covers")
+                self.conn.execute("DELETE FROM songs")
+                self.conn.commit()
+            except Exception:                                    # noqa: BLE001
+                pass
         self.created_at = time.time()
         # 版本信息：每次打开都刷新（用的是"当前这份程序"的算法版本）
         self._set("format_version", FORMAT_VERSION)

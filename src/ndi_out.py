@@ -470,9 +470,17 @@ class NDIOutput:
             except Exception:                                      # noqa: BLE001
                 snap = bytearray(bgra)          # ★ 必须 bytearray —— 绝不能落到 bytes
             # ★ 只留最新一帧：队列里不堆 8MB 大图（与引擎 `_latest_frame` 同一约定）
+            # ⚠ 覆盖旧帧时必须把旧块**归还缓冲池**：旧块的归属是「待 `_video_loop` 消费并 release」，
+            #   若它还没被消费就被这里覆盖，则永远不会走到 `_video_loop` 的 release ⇒ 池逐渐变空、
+            #   退化为每帧新分配 8MB（正是该池要避免的）。这里在 `_vcv` 临界区内**原子接管**旧块
+            #   （`_video_loop` 的「取走并置 None」也在同一把锁内 ⇒ 不可能两边都拿到、重复归还）。
+            _old = None
             with self._vcv:
+                _old = self._vq
                 self._vq = (snap, int(w), int(h))
                 self._vcv.notify()
+            if _old is not None:
+                self._vbuf_pool.release(_old[0])
             self._ensure_vthread()
         except Exception as e:                                     # noqa: BLE001
             self._last_err = str(e)[:160]

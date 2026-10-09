@@ -898,8 +898,8 @@ class GenreVisualEditDialog(I18nDialog):
     def _reset_defaults(self):
         from PySide6.QtWidgets import QMessageBox
         ret = QMessageBox.question(
-            self, "恢复默认",
-            "确定恢复内置的默认曲风→画面标签映射吗？\n你保存过的自定义映射将被清除。",
+            self, T("恢复默认"),
+            T("确定恢复内置的默认曲风→画面标签映射吗？\n你保存过的自定义映射将被清除。"),
             QMessageBox.Yes | QMessageBox.Cancel)
         if ret != QMessageBox.Yes:
             return
@@ -1816,8 +1816,13 @@ class MusicLibraryPanel(QWidget):
             return
         try:
             self.main.remove_music_many(paths)
-        except Exception:                                        # noqa: BLE001
-            pass
+        except Exception as e:                                   # noqa: BLE001
+            # ⚠ 2026-10-10（审计 P2）：移除失败必须让用户看见 —— 旧实现静默 pass，
+            #   用户点了"移除"却什么都没发生、无从排查。失败时不 refresh（避免掩盖）。
+            print("[曲库] 从曲库移除失败：%s" % e)
+            QMessageBox.warning(
+                self, T("从曲库移除"),
+                Tf("移除失败，这 {} 首未从曲库移除：\n{}", len(paths), e))
 
     def _remove_imported(self, fake_paths):
         """从导入库移除（**二次确认**；曲风/封面/指纹一起删 —— 删完就不再认得这些歌）。"""
@@ -1842,8 +1847,14 @@ class MusicLibraryPanel(QWidget):
             from config import app_base_dir
             import imported_lib as _IL
             _IL.remove_songs(app_base_dir(), sids)
-        except Exception:                                        # noqa: BLE001
-            pass
+        except Exception as e:                                   # noqa: BLE001
+            # ⚠ 2026-10-10（审计 P2）：同 _remove_local —— 失败要提示且**不 refresh**
+            #   （旧实现失败也照样 refresh，让"没删掉"看起来像"删掉了"）。
+            print("[曲库] 从导入库移除失败：%s" % e)
+            QMessageBox.warning(
+                self, T("从导入库移除"),
+                Tf("移除失败，这 {} 首未从导入库移除：\n{}", len(sids), e))
+            return
         self.refresh()
 
     def _show_imported_info(self, sid):
@@ -3188,10 +3199,23 @@ class PreviewPanel(QWidget):
 
     def update_layer_thumbs(self, layers):
         """输出预览底部显示每个图层的下一个素材缩略图。
-        多个图层显示多个；图层无素材或被关闭显示时不显示。"""
+        多个图层显示多个；图层无素材或被关闭显示时不显示。
+
+        ⚠ 2026-10-10（审计 P1）：「下一个素材」改为读引擎的**无锁快照**
+          `engine.ui_snapshot()["next_clips"]`（键 = 图层在 engine.layers 里的索引），
+          不再调用 `engine.next_clip_for()` —— 后者会抢渲染锁，导致 GUI 卡渲染。
+        ⚠ 索引对齐：本方法的 `layers` 就是 `engine.layers`（唯一调用点
+          ui_main.py:5391），故 enumerate 的 i 即 engine.layers 下标，与快照键一致。
+        ⚠ Kv 层显示"当前素材"的分支不读快照（它本就不调 next_clip_for），保持不变。
+        """
         infos = []
         if self.chk_next.isChecked() and self.preview_on():
-            for lay in layers:
+            # 无锁只读快照：可能为空 {}（引擎未就绪）⇒ 一律当作"没有下一个素材"。
+            try:
+                _nxt_map = (self.main.engine.ui_snapshot() or {}).get("next_clips") or {}
+            except Exception:                                      # noqa: BLE001
+                _nxt_map = {}
+            for i, lay in enumerate(layers):
                 if not getattr(lay, "visible", False) or not lay.clips:
                     continue
                 if getattr(lay, "is_kv", False):
@@ -3199,7 +3223,7 @@ class PreviewPanel(QWidget):
                     cur = lay.clips[lay.cur] if 0 <= lay.cur < len(lay.clips) else lay.clips[0]
                     infos.append((lay.name, cur))
                     continue
-                nxt = self.main.engine.next_clip_for(lay)
+                nxt = _nxt_map.get(i)
                 if nxt:
                     infos.append((lay.name, nxt))
         while len(self.layer_thumbs) < len(infos):
@@ -3213,7 +3237,7 @@ class PreviewPanel(QWidget):
             if i < len(infos):
                 lname, m = infos[i]
                 lbl.setPixmap(m.pixmap(94, 52))
-                lbl.setToolTip(f"[{lname}]  下一个：{m.name}")
+                lbl.setToolTip(Tf("[{}]  下一个：{}", lname, m.name))
                 if not lbl.isVisible():
                     lbl.show()
             elif lbl.isVisible():
@@ -3503,6 +3527,16 @@ class AudioSourceDialog(I18nDialog):
             return
         self._scanning = True
         try:
+            # ⚠ 2026-10-10（审计 P2）：ASIO 驱动名必须**在清空下拉之前**取走。
+            #   旧实现在 clear()+addItem("正在扫描…") **之后**才读 currentText() ⇒
+            #   读到的永远是占位符 ⇒ list_channels() 拿到"正在扫描…" ⇒ 通道名功能从未生效。
+            #   占位文本（扫描中／未找到设备）不是真驱动名 ⇒ 传空串，
+            #   list_channels("") 会走"取第一个已注册驱动"的兜底（比传占位符正确）。
+            #   ⚠ 这里只把「当前选中文本」取进局部变量，判据仍是"是不是占位符"，不拿控件文本判业务分支。
+            _cur_drv = (self.device.currentText() or "").strip()
+            if (not _cur_drv or _cur_drv.startswith(("（", "("))
+                    or _cur_drv in (T("正在扫描…"), "正在扫描…", "Scanning…")):
+                _cur_drv = ""
             # ⚠ `clear()` / `addItem()` 会**同步**发 `currentIndexChanged` → 回
             #   `_on_device_changed` → 音源==asio 时又调 `scan_devices()`；而此刻
             #   `self._scanner` 还没重新赋值，旧的 `isRunning()` 守卫必然失效。
@@ -3544,8 +3578,7 @@ class AudioSourceDialog(I18nDialog):
                     except Exception as e:
                         self.ready.emit({"system": [], "mic": [], "asio": [], "error": str(e)})
 
-            self._scanner = _Scanner(self.main.audio, self, self._src_key(),
-                                     (self.device.currentText() or "").strip())
+            self._scanner = _Scanner(self.main.audio, self, self._src_key(), _cur_drv)
             self._scanner.ready.connect(self._fill_devices)
             # ⚠ 兜底复位：线程结束就复位，绝不把 `_scanning` 留在 True（那会把之后
             #   所有扫描永久挡死 ⇒ 界面永远停在"正在扫描…"，等于用一个新 bug 换旧的）。

@@ -42,6 +42,9 @@ def export_subset(work, out_path, sids, on_progress=None, app_ver="erlib"):
     src = LibReader(work)
     try:
         root = (src.meta() or {}).get("root", "")
+        # ★★ 2026-10-10（T7 审计修复 1）：`resume=False` ⇒ `LibWriter` 会**清空**三张
+        #   数据表（见 format.LibWriter.__init__）。这样覆盖同名导出时，上一次导出的歌
+        #   不会残留在新包里（否则用户会看到"没勾的歌也进了包"、stats 也虚报）。
         w = LibWriter(out_path, root=root, resume=False, app_ver=app_ver)
         try:
             n, total = 0, len(sids)

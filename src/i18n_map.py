@@ -503,7 +503,6 @@ ZH2EN = {
     "  [自动]": "  [Auto]",
 
     # ==================== 占位符模板（供 i18n.Tf 使用）====================
-    "清除分析数据": "Clear Analysis Data",
     "已有扫描在进行中，请稍候。": "A scan is already running, please wait.",
     "扫描正在进行中，请稍后再清除。": "A scan is running, please try again later.",
     "将删除全部已建立的指纹与自动识别的曲风。\n音乐文件本身和曲库列表不会被删除。":
@@ -770,7 +769,6 @@ ZH2EN = {
     "多层": "Multiply",
     "变亮": "Lighten",
     "变暗": "Darken",
-    "添加": "Add",
 
     # ==================== 状态行 / HUD（动态模板，供 i18n.Tf 使用）====================
     "自动": "Auto",
@@ -928,9 +926,7 @@ ZH2EN = {
         "holds it, ASIO cannot connect and the app falls back to system sound automatically.",
     # ==================== 曲库封面大小 ====================
     "封面大小": "Cover size",
-    "小": "Small",
-    "中": "Medium",
-    "大": "Large",
+    # 小 / 中 / 大 已在文件上方「通用尺寸」处定义，此处不再重复（重复会被静默覆盖）
     "特大": "Extra large",
     # ==================== ASIO 输入通道 ====================
     "输入通道": "Input channels",
@@ -1005,6 +1001,35 @@ ZH2EN = {
     "从曲库移除勾选的 {} 首": "Remove checked from library ({} tracks)",
     "从导入库移除勾选的 {} 首":
         "Remove checked from imported library ({} tracks)",
+    # ==================== 曲库左栏 排序 / 筛选 下拉项（2026-10-10 审计补齐）====================
+    # ⚠ 这些标签以「模块常量列表」形式传给 addItem，AST 覆盖度工具扫不到，但确为显示文案。
+    "原顺序": "Original Order",
+    "BPM 从低到高": "BPM Low → High",
+    "BPM 从高到低": "BPM High → Low",
+    "时长从短到长": "Duration Short → Long",
+    "时长从长到短": "Duration Long → Short",
+    "无节拍网格": "No Beat Grid",
+    "时长未知": "Duration Unknown",
+    "<3 分钟": "<3 min",
+    "3–5 分钟": "3–5 min",
+    "5–7 分钟": "5–7 min",
+    "≥7 分钟": "≥7 min",
+    # ==================== 曲风映射「恢复默认」确认（2026-10-10 审计补齐）====================
+    "确定恢复内置的默认曲风→画面标签映射吗？\n你保存过的自定义映射将被清除。":
+        "Reset the built-in genre → visual-tag map?\n"
+        "Your saved custom map will be cleared.",
+    # ==================== 曲库移除失败提示（2026-10-10 审计补齐）====================
+    "移除失败，这 {} 首未从曲库移除：\n{}":
+        "Removal failed. These {} tracks were not removed from the library:\n{}",
+    "移除失败，这 {} 首未从导入库移除：\n{}":
+        "Removal failed. These {} tracks were not removed from the imported library:\n{}",
+    # ==================== 预览「下一个」缩略图提示（2026-10-10 审计补齐）====================
+    "[{}]  下一个：{}": "[{}]  Next: {}",
+    # ==================== 快捷键冲突提示（2026-10-10 审计补齐）====================
+    "快捷键冲突": "Hotkey Conflict",
+    "检测到 {} 组重复快捷键（{}）；只有先配置的那个会生效，请在快捷键设置里改成不同的键。":
+        "Found {} duplicate hotkey group(s) ({}); only the first configured one takes "
+        "effect — please change them to different keys in the hotkey settings.",
 }
 
 

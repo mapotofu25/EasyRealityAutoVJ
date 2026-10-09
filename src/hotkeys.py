@@ -141,7 +141,12 @@ class HotkeyManager(QObject):
         self.global_hk = GlobalHotkeys(self)
         self.shortcuts = []
         self.global_failed = []     # 本轮注册失败的全局热键名（多为被别的程序占用/无修饰键被系统拒）
+        # ⚠ 2026-10-10（审计 P2）：是否在检测到重复键时弹窗告知。
+        #   __init__ 里的首次 apply() 不弹（启动时不该弹模态框）；之后
+        #   （用户在快捷键对话框点「应用」→ ui_main.HotkeyDialog._apply）才弹。
+        self.interactive = False
         self.apply()
+        self.interactive = True
 
     def apply(self):
         # 清理旧绑定
@@ -154,14 +159,20 @@ class HotkeyManager(QObject):
         self.global_hk.clear()
         self.global_failed = []
 
-        used = set()
+        used = {}                   # key -> name（先到先得；后到同键的被丢弃并记入 conflicts）
+        conflicts = []              # [(key, name, other_name)] 供交互路径弹窗告知
         for name, spec in self.cfg["hotkeys"].items():
             if not spec.get("enabled", True) or not spec.get("key"):
                 continue
             key = spec["key"]
             if key in used:
+                # ⚠ 2026-10-10（审计 P2）：重复键过去在这里被静默 `continue` ⇒
+                #   第二个动作的快捷键无声失效。现在记下来（复用一直没被调用的
+                #   find_conflict），用户交互路径会据此弹窗告知。
+                other = self.find_conflict(self.cfg, name, key) or used.get(key, "")
+                conflicts.append((key, name, other))
                 continue
-            used.add(key)
+            used[key] = name
             cb = self.actions.get(name)
             if not cb:
                 continue
@@ -174,6 +185,31 @@ class HotkeyManager(QObject):
                 # 静默失败会让人以为「按了没反应」—— 设置面板会据此弹提示。
                 if not self.global_hk.register(key, cb):
                     self.global_failed.append(name)
+        if conflicts and self.interactive:
+            self._warn_conflicts(conflicts)
+
+    def _warn_conflicts(self, conflicts):
+        """把检测到的重复键告知用户（否则第二个动作的快捷键会静默失效）。
+
+        ⚠ 由 apply() 在**用户交互路径**调用（`self.interactive` 为 True）；启动时
+          `__init__` 的首次 apply() 不会弹窗。
+        ⚠ 这里只做**告知**，无法"取消保存"：配置在进入 apply() 前已由
+          `ui_main.HotkeyDialog._apply` 写盘。若要"仍然保存 / 取消"二选一，需在
+          ui_main 写盘前插校验（超出本次可改文件范围）。
+        """
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            from i18n import T, Tf
+        except Exception:                                          # noqa: BLE001
+            return
+        keys = "、".join(str(k) for k, _n, _o in conflicts)
+        try:
+            QMessageBox.warning(
+                self.win, T("快捷键冲突"),
+                Tf("检测到 {} 组重复快捷键（{}）；只有先配置的那个会生效，"
+                   "请在快捷键设置里改成不同的键。", len(conflicts), keys))
+        except Exception:                                          # noqa: BLE001
+            pass
 
     @staticmethod
     def find_conflict(cfg, name, key):

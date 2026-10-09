@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 from contextlib import contextmanager
 
 
@@ -223,6 +224,9 @@ class Config:
         self.data = json.loads(json.dumps(DEFAULTS))  # deep copy
         self._batch = 0        # batch() 嵌套层数（>0 时 save() 只标脏）
         self._dirty = False    # 批量期间有未落盘的改动
+        # ★ 进程内写锁：串行化多线程 save()（后台扫描线程 + GUI 线程会并发调）。
+        #   必须在 load()/`_migrate()` 之前创建 —— `_migrate()` 里就会调 save()。
+        self._save_lock = threading.Lock()
         self.load()
         self._migrate()
 
@@ -271,30 +275,41 @@ class Config:
         # 全部失败：保持默认值（软件照常能打开）
 
     def save(self, force: bool = False):
-        """**原子写**：先写临时文件再替换，避免写一半被强杀 → 配置文件损坏。
+        """**原子写 + 多线程安全**：先写临时文件再替换，避免写一半被强杀 → 配置文件损坏。
 
         `batch()` 批量模式内（`_batch > 0`）只标脏不落盘，退出批量时统一写一次 ——
         启动时 UI 初始化会连着触发几十次 save（每次 json.dump + fsync + 备份 170KB
         ≈ 45ms），实测占主窗口构造时间的 43%，而且用户机器上还有杀毒软件在中间插队。
+
+        ⚠ 2026-10-10 审计修复（多线程）：后台扫描线程（TagScan/DynTagScan/MusicScan…）
+          与 GUI 线程都会并发调 `save()`。旧实现临时文件名是**固定的** `CONFIG_FILE + ".tmp"`
+          ⇒ 两个线程互相截断同一个临时文件，极端情况把半截 JSON 落到 config.json。
+          现在：① 进程内 `_save_lock` 串行化；② 临时文件名带 pid + 线程 id 唯一化
+          （即使将来去掉锁也不会撞名）；③ 异常时清理自己的临时文件。
         """
         if not force and getattr(self, "_batch", 0) > 0:
             self._dirty = True
             return
-        try:
-            tmp = CONFIG_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            if os.path.exists(CONFIG_FILE):
+        with self._save_lock:
+            tmp = "%s.tmp.%d.%d" % (CONFIG_FILE, os.getpid(), threading.get_ident())
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if os.path.exists(CONFIG_FILE):
+                    try:
+                        shutil.copyfile(CONFIG_FILE, CONFIG_FILE + ".bak")
+                    except Exception:
+                        pass
+                os.replace(tmp, CONFIG_FILE)
+                self._dirty = False
+            except Exception as e:
+                print("config save failed:", e)
                 try:
-                    shutil.copyfile(CONFIG_FILE, CONFIG_FILE + ".bak")
+                    os.remove(tmp)
                 except Exception:
                     pass
-            os.replace(tmp, CONFIG_FILE)
-            self._dirty = False
-        except Exception as e:
-            print("config save failed:", e)
 
     @contextmanager
     def batch(self):
