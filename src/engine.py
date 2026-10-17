@@ -3142,6 +3142,57 @@ class AutoVJEngine(QObject):
                 continue
         return out
 
+    def _cue_diag(self, sid, votes, off, status, pb, now):
+        """`cue_health.log` 取证（2s 一行，环形 400 行）——回答"到底卡在哪一段"。
+
+        为什么要它（2026-10-17）：用户报"识别不到歌"，而识别链的 print 在 windowed exe 里
+        **根本看不到**（无控制台）⇒ 只能靠猜。这一行把**输入 + 识别 + 绑定 + 位置**串在一起：
+
+          · `silent` 大 / `buf` 小            ⇒ 音频没进来（设备、路由、静音）
+          · `votes=0` 但有能量                  ⇒ 指纹匹配不上（库里没这首 / 指纹不是同一段音频）
+          · `sid` 有票 但 `pb=None`            ⇒ 位置层没接管（码表没绑 / 护栏拦了 / 表没装）
+          · `pb` 有值 但画面不动                ⇒ 渲染或素材问题（看 layer_health.log）
+        """
+        try:
+            t = float(getattr(self, "_cue_diag_t", 0.0) or 0.0)
+            if now - t < 2.0:
+                return
+            self._cue_diag_t = now
+            st = getattr(getattr(self, "audio", None), "state", None)
+            silent = -1.0
+            try:
+                silent = float(getattr(st, "silent_sec", -1.0) or -1.0)
+            except (TypeError, ValueError):
+                pass
+            rt = getattr(self, "_cue_rt", None)
+            tr = getattr(self, "_cue_track", None)
+            idn = getattr(tr, "identity", None) if tr is not None else None
+            n_items = int(getattr(rt, "n_items", 0) or 0) if rt is not None else 0
+            line = ("[%s] silent=%.1fs sid=%s votes=%d off=%.2f status=%s pb=%s "
+                    "| sheet=%d track=%s rt=%d items=%d pos=%s"
+                    % (time.strftime("%H:%M:%S"), silent, sid, int(votes or 0),
+                       float(off if off is not None else -1.0), status,
+                       ("%.1f" % pb) if pb is not None else "None",
+                       1 if getattr(self, "_cue_sheet", None) is not None else 0,
+                       (str(getattr(idn, "title", "") or "?")[:14]) if idn else "None",
+                       1 if rt is not None else 0, n_items,
+                       str(getattr(self, "_cue_pos_src", "") or "-")))
+            path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
+                                "cue_health.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            # 环形：超过 400 行就砍掉前一半（与 layer_health 同风格，绝不无界增长）
+            try:
+                if os.path.getsize(path) > 120 * 1024:
+                    with open(path, "r", encoding="utf-8") as f:
+                        rows = f.readlines()
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.writelines(rows[-200:])
+            except OSError:
+                pass
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def _cue_accept_pos(self, sid, pb):
         """认错歌护栏：识别到的歌必须**属于本表这条曲目**，否则本帧不接管（返回 None）。
 
@@ -3471,6 +3522,7 @@ class AutoVJEngine(QObject):
         #   ⚠ 集合为空（老码表没 fp_id、文件名也对不上）⇒ **不启用守卫**，
         #     退回到"照跟"的旧行为，绝不让护栏变成"永远不跟"的新故障。
         pb = self._cue_accept_pos(sid, pb)
+        self._cue_diag(sid, votes, off, status, pb, now)
         if pb is not None:
             self.set_cue_position(pb, "fp")
         else:
