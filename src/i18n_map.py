@@ -1046,6 +1046,26 @@ ZH2EN = {
     "检测到 {} 组重复快捷键（{}）；只有先配置的那个会生效，请在快捷键设置里改成不同的键。":
         "Found {} duplicate hotkey group(s) ({}); only the first configured one takes "
         "effect — please change them to different keys in the hotkey settings.",
+    # ==================== 码表 UI（2026-10-17 审计补齐）====================
+    "这张码表的该曲目没有 BPM：只能按「1 拍 = 1 秒」播放，画面不会对拍。请在 EasyRealityCue 里补上 BPM 后重新导出。":
+        "This track in the cue sheet has no BPM: it can only play at 1 beat = 1 second, "
+        "so the visuals will not land on the beat. Set the BPM in EasyRealityCue and "
+        "re-export.",
+    "这张码表包含以下曲目。选一首绑定到当前演出（已接入指纹认歌，之后会自动选表）：":
+        "This cue sheet contains the following tracks. Pick one to bind to the current "
+        "performance (fingerprint recognition is wired in, so the sheet is chosen "
+        "automatically from now on):",
+    "指纹认歌认不出时的手动兜底：按下即认为「这首歌从 0:00 开始」，按挂钟喂拍位。":
+        "Manual fallback for when fingerprint recognition cannot identify the track: "
+        "pressing this treats the song as starting at 0:00 and feeds beat positions "
+        "from the wall clock.",
+    "正在准备素材…（首次导入需要解压包内素材，请稍候）":
+        "Preparing media… (the first import has to extract the embedded media, "
+        "please wait)",
+    "引擎或图层不可用（无法装载码表）。":
+        "Engine or layer unavailable (cannot load the cue sheet).",
+    "有 %d 个素材没找到，请指定素材目录（可取消）":
+        "%d media file(s) not found. Please choose the media folder (you can cancel).",
 }
 
 

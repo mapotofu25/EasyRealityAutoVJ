@@ -101,7 +101,7 @@ def pick_track(sheet, parent=None, current_title=""):
     dlg = QDialog(parent)
     dlg.setWindowTitle("选择要绑定的曲目")
     lay = QVBoxLayout(dlg)
-    lay.addWidget(QLabel("这张码表包含以下曲目。选一首绑定到当前演出（Step3 接上后会自动认歌）："))
+    lay.addWidget(QLabel("这张码表包含以下曲目。选一首绑定到当前演出（已接入指纹认歌，之后会自动选表）："))
     box = QComboBox(dlg)
     for t in tracks:
         idn = getattr(t, "identity", None)
@@ -201,7 +201,7 @@ class CueSheetDialog(QDialog):
         row4 = QHBoxLayout()
         self.btn_clock = QPushButton(T("手动起拍（临时位置源）"), self)
         self.btn_clock.setCheckable(True)
-        self.btn_clock.setToolTip("Step3（指纹认歌）落地前用它验跟拍：按下即认为"
+        self.btn_clock.setToolTip("指纹认歌认不出时的手动兜底：按下即认为"
                                   "「这首歌从 0:00 开始」，按挂钟喂拍位。")
         self.btn_clock.toggled.connect(self.on_toggle_clock)
         row4.addWidget(self.btn_clock)
