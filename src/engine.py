@@ -2821,6 +2821,34 @@ class AutoVJEngine(QObject):
                 return True
         return False
 
+    def _cue_set_active(self, lay, paths):
+        """把该层缓存里的播放器按需激活（**两个缓存都必须遍历**）。
+
+        ★★ 这是 2026-09-30「12 核跑满 / 磁盘 750MB/s」事故的**根因防线**：
+          码表图层的解码器存在 `lay._cue_players`（**不是** `lay.cache`）。
+          只遍历 `lay.cache` ⇒ "一旦激活就再没人关" ⇒ 每碰过一个素材就多一个解码器
+          在后台一直解码/一直读盘，越用越多、互相抢 IO。
+        """
+        for cache in (getattr(lay, "cache", None), getattr(lay, "_cue_players", None)):
+            if not isinstance(cache, dict):
+                continue
+            for pth, pl in list(cache.items()):
+                try:
+                    pl.set_active(pth in paths)
+                except Exception:                                 # noqa: BLE001
+                    pass
+
+    def _cuesheet_on(self):
+        """码表图层本帧是否在接管画面（1.0 / 0.0）。
+
+        用户 2026-09-28：「码表图层和 Kv 图层一样，不受画面效果的影响」——
+        码表里是 DJ 做好的成片，再叠调色/特效就不是原片了 ⇒ 接管期间后处理整条跳过。
+        """
+        for lay in (getattr(self, "layers", None) or []):
+            if getattr(lay, "is_cuesheet", False) and getattr(lay, "cs_active", False):
+                return 1.0
+        return 0.0
+
     def set_cue_position(self, pos_beats, src="manual"):
         """喂入本帧的**码内拍位**（Step3 的指纹定位会把结果写到这里）。
 
@@ -2867,6 +2895,7 @@ class AutoVJEngine(QObject):
                 if lay.cs_states:
                     lay.cs_states = []
                 lay.cs_active = False
+                self._cue_set_active(lay, set())   # ★ 不接管 ⇒ 全部失活（别让解码器白烧 CPU）
             return
         try:
             states = rt.update(pos)
@@ -2883,10 +2912,15 @@ class AutoVJEngine(QObject):
                 lay.cs_active = False
             return
         on_any = bool(states)
+        # ★ 每帧按"当前片段 + 过渡中片段 + 预加载的下一个"算活跃路径 —— 解码器有界的前提
+        paths = {ps.clip_path for ps in states
+                 if getattr(ps, "active", False) and getattr(ps, "clip_path", "")
+                 and not getattr(ps, "missing", False)}
         for lay in lays:
             on = bool(getattr(lay, "visible", True)) and on_any
             lay.cs_states = states if on else []
             lay.cs_active = on
+            self._cue_set_active(lay, paths if on else set())
 
     def _cue_item(self, lay, path, xform=None):
         """按路径取（并缓存）**真实 MediaItem**，并把码表的 `xform` 套上去。
@@ -3321,6 +3355,9 @@ class AutoVJEngine(QObject):
         旁路开启时也立即归零（Bypass 要"响应迅速、无延迟"）。
         频闪素材自动休眠：避免「画面在闪 + 颜色在变」叠加成视觉灾难。
         """
+        # ★ 码表接管期间跳整条调色链（与 Kv 同口径：码表里是 DJ 做好的成片，不能再染色）
+        if self._cuesheet_on():
+            return
         cfx = self.color_fx
         try:
             cfg = self.cfg["color"]
@@ -3389,6 +3426,9 @@ class AutoVJEngine(QObject):
         - event    事件：Drop 触发后从峰值按 decay 秒衰减回 0
         自动联动总开关 auto=False 时，全部退化为常驻。
         """
+        # ★ 码表接管期间跳整条后处理链（同 Kv：成片不该被辉光/色差等污染）
+        if self._cuesheet_on():
+            return
         cfg = self.cfg["postfx"]
         # Kv 待机层显示中：画面以 Kv 为主，跳过整条后处理链
         # （Kv 图层要求完全独立，不受「后处理」等任何设置影响）
@@ -3850,6 +3890,12 @@ class AutoVJEngine(QObject):
 
     @_locked
     def close(self):
+        # ★ 必须在关图层/停 timer **之前**卸表：否则码表解码器线程/句柄会留到进程退出
+        #   （9-30「12 核 / 750MB/s」的形态之一就是"没人关的 cue 解码器"）。
+        try:
+            self.clear_cue_sheet(silent=True)
+        except Exception:                                         # noqa: BLE001
+            pass
         self.timer.stop()
         for lay in self.layers:
             lay.close_all()
