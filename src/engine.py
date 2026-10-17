@@ -27,6 +27,7 @@ from media_manager import make_player, _STALL_SECS
 from match_engine import match_clips
 from beatgrid import GridClock
 from fp import hint_window_frames
+from cue_position import CuePositionTracker, choose_sheet   # 位置层（指纹→拍位，带回滞）
 from cue_seek_policy import CueSeekPolicy      # 码表 seek 策略（纯逻辑，见 tools/cue_should_seek_test.py）
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER, DYNAMIC_TAGS)
@@ -611,6 +612,12 @@ class AutoVJEngine(QObject):
         self._cue_jumped = False    # 本帧是否发生跳变重算
         self._cue_closed_last = 0   # 上次 clear 关掉的解码器数（自检/排障用）
         self._cue_index = None      # 码表索引（曲目→码表；**只存摘要**，见 src/cue_index.py）
+        # ---- 自动跟拍（Step3）：指纹位置 → 拍位 ----
+        self._cue_pos_tracker = CuePositionTracker()
+        self._cue_pos_next_t = 0.0     # 下次轮询时刻（0.2s 一次，**不进 compose**）
+        self._cue_pos_song = -1        # 当前自动跟拍的歌（song_id）
+        self._cue_auto_sheet = ""      # 自动装上的表（路径）；"" = 没装
+        self._cue_manual_clock = False # 手动起拍生效中 ⇒ 自动位置让位（兜底优先）
         _cue_cfg = (self.cfg.get("cue") if isinstance(self.cfg, dict) else None) or {}
         # ★ 所有「该不该 seek / 阈值 / 落地 / 计速」的判断都在这个对象里（见 cue_seek_policy）
         self._cue_policy = CueSeekPolicy(cfg=_cue_cfg)
@@ -1353,6 +1360,7 @@ class AutoVJEngine(QObject):
         # 码表：先把「本帧拍位」解释成「每个码表图层该显示什么」（**只算，不画**）。
         # · 没有码表图层时直接返回（实测 0.41µs/帧，见 tools/cue_tick_test.py）；
         # · 内部异常已被吞掉（清空本帧 + 限流记日志），绝不影响下面的合成。
+        self._cue_auto_position()      # 自动跟拍：低频轮询（0.2s），不进 _compose
         self._cuesheet_tick(snap)
 
         # 合成
@@ -2849,6 +2857,178 @@ class AutoVJEngine(QObject):
                                           file_name=file_name, file_md5=file_md5)
         except Exception:                                        # noqa: BLE001
             return []
+
+    # ---------------- 自动跟拍（Step3） ----------------
+    def set_cue_manual_clock(self, on):
+        """手动起拍开关：True 时**暂停自动位置**（Step3 落地后它是兜底，不是主路径）。"""
+        self._cue_manual_clock = bool(on)
+        if on:
+            self._cue_pos_tracker.reset()
+        return self._cue_manual_clock
+
+    def _cue_song_path(self, song_id):
+        """`song_id` → 曲子路径（尽力而为；取不到返回 ""）。
+
+        约定：`fp_db.add_song(song_id, …)` 里的 song_id 由调用方给。这里兼容两种：
+          · 整数索引 ⇒ 查 `cfg["music_library"]` 列表；
+          · 字符串路径 ⇒ 直接用。
+        """
+        try:
+            if isinstance(song_id, str) and song_id:
+                return song_id
+            # ⚠ 不要加 `if isinstance(self.cfg, dict)` 这类前置判断：Config 是**包装对象**，
+            #   不是 dict ⇒ 那个判断会把正常配置也挡掉（表现为"永远查不到歌"）。
+            lib = self.cfg["music_library"]
+            i = int(song_id)
+            if isinstance(lib, (list, tuple)) and 0 <= i < len(lib):
+                return str(lib[i])
+        except Exception:                                        # noqa: BLE001
+            pass
+        return ""
+
+    def _cue_track_query(self, path):
+        """由曲子路径拼"认歌查询参数"（有 meta 用 meta，没有就退化到文件名级）。"""
+        q = {"file_name": os.path.basename(path or "")}
+        try:
+            meta = (self.cfg["music_meta"] or {}).get(path) or {}
+            if meta:
+                q["title"] = str(meta.get("title") or "")
+                q["artist"] = str(meta.get("artist") or "")
+                q["duration_sec"] = float(meta.get("duration") or 0.0)
+                q["file_md5"] = str(meta.get("md5") or "")
+                q["fp_id"] = str(meta.get("fp_id") or "")
+        except Exception:                                        # noqa: BLE001
+            pass
+        return q
+
+    def _cue_beat_len_for(self, path):
+        """该曲子的拍长（秒/拍）。优先码表曲目里的 bpm，其次曲库元数据；都没有 ⇒ 1.0。"""
+        bpm = 0.0
+        try:
+            if self._cue_sheet is not None:
+                for t in (getattr(self._cue_sheet, "tracks", None) or []):
+                    if os.path.basename(str(getattr(t.identity, "file_name", "") or "")) \
+                            == os.path.basename(path or ""):
+                        bpm = float(getattr(t.identity, "bpm", 0.0) or 0.0)
+                        break
+        except Exception:                                        # noqa: BLE001
+            bpm = 0.0
+        if bpm <= 0.0:
+            try:
+                m = (self.cfg["music_meta"] or {}).get(path) or {}
+                bpm = float(m.get("bpm") or 0.0)
+            except Exception:                                    # noqa: BLE001
+                bpm = 0.0
+        return (60.0 / bpm) if bpm > 0 else 1.0
+
+    def _cue_auto_bind(self, path, query):
+        """自动选表 + 装表（换表）；没有候选 ⇒ **卸表**（明确策略，不静默保留错表）。"""
+        hits = self.cue_sheets_for_track(**query)
+        if not hits:
+            if self._cue_auto_sheet:
+                self.clear_cue_sheet(silent=True)
+                self._cue_auto_sheet = ""
+            return False
+        try:
+            prefer = {}
+            cur = self.cfg["cue"] if isinstance(self.cfg, dict) else None
+            if isinstance(cur, dict):
+                prefer = cur.get("prefer") or {}
+        except Exception:                                        # noqa: BLE001
+            prefer = {}
+        meta_id = ""
+        try:
+            meta_id = str(query.get("file_md5") or query.get("fp_id") or query.get("title") or "")
+        except Exception:                                        # noqa: BLE001
+            meta_id = ""
+        pick = choose_sheet(hits, prefer=prefer, track_meta_id=meta_id)
+        if pick is None:
+            return False
+        want = str(pick.get("path") or "")
+        if want and want == self._cue_auto_sheet:
+            return True                       # 已经是这张表，别重装（重装会重建解码器缓存）
+        try:
+            import cuesheet
+            media_dir = ""
+            try:
+                media_dir = str((self.cfg["cue"] or {}).get("media_dir") or "")
+            except Exception:                                    # noqa: BLE001
+                media_dir = ""
+            sheet, info = cuesheet.load(want, media_dir=media_dir or None)
+            tr, _lvl = sheet.match_track(title=query.get("title", ""),
+                                         artist=query.get("artist", ""),
+                                         duration_sec=float(query.get("duration_sec", 0.0) or 0.0),
+                                         fp_id=query.get("fp_id", ""),
+                                         file_name=query.get("file_name", ""),
+                                         file_md5=query.get("file_md5", ""))
+            layer = next((l for l in self.layers if getattr(l, "is_cuesheet", False)), None)
+            ok = self.set_cue_sheet(sheet, media_paths=info.get("present_media") or {},
+                                    track=tr, layer=layer,
+                                    sheet_id=os.path.basename(want))
+        except Exception as e:                                    # noqa: BLE001
+            self._cue_health("自动装表失败：%s: %s" % (type(e).__name__, e))
+            return False
+        self._cue_auto_sheet = want if ok else ""
+        if ok:
+            # 记住"这首歌用这张表"（同级多张时下次直接用它）
+            try:
+                cur = self.cfg["cue"]
+                pref = cur.setdefault("prefer", {}) if isinstance(cur, dict) else None
+                if isinstance(pref, dict) and meta_id:
+                    pref[meta_id] = want
+                    self.cfg.save()
+            except Exception:                                    # noqa: BLE001
+                pass
+        return ok
+
+    def _cue_auto_position(self):
+        """低频轮询指纹识别结果 → 拍位（**0.2s 一次，绝不进 `_compose`**）。
+
+        返回本次的 `(status, pos_beats)`（供自检/日志；正常运行不看返回值）。
+        """
+        if getattr(self, "_cue_manual_clock", False):
+            return ("manual", None)
+        now = time.perf_counter()
+        if now < float(getattr(self, "_cue_pos_next_t", 0.0) or 0.0):
+            return ("skip", None)
+        self._cue_pos_next_t = now + 0.2
+        st = getattr(getattr(self, "audio", None), "state", None)
+
+        # ⚠ 不能写 `int(x or -1)`：`song_id == 0` 是**合法**的（第一首），`0 or -1` 会变成 -1
+        #   ⇒ 表现为"明明识别到了，却一直当没歌"。这类 bug 只在"歌的 id 恰好是 0"时出现。
+        def _i(v, d):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return d
+
+        def _f(v, d):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return d
+
+        sid = _i(getattr(st, "recognized_song_id", -1), -1)
+        off = _f(getattr(st, "recognized_offset", -1.0), -1.0)
+        votes = _i(getattr(st, "recognized_votes", 0), 0)
+        rate = _f(getattr(st, "recognized_rate", 1.0), 1.0)
+        path = self._cue_song_path(sid)
+        trk = self._cue_pos_tracker
+        trk.rate = rate if rate > 0 else 1.0
+        # 认不到歌（sid<0 / 无票）时不用算 beat_len，避免多余 IO
+        bl = self._cue_beat_len_for(path) if (sid >= 0 and votes > 0) else None
+        status, pb, song = trk.feed(sid, off, votes, now, beat_len=bl)
+        if status in ("ok", "switch") and song != self._cue_pos_song:
+            self._cue_pos_song = song
+            q = self._cue_track_query(path) if path else {}
+            if q:
+                self._cue_auto_bind(path, q)     # 换歌 ⇒ 换表/卸表（策略见 docstring）
+        if pb is not None:
+            self.set_cue_position(pb, "fp")
+        else:
+            # 丢了（超容忍期）⇒ 不接管；**表与徽标保留**（用户回到这首歌能立刻继续）
+            self.set_cue_position(None, "fp")
+        return (status, pb)
 
     def cuesheet_wanted(self):
         """是否**有可见的码表图层**在等位置数据（小眼睛关掉 ⇒ 完全不检测）。"""

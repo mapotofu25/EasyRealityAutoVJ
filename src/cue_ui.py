@@ -489,6 +489,13 @@ class CueSheetDialog(QDialog):
             self.btn_clock.setChecked(False)
             self._error("先绑定曲目再起拍（没有曲目就不知道拍长）。")
             return
+        # ★ 告诉引擎"现在用手动起拍"：自动位置（指纹）让位 —— 否则 0.2s 后会被自动值覆盖
+        try:
+            fn = getattr(self.engine, "set_cue_manual_clock", None)
+            if callable(fn):
+                fn(True)
+        except Exception:                                        # noqa: BLE001
+            pass
         self._t0 = time.monotonic()
         self._timer.start()
         if not self.btn_clock.isChecked():
@@ -497,6 +504,12 @@ class CueSheetDialog(QDialog):
     def stop_clock(self):
         self._t0 = None
         self._timer.stop()
+        try:
+            fn = getattr(self.engine, "set_cue_manual_clock", None)
+            if callable(fn):
+                fn(False)          # 交还给自动跟拍（若指纹可用）
+        except Exception:                                        # noqa: BLE001
+            pass
         if self.btn_clock.isChecked():
             self.btn_clock.setChecked(False)
 

@@ -1,0 +1,361 @@
+# -*- coding: utf-8 -*-
+"""Step3 自检：位置认歌（指纹 → 拍位；自动选表；手动起拍降级为兜底）。
+
+6 项判据（团队给定）：
+  1. 真实播放（**模拟指纹流**）⇒ 画面自动跟拍；3 个采样点 `pos_beats` 偏差 ≤ 0.5 拍
+  2. 认不到歌 ⇒ 不接管 / 不报错 / 不黑屏（手动起拍仍可用）
+  3. 切歌 A→B ⇒ A 的表停用；B 有表则换表，没有则卸表（策略明确）
+  4. 指纹抖动（短时丢票）⇒ 不抖断（回滞生效）；恢复后继续跟
+  5. 性能：位置更新是**低频轮询**（0.2s），且 `_compose` 里**没有任何指纹/位置计算**
+  6. 回归另跑（12 项）
+
+⚠ 本文件不接真音频设备：把 `audio_engine` 的识别状态（`recognized_*`）**注入**成假对象，
+   走的仍是引擎里的真代码路径（`_cue_auto_position` → `CuePositionTracker` → `set_cue_position`
+   → `_cuesheet_tick` → `_compose`）。
+
+运行：`python tools/cue_position_test.py`（exit 0 = 全过）
+"""
+from __future__ import annotations
+
+import ast
+import os
+import sys
+import tempfile
+import time
+import types
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.abspath(os.path.join(HERE, "..", "src"))
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+from PySide6.QtGui import QColor, QImage                            # noqa: E402
+
+import cuesheet                                                     # noqa: E402
+import engine                                                       # noqa: E402
+import cue_index                                                    # noqa: E402
+import cue_position                                                 # noqa: E402
+from cue_seek_policy import CueSeekPolicy                            # noqa: E402
+
+W, H = 320, 180
+BPM, BL = 120.0, 0.5          # 120 BPM ⇒ beat_len = 0.5s
+
+
+# ==========================================================================
+class FakeState:
+    """`audio_engine.state` 的替身：只有指纹识别那几个字段。"""
+
+    def __init__(self):
+        self.recognized_song_id = -1
+        self.recognized_offset = -1.0
+        self.recognized_votes = 0
+        self.recognized_rate = 1.0
+        self.recognized_t = 0.0
+        self.lock = __import__("threading").RLock()
+
+
+class FakePlayer:
+    def __init__(self, img):
+        self._img = img
+        self._active = False
+
+    def current(self):
+        return self._img
+
+    def set_active(self, a):
+        self._active = bool(a)
+
+    def warm_up(self):
+        pass
+
+    def set_max_size(self, w, h):
+        pass
+
+    def set_speed(self, s):
+        pass
+
+    def position(self):
+        return 0.0
+
+    def seek(self, s):
+        return True
+
+    def close(self):
+        pass
+
+
+class FakeCfg:
+    def __init__(self):
+        # `_compose` 也要用到这几段（本测试会真的调它出画）
+        self.data = {"music_library": [], "music_meta": {}, "cue": {},
+                     "auto": {"intensity": 1, "transition": None},
+                     "mode": {"transition": ""}, "color": {}, "postfx": {}}
+        self.saves = 0
+
+    def __getitem__(self, k):
+        return self.data[k]
+
+    def __setitem__(self, k, v):
+        self.data[k] = v
+
+    def get(self, k, d=None):
+        return self.data.get(k, d)
+
+    def save(self, force=False):
+        self.saves += 1
+
+
+def make_sheet(title, track_title, artist, dur, bpm, md5, media_name):
+    s = cuesheet.CueSheet(title=title, res_w=W, res_h=H)
+    te = cuesheet.TrackEntry()
+    te.identity = cuesheet.Identity(title=track_title, artist=artist,
+                                    duration_sec=dur, bpm=bpm, file_md5=md5)
+    te.identity.ensure_meta_id()
+    L = cuesheet.CompLayer(lyr_id="L1", z=0)
+    L.items.append(cuesheet.CueItem(item_id="i1", clip_id="c1", at_beats=0.0,
+                                    src_in_sec=0.0, src_out_sec=60.0,
+                                    trans_in="cut", trans_out="cut").normalized())
+    te.layers.append(L)
+    s.tracks.append(te)
+    s.media.append(cuesheet.MediaRef(clip_id="c1", name=media_name))
+    return s
+
+
+def new_engine(cfg, layers, images):
+    eng = engine.AutoVJEngine.__new__(engine.AutoVJEngine)
+    eng.canvas = QImage(W, H, QImage.Format_ARGB32)
+    eng.mode = "normal"
+    eng.blackout = False
+    eng.cfg = cfg
+    eng._silent_now_debounced = False
+    eng._health_log = None
+    eng._cue_tick_fail = 0
+    eng._cue_err_at = 0.0
+    eng._cue_pos_beats = None
+    eng._cue_pos_src = ""
+    eng._cue_sheet = None
+    eng._cue_track = None
+    eng._cue_media = {}
+    eng._cue_jumped = False
+    eng._cue_closed_last = 0
+    eng._cue_policy = CueSeekPolicy(cfg={})
+    eng._cue_index = None
+    eng._cue_rt = None
+    eng.layers = list(layers)
+    eng.audio = types.SimpleNamespace(state=FakeState())
+    eng._cue_pos_tracker = cue_position.CuePositionTracker()
+    eng._cue_pos_next_t = 0.0
+    eng._cue_pos_song = -1
+    eng._cue_auto_sheet = ""
+    eng._cue_manual_clock = False
+    eng._images = images
+    return eng
+
+
+def hold(eng, sec):
+    """让下一次 `_cue_auto_position()` 立即执行（它内部有 0.2s 门控）。"""
+    eng._cue_pos_next_t = 0.0
+    return eng._cue_auto_position()
+
+
+# ==========================================================================
+def main():
+    fails = []
+
+    def check(name, cond, detail=""):
+        print("  [%s] %s%s" % ("ok  " if cond else "FAIL", name,
+                               "" if cond else "   ← " + str(detail)))
+        if not cond:
+            fails.append(name)
+
+    tmp = tempfile.mkdtemp(prefix="cuepos_")
+    media = os.path.join(tmp, "media")
+    os.makedirs(media, exist_ok=True)
+    for nm, col in (("a.mp4", (210, 30, 30, 255)), ("b.mp4", (30, 90, 220, 255))):
+        open(os.path.join(media, nm), "wb").close()
+    images = {}
+    for nm, col in (("a.mp4", (210, 30, 30, 255)), ("b.mp4", (30, 90, 220, 255))):
+        im = QImage(W, H, QImage.Format_ARGB32)
+        im.fill(QColor(*col))
+        images[nm] = im
+
+    real_make = engine.make_player
+    engine.make_player = lambda item, cue=False: FakePlayer(
+        images.get(os.path.basename(getattr(item, "path", "")), QImage()))
+    try:
+        cfg = FakeCfg()
+        cue_index.cue_cfg(cfg)["media_dir"] = media
+        # 两首歌、两张表：chipA 对应 a.mp4，chipB 对应 b.mp4
+        pkgA = os.path.join(tmp, "A.ercue")
+        pkgB = os.path.join(tmp, "B.ercue")
+        cuesheet.save(make_sheet("表A", "SongA", "ArtistA", 200.0, BPM, "md5A", "a.mp4"),
+                      pkgA, app_version="2026.10.17.12")
+        cuesheet.save(make_sheet("表B", "SongB", "ArtistB", 180.0, BPM, "md5B", "b.mp4"),
+                      pkgB, app_version="2026.10.17.12")
+        cfg["music_library"] = [os.path.join(media, "a.mp4"), os.path.join(media, "b.mp4")]
+        cfg["music_meta"] = {
+            os.path.join(media, "a.mp4"): {"title": "SongA", "artist": "ArtistA",
+                                           "duration": 200.0, "md5": "md5A", "bpm": BPM},
+            os.path.join(media, "b.mp4"): {"title": "SongB", "artist": "ArtistB",
+                                           "duration": 180.0, "md5": "md5B", "bpm": BPM},
+        }
+        lay = engine.Layer("码表层")
+        lay.is_cuesheet = True
+        eng = new_engine(cfg, [lay], images)
+        idx = eng.cue_index()
+        idx.add(pkgA)
+        idx.add(pkgB)
+        idx.save_cfg(cfg)
+
+        # ---------------- ① 自动跟拍：3 个采样点 ----------------
+        print("① 自动跟拍（模拟指纹 0.5s 一次）：3 个采样点偏差 ≤ 0.5 拍")
+        st = eng.audio.state
+        st.recognized_song_id, st.recognized_votes, st.recognized_rate = 0, 5, 1.0
+        samples = []
+        for i, off in enumerate((10.0, 12.0, 14.0)):
+            st.recognized_offset = off
+            hold(eng, i * 0.5)
+            eng._cuesheet_tick()
+            pb = eng._cue_pos_beats
+            want = off / BL
+            got = lay.cs_states[0].play_sec if lay.cs_states else None
+            samples.append((off, want, pb, got, (pb or -9) - want))
+            time.sleep(0.02)
+        for off, want, pb, got, err in samples:
+            print("      offset=%.1fs ⇒ 期望 pos_beats=%.1f ；实测 %.2f（偏差 %+.2f 拍）；"
+                  "play_sec=%.2f" % (off, want, pb or -1, err, got if got is not None else -1))
+        check("3 个采样点 pos_beats 偏差都 ≤0.5 拍",
+              all(abs(e) <= 0.5 for _o, _w, _p, _g, e in samples), samples)
+        check("画面随之出画（play_sec 非空且≈offset）",
+              all(g is not None and abs(g - o) <= 0.5 for o, _w, _p, g, _e in samples),
+              samples)
+        check("自动装表成功（表A）", "A.ercue" in (eng._cue_auto_sheet or ""),
+              eng._cue_auto_sheet)
+        check("位置来源标记为 fp", eng._cue_pos_src == "fp", eng._cue_pos_src)
+
+        # ---------------- ④ 抖动：短时丢票不抖断 ----------------
+        print("\n④ 指纹抖动：连续 3 次丢票仍保持（回滞），恢复后继续跟")
+        pb_before = eng._cue_pos_beats
+        holds = []
+        for k in range(3):
+            st.recognized_votes = 0                 # 丢票
+            st.recognized_offset = -1.0
+            status, pb = hold(eng, 0)
+            eng._cuesheet_tick()
+            holds.append((status, eng._cue_pos_beats is not None))
+            time.sleep(0.02)
+        print("      丢票 3 次：%s" % holds)
+        check("容忍期内状态为 hold 且位置不丢",
+              all(s == "hold" and keep for s, keep in holds), holds)
+        st.recognized_votes, st.recognized_offset = 5, 16.0
+        status, pb = hold(eng, 0)
+        eng._cuesheet_tick()
+        check("恢复后立刻回到 ok 并继续跟",
+              status == "ok" and abs((eng._cue_pos_beats or -1) - 16.0 / BL) <= 0.5,
+              (status, eng._cue_pos_beats))
+        # 超过容忍期 ⇒ 不接管
+        for _ in range(6):
+            st.recognized_votes = 0
+            hold(eng, 0)
+            time.sleep(0.01)
+        eng._cuesheet_tick()
+        check("超过容忍期 ⇒ 状态 lost、pos 置空、cs_states 清空（不接管）",
+              eng._cue_pos_beats is None and not lay.cs_states,
+              (eng._cue_pos_beats, len(lay.cs_states)))
+        check("丢歌时**表与徽标保留**（回来能立刻继续）", eng._cue_sheet is not None,
+              eng._cue_sheet)
+
+        # ---------------- ② 认不到歌 ⇒ 手动起拍仍可用 ----------------
+        print("\n② 认不到歌：不接管 / 不报错 / 手动起拍可用")
+        check("此时不接管（cs_states 空）", not lay.cs_states)
+        eng.set_cue_manual_clock(True)          # 相当于点了「手动起拍」
+        eng.set_cue_position(8.0, "wallclock")
+        eng._cuesheet_tick()
+        check("手动起拍立刻接管（cs_states 非空, src=wallclock）",
+              bool(lay.cs_states) and eng._cue_pos_src == "wallclock",
+              (len(lay.cs_states), eng._cue_pos_src))
+        hold(eng, 0)
+        check("手动起拍期间，自动位置**让位**（不被指纹覆盖）",
+              eng._cue_pos_src == "wallclock", eng._cue_pos_src)
+        eng.set_cue_manual_clock(False)
+
+        # ---------------- ③ 切歌 A→B ----------------
+        print("\n③ 切歌：A→B（B 有表 ⇒ 换表）")
+        st.recognized_song_id, st.recognized_votes, st.recognized_offset = 0, 5, 5.0
+        hold(eng, 0)
+        eng._cuesheet_tick()
+        sheetA = eng.cuesheet_status()["title"]
+        autoA = os.path.basename(eng._cue_auto_sheet or "")
+        # 切到 B：需要连续 2 次确认（CONFIRM_N=2）
+        st.recognized_song_id, st.recognized_offset = 1, 7.0
+        hold(eng, 0)
+        mid = eng.cuesheet_status()["title"]
+        hold(eng, 0)
+        eng._cuesheet_tick()
+        sheetB = eng.cuesheet_status()["title"]
+        autoB = os.path.basename(eng._cue_auto_sheet or "")
+        print("      A：表=%s(%s) → 第1次B票仍 %s → 确认后 表=%s(%s)"
+              % (sheetA, autoA, mid, sheetB, autoB))
+        check("A 时用表A", sheetA == "表A" and autoA == "A.ercue", (sheetA, autoA))
+        check("换歌第 1 票不立刻切（防误切）", mid == "表A", mid)
+        check("连续确认后换到表B", sheetB == "表B" and autoB == "B.ercue", (sheetB, autoB))
+        eng._compose({"bass": 0.0})
+        c = eng.canvas.pixelColor(W // 2, H // 2)
+        check("画面跟着换成 B 的内容（蓝）", c.blue() > 120 and c.red() < 120, c.getRgb())
+
+        # ---------------- ⑤ 性能：不进渲染热路径 ----------------
+        print("\n⑤ 性能：位置更新是低频轮询，`_compose` 里零指纹计算")
+        eng._cue_pos_next_t = 1e18          # 让门控命中（模拟"0.2s 内重复调用"）
+        t0 = time.perf_counter()
+        for _ in range(20000):
+            eng._cue_auto_position()
+        cheap = (time.perf_counter() - t0) / 20000 * 1e6
+        eng._cue_pos_next_t = 0.0
+        t0 = time.perf_counter()
+        for _ in range(2000):
+            eng._cue_pos_next_t = 0.0
+            eng._cue_auto_position()
+        full = (time.perf_counter() - t0) / 2000 * 1e6
+        print("      门控命中 %.3f µs/次 ；真轮询 %.1f µs/次（含 tracker+set_cue_position）"
+              % (cheap, full))
+        check("门控命中（未到期）< 5µs", cheap < 5.0, round(cheap, 3))
+        check("真轮询 < 200µs（0.2s 一次 ⇒ 占 0.1%）", full < 200.0, round(full, 1))
+        src = open(os.path.join(SRC, "engine.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        hits = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in ("_compose", "_draw_cuesheet_layer", "_cue_frame"):
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Attribute) and sub.attr.startswith("recognized_"):
+                            hits.append(node.name)
+        check("_compose/_draw_cuesheet_layer/_cue_frame 里零 `recognized_*` 引用",
+              not hits, hits)
+
+        # ---------------- 选表策略（同级多张 ⇒ prefer） ----------------
+        print("\n⑥ 选表策略：级别优先 → prefer → mtime → 路径")
+        ea = {"path": "P:/a.ercue", "mtime": 100.0, "title": "A"}
+        eb = {"path": "P:/b.ercue", "mtime": 200.0, "title": "B"}
+        pick = cue_position.choose_sheet([(ea, "meta"), (eb, "meta")], prefer={}, track_meta_id="")
+        check("同级无偏好 ⇒ 取 mtime 最新", pick["path"] == "P:/b.ercue", pick)
+        pick = cue_position.choose_sheet([(ea, "meta"), (eb, "meta")],
+                                         prefer={"k": "P:/a.ercue"}, track_meta_id="k")
+        check("有 prefer ⇒ 用记住的那张", pick["path"] == "P:/a.ercue", pick)
+        pick = cue_position.choose_sheet([(ea, "md5"), (eb, "meta")], prefer={"k": "P:/b.ercue"},
+                                         track_meta_id="k")
+        check("prefer 不能盖过更高命中级别", pick["path"] == "P:/a.ercue", pick)
+    finally:
+        engine.make_player = real_make
+
+    print("")
+    if fails:
+        print("POS_FAIL  %d 项不通过：%s" % (len(fails), "、".join(fails)))
+        return 1
+    print("POS_OK  自动跟拍/丢歌不接管/切歌换表/抖动不抖断/低频轮询/选表策略 全过")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
