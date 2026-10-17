@@ -2388,6 +2388,11 @@ class LayerStackPanel(QWidget):
     layer_pick = Signal(int)
     header_changed = Signal()                 # 任一图层属性被改（由外部保存配置）
 
+    #: 码表下拉宽度。普通图层：右侧还有 不透明度/α/锁/混合 ⇒ 只剩 92px 可用；
+    #: 码表图层：那 4 个控件隐藏（不占布局）⇒ 可以宽到 200px，长表名能看清。
+    CUE_COMBO_W_COMPACT = 92
+    CUE_COMBO_W = 200
+
     def __init__(self, main):
         super().__init__()
         self.main = main
@@ -2666,10 +2671,11 @@ class LayerStackPanel(QWidget):
         # ★ 码表选择（用户要求 2026-10）：原来是青绿「码」方徽标，点开弹菜单；
         #   现在换成**一整个码表下拉选项**（未绑显示「（无码表）」/ 已绑显示表名）。
         #   ⚠ **只在 `is_cuesheet` 时显示**（隐藏时 QLayout 不占位 ⇒ 普通图层头部逐像素不变）
-        #   ⚠ 宽度 92 是硬约束：图层头固定 HEADER_W=456，现有控件已占 358px
+        #   ⚠ 宽度见 `_apply_cue_header_mode`：普通图层占位时 92，码表图层把右侧控件
+        #     隐藏后可以宽到 200（长表名能看清）
         cmb_cue = QComboBox()
         cmb_cue.setObjectName("cmbCue")
-        cmb_cue.setFixedSize(92, 22)
+        cmb_cue.setFixedSize(self.CUE_COMBO_W_COMPACT, 22)
         cmb_cue.setProperty("_i18nDynamic", True)   # 文本是表名（用户数据）
         cmb_cue.setVisible(bool(getattr(lay, "is_cuesheet", False)))
         self._fill_cue_combo(cmb_cue, lay)
@@ -2736,7 +2742,34 @@ class LayerStackPanel(QWidget):
             btn_vis, btn_solo, name, op, blend, btn_alpha, btn_lock)
         f._btn_role = btn_role
         f._cmb_cue = cmb_cue
+        # 码表图层 / 普通图层的头部**排布不同** ⇒ 建好就应用一次
+        self._apply_cue_header_mode(f, lay)
         return f
+
+    # ---- 码表图层的头部排布（右侧 4 个控件隐藏）----
+    def _apply_cue_header_mode(self, f, lay):
+        """码表图层：头部只留 `[👁][S] 图层名 [▼ 码表]`。
+
+        用户 2026-10：「一整个啊 不要右边那些东西啊 那些不是在码表里都做好了吗」
+        ⇒ **不透明度 / α / 锁 / 混合模式** 是码表里**每个片段/层自己定义的**
+          （Cue 端的 `blend` / `opacity`），演出端再给一遍只会跟码表打架。
+
+        ⚠ **隐藏而不是销毁**：`setVisible(False)` ⇒
+          ① 隐藏控件不占布局（QLayout 跳过）⇒ 右侧控件消失后下拉能吃下更多宽度；
+          ② **信号接线一律不动** ⇒ 换回普通图层（卸下码表）时 `setVisible(True)`
+             立刻恢复原样，不用重建控件。
+        ⚠ 普通图层：这里只做"全部可见 + 下拉 92"，与改动前**逐像素一致**。
+        """
+        is_cue = bool(getattr(lay, "is_cuesheet", False))
+        for w in (getattr(f, "_op", None), getattr(f, "_btn_alpha", None),
+                  getattr(f, "_btn_lock", None), getattr(f, "_blend", None)):
+            if w is not None:
+                w.setVisible(not is_cue)
+        cmb = getattr(f, "_cmb_cue", None)
+        if cmb is not None:
+            cmb.setVisible(is_cue)
+            # 码表图层右侧空了 ⇒ 下拉加宽到 200（长表名能看清）；普通图层保持 92
+            cmb.setFixedWidth(self.CUE_COMBO_W if is_cue else self.CUE_COMBO_W_COMPACT)
 
     # ---- 码表下拉（图层头） ----
     def _fill_cue_combo(self, cmb, lay):
@@ -2972,14 +3005,13 @@ class LayerStackPanel(QWidget):
             f._btn_lock.setChecked(bool(getattr(lay, "lock_motion", False)))
             f._name.setText(lay.name)
             f._name.setToolTip(lay.name + T("\n双击重命名"))
-            # 码表下拉：只在码表层显示（隐藏不占位 ⇒ 普通图层布局逐像素不变）
+            # 码表下拉 + 头部排布：码表层只留 [👁][S] 名称 [▼码表]，右侧 4 个控件隐藏
             cmb_cue = getattr(f, "_cmb_cue", None)
             if cmb_cue is not None:
-                is_cue = bool(getattr(lay, "is_cuesheet", False))
-                cmb_cue.setVisible(is_cue)
-                if is_cue:
+                if bool(getattr(lay, "is_cuesheet", False)):
                     # 表名 / 绑定的包可能变了（换表、导入、被移出列表）⇒ 重建选项并选中当前项
                     self._fill_cue_combo(cmb_cue, lay)
+            self._apply_cue_header_mode(f, lay)
             for w in (f._btn_vis, f._btn_solo, f._op, f._blend, f._btn_alpha, f._btn_lock):
                 w.blockSignals(False)
             # 角色按钮（自动图层专属）

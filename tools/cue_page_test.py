@@ -27,7 +27,9 @@ SHOT_DIR = os.path.join(HERE, "_cueshots")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from PySide6.QtWidgets import QApplication, QAbstractItemView          # noqa: E402
+from PySide6.QtCore import Qt                                        # noqa: E402
+from PySide6.QtWidgets import (QApplication, QAbstractItemView,       # noqa: E402
+                               QWidget)
 
 import cuesheet                                                       # noqa: E402
 import cue_page                                                       # noqa: E402
@@ -383,8 +385,38 @@ def main():
     check("码表层的下拉**可见**", not hdr_cue._cmb_cue.isHidden())
     check("下拉显示表名「测试码表」", hdr_cue._cmb_cue.currentText() == "测试码表",
           hdr_cue._cmb_cue.currentText())
-    check("下拉宽度紧凑（≤92px）", hdr_cue._cmb_cue.width() <= 92,
+    # 用户 2026-10：「一整个啊 不要右边那些东西啊」⇒ 码表图层右侧 4 个控件隐藏，
+    # 空出来的宽度给下拉（92 → 200）
+    check("码表图层：下拉加宽到 200（右侧控件隐藏后腾出的宽度）",
+          hdr_cue._cmb_cue.width() == panels.LayerStackPanel.CUE_COMBO_W,
           hdr_cue._cmb_cue.width())
+    for nm in ("_op", "_btn_alpha", "_btn_lock", "_blend"):
+        w = getattr(hdr_cue, nm, None)
+        check("码表图层：%s 已隐藏（不占布局）" % nm, w is not None and w.isHidden(),
+              None if w is None else w.isHidden())
+    # ⚠ 可见性必须在 show() 之后判：未 show 的窗口里子控件 `isHidden()` 全是 True（假象）
+    ok_s, path_s = shot(lsp, "page4_layer_combo.png", 940, 240)
+    check("截图已落盘 page4_layer_combo.png", ok_s, path_s)
+    # ⚠ 用 layout 项来数（`findChildren(QWidget, "", DirectChildrenOnly)` 在 PySide6 上
+    #   只返回一部分，会误判）
+    lay_cue = hdr_cue.layout()
+    vis_cue = []
+    for _i in range(lay_cue.count()):
+        _w = lay_cue.itemAt(_i).widget()
+        if _w is not None and not _w.isHidden():
+            vis_cue.append(type(_w).__name__)
+    print("      码表图层头可见子控件 = %s" % vis_cue)
+    check("码表图层头只剩 4 个控件（👁 / S / 名称 / 下拉）",
+          len(vis_cue) == 4, vis_cue)
+    check("普通图层：4 个控件仍然可见（一个像素都没动）",
+          all(not getattr(hdr_plain, nm).isHidden()
+              for nm in ("_op", "_btn_alpha", "_btn_lock", "_blend")))
+    # 隐藏必须"不销毁"：信号接线还在 —— 用**行为**证明（改值 ⇒ 图层不透明度跟着变）
+    lay2.opacity = 1.0
+    hdr_cue._op.setValue(40)
+    check("隐藏后 _op 仍能驱动图层（valueChanged 未断）",
+          abs(float(lay2.opacity) - 0.40) < 1e-6, lay2.opacity)
+    hdr_cue._op.setValue(100)
     check("普通层没有可见的码表下拉", hdr_plain._cmb_cue.isHidden(),
           hdr_plain._cmb_cue.isHidden())
     items = [hdr_cue._cmb_cue.itemText(i) for i in range(hdr_cue._cmb_cue.count())]
@@ -392,9 +424,6 @@ def main():
     check("下拉含「（无码表）」", "（无码表）" in items, items)
     check("下拉含两张码表", "测试码表" in items and "第二张" in items, items)
     check("下拉末尾是「导入新码表…」", items[-1] == "导入新码表…", items)
-    ok_s, path_s = shot(lsp, "page4_layer_combo.png", 940, 240)
-    check("截图已落盘 page4_layer_combo.png", ok_s, path_s)
-
     # ================= ⑨ 下拉切换（换表 / 卸下） =================
     print("\n⑨ 下拉切换：换表 ⇒ 引擎的表变；选「（无码表）」⇒ 卸下")
     cmb = hdr_cue._cmb_cue
@@ -418,6 +447,14 @@ def main():
     check("卸下后下拉变回「（无码表）」", cmb.currentText() == "（无码表）",
           cmb.currentText())
     check("卸下后下拉隐藏（普通图层布局不变）", cmb.isHidden(), cmb.isHidden())
+    # 隐藏 ≠ 销毁：卸下后右侧 4 个控件必须**原样回来**（信号也一直没断）
+    check("卸下后 滑杆/α/锁/混合 全部恢复可见（隐藏不是销毁）",
+          all(not getattr(hdr_cue, nm).isHidden()
+              for nm in ("_op", "_btn_alpha", "_btn_lock", "_blend")),
+          [getattr(hdr_cue, nm).isHidden()
+           for nm in ("_op", "_btn_alpha", "_btn_lock", "_blend")])
+    check("卸下后下拉宽度回到 92（普通图层口径）",
+          cmb.width() == panels.LayerStackPanel.CUE_COMBO_W_COMPACT, cmb.width())
 
     # ================= ⑫ 下拉文本：未绑 / 名字空白的表 都要看得出区别 =================
     print("\n⑫ 下拉文本防御：绝不能出现空文本（否则「没绑」和「绑了空名表」混不起来）")

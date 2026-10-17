@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.10.17.04
+Version 2026.10.17.06
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -633,6 +633,11 @@ The **4th tab "Cue Sheets"** (next to Show / Library / Music · Genre).
    "(no cue sheet)" when nothing is loaded):
    - pick another sheet = **change**; pick "(no cue sheet)" = **unload**;
      pick "Import new cue sheet…" = import and bind right away.
+   - A cue layer's header keeps **only** Show / Solo / layer name / cue-sheet
+     dropdown — opacity, alpha, lock and blend mode are **not** offered here:
+     the cue sheet already defines them per clip/layer, and a second set of
+     controls would only fight it. They come back automatically when you
+     unload the cue sheet.
 4. **Play**: start the song. If the song is recognized and has a cue sheet, it
    takes over the visuals; otherwise normal auto scheduling continues.
    - One track in the package -> bound automatically; several -> pick one
