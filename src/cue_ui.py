@@ -387,6 +387,7 @@ class CueSheetDialog(QDialog):
         if self.chk_enable.isChecked():
             self._enable(True)
         self.refresh()
+        self._notify_owner()
         if not ok:
             self._error("已装载码表，但**没有绑定曲目** ⇒ 图层不接管（请选一首曲目）。")
         return ok
@@ -439,6 +440,7 @@ class CueSheetDialog(QDialog):
         except Exception as e:                                   # noqa: BLE001
             self._error("切换启用失败：%s" % e)
         self.refresh()
+        self._notify_owner()
 
     def on_uninstall(self):
         self.stop_clock()
@@ -450,6 +452,7 @@ class CueSheetDialog(QDialog):
         self.pkg, self.sheet, self.track, self.media_paths = "", None, None, {}
         self.lbl_clock.setText("—")
         self.refresh()
+        self._notify_owner()
 
     # ---------------- 手动起拍（临时位置源） ----------------
     def _beat_len(self):
@@ -522,6 +525,26 @@ class CueSheetDialog(QDialog):
         except Exception:                                        # noqa: BLE001
             pass
         self.refresh()
+
+    def _notify_owner(self):
+        """通知主窗刷新图层面板 —— 徽标 与 对话框里的"绑定到"必须**双向一致**。
+
+        （徽标在 `panels.LayerStackPanel._build_header` 里；这里只调它的公开刷新入口，
+          不直接改控件，避免 UI 层互相依赖。）
+        """
+        panel = getattr(self.owner, "layers_panel", None)
+        fn = getattr(panel, "refresh_header", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:                                    # noqa: BLE001
+                pass
+        fn2 = getattr(self.owner, "refresh_playing", None)
+        if callable(fn2):
+            try:
+                fn2()
+            except Exception:                                    # noqa: BLE001
+                pass
 
     def _error(self, msg):
         """**绝不静默**：错误直接写进对话框（设计 §3.4）。"""

@@ -2638,6 +2638,17 @@ class LayerStackPanel(QWidget):
         name._is_name = True
         h.addWidget(name)
 
+        # ★ 码表徽标：**只在 `is_cuesheet` 时显示**（隐藏时 QLayout 不占位 ⇒ 普通图层头部布局零变化）
+        btn_cue = QPushButton("码")
+        btn_cue.setObjectName("btnCue")
+        btn_cue.setFixedSize(24, 22)
+        btn_cue.setStyleSheet(self._btn_cue_style())
+        btn_cue.setProperty("_i18nDynamic", True)      # tooltip 含表名（用户数据）
+        btn_cue.setToolTip(T("码表：这个图层由码表接管（点开可换表 / 卸下）"))
+        btn_cue.setVisible(bool(getattr(lay, "is_cuesheet", False)))
+        btn_cue.clicked.connect(lambda _c=False, i=idx: self.cue_menu(i))
+        h.addWidget(btn_cue)
+
         op = QSlider(Qt.Horizontal)
         op.setRange(0, 100)
         op.setValue(int(lay.opacity * 100))
@@ -2697,7 +2708,68 @@ class LayerStackPanel(QWidget):
         f._btn_vis, f._btn_solo, f._name, f._op, f._blend, f._btn_alpha, f._btn_lock = (
             btn_vis, btn_solo, name, op, blend, btn_alpha, btn_lock)
         f._btn_role = btn_role
+        f._btn_cue = btn_cue
         return f
+
+    def _btn_cue_style(self):
+        """码表徽标：**青绿**（与 Kv 的金、Solo 的黄区分开），一眼能看出"这层被码表接管"。"""
+        return ("#btnCue{padding:0;border:1px solid #1f8a72;border-radius:3px;"
+                "font-size:12px;background:#0d3b33;color:#6ff0cf;}"
+                "#btnCue:hover{background:#12564a;}"
+                "#btnCue:pressed{background:#0a2e28;}")
+
+    def cue_menu(self, idx):
+        """徽标点击：换表 / 打开对话框 / 卸下。
+
+        ⚠ "换表"必须走**同一个对话框**（`main.open_cuesheet()`）—— 包的选择/校验/素材目录
+          逻辑只有一处，避免这里再实现一套（两套迟早分叉）。
+        """
+        lays = getattr(self.main.engine, "layers", None) or []
+        if not (0 <= idx < len(lays)):
+            return
+        lay = lays[idx]
+        m = QMenu(self)
+        # 第一行只做信息展示（灰掉）
+        st = {}
+        try:
+            st = self.main.engine.cuesheet_status()
+        except Exception:                                        # noqa: BLE001
+            st = {}
+        bound = "、".join(st.get("bound_layers") or [])
+        act_info = m.addAction("码表：%s" % ((st.get("title") or "（未装载）")))
+        act_info.setEnabled(False)
+        act_info2 = m.addAction("已绑图层：%s ｜ 片段：%d"
+                                % (bound or "无", int(st.get("rt_items", 0) or 0)))
+        act_info2.setEnabled(False)
+        m.addSeparator()
+        act_open = m.addAction(T("换表 / 导入码表…"))
+        act_off = m.addAction(T("从这个图层卸下码表"))
+        act_off.setEnabled(bool(getattr(lay, "is_cuesheet", False)))
+        btn = self.rows[idx][0] if 0 <= idx < len(self.rows) else self
+        chosen = m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        if chosen is act_open:
+            fn = getattr(self.main, "open_cuesheet", None)
+            if callable(fn):
+                fn()
+        elif chosen is act_off:
+            try:
+                self.main.engine.clear_cue_sheet()
+            except Exception:                                    # noqa: BLE001
+                pass
+            lay.is_cuesheet = False
+            lay.cuesheet_id = ""
+            lay.cs_states = []
+            lay.cs_active = False
+            try:
+                self.main.engine._cue_set_active(lay, set())
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                self.main.save_layers()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self.refresh_header(idx)
+            self.refresh_playing()
 
     def _set_visible(self, idx, visible, btn):
         btn.setText("👁" if visible else "◌")
@@ -2769,6 +2841,15 @@ class LayerStackPanel(QWidget):
             f._btn_lock.setChecked(bool(getattr(lay, "lock_motion", False)))
             f._name.setText(lay.name)
             f._name.setToolTip(lay.name + T("\n双击重命名"))
+            # 码表徽标：只在码表层显示（隐藏不占位 ⇒ 普通图层布局不变）
+            btn_cue = getattr(f, "_btn_cue", None)
+            if btn_cue is not None:
+                is_cue = bool(getattr(lay, "is_cuesheet", False))
+                btn_cue.setVisible(is_cue)
+                btn_cue.setToolTip(
+                    (T("码表：%s（点开可换表 / 卸下）")
+                     % (str(getattr(lay, "cuesheet_id", "") or T("已绑定"))))
+                    if is_cue else T("码表：这个图层由码表接管（点开可换表 / 卸下）"))
             for w in (f._btn_vis, f._btn_solo, f._op, f._blend, f._btn_alpha, f._btn_lock):
                 w.blockSignals(False)
             # 角色按钮（自动图层专属）

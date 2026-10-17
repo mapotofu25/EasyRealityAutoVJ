@@ -824,6 +824,9 @@ class AutoVJEngine(QObject):
             lay.role = ld.get("role", "bg") or "bg"
             lay.auto_mode = bool(ld.get("auto_mode", False))
             lay.is_kv = bool(ld.get("is_kv", False))
+            # ★ 码表绑定关系必须持久化回来（否则重启后徽标/接管关系丢了，用户以为"码表没生效"）
+            lay.is_cuesheet = bool(ld.get("is_cuesheet", False))
+            lay.cuesheet_id = str(ld.get("cuesheet_id", "") or "")
             lay.auto_clips = []
             for p in ld.get("auto_clips", []):
                 m = self.library.get(p)
