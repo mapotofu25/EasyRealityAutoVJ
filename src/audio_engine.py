@@ -1533,7 +1533,7 @@ class AudioEngine:
             except Exception:                                    # noqa: BLE001
                 hit, n_hash = -1, -1
             line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f "
-                    "hit=%d/%d seg=%.3f/%d"
+                    "hit=%d/%d seg=%.3f/%d raw=%d/hint=%d"
                     % (time.strftime("%H:%M:%S"),
                        1 if fp_db is not None else 0,
                        1 if eng is not None else 0,
@@ -1543,7 +1543,9 @@ class AudioEngine:
                        float(getattr(st, "level", 0.0) or 0.0),
                        float(getattr(st, "energy", 0.0) or 0.0),
                        float(getattr(st, "bpm_display", 0.0) or 0.0),
-                       hit, n_hash, seg_rms, seg_n))
+                       hit, n_hash, seg_rms, seg_n,
+                       int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[1]),
+                       int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[3])))
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
@@ -1605,12 +1607,28 @@ class AudioEngine:
                 with self.state.lock:
                     _pred = self.state.grid_pred_orig
                     _pred_w = self.state.grid_pred_w
-                _hint = (_pred * _FP_SR / _FP_HOP) if (_pred is not None and _pred >= 0.0) else None
+                    _locked = self.state.recognized_song_id
+                # ★★★ 2026-10-17：**还没锁定任何歌时绝不给 hint**。
+                #   现场实测（`hit=181/196`，查询哈希 92% 都在库里）：音频与库都没问题，
+                #   但 `votes` 长期偏小、电荷条永远不确认 ⇒ 认不出。根因就是这个 hint：
+                #     `_pick()` 的设计是"窗口内只要有候选（哪怕 1 票）就取它"，这在
+                #     **已锁定**时是对的（防重复段落挑错位置）；但在**尚未锁定**时，
+                #     `grid_pred_orig` 本身没有意义 ⇒ 窗口落点随机 ⇒ 挑中一个 1~3 票的
+                #     杂散候选 ⇒ 票数永远够不到 CONFIRM_VOTES(20) ⇒ 永远锁不上 ⇒
+                #     预测继续错 ⇒ **死锁**。现场表现就是"一直认不出"。
+                #   因此：锁定前走纯全局众数（等于旧行为），锁定后才用 hint 防歧义。
+                _hint = None
+                if (_locked is not None and int(_locked) >= 0
+                        and _pred is not None and _pred >= 0.0):
+                    _hint = _pred * _FP_SR / _FP_HOP
                 # hint 窗口（帧）：引擎按该歌 beat_len 换算后写入；缺省 None ⇒ fp 用缺省 HINT_W
                 _hint_w = (float(_pred_w) if (_hint is not None and _pred_w is not None
                                              and float(_pred_w) > 0.0) else None)
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
+                # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
+                self._last_match = (sid, int(votes or 0), float(off or 0.0),
+                                    1 if _hint is not None else 0)
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
                 cur = eng.current_song_id
