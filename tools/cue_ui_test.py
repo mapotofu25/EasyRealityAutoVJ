@@ -221,7 +221,7 @@ def main():
         check("导入成功并建立运行时", ok is True and eng._cue_rt is not None,
               (ok, eng._cue_rt))
         check("单曲目自动绑定（未认歌但按唯一曲目绑定）",
-              dlg.track is not None and "唯一曲目" in "\n".join(dlg.warnings),
+              dlg.track is not None and "已直接绑定" in "\n".join(dlg.warnings),
               dlg.warnings)
         st = eng.cuesheet_status()
         check("状态：已装载 / 片段数 1 / 已绑图层 1 个",
@@ -308,19 +308,30 @@ def main():
             check("(c) 缺素材：提示缺 N 个",
                   ("缺 1 个素材" in txt) or ("有 1 个素材没找到" in txt), txt[:150])
 
-            # (d) 认不出歌 + 用户取消选择 ⇒ 装表但不接管
+            # (d1) 多曲目 + 没在放歌 ⇒ **不弹窗**（用户：整张表的东西我都要用），
+            #      装表但不绑曲目（安全降级），放歌后引擎自动选对应那首。
             two = make_sheet(2)
             pkg2 = save_pkg(two, os.path.join(tmp, "two.ercue"))
             real_pick = cue_ui.pick_track
-            cue_ui.pick_track = lambda sheet, parent=None, current_title="": None
+            picks = {"n": 0}
+
+            def _no_pick(sheet, parent=None, current_title=""):
+                picks["n"] += 1
+                return None
+
+            cue_ui.pick_track = _no_pick
             try:
                 ok2 = dlg.import_one(pkg2)
                 msg = dlg.lbl_error.text()
-                check("(d1) 认不出歌 + 用户取消 ⇒ 不接管且提示可见",
-                      ok2 is False and "没有绑定曲目" in msg, msg[:120])
+                check("(d1) 导入多曲目包**不弹选曲目窗**（pick_track 未被调用）",
+                      picks["n"] == 0, picks["n"])
+                check("(d1) 装表但不绑曲目（ok=False 属预期，安全降级）",
+                      ok2 is False and dlg.track is None, (ok2, dlg.track))
+                check("(d1) 提示「放歌后会自动选对应的那首」可见",
+                      "自动选对应的那首" in msg, msg[:140])
             finally:
                 cue_ui.pick_track = real_pick
-            # (d2) 认不出歌 + 用户选了第 2 首 ⇒ 绑定成功
+            # (d2) 用户**主动**点「选曲目…」 ⇒ 才弹选择框；选中后绑定并接管
             lay2 = engine.Layer("码表层2")
             lay2.is_cuesheet = True
             eng2 = new_engine([lay2])
@@ -328,9 +339,12 @@ def main():
             cue_ui.pick_track = lambda sheet, parent=None, current_title="": sheet.tracks[1]
             try:
                 ok3 = dlg2.import_one(pkg2)
+                check("(d2) 导入本身仍不弹窗（ok=False，未绑曲目）",
+                      ok3 is False and dlg2.track is None, (ok3, dlg2.track))
+                dlg2.on_pick_track()             # 「选曲目…」按钮
                 _t = getattr(getattr(dlg2.track, "identity", None), "title", None)
-                check("(d2) 用户选第 2 首 ⇒ 绑定成功并接管",
-                      ok3 is True and _t == "曲目1", (ok3, _t))
+                check("(d2) 点「选曲目…」后绑定成功并接管",
+                      _t == "曲目1" and eng2._cue_rt is not None, (_t, eng2._cue_rt))
                 check("状态里显示所选曲目名",
                       "曲目1" in dlg2.lbl_status.text(), dlg2.lbl_status.text()[:120])
             finally:

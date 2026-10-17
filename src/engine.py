@@ -605,7 +605,7 @@ class AutoVJEngine(QObject):
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
         self._cue_sheet = None      # 当前码表（cuesheet.CueSheet）
         self._cue_track = None      # 认到的曲目（TrackEntry）；None ⇒ 不接管
-        self._cue_bound_cache = None    # (track, song_id) 绑定曲目→song_id 的反查缓存
+        self._cue_bound_cache = None    # (track, 主 song_id, frozenset(可接受 id)) 反查缓存
         self._cue_bad_song_n = 0        # 「认到另一首歌」累计次数（限流日志用）
         self._cue_bad_song_t = 0.0
         #   ★ 它同时是 `_cue_beat_len_for()` 的**第一优先**拍长来源（`identity.bpm`）：
@@ -2988,30 +2988,175 @@ class AutoVJEngine(QObject):
             bl = 0.0
         return bl if bl > 1e-6 else 1.0
 
-    def _cue_bound_song_id(self):
-        """当前绑定曲目 → `song_id`（带缓存；`set/clear_cue_sheet` 时清空）。"""
+    def _cue_bound_ids(self):
+        """`(主 id, 可接受 id 集合)`（**带缓存**；`set/clear_cue_sheet` 时清空）。
+
+        为什么要"集合"而不是"单个 id"（用户 2026-10-18 的真实场景）：
+          曲库里是**版本 A**（已扫进曲库），码表包却是用**版本 B**做的
+          （同一首音乐，只有专辑/封面不同；也可能 A=flac、B=mp3 而 `fp_id` 不同）。
+          ⇒ 表里的曲目与"此刻 DJ 放的音频"在演出端是**两个 song_id**：
+             · 灌包指纹得到的那一个（合成 id，`fp_song_id(fp_id)`）；
+             · 本机曲库里同一首音乐的路径 id。
+          只认一个 ⇒ 另一个必被护栏拦掉 ⇒ **不出画**（用户看到"导入了码表却不动"）。
+        所以：把"`match_track()` 会认成同一条 track 的"本机 id **全部**放进集合。
+        ⚠ 保守：判据与认歌同一套（fp_id → file_md5 → meta_id → 名+艺人+时长≤2s），
+          **不**把整库都放进去 —— 别的歌仍然必须被护栏拒掉。
+        """
         tr = getattr(self, "_cue_track", None)
         if tr is None:
-            return None
+            return None, frozenset()
         cache = getattr(self, "_cue_bound_cache", None)
         if cache is not None and cache[0] is tr:
-            return cache[1]
-        sid = self._cue_lookup_song_id(tr)
-        self._cue_bound_cache = (tr, sid)
-        return sid
+            return cache[1], cache[2]
+        primary = self._cue_lookup_song_id(tr)
+        ids = set()
+        if primary is not None:
+            try:
+                ids.add(int(primary))
+            except (TypeError, ValueError):
+                pass
+        try:
+            ids.update(self._cue_peer_song_ids(tr))
+        except Exception:                                        # noqa: BLE001
+            pass
+        frozen = frozenset(ids)
+        self._cue_bound_cache = (tr, primary, frozen)
+        return primary, frozen
+
+    def _cue_bound_song_id(self):
+        """当前绑定曲目 → **主** `song_id`（诊断/日志用；护栏请用 `_cue_bound_song_ids()`）。
+
+        "主" = `_cue_lookup_song_id()` 沿 ⓪→①→②→③ 认出来的那个（等同改动前的返回值）。
+        同一首歌在本机的**其它等价 id**（同音乐另一个版本）不在这个返回值里，
+        它们在 `_cue_bound_song_ids()` 里 —— 护栏要的是集合。
+        """
+        return self._cue_bound_ids()[0]
+
+    def _cue_bound_song_ids(self):
+        """当前绑定曲目在本机**可能对应哪些 song_id**（护栏用的可接受集合）。
+
+        返回 `set`：空集 ⇒ 调用方**不启用护栏**（绝不变成"永远不跟"的新故障）。
+        缓存按 track 对象身份（`set/clear_cue_sheet` 会清）。
+        """
+        return set(self._cue_bound_ids()[1])
+
+    @staticmethod
+    def _cue_local_dur(rec):
+        """`music_meta` 一条记录里的时长（秒）：`grid.dur` → `duration` → `dur`；没有 ⇒ 0.0。
+
+        ⚠ 曲库扫描把时长写在 `meta["grid"]["dur"]`（不是顶层），只读顶层等于永远拿 0
+          ⇒ 第 ④ 级（名+艺人+时长）永远不成立。
+        """
+        if not isinstance(rec, dict):
+            return 0.0
+        for v in ((rec.get("grid") or {}).get("dur") if isinstance(rec.get("grid"), dict)
+                  else None, rec.get("duration"), rec.get("dur")):
+            try:
+                f = float(v or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if f > 0.0:
+                return f
+        return 0.0
+
+    def _cue_peer_song_ids(self, tr):
+        """本机曲库里**同一首音乐**的其它 `song_id`（判据与认歌同级，按可靠性从高到低）。
+
+        ① `fp_id` 相等（同一段音频的指纹签名 —— 换容器/改名仍命中）
+        ② `file_md5` 相等（同一文件字节）
+        ③ `meta_id` 相等（名+艺人+时长取整 2 秒；两边缺失时现算，与 `Identity.meta_key` 同式子）
+        ④ 名 + 艺人（归一化，与认歌第 ③ 级同一口径）**且**时长差 ≤2 秒
+        **绝不**按"文件名"猜（改名/换目录猜不到，且容易把翻唱认成同一首）。
+        取不到 ⇒ 空集（绝不抛）。
+        """
+        idn = getattr(tr, "identity", None)
+        if idn is None:
+            return set()
+        try:
+            meta = self.cfg["music_meta"] or {}
+        except Exception:                                        # noqa: BLE001
+            return set()
+        if not isinstance(meta, dict) or not meta:
+            return set()
+        fp_id = str(getattr(idn, "fp_id", "") or "").strip()
+        fmd5 = str(getattr(idn, "file_md5", "") or "").strip().lower()
+        mid = str(getattr(idn, "meta_id", "") or "").strip()
+        title = str(getattr(idn, "title", "") or "")
+        artist = str(getattr(idn, "artist", "") or "")
+        try:
+            dur = float(getattr(idn, "duration_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        try:
+            import cuesheet as _cs
+            norm = _cs._norm_title_artist
+            want_nt, want_na = norm(title), norm(artist)
+        except Exception:                                        # noqa: BLE001
+            _cs, norm = None, None
+            want_nt = want_na = ""
+        out = set()
+        for p, rec in meta.items():
+            if not isinstance(rec, dict):
+                continue
+            sid = self._cue_song_id_of(p)
+            if sid < 0:
+                continue
+            r_fp = str(rec.get("fp_id") or "").strip()
+            if fp_id and r_fp and r_fp == fp_id:
+                out.add(sid)
+                continue
+            r_md5 = str(rec.get("file_md5") or rec.get("md5") or "").strip().lower()
+            if fmd5 and r_md5 and r_md5 == fmd5:
+                out.add(sid)
+                continue
+            if not (want_nt or want_na):
+                continue
+            r_title = str(rec.get("title") or "")
+            r_artist = str(rec.get("artist") or "")
+            r_dur = self._cue_local_dur(rec)
+            # ③ meta_id（两侧任一缺失就现算 —— 与 `cue_index._meta_key` / `Identity.meta_key` 同式子）
+            r_mid = str(rec.get("meta_id") or "").strip()
+            if _cs is not None:
+                if not r_mid and (r_title or r_artist):
+                    try:
+                        r_mid = _cs.Identity.meta_key(r_title, r_artist, r_dur)
+                    except Exception:                            # noqa: BLE001
+                        r_mid = ""
+                if not mid and (want_nt or want_na):
+                    try:
+                        mid = _cs.Identity.meta_key(title, artist, dur)
+                    except Exception:                            # noqa: BLE001
+                        mid = ""
+            if mid and r_mid and mid == r_mid:
+                out.add(sid)
+                continue
+            # ④ 名 + 艺人 + 时长差 ≤2 秒（时长必须两侧都有，否则宁可不算 —— 保守）
+            if norm is None or dur <= 0.0 or r_dur <= 0.0:
+                continue
+            if abs(r_dur - dur) > 2.0:
+                continue
+            try:
+                if norm(r_title) == want_nt and norm(r_artist) == want_na:
+                    out.add(sid)
+            except Exception:                                    # noqa: BLE001
+                continue
+        return out
 
     def _cue_accept_pos(self, sid, pb):
-        """认错歌护栏：识别到的歌必须**就是本表绑定的那首**，否则本帧不接管（返回 None）。
+        """认错歌护栏：识别到的歌必须**属于本表这条曲目**，否则本帧不接管（返回 None）。
 
         背景（用户 2026-10-17 追问「识别错了怎么办」）：指纹会在重复段落 / 同曲不同版本 /
         翻唱上认成另一首歌。照跟的话 `pos_beats` 是**那首歌**的秒数，码表会整段乱跳。
-        取不到绑定关系（`_cue_bound_song_id()` 为 None）⇒ **不启用护栏**，退回"照跟"，
-        绝不让护栏变成"永远不跟"的新故障。
+
+        ★ 2026-10-18 修正：判据从"单个 id 相等"改成"**属于可接受集合**"
+          （`_cue_bound_song_ids()`）—— 同一首音乐在本机可能有两个 id（码表包里那版 +
+          曲库里那版），只认一个会把其中一版判成"另一首歌"⇒ 不出画。
+          集合为空 ⇒ **不启用护栏**（退回"照跟"），绝不让护栏变成"永远不跟"的新故障。
         """
         if pb is None:
             return None
-        want = self._cue_bound_song_id()
-        if want is not None and sid >= 0 and sid != want:
+        want = self._cue_bound_song_ids()
+        if want and sid >= 0 and sid not in want:
             self._cue_bad_song_log(sid, want)
             return None
         self._cue_bad_song_n = 0
@@ -3026,8 +3171,12 @@ class AutoVJEngine(QObject):
             if now - float(getattr(self, "_cue_bad_song_t", 0.0) or 0.0) < 10.0:
                 return
             self._cue_bad_song_t = now
+            try:
+                shown = ",".join(str(int(x)) for x in sorted(want))
+            except TypeError:
+                shown = str(want)
             self._cue_health("认到另一首歌（song_id=%s，本表绑定 %s）⇒ 码表暂不跟位（累计 %d 次）"
-                             % (sid, want, n))
+                             % (sid, shown, n))
         except Exception:                                        # noqa: BLE001
             pass
 
@@ -3314,11 +3463,12 @@ class AutoVJEngine(QObject):
                         pb = trk.pos_beats_at(now)
         # ★★ 认错歌的护栏（用户 2026-10-17 追问「识别错了怎么办」）：
         #   指纹偶尔会认成另一首歌（重复段落 / 翻唱 / 同一首的不同版本）。若照跟，绘出来的
-        #   位置是**那首歌**的秒数，码表会整段乱跳。这里要求"识别到的 song_id 必须等于
-        #   当前这张码表绑定的那首"；不等 ⇒ 本帧不接管（保留上一帧），并限流记日志。
+        #   位置是**那首歌**的秒数，码表会整段乱跳。这里要求"识别到的 song_id 必须**属于**
+        #   这张码表这条曲目的可接受集合"（`_cue_bound_song_ids()`：包里那版 + 曲库里同音乐
+        #   的其它版本）；不属于 ⇒ 本帧不接管（保留上一帧），并限流记日志。
         #   ⚠ 换歌流程不受影响：`_cue_auto_bind` 已在上面把表换成新歌的那张，
-        #     `_cue_bound_song_id()` 随之变成新歌 ⇒ 守卫自动放行。
-        #   ⚠ 取不到绑定关系（老码表没 fp_id、文件名也对不上）时返回 None ⇒ **不启用守卫**，
+        #     `_cue_bound_song_ids()` 随之变成新歌 ⇒ 守卫自动放行。
+        #   ⚠ 集合为空（老码表没 fp_id、文件名也对不上）⇒ **不启用守卫**，
         #     退回到"照跟"的旧行为，绝不让护栏变成"永远不跟"的新故障。
         pb = self._cue_accept_pos(sid, pb)
         if pb is not None:

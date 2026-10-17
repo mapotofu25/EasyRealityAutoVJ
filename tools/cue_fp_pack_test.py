@@ -453,6 +453,11 @@ def main():
         "_cue_lookup_song_id": eng_mod.AutoVJEngine._cue_lookup_song_id,
         "_cue_track_query_by_sid": eng_mod.AutoVJEngine._cue_track_query_by_sid,
         "_cue_bound_song_id": eng_mod.AutoVJEngine._cue_bound_song_id,
+        # `_cue_bound_song_id()` 现在走 `_cue_bound_ids()`（主 id + 可接受 id 集合）
+        "_cue_bound_ids": eng_mod.AutoVJEngine._cue_bound_ids,
+        "_cue_bound_song_ids": eng_mod.AutoVJEngine._cue_bound_song_ids,
+        "_cue_peer_song_ids": eng_mod.AutoVJEngine._cue_peer_song_ids,
+        "_cue_local_dur": staticmethod(eng_mod.AutoVJEngine._cue_local_dur),
         "_cue_accept_pos": eng_mod.AutoVJEngine._cue_accept_pos,
         "_cue_bad_song_log": eng_mod.AutoVJEngine._cue_bad_song_log,
         "_cue_song_id_of": staticmethod(eng_mod.AutoVJEngine._cue_song_id_of),

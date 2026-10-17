@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
 
 import cue_fp_pack
 import cuesheet
-from i18n import T, lang as i18n_lang
+from i18n import T, Tf, lang as i18n_lang
 
 CUE_CFG_DEFAULTS = {
     "recent": [],            # 最近打开的包（最多 10 条，最新在前）
@@ -129,6 +129,49 @@ def pick_track(sheet, parent=None, current_title=""):
     return tracks[idx] if 0 <= idx < len(tracks) else None
 
 
+def now_playing_query(engine):
+    """**此刻正在播放的歌** → `(认歌查询参数, 人类可读描述)`；没有在放歌 ⇒ `({}, "")`。
+
+    为什么要问引擎而不是问用户：`audio_engine` 每 0.5s 用最近 4.5s 音频做指纹匹配，
+    结果就写在 `state.recognized_song_id`（= 指纹库主键）。这里只读它，**零成本**。
+
+    ⚠ **不能写 `int(x or -1)`**：`song_id == 0` 是合法值（第一首），`0 or -1` 会变成 -1
+      ⇒ "明明认得却当成没歌"。所以用 try/except。
+    ⚠ 两条路都试：本机有文件 ⇒ `_cue_song_path(sid)` 得到路径（读 `music_meta`）；
+      本机没文件 ⇒ `_cue_track_query_by_sid(sid)` 从 `cfg["cue"]["fp_songs"]` 反查
+      （码表包里带的指纹灌库后就是这条路）。
+    """
+    if engine is None:
+        return {}, ""
+    try:
+        st = getattr(getattr(engine, "audio", None), "state", None)
+        sid = int(getattr(st, "recognized_song_id", -1))
+    except (TypeError, ValueError, AttributeError):
+        return {}, ""
+    if sid < 0:
+        return {}, ""
+    path = ""
+    try:
+        path = str(engine._cue_song_path(sid) or "")
+    except Exception:                                            # noqa: BLE001
+        path = ""
+    q = {}
+    try:
+        q = (engine._cue_track_query(path) if path
+             else engine._cue_track_query_by_sid(sid))
+    except Exception:                                            # noqa: BLE001
+        q = {}
+    if not isinstance(q, dict):
+        return {}, ""
+    title = str(q.get("title") or "")
+    artist = str(q.get("artist") or "")
+    if title or artist:
+        how = Tf("正在播放：{} — {}", artist or "?", title or "?")
+    else:
+        how = Tf("正在播放 song_id={}", sid)
+    return q, how
+
+
 # ==========================================================================
 # 主对话框
 # ==========================================================================
@@ -206,6 +249,13 @@ class CueSheetDialog(QDialog):
                                   "「这首歌从 0:00 开始」，按挂钟喂拍位。")
         self.btn_clock.toggled.connect(self.on_toggle_clock)
         row4.addWidget(self.btn_clock)
+        # ★ 手动指定曲目：**只在用户点它时**才弹选择框。导入本身绝不弹窗
+        #   （用户：整张表的东西我都要用；弹"选一首"会让人以为要二选一）。
+        self.btn_pick_track = QPushButton(T("选曲目…"), self)
+        self.btn_pick_track.setToolTip(T("这张表有多首歌的编排时，在这里手动指定要跟哪一首"
+                                         "（不指定也能用：放歌后会自动认）"))
+        self.btn_pick_track.clicked.connect(self.on_pick_track)
+        row4.addWidget(self.btn_pick_track)
         self.lbl_clock = QLabel("—", self)
         row4.addWidget(self.lbl_clock, 1)
         root.addLayout(row4)
@@ -431,10 +481,10 @@ class CueSheetDialog(QDialog):
                     self.media_paths.update(by_id)
                     self.missing = [n for n in self.missing if n not in found]
 
-        # 认歌：没有位置源/曲目信息时**必然**认不出 ⇒ 直接走"手动绑歌"
+        # 认歌：**用此刻正在播放的那首歌**（`recognized_song_id`）走表里的五级链。
+        # ★ 认不出 / 多曲目 ⇒ track=None：**装表不绑曲目**（安全降级），之后放歌时引擎会
+        #   自动选对应那首；**绝不弹"选一首"**（用户：整张表的东西我都要用）。
         track = self._auto_match(sheet)
-        if track is None:
-            track = self._ask_track(sheet)
         self.track = track
         # ★ BPM 只是「拍 ↔ 秒」的换算系数：编排端按 bpm 把秒写成 at_beats，演出端按
         #   **同一个** bpm 把 at_beats 换回秒 ⇒ 两端一致就完全抵消，**填错/留空都不会错位**
@@ -478,7 +528,13 @@ class CueSheetDialog(QDialog):
         self.refresh()
         self._notify_owner()
         if not ok:
-            self._error("已装载码表，但**没有绑定曲目** ⇒ 图层不接管（请选一首曲目）。")
+            # ★ 多曲目表**没绑曲目**是**预期**状态（不是错误）：装表成功、放歌后自动选曲目。
+            #   只有"单曲目表却没接上"才是真异常，才按错误报。
+            n_tr = len(getattr(sheet, "tracks", None) or [])
+            if track is None and n_tr > 1:
+                pass                    # 提示已在 `_auto_match()` 里 append 过
+            else:
+                self._error(T("已装载码表，但**没有绑定曲目** ⇒ 图层不接管（请选一首曲目）。"))
         return ok
 
     def _extract_embedded(self, pkg, sheet):
@@ -540,30 +596,79 @@ class CueSheetDialog(QDialog):
         self.missing = [n for n in self.missing if n not in got]
         self.lbl_error.setText("")
 
-    def _auto_match(self, sheet):
-        """先用"当前曲目信息"认歌。Step3 未落地 ⇒ 这里只能拿到空信息。
+    def _now_playing_query(self):
+        """`now_playing_query(self.engine)` 的薄封装（见模块级同名函数的说明）。"""
+        return now_playing_query(self.engine)
 
-        ★ 单曲目码表：直接用它（否则每次导入都要弹窗，体验很差）；
-          多曲目码表：交给用户选（弹一次）。
+    def _auto_match(self, sheet):
+        """用**此刻正在播放的那首歌**认表里的曲目；认不出 ⇒ `None`（**不弹窗**）。
+
+        ★ 这里原来有个真 bug（用户 2026-10-18 撞上）：老代码是 `sheet.match_track()`
+          —— **一个参数都不给**，而 `match_track` 全靠关键字参数匹配 ⇒ 必然 `(None, "")`
+          ⇒ 这段认歌是**死代码**，哪怕正在放的歌就在表里也照样弹"选一首"。
+
+        ★ 为什么不弹窗（用户原话）：「**我做了这个码表那就说明码表里所有的东西包括音乐和
+          素材我都要用**」。弹"选一首"会让人以为要二选一、另一首就丢了。
+          现在：多曲目表 **装表但不绑曲目**（`track=None`，安全降级、不接管），
+          之后第一首歌被认出来时 `_cue_auto_position → _cue_auto_bind` **自动**选对应那首
+          —— 这条链路本来就存在，不需要用户在导入时做决定。
+          想手动指定也有入口：对话框里的「选曲目…」按钮（`on_pick_track`）。
         """
-        try:
-            tr, level = sheet.match_track()          # 无信息 ⇒ (None, "")
+        q, how = self._now_playing_query()
+        if q:
+            try:
+                tr, level = sheet.match_track(**q)
+            except TypeError:                                    # 老签名兼容（防御）
+                tr, level = None, ""
+            except Exception:                                    # noqa: BLE001
+                tr, level = None, ""
             if tr is not None:
-                self.warnings.append("已按 %s 命中曲目。" % (level or "?"))
+                self.warnings.append(Tf("已按 {} 命中曲目（{}）。", level or "?", how))
                 return tr
-        except Exception:                                        # noqa: BLE001
-            pass
+            self.warnings.append(Tf("{}，但表里没有对应的曲目 ⇒ 不预设曲目。", how))
         tracks = list(getattr(sheet, "tracks", None) or [])
         if len(tracks) == 1:
-            self.warnings.append("未认歌（Step3 未接）：已按表中唯一曲目绑定 —— %s"
-                                 % (getattr(tracks[0].identity, "title", "") or "(无标题)"))
+            self.warnings.append(
+                Tf("这张表只有一首歌的编排：已直接绑定 —— {}。",
+                   getattr(tracks[0].identity, "title", "") or T("(无标题)")))
             return tracks[0]
+        if len(tracks) > 1:
+            self.warnings.append(
+                Tf("这张表有 {} 首歌的编排：已装表，放歌后会自动选对应的那首。", len(tracks)))
         return None
 
+    def on_pick_track(self):
+        """「选曲目…」：**用户主动**指定这首表里要跟哪一首（自动认不出时的兜底）。
+
+        ⚠ 与"导入即绑定"分开：导入**不**弹窗（弹窗会让人以为二选一）；
+          只有用户点了这个按钮才问 —— 那是明确的"我要指定"。
+        """
+        if self.sheet is None or self.engine is None:
+            return
+        tr = self._ask_track(self.sheet)
+        if tr is None:
+            return
+        self.track = tr
+        try:
+            self.engine.set_cue_sheet(self.sheet, media_paths=self.media_paths, track=tr,
+                                      layer=self._current_layer(),
+                                      sheet_id=os.path.basename(self.pkg or ""))
+        except Exception as e:                                   # noqa: BLE001
+            self._error(Tf("切换曲目失败：{}", e))
+            return
+        idn = getattr(tr, "identity", None)
+        self.warnings = [w for w in self.warnings if "首歌的编排" not in str(w)]
+        self.warnings.append(Tf("已手动指定曲目：{} — {}。",
+                                getattr(idn, "artist", "") or "?",
+                                getattr(idn, "title", "") or "?"))
+        self.refresh()
+        self._notify_owner()
+
     def _ask_track(self, sheet):
+        """（保留给显式"选曲目"入口）弹一次选择框；取消 ⇒ None。"""
         tr = pick_track(sheet, self)
         if tr is None:
-            self.warnings.append("未选择曲目 ⇒ 已装表但**不接管**（画面仍走普通自动调度）。")
+            self.warnings.append(T("未选择曲目 ⇒ 已装表但**不接管**（画面仍走普通自动调度）。"))
         return tr
 
     # ---------------- 绑定 / 启停 / 卸下 ----------------
@@ -767,7 +872,7 @@ def _extract_embedded_media(pkg, sheet):
     return out
 
 
-def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True):
+def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track=False):
     """把 `.ercue` 装到指定图层。返回 `(ok, msg)`：`ok` = 引擎已建立运行时（能接管）。
 
     这是**导入/换表的唯一实现**，调它的人：
@@ -775,9 +880,15 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True):
       · 图层头的码表下拉（选某张表 / 「导入新码表…」）
       · 新建「码表图层」后立刻应用
 
-    ⚠ `CueSheetDialog`（轻量对话框）**刻意保持原有实现不动** —— 它的手动起拍、
-      状态行、最近文件是另一条交互路径，动它等于冒着把 Step5/6 弄坏的风险。
-      两者共用的是底下的 `cuesheet.load()` / `pick_track()` / `engine.set_cue_sheet()`。
+    `ask_track=False`（默认）：**多曲目表认不出时也不弹窗** —— 直接"装表不绑曲目"
+      （`track=None`），放歌后由 `_cue_auto_position → _cue_auto_bind` 自动选对应那首。
+      用户原话：「我做了这个码表那就说明码表里所有的东西包括音乐和素材我都要用」。
+    `ask_track=True`：认不出时弹一次「选要绑定的曲目」（**显式**绑定动作才用得到它）。
+      想事后手动指定：`CueSheetDialog` 里的「选曲目…」按钮。
+
+    ⚠ `CueSheetDialog`（轻量对话框）有自己的一条交互路径（手动起拍 / 状态行 / 最近文件），
+      两者共用的是底下的 `cuesheet.load()` / `now_playing_query()` / `pick_track()` /
+      `engine.set_cue_sheet()`。
     """
     cfg = getattr(owner, "cfg", None)
     engine = getattr(owner, "engine", None)
@@ -837,19 +948,29 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True):
     except Exception:                                            # noqa: BLE001
         warnings = list(info.get("warnings") or [])
 
-    # 认歌：先自动（五级链），单曲目表直接用；多曲目且认不出 ⇒ 让用户选
+    # 认歌：先用**此刻正在播放的那首歌**（`recognized_song_id`）走五级链。
+    # ★ 老实现是 `sheet.match_track()`（**一个参数都不给**）⇒ `match_track` 全靠关键字
+    #   参数匹配 ⇒ 必然 `(None, "")` ⇒ 这段认歌一直是**死代码**，哪怕正在放的歌就在表里
+    #   也照样弹"选一首"（用户 2026-10-18 撞上）。
+    q, _how = now_playing_query(engine)
     track = None
-    try:
-        tr, _level = sheet.match_track()
-        track = tr
-    except Exception:                                            # noqa: BLE001
-        track = None
+    if q:
+        try:
+            tr, _level = sheet.match_track(**q)
+            track = tr
+        except Exception:                                        # noqa: BLE001
+            track = None
     if track is None:
         tracks = list(getattr(sheet, "tracks", None) or [])
         if len(tracks) == 1:
-            track = tracks[0]
-        else:
+            track = tracks[0]                    # 单曲目表：直接绑（老行为不能破）
+        elif ask_track:
+            # 只有**显式要求**（用户主动点「绑定」）才问 —— 导入路径问会让人以为二选一
             track = pick_track(sheet, parent)
+        else:
+            # 多曲目 + 认不出 ⇒ **装表不绑曲目**（安全降级），放歌后自动选对应那首
+            warnings.append(Tf("这张表有 {} 首歌的编排：已装表，放歌后会自动选对应的那首。",
+                               len(tracks)))
     if track is not None:
         try:
             if float(getattr(track.identity, "bpm", 0.0) or 0.0) <= 0.0:

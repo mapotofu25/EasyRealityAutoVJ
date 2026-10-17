@@ -1186,6 +1186,29 @@ ZH2EN.update({
     "码表指纹：{} 读不出曲目": "Cue-sheet fingerprints: cannot read tracks from {}",
     "已移除码表指纹：{}（{} 条）": "Cue-sheet fingerprints removed: {} ({} hash(es))",
     "码表指纹处理失败：{}": "Cue-sheet fingerprint handling failed: {}",
+    # —— 认歌 / 选曲目（cue_ui）：导入**不弹窗**，放歌后自动选对应那首 ——
+    "正在播放：{} — {}": "Now playing: {} — {}",
+    "正在播放 song_id={}": "Now playing song_id={}",
+    "选曲目…": "Pick track…",
+    "这张表有多首歌的编排时，在这里手动指定要跟哪一首（不指定也能用：放歌后会自动认）":
+        "If this sheet arranges several songs, pick the one to follow here "
+        "(optional — it is recognised automatically once the song plays)",
+    "已装载码表，但**没有绑定曲目** ⇒ 图层不接管（请选一首曲目）。":
+        "The cue sheet is loaded but no track is bound, so the layer does not take "
+        "over (pick a track first).",
+    "已按 {} 命中曲目（{}）。": "Track matched by {} ({}).",
+    "{}，但表里没有对应的曲目 ⇒ 不预设曲目。":
+        "{} — but this sheet has no matching track, so no track is preselected.",
+    "这张表只有一首歌的编排：已直接绑定 —— {}。":
+        "This sheet arranges a single song: bound directly — {}.",
+    "这张表有 {} 首歌的编排：已装表，放歌后会自动选对应的那首。":
+        "This sheet arranges {} songs: loaded without binding; the matching one is "
+        "chosen automatically once the song plays.",
+    "切换曲目失败：{}": "Failed to switch track: {}",
+    "已手动指定曲目：{} — {}。": "Track set manually: {} — {}.",
+    "未选择曲目 ⇒ 已装表但**不接管**（画面仍走普通自动调度）。":
+        "No track selected — the sheet is loaded but does not take over "
+        "(normal auto scheduling continues).",
     "以下 {} 个文件不是有效的码表包：": "These {} file(s) are not valid cue-sheet packages:",
     "请先选中一行。": "Select a row first.",
     "文件和目录都不存在了：{}": "File and folder no longer exist: {}",

@@ -32,7 +32,11 @@ import cue_ui                                                       # noqa: E402
 import engine                                                       # noqa: E402
 from cue_seek_policy import CueSeekPolicy                            # noqa: E402
 
-REAL_PKG = r"Y:\EasyRealityAutoVJ\测试.ercue"
+#: 用户那个真实包（177MB / 内嵌 4 个素材）。2026-10-18 用户把它挪进了 `码表素材\`
+#: ⇒ 两个位置都试（老位置留着兼容，谁先存在用谁）。
+REAL_PKG = next((p for p in (r"Y:\EasyRealityAutoVJ\码表素材\测试.ercue",
+                             r"Y:\EasyRealityAutoVJ\测试.ercue")
+                 if os.path.isfile(p)), r"Y:\EasyRealityAutoVJ\码表素材\测试.ercue")
 
 
 class FakeCfg:
@@ -165,8 +169,10 @@ def main():
         #   ⚠ 文案 2026-10-17 改过：原文写"画面不会对拍"是**错的**（BPM 只是拍↔秒换算系数，
         #     两端用同一个值就抵消）。现在断言新文案，且断言不再出现旧的误导措辞。
         red = dlg.lbl_error.text()
-        check("曲目缺 BPM 时有可见提示（且措辞正确）",
-              "没填 BPM" in red, red[:120])
+        # ★ 这个真实包有 **2 首曲目**：导入**不弹窗**、也不预设曲目（放歌后自动选）。
+        #   ⇒ 曲目级提示（缺 BPM）此刻不适用，可见提示应是"会按歌自动选"那句。
+        check("多曲目包：提示「放歌后会自动选对应的那首」",
+              "自动选对应的那首" in red, red[:140])
         check("不再出现误导措辞「画面不会对拍」", "画面不会对拍" not in red, red[:120])
 
         # ③ 幂等：再导入一次 ⇒ 不再解压，文件 mtime 不变
@@ -179,7 +185,11 @@ def main():
         after = {f: os.path.getmtime(os.path.join(dest, f)) for f in files}
         print("\n第二次导入：%.2fs ｜ 装表=%s ｜ extract 调用 +%d"
               % (t_second, ok2, calls["n"] - n_before))
-        check("第二次装表也成功", ok2 is True)
+        # ⚠ 多曲目包不预设曲目 ⇒ `import_one()` 返回 False（= 没建运行时）是**预期**；
+        #   这里要验的是"表仍然被装上了、且没重复解压"。
+        check("第二次仍装表（表在引擎里；多曲目不绑曲目 ⇒ ok=False 属预期）",
+              ok2 is False and dlg.sheet is not None and eng._cue_sheet is not None,
+              (ok2, dlg.sheet is not None, eng._cue_sheet is not None))
         check("第二次**没有解压**（extract 调用 +0）", calls["n"] == n_before,
               calls["n"] - n_before)
         check("文件 mtime 未变（真的没重写）", before == after,
