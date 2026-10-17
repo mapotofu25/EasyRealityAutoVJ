@@ -2319,13 +2319,8 @@ class MainWindow(QMainWindow):
         self.act_about = self._more_menu.addAction(tr("about"))
         self.act_about.setToolTip(T("版本信息、第三方组件、反馈渠道"))
         self.act_about.triggered.connect(self.open_about)
-        # ★ 码表（演出端）：入口放在「⋯ 更多」里（**不新增页签** —— 编排在 EasyRealityCue，
-        #   演出端只负责执行；历史上把编排搬进主程序导致过"码表把主程序拖垮"）。
-        self._more_menu.addSeparator()
-        self.act_cuesheet = self._more_menu.addAction("码表（演出端）…")
-        self.act_cuesheet.setToolTip(
-            T("导入 / 绑定 / 启停 .ercue 码表；不接管时画面仍走普通自动调度"))
-        self.act_cuesheet.triggered.connect(self.open_cuesheet)
+        # ★ 码表入口**只从第 4 个页签进**（用户明确：2026-10「更多里面的删了」）。
+        #   原来这里有一个「码表（演出端）…」弹窗项，已删除 —— 不要再加回来。
         self.btn_more.setMenu(self._more_menu)
         tb.addWidget(self.btn_more)
         self._sync_more_menu()
@@ -2427,7 +2422,8 @@ class MainWindow(QMainWindow):
         for i, (txt, tip) in enumerate((
                 ("🎬 演出台", "现场：预览 / 图层 / 效果 / 输出"),
                 ("🗂 素材库", "全屏管理素材：搜索 / 筛选 / 导入 / 打标签（演出台那份原样不动）"),
-                ("🎵 曲库 · 曲风", "演出前准备：音乐曲库（导入音乐 + 扫描分析曲风）/ 曲风映射"))):
+                ("🎵 曲库 · 曲风", "演出前准备：音乐曲库（导入音乐 + 扫描分析曲风）/ 曲风映射"),
+                ("🎞 码表", "演出前准备：管理 .ercue 码表（查看 / 添加 / 删除 / 定位）"))):
             b = QPushButton(T(txt))
             b.setCheckable(True)
             b.setMinimumHeight(28)
@@ -2491,13 +2487,35 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(p2)
         self._sync_p2_stat()
 
+        # ---- 第 4 页：码表管理（2026-10 用户要求：与演出台/素材库/曲库并列的独立页签）----
+        self.pages.addWidget(self._build_cue_page())
+
         try:
             idx = int(self.cfg["ui"].get("page", 0) or 0)
         except Exception:                                         # noqa: BLE001
             idx = 0
-        # ⚠ 上界是 2（三页：演出台 / 素材库 / 曲库·曲风）。老配置里的值一律钳回合法范围，
+        # ⚠ 上界是 3（四页：演出台 / 素材库 / 曲库·曲风 / 码表）。老配置里的值一律钳回合法范围，
         #   否则 setCurrentIndex 会切到不存在的页，界面一片空白。
-        self.switch_page(idx if 0 <= idx <= 2 else 0, save=False)
+        self.switch_page(idx if 0 <= idx <= 3 else 0, save=False)
+
+    def _build_cue_page(self):
+        """第 4 页：码表管理（列表 + 添加/删除/定位/刷新 + 双击详情 + 右键绑图层）。
+
+        ⚠ 面板在 `src/cue_page.py`：主窗已经 5 千行，不再往这里堆；
+          失败必须可见（不许静默把界面变成白板）。
+        """
+        try:
+            import cue_page
+            self.cue_panel = cue_page.CueSheetPanel(self)
+        except Exception as e:                                    # noqa: BLE001
+            w = QWidget()
+            lv = QVBoxLayout(w)
+            lv.setContentsMargins(12, 12, 12, 12)
+            lv.addWidget(QLabel(Tf("码表页加载失败：{}", "%s: %s"
+                                   % (type(e).__name__, e))))
+            lv.addStretch(1)
+            self.cue_panel = w
+        return self.cue_panel
 
     def _build_library_page(self):
         """第 2 页：**全屏素材库**（演出台那份原样不动，这里是复制出来的一份）。
@@ -2656,9 +2674,9 @@ class MainWindow(QMainWindow):
             pass
 
     def switch_page(self, i, save=True):
-        """切到三界面之一（页签条 / 「⋯ 更多」菜单都走这里）。"""
+        """切到四界面之一（页签条走这里；码表页也支持外部跳转）。"""
         try:
-            i = max(0, min(2, int(i)))
+            i = max(0, min(3, int(i)))
         except Exception:                                         # noqa: BLE001
             i = 0
         self.pages.setCurrentIndex(i)
@@ -2671,6 +2689,16 @@ class MainWindow(QMainWindow):
                 pass
         if getattr(self, "grid_full", None) is not None:
             self._sync_lib_controls()
+        # ★ 码表页：切过来才去算「片段」列（要全量读包，启动路径绝不能碰）
+        if i == 3:
+            panel = getattr(self, "cue_panel", None)
+            for fn_name in ("refresh", "ensure_frag_counts"):
+                fn = getattr(panel, fn_name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:                             # noqa: BLE001
+                        pass
         for k, b in enumerate(getattr(self, "_page_btns", [])):
             b.setChecked(k == i)
         if save:
@@ -5175,17 +5203,38 @@ class MainWindow(QMainWindow):
         dlg = NewLayerDialog(self, default)
         if dlg.exec() != QDialog.Accepted:
             return
-        name, auto, role, is_kv = dlg.result_data()
+        name, auto, role, is_kv, is_cue = dlg.result_data()
         # Kv 主视觉图层：全局唯一，已存在则提醒并中止
         if is_kv and self.engine.kv_layer() is not None:
             QMessageBox.information(
                 self, "Kv 主视觉图层已存在",
                 "Kv 主视觉图层全局只能有一个。\n请先删除现有的 Kv 图层，再添加新的。")
             return
-        lay = Layer((name or ("Kv 主视觉" if is_kv else default)).strip())
+        # ★ 码表图层：**先选表再建层**（用户要求：新建时就要能选"应用哪一张码表"）。
+        #   没有码表 ⇒ 直接提示去第 4 页签导入，不建一个空壳层（避免用户看到"码表图层但不接管"）。
+        sheet_entry = None
+        if is_cue:
+            try:
+                import cue_page
+                sheet_entry = cue_page.pick_sheet(
+                    self, self, T("新建「码表图层」—— 选择这张图层要应用的码表："))
+            except Exception as e:                                # noqa: BLE001
+                QMessageBox.warning(self, T("码表"),
+                                    Tf("打开码表列表失败：{}", "%s: %s"
+                                       % (type(e).__name__, e)))
+                return
+            if sheet_entry is None:
+                return
+        lay = Layer((name or ("Kv 主视觉" if is_kv
+                              else ("码表图层" if is_cue else default))).strip())
         lay.auto_mode = auto
         lay.is_kv = is_kv
         lay.role = role
+        # 码表图层是"容器层"：画面由码表接管 ⇒ 先标好类型与绑定的包名
+        # （`Layer.to_dict` 已持久化这两个字段，见 engine.py）
+        if is_cue:
+            lay.is_cuesheet = True
+            lay.cuesheet_id = os.path.basename(str(sheet_entry.get("path") or ""))
         # 「自动图层应该跟着音乐走」：新建**自动**图层默认勾选「无声音时隐藏本层」。
         # 仅限自动图层；手动图层保持现有默认（不勾选）；Kv 待机层本就有独立的静音逻辑
         # （无声音切入），不能叠加 hide_silent，故排除。
@@ -5210,6 +5259,28 @@ class MainWindow(QMainWindow):
             self.engine._refresh_auto_layers(self.audio.state.snapshot())
         self._cur_layer = 0 if is_kv else (len(self.engine.layers) - 1)
         self._sync_layers()
+        # 码表图层：装表（导入/校验/绑曲/素材目录/报错全走 cue_ui 的**唯一实现**）
+        if is_cue and sheet_entry is not None:
+            try:
+                import cue_ui
+                _ok, msg = cue_ui.load_and_bind(
+                    self, str(sheet_entry.get("path") or ""), lay, parent=self)
+            except Exception as e:                                # noqa: BLE001
+                _ok, msg = False, "装载码表失败：%s: %s" % (type(e).__name__, e)
+            self.layers_panel.refresh_header(self._cur_layer)
+            try:
+                self.save_layers()
+            except Exception:                                     # noqa: BLE001
+                pass
+            page = getattr(self, "cue_panel", None)
+            fn = getattr(page, "refresh", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:                                 # noqa: BLE001
+                    pass
+            if msg:
+                QMessageBox.warning(self, T("码表"), msg)
 
     def layer_del(self):
         if len(self.engine.layers) <= 1 or not (0 <= self._cur_layer < len(self.engine.layers)):
@@ -5274,6 +5345,9 @@ class MainWindow(QMainWindow):
 
         UI 逻辑全在 `src/cue_ui.py`：这里只做"打开"，避免主窗继续膨胀。
         失败必须可见（不许静默）—— 对话框打不开也要弹一句。
+
+        ⚠ 入口：第 4 页签「码表」→「更多操作…」。**「⋯ 更多」里的旧菜单项已删除**
+          （用户 2026-10 明确要求），但对话框本身**保留**：手动起拍/最近文件都在里面。
         """
         try:
             import cue_ui
@@ -5281,6 +5355,10 @@ class MainWindow(QMainWindow):
         except Exception as e:                                    # noqa: BLE001
             QMessageBox.warning(self, "码表", "打开码表对话框失败：%s: %s"
                                 % (type(e).__name__, e))
+
+    def open_cuesheet_page(self):
+        """跳到第 4 个页签「码表」（供其它入口/脚本调用）。"""
+        self.switch_page(3)
 
     def switch_lang(self, i):
         """语言即时切换：不重启，直接重建全部界面文本。"""
@@ -5315,7 +5393,8 @@ class MainWindow(QMainWindow):
             self.settings.retranslate_palette()
         except Exception:
             pass
-        for panel in (getattr(self, "output_panel", None),):
+        for panel in (getattr(self, "output_panel", None),
+                      getattr(self, "cue_panel", None)):
             try:
                 if panel is not None and hasattr(panel, "retranslate"):
                     panel.retranslate()

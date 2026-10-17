@@ -1087,6 +1087,129 @@ ZH2EN.update({
     "关闭": "Close",
     "（未装载码表）": "(no cue sheet loaded)",
     "码表：这个图层由码表接管（点开可换表 / 卸下）": "Cue sheet: this layer is driven by a cue sheet (click to change/unload)",
+
+    # ==================== 码表管理页（第 4 个页签）+ 码表图层 ====================
+    "🎞 码表": "🎞 Cue Sheets",
+    "演出前准备：管理 .ercue 码表（查看 / 添加 / 删除 / 定位）":
+        "Pre-show: manage .ercue cue sheets (view / add / remove / locate)",
+    "这里管理演出端可用的码表文件：查看 / 添加 / 移除 / 定位。双击一行查看详情（只读）。\n"
+    "「删除」只把码表从列表里移除，不会删除磁盘上的 .ercue 文件。"
+    "编排请在 EasyRealityCue 里做，演出端只负责执行。":
+        "Manage the cue-sheet files available to the show: view / add / remove / locate. "
+        "Double-click a row for read-only details.\n"
+        "“Delete” only removes the cue sheet from this list — it does NOT delete the "
+        ".ercue file on disk. Authoring is done in EasyRealityCue; the show only plays it.",
+    "添加…": "Add…",
+    "定位文件": "Show in folder",
+    "更多操作…": "More actions…",
+    "打开码表对话框：最近文件 / 手动绑歌 / 手动起拍 / 定位档位":
+        "Open the cue-sheet dialog: recent files / manual track bind / manual beat start / seek profile",
+    "从列表移除（不删除磁盘文件）": "Remove from list (does NOT delete the file)",
+    "在资源管理器里选中这个码表文件": "Reveal this cue-sheet file in Explorer",
+    "重新读取码表包的表头（文件改过才重读）":
+        "Re-read cue-sheet headers (only files that changed)",
+    "导入 .ercue 码表包（可多选）": "Import .ercue cue sheets (multi-select)",
+    "导入码表": "Import cue sheet",
+    "码表包 (*.ercue);;所有文件 (*)": "Cue sheet (*.ercue);;All files (*)",
+    "表名": "Sheet",
+    "覆盖曲目": "Covers",
+    "片段": "Clips",
+    "修改时间": "Modified",
+    "已绑图层": "Bound layer",
+    "{} 首": "{} track(s)",
+    "{} 片段": "{} clip(s)",
+    "{} 张码表": "{} cue sheet(s)",
+    "共 {} 张码表": "{} cue sheet(s) in total",
+    "{}（文件已丢失）": "{} (file missing)",
+    "{} 张文件已丢失（请「删除」后重新「添加」，或用「定位文件」检查）":
+        "{} file(s) missing — remove and re-add them, or use “Show in folder” to check",
+    "已绑图层：{}": "Bound layers: {}",
+    "删除码表": "Delete cue sheet",
+    "请先选中要移除的码表。": "Select the cue sheet(s) to remove first.",
+    "从列表移除以下 {} 张码表？": "Remove these {} cue sheet(s) from the list?",
+    "只会从列表里移除，不会删除磁盘上的 .ercue 文件。\n"
+    "（之后仍可用「添加…」重新导入）":
+        "This only removes them from the list — the .ercue files on disk are untouched.\n"
+        "(You can add them again later with “Add…”.)",
+    "移除": "Remove",
+    "码表索引不可用，无法移除。": "Cue-sheet index unavailable; cannot remove.",
+    "已从列表移除 {} 张码表（磁盘文件仍在）。":
+        "Removed {} cue sheet(s) from the list (files on disk untouched).",
+    "已导入 {} 张码表。右键一行可以「绑到图层…」。":
+        "Imported {} cue sheet(s). Right-click a row to “Bind to layer…”.",
+    "已导入 {} 张码表。": "Imported {} cue sheet(s).",
+    "以下 {} 个文件不是有效的码表包：": "These {} file(s) are not valid cue-sheet packages:",
+    "请先选中一行。": "Select a row first.",
+    "文件和目录都不存在了：{}": "File and folder no longer exist: {}",
+    "刷新": "Refresh",
+    "已装载码表，但没有绑定曲目 ⇒ 这个图层暂不接管（画面仍走普通自动调度）。":
+        "The cue sheet is loaded but no track is bound, so this layer is not taken "
+        "over yet (normal auto scheduling continues).",
+    "刷新码表": "Refresh cue sheets",
+    "查看详情…": "View details…",
+    "绑到图层…": "Bind to layer…",
+    "删除（仅从列表移除）": "Delete (remove from list only)",
+    "请先选中要绑定码表。": "Select a cue sheet first.",
+    "请先选中一张码表。": "Select a cue sheet first.",
+    "当前没有图层。": "There are no layers yet.",
+    "绑到图层": "Bind to layer",
+    "把码表「{}」应用到哪个图层？": "Apply cue sheet “{}” to which layer?",
+    "（码表层）": " (cue layer)",
+    "提示：被绑定的图层会变成「码表图层」，画面由码表接管；普通素材不会被删除。":
+        "Note: the bound layer becomes a “cue layer” and its picture is driven by the "
+        "cue sheet. Regular clips are not deleted.",
+    "绑定": "Bind",
+    "加载码表模块失败：{}": "Failed to load the cue-sheet module: {}",
+    "已把「{}」绑到图层「{}」。": "Bound “{}” to layer “{}”.",
+    "选择码表": "Choose a cue sheet",
+    "选择这张图层要应用的码表：": "Choose the cue sheet this layer should use:",
+    "还没有码表。\n\n请先到「码表」页签（第 4 个）点「添加…」导入 .ercue 码表包，"
+    "再回来选择。":
+        "No cue sheets yet.\n\nOpen the “Cue Sheets” tab (4th one) and click “Add…” to "
+        "import a .ercue package, then come back and choose one.",
+    "码表详情 — {}": "Cue sheet details — {}",
+    "表名：{}": "Sheet: {}",
+    "画布：{} × {}": "Canvas: {} × {}",
+    "曲目：{} 首 ｜ 片段：{} 个 ｜ 素材：{} 个": "Tracks: {} | Clips: {} | Media: {}",
+    "文件：{}": "File: {}",
+    "大小：{} ｜ 修改时间：{}": "Size: {} | Modified: {}",
+    "格式版本：{} ｜ 要求主机版本：{}": "Format version: {} | Required host version: {}",
+    "无": "None",
+    "曲目（含 BPM 与每层片段数）": "Tracks (BPM and clips per layer)",
+    "曲目": "Track",
+    "艺术家": "Artist",
+    "层 / 片段": "Layers / clips",
+    "每层片段数": "Clips per layer",
+    "{} 层 / {} 片段": "{} layer(s) / {} clip(s)",
+    "内嵌素材清单": "Embedded media",
+    "文件名": "File name",
+    "片段 ID": "Clip ID",
+    "透明 / 内嵌": "Alpha / embedded",
+    "透明": "Alpha",
+    "内嵌": "Embedded",
+    "(无标题)": "(untitled)",
+    "无（退化 1 拍=1 秒）": "None (fallback: 1 beat = 1 s)",
+    "读取失败：{}": "Failed to read: {}",
+    "文件不存在：{}": "File not found: {}",
+    "码表页加载失败：{}": "Failed to load the cue-sheet page: {}",
+    "新建「码表图层」—— 选择这张图层要应用的码表：":
+        "New “cue layer” — choose the cue sheet to apply:",
+    "打开码表列表失败：{}": "Failed to open the cue-sheet list: {}",
+    "码表图层（按码表接管画面）": "Cue layer (picture driven by a cue sheet)",
+    "码表图层": "Cue layer",
+    "码表图层：画面由码表接管（片段入点/出场都按码表走）。\n"
+    "确定后会让你选择「应用哪一张码表」——还没导入码表的话，\n"
+    "请先到「码表」页签点「添加…」。":
+        "Cue layer: its picture is driven by a cue sheet (clip in/out points follow it).\n"
+        "After you confirm, you'll pick which cue sheet to apply — if you haven't "
+        "imported one yet,\nuse “Add…” on the “Cue Sheets” tab first.",
+    "（无码表）": "(no cue sheet)",
+    "导入新码表…": "Import new cue sheet…",
+    "码表：（无码表）—— 选一张表让本图层由码表接管":
+        "Cue sheet: (none) — pick one to let this layer be driven by it",
+    "码表：{}（选择换表 /「（无码表）」卸下）":
+        "Cue sheet: {} (pick another to change, or “(no cue sheet)” to unload)",
+    "码表：{}（包：{}）": "Cue sheet: {} (package: {})",
 })
 
 CATEGORY_EN = {

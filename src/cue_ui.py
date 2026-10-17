@@ -715,7 +715,198 @@ class CueSheetDialog(QDialog):
 
 
 def open_cuesheet_dialog(owner):
-    """打开码表对话框（ui_main 的「⋯ 更多」菜单调用它）。"""
+    """打开码表对话框。入口：第 4 页签「码表」→「更多操作…」。
+
+    ⚠ 对话框**保留**（用户 2026-10：「更多里面的删了」只删了**菜单项**）：
+      最近文件 / 手动绑歌 / **手动起拍** / 定位档位 都在这里面，删了入口就等于丢能力。
+    """
     dlg = CueSheetDialog(owner)
     dlg.exec()
     return dlg
+
+
+# ==========================================================================
+# 导入 / 换表 / 卸下 —— **唯一实现**（第 4 页签 + 图层头下拉共用）
+# ==========================================================================
+def _extract_embedded_media(pkg, sheet):
+    """包内 `media/` → `<包路径>.media/`（幂等：该有的都在就不重解）。返回 {clip_id: path}。
+
+    与 `CueSheetDialog._extract_embedded` **同一约定**（那边是对话框自己用的方法，不动它）；
+    这里给"从页签/下拉导入"这条路径用，避免为了复用去改对话框（改它有回归风险）。
+    """
+    out = {}
+    names = [str(m.name) for m in (getattr(sheet, "media", None) or []) if m.name]
+    if not names:
+        return out
+    dest = str(pkg) + ".media"
+    have = set()
+    if os.path.isdir(dest):
+        try:
+            have = set(os.listdir(dest))
+        except OSError:
+            have = set()
+    if [n for n in names if n not in have]:
+        try:
+            cuesheet.extract_media(pkg, dest) or {}
+        except Exception:                                        # noqa: BLE001
+            pass
+    for m in (getattr(sheet, "media", None) or []):
+        if not m.name:
+            continue
+        pth = os.path.join(dest, m.name)
+        if os.path.isfile(pth):
+            out[m.clip_id] = pth
+    return out
+
+
+def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True):
+    """把 `.ercue` 装到指定图层。返回 `(ok, msg)`：`ok` = 引擎已建立运行时（能接管）。
+
+    这是**导入/换表的唯一实现**，调它的人：
+      · 第 4 页签「添加…」/ 右键「绑到图层…」
+      · 图层头的码表下拉（选某张表 / 「导入新码表…」）
+      · 新建「码表图层」后立刻应用
+
+    ⚠ `CueSheetDialog`（轻量对话框）**刻意保持原有实现不动** —— 它的手动起拍、
+      状态行、最近文件是另一条交互路径，动它等于冒着把 Step5/6 弄坏的风险。
+      两者共用的是底下的 `cuesheet.load()` / `pick_track()` / `engine.set_cue_sheet()`。
+    """
+    cfg = getattr(owner, "cfg", None)
+    engine = getattr(owner, "engine", None)
+    if engine is None or layer is None:
+        return False, T("引擎或图层不可用（无法装载码表）。")
+    # 上次指定过的素材目录先传给 load（能让 present_media 一次到位，少一次"缺素材"提示）
+    md = ""
+    try:
+        md = str((cue_cfg(cfg) or {}).get("media_dir") or "") if cfg is not None else ""
+    except Exception:                                            # noqa: BLE001
+        md = ""
+    try:
+        sheet, info = cuesheet.load(path, media_dir=(md or None))
+    except Exception as e:                                       # noqa: BLE001
+        return False, "导入失败：%s\n%s" % (os.path.basename(str(path)), e)
+
+    media_paths = dict(info.get("present_media") or {})
+    # 内嵌素材：先解压（否则内嵌包会报"全部缺素材"）
+    if info.get("missing_media"):
+        for cid, pth in _extract_embedded_media(path, sheet).items():
+            media_paths.setdefault(cid, pth)
+    # 还缺：按上次素材目录找，找不到就让用户指定一次（与对话框一致）
+    missing = [str(m.name) for m in (getattr(sheet, "media", None) or [])
+               if m.name and not media_paths.get(m.clip_id)]
+    if missing and cfg is not None:
+        found = scan_media_dir(cue_cfg(cfg).get("media_dir") or "", missing)
+        if found:
+            for m in (sheet.media or []):
+                if m.name in found:
+                    media_paths.setdefault(m.clip_id, found[m.name])
+            missing = [n for n in missing if n not in found]
+    if missing and ask_media_dir:
+        d = QFileDialog.getExistingDirectory(
+            parent, T("有 %d 个素材没找到，请指定素材目录（可取消）") % len(missing), "")
+        if d:
+            if cfg is not None:
+                cue_cfg(cfg)["media_dir"] = d
+                try:
+                    cfg.save()
+                except Exception:                                # noqa: BLE001
+                    pass
+            found = scan_media_dir(d, missing)
+            for m in (sheet.media or []):
+                if m.name in found:
+                    media_paths.setdefault(m.clip_id, found[m.name])
+            missing = [n for n in missing if n not in found]
+
+    # ★ 能力协商（版本过高 / 缺特性 / 缺素材）**只提示不阻断**。
+    #   ⚠ 必须**在素材找齐之后**再算：否则会把"已经找到了"的素材继续报成缺失
+    #     （`cuesheet.load` 内部的 capability_report 只知道 load 那一刻的结果）。
+    warnings = []
+    try:
+        from version import APP_VERSION
+        _w, _ = cuesheet.capability_report(
+            sheet, app_version=str(APP_VERSION), missing_media=missing)
+        warnings = list(_w or [])
+    except Exception:                                            # noqa: BLE001
+        warnings = list(info.get("warnings") or [])
+
+    # 认歌：先自动（五级链），单曲目表直接用；多曲目且认不出 ⇒ 让用户选
+    track = None
+    try:
+        tr, _level = sheet.match_track()
+        track = tr
+    except Exception:                                            # noqa: BLE001
+        track = None
+    if track is None:
+        tracks = list(getattr(sheet, "tracks", None) or [])
+        if len(tracks) == 1:
+            track = tracks[0]
+        else:
+            track = pick_track(sheet, parent)
+    if track is not None:
+        try:
+            if float(getattr(track.identity, "bpm", 0.0) or 0.0) <= 0.0:
+                warnings.append(
+                    "这张码表的曲目没有 BPM（拍长未知）：只能按「1 拍 = 1 秒」播放，"
+                    "画面不会对拍 —— 请在 EasyRealityCue 里补上该曲目的 BPM 后重新导出。")
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    ok = False
+    try:
+        ok = bool(engine.set_cue_sheet(
+            sheet, media_paths=media_paths, track=track, layer=layer,
+            sheet_id=os.path.basename(str(path))))
+    except Exception as e:                                       # noqa: BLE001
+        return False, "装载失败（引擎）：%s" % e
+
+    if cfg is not None:
+        add_recent(cfg, path)
+    # 建/更新索引（只存摘要）—— 顺带让第 4 页签立刻能列出这张表
+    try:
+        idx = engine.cue_index() if callable(getattr(engine, "cue_index", None)) else None
+        if idx is not None:
+            idx.add(path)
+            idx.save_cfg(cfg)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    msg = "\n".join(warnings)
+    if missing:
+        msg = (msg + "\n" if msg else "") + (
+            "缺 %d 个素材：%s%s" % (len(missing), "、".join(missing[:6]),
+                                  "…" if len(missing) > 6 else ""))
+    if track is None:
+        msg = (msg + "\n" if msg else "") + T(
+            "已装载码表，但没有绑定曲目 ⇒ 这个图层暂不接管（画面仍走普通自动调度）。")
+    return ok, msg
+
+
+def unbind_layer(owner, layer):
+    """把图层从码表接管里卸下（`is_cuesheet=False` + 清运行时），并落盘。
+
+    ⚠ 卸下的是**图层**：引擎当前装载的那张表一并清掉（同一时刻只装一张表），
+      与图层面板原有的「从这个图层卸下码表」行为逐字一致。
+    """
+    if layer is None:
+        return
+    engine = getattr(owner, "engine", None)
+    try:
+        fn = getattr(engine, "clear_cue_sheet", None)
+        if callable(fn):
+            fn()
+    except Exception:                                            # noqa: BLE001
+        pass
+    layer.is_cuesheet = False
+    layer.cuesheet_id = ""
+    layer.cs_states = []
+    layer.cs_active = False
+    try:
+        engine._cue_set_active(layer, set())
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        fn = getattr(owner, "save_layers", None)
+        if callable(fn):
+            fn()
+    except Exception:                                            # noqa: BLE001
+        pass

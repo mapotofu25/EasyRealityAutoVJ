@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Step6 自检：图层**码表徽标**（`btnCue`）—— 出现 / 点击菜单 / 换表 / 持久化 / 不干扰普通图层。
+"""Step6 自检：图层**码表选择下拉**（`cmbCue`）—— 出现 / 换表 / 持久化 / 不干扰普通图层。
 
 5 项判据（团队给定）：
-  1. 徽标出现：`is_cuesheet` 的图层头出现青绿徽标（**真窗口截图** `tools/_cueshots/step6_badge.png`）
-  2. 点击弹菜单：能换表 / 卸下；**换表后画面跟着换**（用假播放器 + 不同颜色图验证）
+  1. 下拉出现：`is_cuesheet` 的图层头出现青绿码表下拉（**真窗口截图** `tools/_cueshots/step6_badge.png`）
+  2. 换表：能换表 / 卸下；**换表后画面跟着换**（用假播放器 + 不同颜色图验证）
   3. 持久化：`to_dict → rebuild_from_cfg` 后 `is_cuesheet` / `cuesheet_id` 仍在
   4. 不干扰普通图层：非码表图层的头部**子控件几何 + 渲染像素**与改动前（git HEAD 的 panels.py）一致
   5. 回归另跑（9 项 + 守卫 + parity）
@@ -213,18 +213,18 @@ def main():
     main_obj = FakeMain(eng.layers)
     main_obj.engine = eng
 
-    # ---------------- ① 徽标出现 ----------------
-    print("① 徽标：只有码表层显示")
+    # ---------------- ① 下拉出现 ----------------
+    print("① 下拉：只有码表层显示")
     panel = panels.LayerStackPanel(main_obj)
     panel.rebuild()
     hdr_cue = panel.rows[0][0]
     hdr_plain = panel.rows[1][0]
-    check("码表层有 _btn_cue", hasattr(hdr_cue, "_btn_cue"))
-    check("码表层的徽标可见", hdr_cue._btn_cue.isVisible()
-          or not hdr_cue._btn_cue.isHidden(), hdr_cue._btn_cue.isHidden())
-    check("普通层的徽标隐藏", hdr_plain._btn_cue.isHidden(), hdr_plain._btn_cue.isHidden())
-    print("      徽标文案=%r tooltip=%r" % (hdr_cue._btn_cue.text(),
-                                        hdr_cue._btn_cue.toolTip()[:40]))
+    check("码表层有 _cmb_cue", hasattr(hdr_cue, "_cmb_cue"))
+    check("码表层的下拉可见", hdr_cue._cmb_cue.isVisible()
+          or not hdr_cue._cmb_cue.isHidden(), hdr_cue._cmb_cue.isHidden())
+    check("普通层的下拉隐藏", hdr_plain._cmb_cue.isHidden(), hdr_plain._cmb_cue.isHidden())
+    print("      下拉文案=%r tooltip=%r" % (hdr_cue._cmb_cue.currentText(),
+                                        hdr_cue._cmb_cue.toolTip()[:40]))
     os.makedirs(SHOT_DIR, exist_ok=True)
     shot = os.path.join(SHOT_DIR, "step6_badge.png")
     panel.resize(420, 200)
@@ -252,13 +252,13 @@ def main():
             app.processEvents()
         hdr_old = p2.rows[0][0]
         # 同样的图层 ⇒ 子控件几何应完全一致（徽标隐藏时不占位）
-        g_new = children_geom(hdr_plain, skip=(hdr_plain._btn_cue,))
+        g_new = children_geom(hdr_plain, skip=(hdr_plain._cmb_cue,))
         g_old = children_geom(hdr_old)
         print("      可见子控件：新版 %d 个（已排除徽标）｜ HEAD %d 个" % (len(g_new), len(g_old)))
         check("普通层的可见子控件与改动前**完全相同**（数量 + 逐个几何）",
               g_new == g_old, [x for x in g_new if x not in g_old][:3])
-        check("徽标本体是隐藏的（不占布局）",
-              hdr_plain._btn_cue.isHidden() is True, hdr_plain._btn_cue.isHidden())
+        check("下拉本体是隐藏的（不占布局）",
+              hdr_plain._cmb_cue.isHidden() is True, hdr_plain._cmb_cue.isHidden())
         md5_new = md5_png(hdr_plain)
         md5_old = md5_png(hdr_old)
         print("      普通层头部 PNG md5：新版 %s ｜ HEAD %s" % (md5_new[:8], md5_old[:8]))
@@ -319,7 +319,7 @@ def main():
               (titleA, titleB))
         check("画面跟着换（像素不同，且分别对应 A/B 的颜色）",
               colA != colB and colA[0] > colA[2] and colB[2] > colB[0], (colA, colB))
-        check("徽标 tooltip 跟着更新（cue_sheet_id = 当前包名）",
+        check("下拉绑定的包跟着更新（cue_sheet_id = 当前包名）",
               str(lay.cuesheet_id or "") in (os.path.basename(pb),)
               or lay.cuesheet_id != "", lay.cuesheet_id)
 

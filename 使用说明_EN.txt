@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.10.17.02
+Version 2026.10.17.04
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -606,22 +606,39 @@ A cue sheet is a **pre-edited show package** made in EasyRealityCue (visuals cut
 to the beat, with speed changes and crops). The show app only **plays it in
 sync with the beat** — it does no editing.
 
-[Where]
-Toolbar, far right: "⋯ More" -> "Cue Sheet (Show)…".
+[Where (changed 2026-10)]
+The **4th tab "Cue Sheets"** (next to Show / Library / Music · Genre).
+- The old "⋯ More -> Cue Sheet (Show)…" entry has been **removed**; cue sheets are
+  reached only from the 4th tab.
+
+[Cue-sheet management page (4th tab)]
+- List: Sheet / Covers / Clips / Size / Modified / Bound layer.
+- Buttons: **Add…** (import .ercue, multi-select) | **Delete** (removes it from the
+  list only — **the .ercue file on disk is NOT deleted**) | **Show in folder** |
+  **Refresh** (re-reads only changed packages).
+- **Double-click a row** -> read-only details: sheet name / canvas / tracks (with
+  BPM) / clips per layer / embedded media.
+- **Right-click a row** -> Bind to layer… | Delete | Show in folder | View details.
+- **More actions…** -> the classic dialog (recent files / manual track bind /
+  **manual beat start** / seek profile).
 
 [A complete run]
-1. Click "Import .ercue…" (multiple selection allowed; failures are explained
-   in red inside the dialog).
-2. **Bind a track**:
-   - one track inside the package -> bound automatically (a red note says so);
-   - several tracks -> pick one from the list (artist — title | BPM | clips).
-   - Track detection failing is fine — see "Manual beat start" below.
-3. **Bind a layer**: choose one in "Bind to:"; that layer's header then shows a
-   teal "码" badge.
+1. On the 4th tab click "Add…" and import an .ercue (failures are explained).
+2. When creating a layer, pick the type "**Cue layer** (picture driven by a cue
+   sheet)" -> you are immediately asked which cue sheet to apply (if the list is
+   empty you are told to use "Add…" on the 4th tab first).
+   - An existing layer can be converted: right-click a row on the 4th tab ->
+     "Bind to layer…".
+3. The layer header then shows a **teal cue-sheet dropdown** (the sheet name;
+   "(no cue sheet)" when nothing is loaded):
+   - pick another sheet = **change**; pick "(no cue sheet)" = **unload**;
+     pick "Import new cue sheet…" = import and bind right away.
 4. **Play**: start the song. If the song is recognized and has a cue sheet, it
    takes over the visuals; otherwise normal auto scheduling continues.
-5. To disable: untick "Enable (take over)", or click the "码" badge ->
-   "Unload cue sheet from this layer".
+   - One track in the package -> bound automatically; several -> pick one
+     (artist — title | BPM | clips).
+5. To disable: set the dropdown to "(no cue sheet)", or untick
+   "Enable (take over)" in the "More actions…" dialog.
 
 [Four rules (all measured)]
 - **Long-GOP media (HEVC / large keyframe interval)**: seeking can only land

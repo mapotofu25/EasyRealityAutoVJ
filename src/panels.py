@@ -70,12 +70,15 @@ class StayOpenMenu(QMenu):
 
 
 class NewLayerDialog(I18nDialog):
-    """新建图层对话框：名称 + 类型(手动 / 自动 / Kv 主视觉) + 角色(前景/背景)。
+    """新建图层对话框：名称 + 类型(手动 / 自动 / Kv 主视觉 / **码表**) + 角色(前景/背景)。
 
-    自动图层按曲风匹配画面；Kv 主视觉是唯一的待机层。
+    自动图层按曲风匹配画面；Kv 主视觉是唯一的待机层；
+    **码表图层**是"按码表接管画面"的容器层（选中后由 `ui_main.layer_add`
+    立刻弹「选一张表」——本对话框只负责把类型带出去）。
     """
 
     KV_DEFAULT_NAME = "Kv 主视觉"
+    CUE_DEFAULT_NAME = "码表图层"
 
     def __init__(self, parent=None, default_name="图层 1"):
         super().__init__(parent)
@@ -95,6 +98,7 @@ class NewLayerDialog(I18nDialog):
         v.addWidget(QLabel("图层类型"))
         self.rb_manual = QRadioButton("手动（自己拖素材）")
         self.rb_auto = QRadioButton("自动（按曲风匹配画面）")
+        self.rb_cue = QRadioButton("码表图层（按码表接管画面）")
         self.rb_kv = QRadioButton("Kv 主视觉图层（待机层：无声音时切入）")
         self.rb_manual.setChecked(True)
         # 必须显式分组：同一 parent 下的 QRadioButton 会自动互斥成一组，
@@ -102,11 +106,13 @@ class NewLayerDialog(I18nDialog):
         self._grp_type = QButtonGroup(self)
         self._grp_type.addButton(self.rb_manual)
         self._grp_type.addButton(self.rb_auto)
+        self._grp_type.addButton(self.rb_cue)
         self._grp_type.addButton(self.rb_kv)
         tv = QVBoxLayout()
         tv.setSpacing(4)
         tv.addWidget(self.rb_manual)
         tv.addWidget(self.rb_auto)
+        tv.addWidget(self.rb_cue)
         tv.addWidget(self.rb_kv)
         v.addLayout(tv)
 
@@ -133,7 +139,7 @@ class NewLayerDialog(I18nDialog):
         self._hint.setWordWrap(True)
         v.addWidget(self._hint)
 
-        for rb in (self.rb_manual, self.rb_auto, self.rb_kv):
+        for rb in (self.rb_manual, self.rb_auto, self.rb_cue, self.rb_kv):
             rb.toggled.connect(self._on_type)
         self._on_type()
 
@@ -149,28 +155,35 @@ class NewLayerDialog(I18nDialog):
         self._role_box.setVisible(auto)
         if auto:
             self._hint.setText("自动图层会随曲风实时替换画面，手动拖入的素材不生效")
+        elif self.rb_cue.isChecked():
+            self._hint.setText("码表图层：画面由码表接管（片段入点/出场都按码表走）。\n"
+                               "确定后会让你选择「应用哪一张码表」——还没导入码表的话，\n"
+                               "请先到「码表」页签点「添加…」。")
         elif self.rb_kv.isChecked():
             self._hint.setText("Kv 主视觉图层：没有声音时把待机画面带进来、有声音时带出去。\n"
                                "全局只能有一个，添加后自动置顶；参数在右侧设置区顶部单独配置。")
         else:
             self._hint.setText("")
-        # 名字跟着类型走：选 Kv 时默认名换成「Kv 主视觉」（不再叫「图层 N」），
-        # 切回普通图层再换回来。用户手动改过名字就一律不覆盖。
+        # 名字跟着类型走：选 Kv 时默认名换成「Kv 主视觉」、选码表时换成「码表图层」
+        # （不再叫「图层 N」），切回普通图层再换回来。用户手动改过名字就一律不覆盖。
         if not self._name_touched:
             if self.rb_kv.isChecked():
                 self.name_edit.setText(self.KV_DEFAULT_NAME)
+            elif self.rb_cue.isChecked():
+                self.name_edit.setText(self.CUE_DEFAULT_NAME)
             else:
                 self.name_edit.setText(self._default_name)
 
     def result_data(self):
-        """返回 (name, auto, role, is_kv)。唯一调用点：ui_main.layer_add。
+        """返回 (name, auto, role, is_kv, is_cue)。唯一调用点：ui_main.layer_add。
 
         ⚠ 改返回值元数必须 grep 全部调用点（项目铁律）。"""
         name = self.name_edit.text().strip()
         auto = self.rb_auto.isChecked()
         is_kv = self.rb_kv.isChecked()
+        is_cue = self.rb_cue.isChecked()
         role = "fg" if self.rb_fg.isChecked() else "bg"
-        return name, auto, role, is_kv
+        return name, auto, role, is_kv, is_cue
 
 
 class TagEditDialog(I18nDialog):
@@ -2590,7 +2603,19 @@ class LayerStackPanel(QWidget):
                 theme.V("text") + ";border:1px solid " + theme.V("border") + ";}"
                 "#layerHeader QComboBox QAbstractItemView{background:" + theme.V("panel") +
                 ";color:" + theme.V("text") +
-                ";selection-background-color:#4a6cf7;selection-color:#fff;}")
+                ";selection-background-color:#4a6cf7;selection-color:#fff;}"
+                # 码表下拉：青绿（与 Kv 的金、Solo 的黄区分开），一眼看出"这层被码表接管"
+                # ⚠ 必须写成 `#layerHeader QComboBox#cmbCue`：CSS 特异性里
+                #   `#layerHeader QComboBox`（id+类型）**高于** `#cmbCue`（只有 id），
+                #   只写 #cmbCue 会被上面那条基础规则盖掉。
+                "#layerHeader QComboBox#cmbCue{border:1px solid #1f8a72;background:#0d3b33;"
+                "color:#6ff0cf;font-size:11px;padding:0 2px;}"
+                "#layerHeader QComboBox#cmbCue:hover{background:#12564a;}"
+                # ⚠ 不要自定义 `::drop-down`：一旦写了该子控件，Qt 就不再画默认箭头
+                #   ⇒ 用户会以为那是个标签而不是下拉（实测截图里箭头会消失）。
+                "#layerHeader QComboBox#cmbCue QAbstractItemView{background:" +
+                theme.V("panel") + ";color:" + theme.V("text") +
+                ";selection-background-color:#1f8a72;selection-color:#fff;}")
 
     def _build_header(self, idx, lay):
         f = QFrame()
@@ -2638,16 +2663,18 @@ class LayerStackPanel(QWidget):
         name._is_name = True
         h.addWidget(name)
 
-        # ★ 码表徽标：**只在 `is_cuesheet` 时显示**（隐藏时 QLayout 不占位 ⇒ 普通图层头部布局零变化）
-        btn_cue = QPushButton("码")
-        btn_cue.setObjectName("btnCue")
-        btn_cue.setFixedSize(24, 22)
-        btn_cue.setStyleSheet(self._btn_cue_style())
-        btn_cue.setProperty("_i18nDynamic", True)      # tooltip 含表名（用户数据）
-        btn_cue.setToolTip(T("码表：这个图层由码表接管（点开可换表 / 卸下）"))
-        btn_cue.setVisible(bool(getattr(lay, "is_cuesheet", False)))
-        btn_cue.clicked.connect(lambda _c=False, i=idx: self.cue_menu(i))
-        h.addWidget(btn_cue)
+        # ★ 码表选择（用户要求 2026-10）：原来是青绿「码」方徽标，点开弹菜单；
+        #   现在换成**一整个码表下拉选项**（未绑显示「（无码表）」/ 已绑显示表名）。
+        #   ⚠ **只在 `is_cuesheet` 时显示**（隐藏时 QLayout 不占位 ⇒ 普通图层头部逐像素不变）
+        #   ⚠ 宽度 92 是硬约束：图层头固定 HEADER_W=456，现有控件已占 358px
+        cmb_cue = QComboBox()
+        cmb_cue.setObjectName("cmbCue")
+        cmb_cue.setFixedSize(92, 22)
+        cmb_cue.setProperty("_i18nDynamic", True)   # 文本是表名（用户数据）
+        cmb_cue.setVisible(bool(getattr(lay, "is_cuesheet", False)))
+        self._fill_cue_combo(cmb_cue, lay)
+        cmb_cue.activated.connect(lambda _k, i=idx: self._on_cue_combo(i))
+        h.addWidget(cmb_cue)
 
         op = QSlider(Qt.Horizontal)
         op.setRange(0, 100)
@@ -2708,21 +2735,115 @@ class LayerStackPanel(QWidget):
         f._btn_vis, f._btn_solo, f._name, f._op, f._blend, f._btn_alpha, f._btn_lock = (
             btn_vis, btn_solo, name, op, blend, btn_alpha, btn_lock)
         f._btn_role = btn_role
-        f._btn_cue = btn_cue
+        f._cmb_cue = cmb_cue
         return f
 
-    def _btn_cue_style(self):
-        """码表徽标：**青绿**（与 Kv 的金、Solo 的黄区分开），一眼能看出"这层被码表接管"。"""
-        return ("#btnCue{padding:0;border:1px solid #1f8a72;border-radius:3px;"
-                "font-size:12px;background:#0d3b33;color:#6ff0cf;}"
-                "#btnCue:hover{background:#12564a;}"
-                "#btnCue:pressed{background:#0a2e28;}")
+    # ---- 码表下拉（图层头） ----
+    def _fill_cue_combo(self, cmb, lay):
+        """填「（无码表） + 管理页里的所有码表 + 导入新码表…」，并选中当前绑定的那张。
+
+        ⚠ 全程 `blockSignals`：这是**程序**在同步，不是用户在选，
+          否则每次 refresh_header 都会触发一次换表/卸下。
+        """
+        cmb.blockSignals(True)
+        try:
+            cmb.clear()
+            cmb.addItem(T("（无码表）"), "")
+            entries = []
+            label_fn = None
+            try:
+                # 延迟 import：cue_page 会 import panels（I18nDialog）⇒ 模块级 import 会成环
+                import cue_page
+                entries = cue_page.sheet_entries(self.main)
+                label_fn = cue_page.sheet_label
+            except Exception:                                    # noqa: BLE001
+                entries = []
+            cur = str(getattr(lay, "cuesheet_id", "") or "")
+            sel = 0
+            found = False
+            for e in entries:
+                p = str(e.get("path") or "")
+                label = (label_fn(e) if label_fn is not None
+                         else (os.path.basename(p) or p))
+                cmb.addItem(label, p)
+                if cur and (cur == os.path.basename(p) or cur == label or cur == p):
+                    sel = cmb.count() - 1
+                    found = True
+            # 绑着一张**不在索引里**的表（比如被手动移出列表 / 索引没建）⇒ 也要如实显示，
+            # 不能假装"（无码表）"（否则用户看到的绑定状态是假的）
+            if cur and not found:
+                cmb.addItem(os.path.splitext(os.path.basename(cur))[0] or cur, "__bound__")
+                sel = cmb.count() - 1
+            cmb.addItem(T("导入新码表…"), "__import__")
+            cmb.setCurrentIndex(sel if 0 <= sel < cmb.count() else 0)
+            # tooltip：完整表名（下拉只有 92px，长名字会被截断）
+            txt = cmb.itemText(cmb.currentIndex())
+            cmb.setToolTip(Tf("码表：{}（选择换表 /「（无码表）」卸下）", txt)
+                           if sel else T("码表：（无码表）—— 选一张表让本图层由码表接管"))
+            if sel and cur:
+                cmb.setToolTip(Tf("码表：{}（包：{}）", txt, cur))
+        except Exception:                                        # noqa: BLE001
+            pass
+        finally:
+            cmb.blockSignals(False)
+
+    def _on_cue_combo(self, idx):
+        """用户在下拉里选了一项：换表 / 卸下 / 导入新码表。"""
+        lays = list(getattr(self.main.engine, "layers", None) or [])
+        if not (0 <= idx < len(lays)):
+            return
+        lay = lays[idx]
+        cmb = getattr(self.rows[idx][0], "_cmb_cue", None) if 0 <= idx < len(self.rows) else None
+        if cmb is None:
+            return
+        data = str(cmb.currentData() or "")
+        import cue_ui
+        if data == "":
+            # 卸下：复用与「从这个图层卸下码表」**同一段**逻辑
+            cue_ui.unbind_layer(self.main, lay)
+            self._fill_cue_combo(cmb, lay)
+            self.refresh_header(idx)
+            self.refresh_playing()
+            self._refresh_cue_page()
+            return
+        if data == "__import__":
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, T("导入码表"), "", T("码表包 (*.ercue);;所有文件 (*)"))
+            if not paths:
+                self._fill_cue_combo(cmb, lay)     # 取消 ⇒ 把下拉还原成当前绑定
+                return
+            data = paths[0]
+        # 换表 / 导入并绑定：**唯一实现**在 cue_ui.load_and_bind
+        _ok, msg = cue_ui.load_and_bind(self.main, data, lay, parent=self)
+        self._fill_cue_combo(cmb, lay)
+        self.refresh_header(idx)
+        self.refresh_playing()
+        try:
+            self.main.save_layers()
+        except Exception:                                        # noqa: BLE001
+            pass
+        self._refresh_cue_page()
+        if msg:
+            QMessageBox.warning(self, T("码表"), msg)
+
+    def _refresh_cue_page(self):
+        """绑/换/卸之后：第 4 页签的「已绑图层」列要跟着变。"""
+        page = getattr(self.main, "cue_panel", None)
+        fn = getattr(page, "refresh", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:                                    # noqa: BLE001
+                pass
 
     def cue_menu(self, idx):
-        """徽标点击：换表 / 打开对话框 / 卸下。
+        """（**已停用**）原「码」徽标的点击菜单。
 
-        ⚠ "换表"必须走**同一个对话框**（`main.open_cuesheet()`）—— 包的选择/校验/素材目录
-          逻辑只有一处，避免这里再实现一套（两套迟早分叉）。
+        2026-10 用户要求：徽标 → 码表下拉（`_cmb_cue`），换表/卸下都走下拉，
+        本函数不再被任何地方调用。**函数体保留**是因为它里面的"卸下"两步
+        （`clear_cue_sheet` + 清 `is_cuesheet/cuesheet_id/cs_states/cs_active`）
+        已完整搬进 `cue_ui.unbind_layer()` —— 留一份可读的对照，不要删了以后
+        再有人把它"重新实现"一遍。
         """
         lays = getattr(self.main.engine, "layers", None) or []
         if not (0 <= idx < len(lays)):
@@ -2753,19 +2874,8 @@ class LayerStackPanel(QWidget):
                 fn()
         elif chosen is act_off:
             try:
-                self.main.engine.clear_cue_sheet()
-            except Exception:                                    # noqa: BLE001
-                pass
-            lay.is_cuesheet = False
-            lay.cuesheet_id = ""
-            lay.cs_states = []
-            lay.cs_active = False
-            try:
-                self.main.engine._cue_set_active(lay, set())
-            except Exception:                                    # noqa: BLE001
-                pass
-            try:
-                self.main.save_layers()
+                import cue_ui
+                cue_ui.unbind_layer(self.main, lay)
             except Exception:                                    # noqa: BLE001
                 pass
             self.refresh_header(idx)
@@ -2841,15 +2951,14 @@ class LayerStackPanel(QWidget):
             f._btn_lock.setChecked(bool(getattr(lay, "lock_motion", False)))
             f._name.setText(lay.name)
             f._name.setToolTip(lay.name + T("\n双击重命名"))
-            # 码表徽标：只在码表层显示（隐藏不占位 ⇒ 普通图层布局不变）
-            btn_cue = getattr(f, "_btn_cue", None)
-            if btn_cue is not None:
+            # 码表下拉：只在码表层显示（隐藏不占位 ⇒ 普通图层布局逐像素不变）
+            cmb_cue = getattr(f, "_cmb_cue", None)
+            if cmb_cue is not None:
                 is_cue = bool(getattr(lay, "is_cuesheet", False))
-                btn_cue.setVisible(is_cue)
-                btn_cue.setToolTip(
-                    (T("码表：%s（点开可换表 / 卸下）")
-                     % (str(getattr(lay, "cuesheet_id", "") or T("已绑定"))))
-                    if is_cue else T("码表：这个图层由码表接管（点开可换表 / 卸下）"))
+                cmb_cue.setVisible(is_cue)
+                if is_cue:
+                    # 表名 / 绑定的包可能变了（换表、导入、被移出列表）⇒ 重建选项并选中当前项
+                    self._fill_cue_combo(cmb_cue, lay)
             for w in (f._btn_vis, f._btn_solo, f._op, f._blend, f._btn_alpha, f._btn_lock):
                 w.blockSignals(False)
             # 角色按钮（自动图层专属）
