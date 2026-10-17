@@ -2924,16 +2924,33 @@ class AutoVJEngine(QObject):
         """码表里的**一条曲目** → 演出端 `song_id`（= 指纹库 id = `md5(路径)[:8]`）。
 
         与 `CueSheet.match_track()` 同一套判据，但**方向相反**（从码表反查本机曲库）：
+          ⓪ `identity.fp_id` 在 `cfg["cue"]["fp_songs"]` 里 ⇒ 直接用它记的 **合成 id**
+             （= 码表包里带的完整指纹已经灌进了指纹库，**本机没有这个文件**也能认）
           ① `identity.fp_id`     == `meta["fp_id"]`      （指纹签名，抗改名/换容器）
           ② `identity.file_md5`  == `meta["file_md5"]`   （同一文件字节）
           ③ basename(`file_name`) == basename(本机路径)   （老码表没有前两个字段时兜底）
         取不到 ⇒ None（调用方据此**不启用**认错歌护栏，退回旧行为）。
+
+        ⚠ ⓪ 级必须在最前：灌库后识别器返回的就是那个合成 id，若这里反查成本机路径哈希，
+          `_cue_accept_pos()` 会认为"认到了另一首歌"⇒ 永远不跟位（看着像功能没生效）。
+          去重守卫（`cue_fp_pack.ingest_sheet`：本机曲库已有同 fp_id 就不灌）保证
+          "同一首歌两份指纹"这种拆票情况不会发生。
         """
         idn = getattr(tr, "identity", None)
         if idn is None:
             return None
         fp_id = str(getattr(idn, "fp_id", "") or "").strip()
         fmd5 = str(getattr(idn, "file_md5", "") or "").strip().lower()
+        # ---- ⓪ 码表包里带来的指纹（合成 id；本机没有文件）----
+        if fp_id:
+            rec = self._cue_fp_songs().get(fp_id)
+            if isinstance(rec, dict):
+                try:
+                    sid = int(rec.get("song_id", -1))
+                except (TypeError, ValueError):
+                    sid = -1
+                if sid >= 0:
+                    return sid
         try:
             meta = self.cfg["music_meta"] or {}
             lib = self.cfg["music_library"] or []
@@ -3038,6 +3055,61 @@ class AutoVJEngine(QObject):
         except Exception:                                        # noqa: BLE001
             pass
         return q
+
+    def _cue_fp_songs(self):
+        """`cfg["cue"]["fp_songs"]`：码表包里带来的指纹 → **合成 song_id** 的映射。
+
+        由 `cue_fp_pack.ingest_sheet()` 写入（导入码表时后台灌库），形如：
+            {"fp2-xxxx": {"song_id": int, "title": str, "artist": str,
+                          "duration": float, "sheet": "<包路径>"}}
+
+        ★ 这些歌**本机没有音频文件** —— 这正是整条链的意义：音频从系统声音/调音台进来，
+          指纹库里已经有它的哈希 ⇒ 照样能认，码表照样能跟位。
+        ⚠ `Config` 是包装对象（**没有 `.get()`**）⇒ 只能 `cfg["cue"]`，且一律兜异常。
+        """
+        try:
+            cur = self.cfg["cue"]
+        except Exception:                                        # noqa: BLE001
+            return {}
+        if not isinstance(cur, dict):
+            return {}
+        m = cur.get("fp_songs")
+        return m if isinstance(m, dict) else {}
+
+    def _cue_track_query_by_sid(self, sid):
+        """**合成 `song_id`**（码表包带来的指纹）→ 认歌查询参数；不是合成 id ⇒ `{}`。
+
+        返回键与 `_cue_track_query(path)` **完全一致**（`fp_id` / `title` / `artist` /
+        `duration_sec` / `file_name`），这样 `_cue_auto_bind(**q)` 两条路径走同一段代码，
+        不会分叉。`file_name` 恒为 `""`：这类歌本机本来就没有文件，猜文件名只会误配。
+
+        ⚠ 只有 `_cue_song_path(sid)` 返回空（= `cfg["music_library"]` 里没有这个 id）时
+          才会被用到；有文件的老路径行为**逐值不变**。
+        """
+        try:
+            want = int(sid)
+        except (TypeError, ValueError):
+            return {}
+        for fp_id, rec in self._cue_fp_songs().items():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                if int(rec.get("song_id", -1)) != want:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
+                dur = float(rec.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            return {
+                "fp_id": str(fp_id),
+                "title": str(rec.get("title") or ""),
+                "artist": str(rec.get("artist") or ""),
+                "duration_sec": dur,
+                "file_name": "",
+            }
+        return {}
 
     def _cue_beat_len_for(self, path, use_track=True):
         """⚠ **诊断用，不要再用它算 `pos_beats`**（2026-10-17 起）。
@@ -3224,6 +3296,11 @@ class AutoVJEngine(QObject):
         if status in ("ok", "switch") and song != self._cue_pos_song:
             self._cue_pos_song = song
             q = self._cue_track_query(path) if path else {}
+            # ★ 本机没有这个文件（= 码表包里带来的指纹 ⇒ 合成 id，`_cue_song_path` 返回 ""）：
+            #   改用 `cfg["cue"]["fp_songs"]` 反查认歌参数，再走**同一个** `_cue_auto_bind()`。
+            #   不这么做的话 `q` 恒为空 ⇒ 不会自动选表 ⇒ 用户看到"导入了码表却完全不动"。
+            if not q and sid >= 0:
+                q = self._cue_track_query_by_sid(sid)
             if q:
                 self._cue_auto_bind(path, q)     # 换歌 ⇒ 换表/卸表（策略见 docstring）
                 # ★ 装表可能**刚换了拍长**（新表曲目 bpm 与旧表不同；或首次绑定时 rt 原先为

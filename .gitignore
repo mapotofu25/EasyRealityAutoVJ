@@ -99,6 +99,14 @@ config.json
 config.local.json
 *local*.json
 
+# ---------- 指纹库（运行期产物：可由「扫描曲库」整库重建，且体积可达数百 MB）----------
+# ⚠ 2026-10-18：导入码表时会把包内 `fp/<fp_id>.bin` 的指纹灌进这个库
+#   （`src/cue_fp_pack.py`）⇒ 源码运行时它会被建在项目根目录。绝不能进仓库：
+#   ① 它跟个人曲库绑定；② 几百 MB 的二进制；③ 随时可重建。
+fingerprints.db
+fingerprints.db-wal
+fingerprints.db-shm
+
 # ---------- 音频素材（第三方版权，且体积大）----------
 *.flac
 *.mp3

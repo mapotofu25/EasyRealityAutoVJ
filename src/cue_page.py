@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
+import cue_fp_pack
 import cuesheet
 from i18n import T, Tf
 from panels import I18nDialog
@@ -627,6 +628,12 @@ class CueSheetPanel(QWidget):
         self.engine = getattr(owner, "engine", None)
         self._frag_busy = False
         self._build()
+        # ★ 码表指纹灌库是**后台线程**（一张表 5 万条 INSERT ≈ 0.3~0.6s，放 GUI 线程会卡住
+        #   演出台）；这里只起一个 250ms 的轮询把结果写进状态行。用轮询而不是 Qt 信号，
+        #   是为了让 `cue_fp_pack` 保持**零 Qt**（可无头单测）。
+        self._fp_timer = QTimer(self)
+        self._fp_timer.setInterval(250)
+        self._fp_timer.timeout.connect(self._fp_poll)
         self.refresh()
 
     # ---------------- UI ----------------
@@ -818,6 +825,76 @@ class CueSheetPanel(QWidget):
                 return e
         return None
 
+    # ---------------- 码表指纹（包内 fp/*.bin → 指纹库） ----------------
+    def _fp_start(self, paths, kind="ingest"):
+        """把「灌指纹 / 清指纹」丢到**后台线程**，返回成功排队的张数。
+
+        为什么必须后台：一张真实码表 49462 条哈希，`executemany` + 一次 commit 约
+        0.3~0.6s，同步跑会把界面冻住（用户会以为程序卡死）。
+
+        ⚠ 失败**不阻断**导入：灌不进去只意味着"这首没有文件时认不出"，码表本身照常用
+          （`cue_fp_pack` 里所有异常都被兜住，作业对象只记 `error` 文案）。
+        """
+        if self.cfg is None:
+            return 0                    # 没有配置就没处记 `fp_songs` 映射，灌了也用不上
+        n = 0
+        for p in (paths or []):
+            try:
+                if kind == "drop":
+                    job = cue_fp_pack.start_drop(self.cfg, self.owner, p)
+                else:
+                    job = cue_fp_pack.start_ingest(self.cfg, self.owner, p)
+            except Exception as e:                               # noqa: BLE001
+                print("[码表] 指纹作业启动失败：%s: %s" % (type(e).__name__, e))
+                job = None
+            if job is not None:
+                n += 1
+        if n:
+            try:
+                self._fp_timer.start()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self._flash(T("正在把码表里的指纹写进指纹库…") if kind == "ingest"
+                        else T("正在移除码表指纹…"))
+        return n
+
+    def _fp_poll(self):
+        """轮询后台作业（纯读属性，不阻塞）；结果写状态行，全部结束就停表。"""
+        jobs = []
+        try:
+            jobs = cue_fp_pack.poll_jobs()
+        except Exception:                                        # noqa: BLE001
+            jobs = []
+        if jobs:
+            self._flash(" ｜ ".join(self._fp_text(j) for j in jobs))
+        try:
+            left = cue_fp_pack.pending_jobs()
+        except Exception:                                        # noqa: BLE001
+            left = 0
+        if left <= 0:
+            try:
+                self._fp_timer.stop()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _fp_text(job):
+        """一个后台作业 → 一句状态行文案（**文案在本模块**，`cue_fp_pack` 保持零 Qt/零 i18n）。"""
+        name = os.path.basename(getattr(job, "pkg", "") or "") or str(getattr(job, "pkg", ""))
+        err = str(getattr(job, "error", "") or "")
+        if err:
+            return Tf("码表指纹处理失败：{}", err)
+        if str(getattr(job, "kind", "")) == "drop":
+            return Tf("已移除码表指纹：{}（{} 条）", name, int(job.result or 0))
+        r = job.result if isinstance(job.result, dict) else {}
+        if not r:
+            return Tf("码表指纹：{} 读不出曲目", name)
+        if int(r.get("tracks", 0)) or int(r.get("hashes", 0)):
+            return Tf("码表指纹已入库：{}（{} 首 / {} 条，{} ms）", name,
+                      int(r.get("tracks", 0)), int(r.get("hashes", 0)),
+                      int(float(r.get("ms", 0.0))))
+        return Tf("码表指纹：{} 包里没有指纹（老包，跳过）", name)
+
     # ---------------- 动作 ----------------
     def on_add(self):
         """添加…：多选导入 .ercue ⇒ 只进列表（绑定用右键「绑到图层…」）。"""
@@ -847,6 +924,9 @@ class CueSheetPanel(QWidget):
                 idx.save_cfg(self.cfg)
             except Exception:                                    # noqa: BLE001
                 pass
+        # ★ 把包里的完整指纹哈希序列灌进演出端指纹库（后台线程）——
+        #   没有这一步，歌不在本机曲库时永远认不出（只有 16 hex 的 fp_id 摘要没用）。
+        self._fp_start(ok, "ingest")
         self.refresh()
         if bad:
             QMessageBox.warning(
@@ -905,6 +985,9 @@ class CueSheetPanel(QWidget):
                 except Exception:                                # noqa: BLE001
                     lay.is_cuesheet = False
                     lay.cuesheet_id = ""
+        # ★ 把这张包灌进指纹库的指纹一起撤掉（后台）——
+        #   否则放这首"本机没有文件"的歌时识别器会一直返回一个已经不存在的合成 id。
+        self._fp_start(paths, "drop")
         self._after_layers_changed()
         self.refresh()
         self._flash(Tf("已从列表移除 {} 张码表（磁盘文件仍在）。", len(paths)))

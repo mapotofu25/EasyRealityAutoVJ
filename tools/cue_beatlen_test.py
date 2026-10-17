@@ -81,6 +81,10 @@ def fake_engine(sh, tr, meta, lib):
         "_cue_pos_beat_len": eng_mod.AutoVJEngine._cue_pos_beat_len,
         "_cue_bound_song_id": eng_mod.AutoVJEngine._cue_bound_song_id,
         "_cue_lookup_song_id": eng_mod.AutoVJEngine._cue_lookup_song_id,
+        # ★ `_cue_lookup_song_id` 的 ⓪ 级会读 `cfg["cue"]["fp_songs"]`（码表包带来的指纹），
+        #   所以这份"只挂被测方法"的骨架也要把 `_cue_fp_songs` 挂上 —— 否则挂到真引擎上
+        #   能跑、挂到假引擎上就 AttributeError（那是骨架缺件，不是行为差异）。
+        "_cue_fp_songs": eng_mod.AutoVJEngine._cue_fp_songs,
         "_cue_accept_pos": eng_mod.AutoVJEngine._cue_accept_pos,
         "_cue_bad_song_log": eng_mod.AutoVJEngine._cue_bad_song_log,
         "_cue_beat_len_for": eng_mod.AutoVJEngine._cue_beat_len_for,

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                QPushButton, QVBoxLayout, QWidget)
 
+import cue_fp_pack
 import cuesheet
 from i18n import T, lang as i18n_lang
 
@@ -466,6 +467,12 @@ class CueSheetDialog(QDialog):
                 idx.save_cfg(self.cfg)
         except Exception:                                        # noqa: BLE001
             pass
+        # ★ 包里的完整指纹哈希序列 → 演出端指纹库（**后台线程**，绝不卡对话框）。
+        #   没有这一步，歌不在本机曲库时永远认不出（只有 16 hex 的 `fp_id` 摘要不够用）。
+        try:
+            cue_fp_pack.start_ingest(self.cfg, self.engine, self.pkg)
+        except Exception:                                        # noqa: BLE001
+            pass
         if self.chk_enable.isChecked():
             self._enable(True)
         self.refresh()
@@ -867,6 +874,11 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True):
         if idx is not None:
             idx.add(path)
             idx.save_cfg(cfg)
+    except Exception:                                            # noqa: BLE001
+        pass
+    # 包里带的完整指纹哈希序列 → 指纹库（后台线程；失败不阻断导入）
+    try:
+        cue_fp_pack.start_ingest(cfg, engine, path)
     except Exception:                                            # noqa: BLE001
         pass
 

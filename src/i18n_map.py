@@ -1174,6 +1174,18 @@ ZH2EN.update({
     "已导入 {} 张码表。右键一行可以「绑到图层…」。":
         "Imported {} cue sheet(s). Right-click a row to “Bind to layer…”.",
     "已导入 {} 张码表。": "Imported {} cue sheet(s).",
+    # —— 码表包里的完整指纹 → 指纹库（cue_fp_pack / 码表管理页状态行）——
+    # 为什么要有这几条：歌不在本机曲库时，靠包内 `fp/<fp_id>.bin` 灌进指纹库也能认出来。
+    "正在把码表里的指纹写进指纹库…":
+        "Writing the fingerprints from the cue sheet into the fingerprint DB…",
+    "正在移除码表指纹…": "Removing the cue-sheet fingerprints…",
+    "码表指纹已入库：{}（{} 首 / {} 条，{} ms）":
+        "Cue-sheet fingerprints imported: {} ({} track(s) / {} hash(es), {} ms)",
+    "码表指纹：{} 包里没有指纹（老包，跳过）":
+        "Cue-sheet fingerprints: {} has none in the package (old package, skipped)",
+    "码表指纹：{} 读不出曲目": "Cue-sheet fingerprints: cannot read tracks from {}",
+    "已移除码表指纹：{}（{} 条）": "Cue-sheet fingerprints removed: {} ({} hash(es))",
+    "码表指纹处理失败：{}": "Cue-sheet fingerprint handling failed: {}",
     "以下 {} 个文件不是有效的码表包：": "These {} file(s) are not valid cue-sheet packages:",
     "请先选中一行。": "Select a row first.",
     "文件和目录都不存在了：{}": "File and folder no longer exist: {}",
