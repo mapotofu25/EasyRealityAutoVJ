@@ -1260,6 +1260,17 @@ class AudioEngine:
         #   多开一条 12s 缓冲只多 ~2.3MB，风险为零。
         self._fp_buf = _AudioRing(48000 * 8)
         self._fp_sr = 48000
+        # ★★ 认歌连续性提示的锚点 + 取证字段。
+        #   ⚠⚠ 曾经**只在使用处 `self._last_match[2]` 读、从未初始化**
+        #      ⇒ 每个 tick 抛 AttributeError ⇒ 被 `except: pass` 吞掉
+        #      ⇒ 整段认歌逻辑从不执行 ⇒ **所有歌都认不出**（现场表现"连曲库歌也不认了"）。
+        #      这就是"新增字段必须初始化 + 两处独立复位"（铁律 11）的反面教材。
+        self._last_match = None      # (sid, votes, off, hint_used)
+        self._last_match_t = 0.0     # 上一拍的时刻（算 dt 用）
+        self._last_sig = (-1, -1.0)  # 取证：真正喂给 match 的信号 (len, rms)
+        self._last_adv = 0           # 取证：本拍 offset 是否推进 0.5s±0.4
+        self._eng_state = (0, -1, 0, 0)   # 取证：电荷条 (cur, cand, bar, hits)
+        self._rec_err_t = 0.0
         self._genre_lock = threading.Lock()
         self._genre_stop = threading.Event()
         self._genre_thread = threading.Thread(
@@ -1648,10 +1659,17 @@ class AudioEngine:
                     # 未锁定：连续性提示（上一窗起点 + 实际间隔），窗口半宽 0.3s
                     _hint = (_lm[2] + max(0.2, min(1.5, _dt))) * _FP_SR / _FP_HOP
                     _hint_w = 0.3 * _FP_SR / _FP_HOP
+                try:
+                    _sig_n = int(sig.size)
+                    _sig_rms = float(_np.sqrt(_np.mean(sig * sig))) if _sig_n else 0.0
+                except Exception:                                # noqa: BLE001
+                    _sig_n, _sig_rms = -1, -1.0
+                self._last_sig = (_sig_n, _sig_rms)      # 取证：真正喂给 match 的信号
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
-                _prev_off = float(self._last_match[2]) if self._last_match else None
+                _lm0 = getattr(self, "_last_match", None)
+                _prev_off = float(_lm0[2]) if _lm0 else None
                 self._last_match = (sid, int(votes or 0), float(off or 0.0),
                                     1 if _hint is not None else 0)
                 self._last_match_t = _now
@@ -1684,8 +1702,24 @@ class AudioEngine:
                             self.state.recognized_offset = -1.0
                             self.state.recognized_rate = 1.0
                             self._rate_est.reset()
-            except Exception:
-                pass
+            except Exception:                                    # noqa: BLE001
+                # ⚠⚠ 原来是 `pass`：认不出歌时任何异常都被吞掉，日志只有 raw=0，
+                #   分不清"没匹配到"还是"炸了"。现在写 traceback（10s 限流）。
+                try:
+                    import traceback as _tb
+                    t2 = time.perf_counter()
+                    if t2 - float(getattr(self, "_rec_err_t", 0.0) or 0.0) >= 10.0:
+                        self._rec_err_t = t2
+                        _p = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                          "AutoVJ", "cue_health.log")
+                        _d = os.path.dirname(_p)
+                        if _d and not os.path.isdir(_d):
+                            os.makedirs(_d, exist_ok=True)
+                        with open(_p, "a", encoding="utf-8") as _f:
+                            _f.write("[%s] [E] 认歌循环异常：\n%s\n"
+                                     % (time.strftime("%H:%M:%S"), _tb.format_exc()))
+                except Exception:                                # noqa: BLE001
+                    pass
 
     # ---------------- 采集（运行在音频线程） ----------------
     def _run_asio(self, st, device_name, mono, sr, gen, ch0=0, ch1=1):
