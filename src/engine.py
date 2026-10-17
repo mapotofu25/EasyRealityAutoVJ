@@ -605,6 +605,8 @@ class AutoVJEngine(QObject):
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
         self._cue_sheet = None      # 当前码表（cuesheet.CueSheet）
         self._cue_track = None      # 认到的曲目（TrackEntry）；None ⇒ 不接管
+        #   ★ 它同时是 `_cue_beat_len_for()` 的**第一优先**拍长来源（`identity.bpm`）：
+        #     `match_track()` 五级链（含 md5/指纹）认出来的，不靠本机文件名猜。
         self._cue_rt = None         # cuesheet_runtime.CueRuntime
         self._cue_media = {}        # clip_id → 磁盘路径
         self._cue_pos_beats = None  # 本帧拍位（S3 只初始化，S4 才写）
@@ -2912,7 +2914,16 @@ class AutoVJEngine(QObject):
             return ""
 
     def _cue_track_query(self, path):
-        """由曲子路径拼"认歌查询参数"（有 meta 用 meta，没有就退化到文件名级）。"""
+        """由曲子路径拼"认歌查询参数"（有 meta 用 meta，没有就退化到文件名级）。
+
+        ⚠⚠ **三个 md5 不是一回事，别混用**（混用不报错、只让某一级**静默永不命中**）：
+          · `meta["song_id"]`  = `int(md5(路径字符串)[:8],16)`（8 hex 整数）
+                                 → 指纹库主键 / `recognized_song_id`；**与文件内容无关**
+          · `meta["file_md5"]` = **音频文件字节**的 md5（32 hex）→ 码表认歌 ⓪ 级
+          · `meta["fp_id"]`    = 指纹签名 `fp2-<16hex>`        → 码表认歌 ① 级
+        把 `song_id` 当 `file_md5` / `fp_id` 用不会抛异常，只会让 ⓪/① 两级永不命中，
+        认歌就退化成"标题+艺人 / 文件名"这些最容易误判的级别。
+        """
         q = {"file_name": os.path.basename(path or "")}
         try:
             meta = (self.cfg["music_meta"] or {}).get(path) or {}
@@ -2920,24 +2931,45 @@ class AutoVJEngine(QObject):
                 q["title"] = str(meta.get("title") or "")
                 q["artist"] = str(meta.get("artist") or "")
                 q["duration_sec"] = float(meta.get("duration") or 0.0)
-                q["file_md5"] = str(meta.get("md5") or "")
+                # `md5` 是早期键名，保留作旧配置兼容（新扫描只写 `file_md5`）
+                q["file_md5"] = str(meta.get("file_md5") or meta.get("md5") or "")
                 q["fp_id"] = str(meta.get("fp_id") or "")
         except Exception:                                        # noqa: BLE001
             pass
         return q
 
     def _cue_beat_len_for(self, path):
-        """该曲子的拍长（秒/拍）。优先码表曲目里的 bpm，其次曲库元数据；都没有 ⇒ 1.0。"""
+        """该曲子的拍长（秒/拍）。优先码表曲目里的 bpm，其次曲库元数据；都没有 ⇒ 1.0。
+
+        ★ 三级取值（可靠性从高到低）：
+          ① `self._cue_track`：装表时 `match_track()` **五级链**（md5 → 指纹 → meta →
+             名+艺人 → 文件名）认定出来的那一条，`set_cue_sheet(track=...)` 时记下。
+             它**不依赖本机文件名**——码表里写的是对方的文件名，用户改名/换目录后
+             basename 猜不到，旧实现就会退回 `music_meta` 的 bpm（**拍长错 ⇒ 画面整体不对拍**）。
+          ② basename 猜测（老路径）：`_cue_track` 为空但表已装（例如只装了表没认曲目）
+             时保留，行为与改动前一致。
+          ③ `music_meta` 的 bpm。
+        ⚠ `_cue_track` 的复位点（至少两处，铁律 11）：
+          `__init__`（None）、`set_cue_sheet()`（先 clear 再赋值）、`clear_cue_sheet()`（None）
+          ⇒ 换歌/卸表不会留下上一首的 track 污染下一首。
+        """
         bpm = 0.0
         try:
-            if self._cue_sheet is not None:
-                for t in (getattr(self._cue_sheet, "tracks", None) or []):
-                    if os.path.basename(str(getattr(t.identity, "file_name", "") or "")) \
-                            == os.path.basename(path or ""):
-                        bpm = float(getattr(t.identity, "bpm", 0.0) or 0.0)
-                        break
+            _ct = getattr(self, "_cue_track", None)
+            if _ct is not None:
+                bpm = float(getattr(_ct.identity, "bpm", 0.0) or 0.0)
         except Exception:                                        # noqa: BLE001
             bpm = 0.0
+        if bpm <= 0.0:
+            try:
+                if self._cue_sheet is not None:
+                    for t in (getattr(self._cue_sheet, "tracks", None) or []):
+                        if os.path.basename(str(getattr(t.identity, "file_name", "") or "")) \
+                                == os.path.basename(path or ""):
+                            bpm = float(getattr(t.identity, "bpm", 0.0) or 0.0)
+                            break
+            except Exception:                                    # noqa: BLE001
+                bpm = 0.0
         if bpm <= 0.0:
             try:
                 m = (self.cfg["music_meta"] or {}).get(path) or {}
@@ -2987,6 +3019,9 @@ class AutoVJEngine(QObject):
                                          file_name=query.get("file_name", ""),
                                          file_md5=query.get("file_md5", ""))
             layer = next((l for l in self.layers if getattr(l, "is_cuesheet", False)), None)
+            # ★ `tr`（`match_track()` 认出来的那一条）随装表一起记到引擎上（`_cue_track`），
+            #   `_cue_beat_len_for()` 优先用它算拍长 —— 码表里的 `file_name` 与本机文件名
+            #   不一致（改名/换目录）时也能拿到正确 bpm，不再退回 `music_meta` 的兜底值。
             ok = self.set_cue_sheet(sheet, media_paths=info.get("present_media") or {},
                                     track=tr, layer=layer,
                                     sheet_id=os.path.basename(want))

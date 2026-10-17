@@ -1694,6 +1694,7 @@ class MusicScanThread(QThread):
         import soundfile as sf
         import genre_lookup as gl
         from fp import FingerprintDB
+        import fp as fpvj          # 指纹算法本体（签名/文件 md5 也在里面）
         from music_meta import resolve_music_genre
         from genre_keywords import simplify_genres
         from config import app_base_dir
@@ -1756,9 +1757,39 @@ class MusicScanThread(QThread):
         todo = [p for p in items if self.force or p not in meta]
         todo_grid = [p for p in items
                      if not (self.force or p not in meta) and _need_grid(p)]
-        total = len(todo) + len(todo_grid)
+        # ★ 第三类待办：**已有元数据、但缺 `fp_id`**（存量曲库）。
+        #   为什么必须有：引擎侧拼"认歌查询参数"的那一步（`engine._cue_track_query`）的
+        #   ① 级（指纹认歌）读 `meta["fp_id"]`，
+        #   而本轮之前扫过的歌**一个都没有**这个字段 ⇒ 码表认歌的 ⓪ md5 / ① 指纹两级
+        #   **永不命中**，只剩最容易误判的"标题+艺人 / 文件名"在撑。用户不重扫就永远拿不到。
+        #   这类只做「解码 → 指纹 → 签名 → 写 fp_id」，**不重跑**联网曲风 / 本地 AI / 封面 /
+        #   节拍网格（已有就保留）。
+        def _need_fp(p):
+            m = meta.get(p)
+            if not isinstance(m, dict):
+                return False
+            return not str(m.get("fp_id") or "")
+
+        todo_fp = [p for p in items
+                   if not (self.force or p not in meta) and _need_fp(p)]
+        total = len(todo) + len(todo_grid) + len(todo_fp)
         if todo_grid:
             _log("网格增量补算：%d 首缺网格（已有元数据）只补网格，不重跑指纹/联网" % len(todo_grid))
+        if todo_fp:
+            _log("指纹签名增量补算：%d 首缺 fp_id（已有元数据）只补签名，不重跑曲风/封面/网格"
+                 % len(todo_fp))
+
+        # 老曲库已算过的 `fp_id` 快照（**主线程先取好**，worker 里不再并发读 `cfg["music_meta"]`）
+        old_fp = {}
+        for _p in items:
+            try:
+                _m = meta.get(_p)
+            except Exception:                                        # noqa: BLE001
+                _m = None
+            if isinstance(_m, dict):
+                _v = str(_m.get("fp_id") or "")
+                if _v:
+                    old_fp[_p] = _v
 
         def _grid_one(p):
             """只算网格（已有元数据、缺网格）：解码一次 → grid_from_signal → 返回 grid。
@@ -1779,7 +1810,7 @@ class MusicScanThread(QThread):
                 return p, None
 
         def _one(p):
-            """单首：解码 → 指纹入库 → 曲风（本地）。返回 (path, r, 三段耗时)。
+            """单首：解码 → 指纹入库（+ 指纹签名） → 曲风（本地）。返回 (path, r, 三段耗时)。
 
             本函数在 worker 线程里跑，**任何异常都自己吞掉**（返回 r=None），
             免得一个坏文件把整轮扫描打断。
@@ -1790,10 +1821,28 @@ class MusicScanThread(QThread):
                 sig = np.mean(data, axis=1)
                 t1 = _tm.perf_counter()
                 song_id = int(hashlib.md5(p.encode("utf-8")).hexdigest()[:8], 16)
+                # ★ 指纹签名 `fp2-<16hex>`（= 码表 `identity.fp_id`，认歌 **① 级**用它）。
+                #   ⚠ 全曲 STFT 是纯 CPU 活，**必须放在 db_lock 外面**：放里面会让 6 个
+                #     worker 全部串行等锁，扫描退化成单线程（65 首要等几分钟）。
+                #   ⚠ 签名算不出来**不能丢整首**：指纹入库是主功能、签名是附加 ⇒
+                #     失败就 `fp_sig=""`，元数据照写（下次扫描会再补，见阶段 1d）。
+                #   ⚠ 已有 `fp_id` 的老歌（force 重扫）直接复用，不重算 sha1。
+                hashes = None
+                try:
+                    hashes = fpvj.fingerprint_audio(sig, sr)
+                except Exception:                                    # noqa: BLE001
+                    hashes = None          # add_song 会自己算一次；仍失败则整首丢（同改动前）
+                fp_sig = str(old_fp.get(p) or "")
+                if hashes is not None and not fp_sig:
+                    try:
+                        fp_sig = fpvj.signature_from_hashes(hashes)
+                    except Exception:                                # noqa: BLE001
+                        fp_sig = ""
                 with db_lock:
                     # ★ 批量写入：攒 6 首落一次盘 —— INSERT 本身躲不掉，但能省掉"每首一次 fsync"
                     #   （HDD 上单次 fsync 要等盘片 10~50ms，这钱白花）。
-                    db.add_song(song_id, sig, sr, commit=False)
+                    # ★ 传 `hashes=` 复用刚算好的指纹，避免第二次全曲 STFT。
+                    db.add_song(song_id, sig, sr, commit=False, hashes=hashes)
                     if db.pending() >= 6:
                         db.commit_batch()
                 t2 = _tm.perf_counter()
@@ -1817,6 +1866,9 @@ class MusicScanThread(QThread):
                         if not on and ai_zh:
                             r["source"] = "localai"
                 r["song_id"] = song_id
+                # ★ 指纹签名（码表认歌 ① 级）。空串 = 这次没算出来（下次扫描会重试），
+                #   **绝不**退化成写 `song_id`（那是「路径」哈希，与文件内容无关 ⇒ 静默永不命中）。
+                r["fp_id"] = fp_sig
                 # 段落分析已移除（用户反馈：不准，去掉曲库的段落分析与预览里的段落显示）
                 # ★ 节拍网格（BPM / 锚点 / 八拍乐句相位）—— 离线一次入库，演出中只查表。
                 #   复用刚解码的 sig：扫描已经为指纹读过一次盘，这里不再读第二遍。
@@ -1952,6 +2004,78 @@ class MusicScanThread(QThread):
                 pass
             _log("阶段1c（补封面）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
                  % (len(todo_cover), okc, _tm.perf_counter() - tc0))
+
+        # ---- 阶段 1d：**补指纹签名 `fp_id`**（存量曲库：有元数据但没有 fp_id）----
+        # 只做「解码 → 指纹 → 签名 → 写 `fp_id`」（顺带把缺的指纹行补进库），
+        # **不重跑**联网曲风 / 本地 AI / 封面 / 节拍网格 —— 那些已有就保留。
+        if todo_fp:
+            tf0 = _tm.perf_counter()
+            okf = 0
+
+            def _fp_one(p):
+                """只补签名（已有元数据、缺 `fp_id`）；返回 `(path, fp_sig)`。
+
+                ⚠ 解码/声道混合必须与本文件 `_one()` **逐字一致**（整曲读、`np.mean(axis=1)`）：
+                  签名是「指纹哈希序列」的 sha1，而哈希来自 PCM ⇒ 截断/重采样/单声道取法
+                  只要差一点，算出来就是**另一串**，跨端比对会**静默永不命中**。
+                ⚠ 任何异常自己吞掉，返回 `(p, "")`（坏文件不能打断整轮扫描）。
+                """
+                try:
+                    if not _os.path.isfile(p):
+                        return p, ""
+                    data, sr = sf.read(p, dtype="float32", always_2d=True)
+                    sig = np.mean(data, axis=1)
+                    hs = fpvj.fingerprint_audio(sig, sr)
+                    fp_sig = fpvj.signature_from_hashes(hs)
+                    if not fp_sig:
+                        return p, ""
+                    song_id = int(hashlib.md5(p.encode("utf-8")).hexdigest()[:8], 16)
+                    with db_lock:
+                        # 老曲库几乎**都已有指纹行**（本阶段只缺签名）⇒ 先查一次，
+                        # 有就跳过写库（`idx_song` 索引让这条 SELECT 是常数级），
+                        # 免得几千首全量重写几千万行。
+                        has_rows = False
+                        try:
+                            has_rows = db.conn.execute(
+                                "SELECT 1 FROM fingerprints WHERE song_id=? LIMIT 1",
+                                (song_id,)).fetchone() is not None
+                        except Exception:                            # noqa: BLE001
+                            has_rows = False
+                        if not has_rows:
+                            db.add_song(song_id, sig, sr, commit=False, hashes=hs)
+                            if db.pending() >= 6:
+                                db.commit_batch()
+                    return p, fp_sig
+                except Exception:                                    # noqa: BLE001
+                    return p, ""
+
+            try:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    for p, fs in ex.map(_fp_one, todo_fp):
+                        if fs:
+                            rec = dict(meta.get(p) or {})
+                            rec["fp_id"] = fs
+                            meta[p] = rec
+                            okf += 1
+                        done += 1
+                        self.progress.emit(done, total, p)
+                        if done % 20 == 0:
+                            try:
+                                self.main.cfg.save()
+                            except Exception:                        # noqa: BLE001
+                                pass
+            except Exception as e:                                   # noqa: BLE001
+                _log("阶段1d（补指纹签名）异常终止：%s" % e)
+            try:
+                db.commit_batch()
+            except Exception:                                        # noqa: BLE001
+                pass
+            try:
+                self.main.cfg.save()
+            except Exception:                                        # noqa: BLE001
+                pass
+            _log("阶段1d（补指纹签名）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
+                 % (len(todo_fp), okf, _tm.perf_counter() - tf0))
 
         # ---- 阶段 2：**串行**补在线曲风（尊重限流；网络差就提前收手）----
         if todo and not gl.online_blocked():

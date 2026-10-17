@@ -165,6 +165,59 @@ def fingerprint_audio(sig, sr):
     return _hashes(_find_peaks(spec))
 
 
+# ==========================================================================
+# 「指纹签名」`fp2-<16hex>` —— 与 EasyRealityCue 的 `model/fp_core.py` **逐字节一致**
+# ==========================================================================
+#: 签名格式版本；`2` 对应 `FP_SCHEMA_VERSION=2`。两端必须同步改。
+SIG_PREFIX = "fp2-"
+SIG_HEX = 16              # sha1 前 16 hex = 64 bit
+
+
+def signature_from_hashes(hashes):
+    """指纹哈希序列 → **稳定的签名串**（`fp2-<16 hex>`）；空序列 ⇒ `""`。
+
+    ★ 这是码表（.ercue）里 `identity.fp_id` 的**同一个东西**：编排端
+      `fp_core.signature_from_hashes()` 逐字节同算法 ⇒ 同一段音频在两端算出**同一串**。
+      ⚠「同一段音频」= 解码出的 PCM 必须一致。任何一端换了重采样/声道混合方式，
+        签名就变 ⇒ 跨端比对**静默永不命中**（`tools/_fp_sig_probe.py` 就是为此写的探针）。
+    """
+    if not hashes:
+        return ""
+    h = hashlib.sha1()
+    for hh, off in hashes:
+        h.update(hh.encode("ascii", "replace"))
+        h.update(b":")
+        h.update(b"%d|" % int(off))
+    return SIG_PREFIX + h.hexdigest()[:SIG_HEX]
+
+
+def fingerprint_signature(sig, sr):
+    """一步到位：音频信号 → 指纹签名（`fp2-<16 hex>`）；算不出来返回 `""`。"""
+    try:
+        return signature_from_hashes(fingerprint_audio(sig, sr))
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def file_md5(path, chunk=1 << 20):
+    """**文件内容**的 md5（`hexdigest`，小写）；读不到返回 `""`。
+
+    ⚠⚠ **不要和 `song_id` 混用**：
+      · 本函数 = 文件字节的 md5（32 hex），码表 `identity.file_md5` 就是这个；
+      · `song_id = int(md5(路径字符串)[:8], 16)`（8 hex，见 `ui_main` 建库处）
+        —— 它是**指纹库主键 / `recognized_song_id`**，跟文件内容无关。
+      两者互比永远不相等，且**不会报错**（一个 32 hex、一个整数）。
+    """
+    try:
+        h = hashlib.md5()
+        with open(str(path), "rb") as f:
+            for blk in iter(lambda: f.read(chunk), b""):
+                h.update(blk)
+        return h.hexdigest()
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 class FingerprintDB:
     """指纹库：add_song 建库，match 现场匹配（返回对齐票数，供音乐电池引擎消费）"""
 
@@ -194,11 +247,27 @@ class FingerprintDB:
             self.conn.execute(f"PRAGMA user_version={FP_SCHEMA_VERSION}")
         self.conn.commit()
 
-    def add_song(self, song_id, sig, sr, commit=True):
+    def add_song(self, song_id, sig, sr, commit=True, hashes=None, want_sig=False):
+        """把一首歌的指纹入库。返回**入库行数**；`want_sig=True` 时返回 `(行数, 签名)`。
+
+        :param song_id:  指纹库主键（`int(md5(路径字符串)[:8], 16)`，见 `ui_main` 建库处）。
+                         ⚠ 这是**路径**哈希，与文件内容无关，**不能**当 `file_md5` 用。
+        :param sig:      单声道 float 波形（`sr` 采样率）。
+        :param sr:       采样率。
+        :param commit:   `False` ⇒ 攒批（配合 `commit_batch()`）。
+        :param hashes:   **可选**，已算好的 `fingerprint_audio(sig, sr)` 结果
+                         （`[(hash, offset), ...]`）。扫描流程要同时拿"入库行"和
+                         "`fp_id` 签名"，若这里再算一次就等于对整首歌做**两遍**
+                         全曲 STFT（65 首要几分钟）。传进来就复用，`None` 才算。
+        :param want_sig: 是否顺带返回指纹签名 `fp2-<16hex>`（= 码表 `identity.fp_id`）。
+                         ⚠ 返回值类型随它变化是**刻意**的：所有旧调用方不传 `want_sig`
+                         就拿 `int`，行为与改动前**逐值一致**。
+        """
         # 重扫时先删该曲旧指纹，防止库膨胀、匹配变慢（DELETE+INSERT 同一隐式事务）
         # ★ `idx_song` 索引让这条 DELETE 从"全表扫描"变成按索引定位（2026-09-26 实测 0.000s）。
         self.conn.execute("DELETE FROM fingerprints WHERE song_id=?", (song_id,))
-        rows = [(h, song_id, off) for h, off in fingerprint_audio(sig, sr)]
+        hs = hashes if hashes is not None else fingerprint_audio(sig, sr)
+        rows = [(h, song_id, off) for h, off in hs]
         if rows:
             self.conn.executemany(
                 "INSERT INTO fingerprints VALUES (?,?,?)", rows)
@@ -207,7 +276,9 @@ class FingerprintDB:
             self._pending = 0
         else:
             self._pending += 1          # 攒着，由调用方 commit_batch() 统一落盘
-        return len(rows)
+        if want_sig:
+            return len(rows), signature_from_hashes(hs)
+        return len(rows)                # ← 旧调用方拿到的仍是 int（行为不变）
 
     def pending(self):
         """批量模式下"已写未 commit"的歌曲数"""
