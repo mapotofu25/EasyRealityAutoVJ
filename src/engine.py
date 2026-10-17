@@ -519,6 +519,27 @@ def _crop_src_rect(image, crop):
 
 
 
+class _CueItemStub:
+    """`MediaItem` 构造失败时的兜底（只为让 `make_player` 能跑；不含任何播放逻辑）。
+
+    正常情况不会用到：真实素材一律走 `MediaItem`。
+    """
+    def __init__(self, path):
+        self.path = str(path or "")
+        self.kind = "video"
+        self.name = os.path.basename(self.path)
+        self._has_alpha = False
+        self._is_dxv = False
+        self.img_scale = 1.0
+        self.img_x = 0.0
+        self.img_y = 0.0
+        self.img_rot = 0.0
+        self._thumb_path = lambda ext=".jpg": self.path + ext
+
+    def all_tags(self):
+        return ()
+
+
 class _CueSubLayer:
     """码表内**单个子层**的轻量替身（**照搬备份 284-317 的完整 `__slots__`**）。
 
@@ -2858,6 +2879,118 @@ class AutoVJEngine(QObject):
             lay.cs_states = states if on else []
             lay.cs_active = on
 
+    def _cue_item(self, lay, path, xform=None):
+        """按路径取（并缓存）**真实 MediaItem**，并把码表的 `xform` 套上去。
+
+        ⚠ 必须是真实 `MediaItem`：`make_player()` 读 `item.kind` / `item._thumb_path()` /
+          `item._has_alpha` / `item._is_dxv`，自造极简替身会让工厂抛异常（被吞掉 ⇒ 静默黑屏）。
+        ⚠ 同一个素材被多个子层复用时共用一条缓存（`lay._cue_items`）；`img_*` 是**画之前当场设**的
+          （绘制是同步串行的，所以安全）。
+        """
+        if not isinstance(getattr(lay, "_cue_items", None), dict):
+            lay._cue_items = {}
+        it = lay._cue_items.get(path)
+        if it is None:
+            try:
+                from media_manager import MediaItem   # 局部导入：与引擎里其它调用点一致
+                it = MediaItem(path)
+            except Exception:                                     # noqa: BLE001
+                it = _CueItemStub(path)
+            lay._cue_items[path] = it
+        xf = xform or {}
+        try:
+            it.img_scale = float(xf.get("scale", 1.0) or 1.0)
+            it.img_x = float(xf.get("x", 0.0) or 0.0)
+            it.img_y = float(xf.get("y", 0.0) or 0.0)
+            it.img_rot = float(xf.get("rot", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+        return it
+
+    def _cue_frame(self, lay, ps):
+        """取该子层当前应显示的帧（S5 版：**只取帧，不 seek**）。
+
+        S6 会在这里接 `play_sec` / `src_in` / `src_ended`（seek + 冻结）。
+        现在只做三件事：激活 → 预热首帧 → 取帧；取不到就用上一帧兜底（不黑）。
+        """
+        try:
+            item = self._cue_item(lay, ps.clip_path, ps.xform)
+            player = self._get_player(lay, item)
+        except Exception:                                         # noqa: BLE001
+            return None
+        if player is None:
+            return None
+        try:
+            player.set_active(True)      # ⚠ 不激活时 current() 恒 None（历史坑：码表层一片黑）
+            if not getattr(player, "_cue_warmed", False):
+                player._cue_warmed = True
+                player.warm_up()
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            img = player.current()
+        except Exception:                                         # noqa: BLE001
+            img = None
+        cache = getattr(lay, "_cue_last_frame", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            lay._cue_last_frame = cache
+        if img is None or img.isNull():
+            return cache.get(ps.lyr_id)
+        cache[ps.lyr_id] = img            # 只存引用，不拷贝（解码线程每帧产出新 QImage）
+        return img
+
+    def _draw_cuesheet_layer(self, p, lay, W, H, snap, subtract_jobs):
+        """把码表图层的所有激活子层画到画布上（按 z 升序 = 后画的在上）。
+
+        **α² 的来源**：`op = 容器层不透明度 × 片段有效不透明度 × alpha`，再把 `trans_p` 作为
+        `prog` 传给 `_draw_layer` ⇒ 有效 α = `opacity × alpha × trans_p` = **α²**（`trans_p=a_in`）。
+        ⚠ **不要在这里再乘一次 alpha**（会偏暗），也不要改 `prog` 的定义。
+        """
+        if not getattr(lay, "cs_active", False):
+            return
+        base_op = max(0.0, min(1.0, float(getattr(lay, "opacity", 1.0) or 0.0)))
+        for ps in list(getattr(lay, "cs_states", None) or []):
+            if not ps.active or ps.missing or not ps.clip_path:
+                continue
+            op = base_op * float(ps.opacity) * float(ps.alpha)
+            if op <= 0.002:               # 与普通图层同门槛
+                continue
+            img = self._cue_frame(lay, ps)
+            if img is None or img.isNull():
+                continue
+            item = self._cue_item(lay, ps.clip_path, ps.xform)
+            stub = _CueSubLayer(ps.lyr_id, op, item, name=ps.lyr_id)
+            tr = ps.trans if ps.trans in ("fade", "cut", "slide", "zoom", "glitch") else "fade"
+            prog = 1.0 if tr == "cut" else max(0.0, min(1.0, float(ps.trans_p)))
+            # ★★ 必须置 `trans_active = True`（过渡中），否则 `_draw_layer` 会在
+            #   `if tr == "beat_cut" or prog >= 1.0 or (not is_kv and not lay.trans_active)`
+            #   处**提前返回**，把 tr/prog 全部忽略 ⇒ 过渡退化成"一次性满不透明度"，
+            #   有效 α 就从 α² 变成 α（实测差一倍：64 → 127）。备份实现漏了这一句。
+            stub.trans_active = bool(prog < 1.0)
+            blend = ps.blend if (ps.blend in BLEND_QT or ps.blend == "subtract") else "normal"
+            if blend == "subtract":
+                # 复用引擎既有"逐像素减少"机制：先画到暂存图，合成完统一相减
+                tmp = (getattr(lay, "_cue_sub_tmps", None) or {}).get(ps.lyr_id)
+                if tmp is None or tmp.width() != W or tmp.height() != H:
+                    tmp = QImage(W, H, QImage.Format_ARGB32)
+                    if not isinstance(getattr(lay, "_cue_sub_tmps", None), dict):
+                        lay._cue_sub_tmps = {}
+                    lay._cue_sub_tmps[ps.lyr_id] = tmp
+                tmp.fill(Qt.transparent)
+                tp = QPainter(tmp)
+                tp.setRenderHint(QPainter.SmoothPixmapTransform)
+                self._draw_layer(tp, stub, img, W, H, prog, tr, 1.0, snap, 0.0, 0.0,
+                                 crop=ps.crop)
+                tp.end()
+                subtract_jobs.append((tmp, op))
+            else:
+                p.setCompositionMode(
+                    BLEND_QT.get(blend, QPainter.CompositionMode_SourceOver))
+                self._draw_layer(p, stub, img, W, H, prog, tr, 1.0, snap, 0.0, 0.0,
+                                 crop=ps.crop)
+                p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
     def _preload_clips(self, lay, clips=None, max_preload=3):
         """已废弃：预加载机制曾导致 decoder 线程堆积、CPU 20%→60%（详见 memory）。
         现在**惰性打开**：切换时才创建解码器，而且构造不再阻塞（容器在解码线程里打开），
@@ -3378,6 +3511,17 @@ class AutoVJEngine(QObject):
         # 图层列表 index 0 = 最上层 → 从下往上绘制
         for lay in reversed(self.layers):
             if not lay.visible:
+                continue
+            # ★★ 码表图层是**容器**：它没有单一 player，画面由内部子层按码表渲染。
+            #   必须拦在下面的 `if not lay.player: continue` **之前**，并且**必须 continue** ——
+            #   否则会落到 `lay.player.current()`（None ⇒ 抛异常/整帧丢）。
+            #   solo / hide_silent 与普通图层同口径（旧实现曾让码表层"盖在最上不受 solo 管"）。
+            if getattr(lay, "is_cuesheet", False):
+                if solo_on and not getattr(lay, "solo", False):
+                    continue
+                if getattr(lay, "hide_silent", False) and silent:
+                    continue
+                self._draw_cuesheet_layer(p, lay, W, H, snap, subtract_jobs)
                 continue
             if not lay.player:
                 continue
