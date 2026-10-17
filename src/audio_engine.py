@@ -1617,18 +1617,39 @@ class AudioEngine:
                 #     杂散候选 ⇒ 票数永远够不到 CONFIRM_VOTES(20) ⇒ 永远锁不上 ⇒
                 #     预测继续错 ⇒ **死锁**。现场表现就是"一直认不出"。
                 #   因此：锁定前走纯全局众数（等于旧行为），锁定后才用 hint 防歧义。
+                # ★★ 2026-10-17（第二版，现场实证）：**未锁定时必须给「连续性提示」**，
+                #   但提示只能来自**上一次匹配的偏移 + 实际间隔**，不能来自拍钟预测。
+                #   为什么（这次是 `charge_engine` 的判据逼出来的）：
+                #     `tick()` 要求 `offset_sec` 每拍递增 DELTA_ADVANCE_SEC(0.5s) 才允许充电
+                #     （`chargeable = advancing and votes >= CONFIRM_VOTES`）。
+                #     不给 hint ⇒ `_pick` 取**全局众数**，在重复段落里位置会在几处之间来回跳
+                #       （现场日志：136→89→83→139→349）⇒ advancing 永远 False ⇒ 永不充电。
+                #     给拍钟 hint ⇒ 未锁定时预测无意义 ⇒ 挑中 1~8 票杂散候选 ⇒ 同样不充电。
+                #   ⇒ 两条路都堵死，表现就是"raw 有 80~180 票也不确认"。
+                #   正解：用「上次偏移 + dt」当 hint —— 既保证连续推进（满足充电判据），
+                #     又不依赖任何未建立的坐标；DJ seek 时该窗口自然无候选 ⇒ 退回全局众数。
+                _now = _t.perf_counter()
+                _lm = getattr(self, "_last_match", None)
+                _lm_t = float(getattr(self, "_last_match_t", 0.0) or 0.0)
+                _dt = (_now - _lm_t) if _lm_t > 0.0 else 0.5
                 _hint = None
+                _hint_w = None
                 if (_locked is not None and int(_locked) >= 0
                         and _pred is not None and _pred >= 0.0):
+                    # 已锁定：用拍钟预测（专治重复段落歧义）
                     _hint = _pred * _FP_SR / _FP_HOP
-                # hint 窗口（帧）：引擎按该歌 beat_len 换算后写入；缺省 None ⇒ fp 用缺省 HINT_W
-                _hint_w = (float(_pred_w) if (_hint is not None and _pred_w is not None
-                                             and float(_pred_w) > 0.0) else None)
+                    _hint_w = (float(_pred_w) if (_pred_w is not None and float(_pred_w) > 0.0)
+                               else None)
+                elif _lm and int(_lm[0]) >= 0 and int(_lm[1]) >= 4:
+                    # 未锁定：连续性提示（上一窗起点 + 实际间隔），窗口半宽 0.3s
+                    _hint = (_lm[2] + max(0.2, min(1.5, _dt))) * _FP_SR / _FP_HOP
+                    _hint_w = 0.3 * _FP_SR / _FP_HOP
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 self._last_match = (sid, int(votes or 0), float(off or 0.0),
                                     1 if _hint is not None else 0)
+                self._last_match_t = _now
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
                 cur = eng.current_song_id
