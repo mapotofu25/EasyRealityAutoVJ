@@ -22,8 +22,10 @@
 数据来源
 --------
 列表**不自己扫盘**，一律读 `engine.cue_index()`（`cfg["cue"]["sheets"]`，只存摘要）。
-「片段总数」摘要里没有（红线：不改 `cue_index.py` / `cuesheet.py`）⇒ 用公开 API
+「片段总数」摘要里没有（不在本模块另写一套扫描逻辑）⇒ 用公开 API
 `cuesheet.load()` 读一次后按 `(mtime, size)` 缓存在本模块，**只在包变了才重读**。
+素材缩略图同样来自 `cuesheet.load()` 填好的 `sheet.thumbs`（包内 `thumbs/<clip_id>.png`，
+由 `cuesheet.extract_thumbs()` 幂等解到 `<包>.thumbs/`）—— 本模块只负责显示。
 """
 from __future__ import annotations
 
