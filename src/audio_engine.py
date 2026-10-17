@@ -1533,7 +1533,7 @@ class AudioEngine:
             except Exception:                                    # noqa: BLE001
                 hit, n_hash = -1, -1
             line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f "
-                    "hit=%d/%d seg=%.3f/%d raw=%d/hint=%d adv=%d cur=%d cand=%d bar=%d hits=%d"
+                    "hit=%d/%d seg=%.3f/%d sig=%d/%.3f raw=%d/hint=%d adv=%d cur=%d cand=%d bar=%d hits=%d"
                     % (time.strftime("%H:%M:%S"),
                        1 if fp_db is not None else 0,
                        1 if eng is not None else 0,
@@ -1544,6 +1544,8 @@ class AudioEngine:
                        float(getattr(st, "energy", 0.0) or 0.0),
                        float(getattr(st, "bpm_display", 0.0) or 0.0),
                        hit, n_hash, seg_rms, seg_n,
+                       int((getattr(self, "_last_sig", (-1, -1.0)) or (-1, -1.0))[0]),
+                       float((getattr(self, "_last_sig", (-1, -1.0)) or (-1, -1.0))[1]),
                        int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[1]),
                        int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[3]),
                        int(getattr(self, "_last_adv", 0) or 0),
