@@ -35,6 +35,10 @@ CLIP_MIME = "application/x-autovj-media"
 HEADER_W = 456          # 图层头列宽
 LIB_THUMB_SIZES = [(96, 54, 112, 82), (160, 90, 178, 138), (240, 135, 262, 194)]
 COVER_ICON = 64         # 曲库列表每行左侧的歌曲封面边长默认值（px）
+# ★ 2026-10-17（用户要求「用不一样的颜色」）：曲库里**码表带来**的派生行用**青绿**
+#   （与码表 UI 的主色一致）。蓝 `#7aa2f7` 已被「导入曲库分析包」占用、
+#   红 `#e06666` 已被「文件缺失」占用 —— 三者语义必须能一眼分开。
+CUE_ROW_COLOR = "#4ec9b0"
 # 封面尺寸档位（右键「封面大小」里选）。⚠ 值要在下面的 COVER_SIZES 里唯一，
 #   因为它同时是配置里存的值 —— 改档位就是要让老的配置能对上（对不上回退默认）。
 COVER_SIZES = [("小", 40), ("中", 64), ("大", 96), ("特大", 128)]
@@ -1375,12 +1379,18 @@ class MusicLibraryPanel(QWidget):
 
     def _sort_key(self, key, meta):
         def k(path):
+            rec = meta.get(path) or {}
             bpm, dur, _e = self._info(meta, path)
-            name = os.path.basename(path)
+            # ⚠ 码表派生行的 key 是伪路径（`@cue:<表路径>#…`），basename 没有意义 ⇒
+            #   按曲名排序。本机行保持原行为（按文件名），避免改变既有排序结果。
+            if rec.get("_cue"):
+                name = (rec.get("title") or rec.get("file_name") or "").lower()
+            else:
+                name = os.path.basename(path).lower()
             if key == "title":
-                return (name.lower(),)
+                return (name,)
             if key == "artist":
-                return ((meta.get(path) or {}).get("artist") or "").lower()
+                return (rec.get("artist") or "").lower()
             if key == "bpm":
                 return (bpm is None, bpm or 0.0, name.lower())
             if key == "bpm_d":
@@ -1400,6 +1410,9 @@ class MusicLibraryPanel(QWidget):
           都不会丢用户的勾选。
         ★ 2026-10-09（用户要求②）：按**来源**（本机 / 具体导入包）筛选。
         ★ 2026-10-09（用户要求③）：导入歌行尾显示**包名**而非笼统的「导入包」。
+        ★ 2026-10-17（用户要求）：**码表里的曲目（含指纹）也进曲库列表** ——
+          青绿行、可筛「仅码表 / 某张表」、行尾显示「未入库 + 指纹」。
+          ⚠ 它们是**派生视图**（每次现算，不落盘）⇒ 码表删了它们自动消失。
         """
         try:
             # ① 先收集**重建前**的勾选键（列表即将 clear，必须先记下来）
@@ -1411,8 +1424,16 @@ class MusicLibraryPanel(QWidget):
             #   数据合并进一份**视图 meta**（不动 `cfg["music_meta"]`，
             #   避免污染"按文件路径索引"的曲库数据，也避免被扫描逻辑当成曲目）。
             imp_lib = self._imported_lib()
+            # ★★ 2026-10-17（用户要求）：把**码表里的曲目（含指纹）**也列进曲库。
+            #   ⚠ 这些行是**派生视图**：每次 refresh 现算，**绝不写进
+            #     `cfg["music_library"]` / `cfg["music_meta"]`**。
+            #     所以「码表被删 / 移除 ⇒ 曲库里对应条目一起消失」天然成立 ——
+            #     派生行没有实体，表没了下次 refresh 就再也算不出来。
+            #     ⇒ 不要在这里补"级联删除"：`music_library` 是用户曲库唯一真源，
+            #       级联删错删的是用户本机的真歌。详见 cue_index.library_rows()。
+            cue_lib = self._cue_lib_rows()
             view_meta = meta
-            if imp_lib:
+            if imp_lib or cue_lib:
                 view_meta = dict(meta)
                 for _fp, _r in imp_lib.items():
                     view_meta[_fp] = {
@@ -1423,10 +1444,22 @@ class MusicLibraryPanel(QWidget):
                         # ★ 包名（用于来源筛选 + 行尾显示）——空串 = 早期导入
                         "pack": _r.get("pack", ""),
                     }
-                lib = lib + list(imp_lib)
-            # ★ 来源下拉在**过滤前**重建（用户可能刚导入新包 ⇒ 包名要实时更新）；
+                for _fp, _r in cue_lib.items():
+                    # 码表派生行：BPM/时长来自码表曲目身份（不读本机文件）
+                    view_meta[_fp] = {
+                        "grid": {"bpm": _r["bpm"], "dur": _r["duration_sec"]},
+                        "genres": [], "artist": _r["artist"], "title": _r["title"],
+                        "source": "", "cover": "", "song_id": "",
+                        "_cue": True,
+                        # 表名/表路径：来源筛选（稳定键用绝对路径）+ 行尾显示
+                        "sheet": _r["sheet_name"], "sheet_path": _r["sheet_path"],
+                        "fp_id": _r["fp_id"], "file_md5": _r["file_md5"],
+                        "meta_id": _r["meta_id"], "file_name": _r["file_name"],
+                    }
+                lib = lib + list(imp_lib) + list(cue_lib)
+            # ★ 来源下拉在**过滤前**重建（用户可能刚导入新包 / 刚加码表 ⇒ 选项要实时更新）；
             #   程序化重填内部 blockSignals，绝不触发 cascade refresh。
-            self._refresh_source_combo(imp_lib)
+            self._refresh_source_combo(imp_lib, cue_lib)
             src_key = self.cb_src.currentData(Qt.UserRole) or "__all__"
             bpm_b = self.BPM_FILTERS[self.cb_bpm.currentIndex()][1]
             dur_b = self.DUR_FILTERS[self.cb_dur.currentIndex()][1]
@@ -1434,18 +1467,19 @@ class MusicLibraryPanel(QWidget):
             rows = []
             for p in lib:
                 imp = p in imp_lib
-                # ★ 来源筛选（②）：全部 / 仅本机 / 某导入包
-                if not self._src_ok(p, imp, imp_lib, src_key):
+                cue = p in cue_lib
+                # ★ 来源筛选（②）：全部 / 仅本机 / 某导入包 / 仅码表 / 某张码表
+                if not self._src_ok(p, imp, imp_lib, src_key, cue, cue_lib):
                     continue
                 bpm, dur, exists = self._info(view_meta, p)
                 if not self._in_bucket(bpm, bpm_b):
                     continue
                 if not self._in_bucket(dur, dur_b):
                     continue
-                # ⚠ 导入的歌**不算**"文件缺失"：它们本来就没有本机文件，
+                # ⚠ 导入的歌 / 码表派生行**都不算**"文件缺失"：它们本来就没有本机文件，
                 #   混进来会让"只看文件缺失"（那是"换盘/改名后找不到文件"的
                 #   修复清单）语义混乱。
-                if only_miss and (exists or imp):
+                if only_miss and (exists or imp or cue):
                     continue
                 rows.append((p, bpm, dur, exists))
             sk = self.SORTS[self.cb_sort.currentIndex()][1]
@@ -1460,6 +1494,7 @@ class MusicLibraryPanel(QWidget):
                 for p, bpm, dur, exists in rows:
                     m = view_meta.get(p) or {}
                     imp = bool(m.get("_imported"))
+                    cue = bool(m.get("_cue"))
                     genres = "、".join(m.get("genres") or []) or T("未分析")
                     src = m.get("source") or ""
                     bits = []
@@ -1477,6 +1512,24 @@ class MusicLibraryPanel(QWidget):
                         disp = "📦 " + disp
                         # ★（③）行尾显示**包名**；空串 = 加列之前的旧数据
                         src = (m.get("pack") or "") or T("早期导入")
+                    elif cue:
+                        # ★ 码表带来的曲目：行尾显示**表名** + 「未入库」+ 指纹前 8 位
+                        #   （指纹整串 16 hex 太长，会把行撑出去）
+                        name = m.get("title") or m.get("file_name") or ""
+                        artist = m.get("artist") or ""
+                        disp = ("%s - %s" % (artist, name)) if artist else name
+                        disp = "🀄 " + (disp or T("未命名"))
+                        src = Tf("码表：{}", m.get("sheet")
+                                 or os.path.basename(str(m.get("sheet_path") or "")))
+                        bits.append(T("未入库"))
+                        fp = str(m.get("fp_id") or "")
+                        if fp:
+                            bits.append(Tf("指纹 {}",
+                                           fp if len(fp) <= 12 else fp[:12] + "…"))
+                        else:
+                            md = str(m.get("file_md5") or "")
+                            if md:
+                                bits.append("md5 " + md[:8] + "…")
                     else:
                         disp = os.path.basename(p)
                         if not exists:
@@ -1494,15 +1547,21 @@ class MusicLibraryPanel(QWidget):
                     if imp:
                         # 来自导入包：用**蓝**区分（红色是"文件缺失"，别混用语义）
                         it.setForeground(QColor("#7aa2f7"))
+                    elif cue:
+                        # 来自码表：用**青绿**区分（蓝=导入包、红=文件缺失，各占一种）
+                        it.setForeground(QColor(CUE_ROW_COLOR))
                     elif not exists:
                         it.setForeground(QColor("#e06666"))
                     self.list.addItem(it)
             finally:
                 self._building = False
-            done = sum(1 for p in lib if p in view_meta)
+            # ⚠ 「已分析」只数本机/导入库的曲目：码表派生行没有任何本机分析数据，
+            #   算进去会虚报（它们连音频文件都不在本机）。
+            done = sum(1 for p in lib if p in view_meta and p not in cue_lib)
             # 底部统计：勾选数由 _update_lbl 追加（勾选变化时不必整表重建）
             self._stat = {"lib": len(lib), "done": done,
-                          "rows": len(rows), "imp": len(imp_lib)}
+                          "rows": len(rows), "imp": len(imp_lib),
+                          "cue": len(cue_lib)}
             self._update_lbl()
             self.lbl_filter.setText(Tf("筛选后 {} / {} 首", len(rows), len(lib)))
             # 缺封面 ⇒ 起一次后台补图，补完再刷一遍（不阻塞、不重复起）
@@ -1571,24 +1630,32 @@ class MusicLibraryPanel(QWidget):
                  s["lib"], s["done"], s["rows"])
         if s["imp"]:
             lbl += Tf("   ｜ 含导入包 {} 首", s["imp"])
+        n_cue = int(s.get("cue") or 0)
+        if n_cue > 0:
+            lbl += Tf("   ｜ 含码表 {} 首", n_cue)
         n = len(self._checked_items())
         if n > 0:
             lbl += Tf("   ｜ 已勾选 {} 首", n)
         self.lbl.setText(lbl)
 
     # ---------------- 来源筛选（用户要求②）----------------
-    def _refresh_source_combo(self, imp_lib):
-        """重建「来源」下拉：全部 / 仅本机 / <包名>…（按需保留当前选择）。
+    def _refresh_source_combo(self, imp_lib, cue_lib=None):
+        """重建「来源」下拉：全部 / 仅本机 / <包名>… / 仅码表 / <码表名>…
 
         选项值（`Qt.UserRole` 数据）用**稳定键**而非显示文本：
-          `"__all__"` / `"__local__"` / `"pack:<包名>"`（包名可为空串=早期导入）。
-        这样切换语言后文本变了也不会选错；包名是**用户数据**，不走词表翻译
-        （只 `i18n_retranslate` 会把固定的「全部/仅本机/早期导入」翻成当前语言）。
+          `"__all__"` / `"__local__"` / `"pack:<包名>"`（包名可为空串=早期导入）/
+          `"__cue__"`（仅码表派生行）/ `"cue:<码表**绝对路径**>"`。
+        这样切换语言后文本变了也不会选错；包名/表名是**用户数据**，不走词表翻译
+        （只 `i18n_retranslate` 会把固定的「全部/仅本机/早期导入/仅码表」翻成当前语言）。
+
+        ⚠ 表名会重名（两张表同名、或同名不同目录）⇒ **稳定键用绝对路径**，
+          显示文本才用 basename。
 
         ⚠ 程序化重填**必须** blockSignals —— 否则 clear/addItem/setCurrentIndex
           会一路触发 currentIndexChanged → cascade refresh（项目铁律）。
         """
         cb = self.cb_src
+        cue_lib = cue_lib or {}
         try:
             cur = cb.currentData(Qt.UserRole)
         except Exception:                                          # noqa: BLE001
@@ -1597,6 +1664,12 @@ class MusicLibraryPanel(QWidget):
         packs = sorted({(r.get("pack") or "") for r in imp_lib.values()})
         named = [p for p in packs if p]
         has_early = "" in packs
+        # 收集码表（绝对路径 → 显示用表名）；按表名排序，用户好在列表里找
+        sheets = {}
+        for r in cue_lib.values():
+            sp = str(r.get("sheet_path") or "")
+            if sp:
+                sheets[sp] = str(r.get("sheet_name") or "") or os.path.basename(sp)
         cb.blockSignals(True)
         try:
             cb.clear()
@@ -1606,24 +1679,35 @@ class MusicLibraryPanel(QWidget):
                 cb.addItem(pk, "pack:" + pk)
             if has_early:
                 cb.addItem("早期导入", "pack:")
-            # 按稳定键恢复之前的选择；找不到（如那个包刚被删空）就回「全部」
+            if sheets:
+                cb.addItem("仅码表 · 未入库", "__cue__")
+                for sp, sn in sorted(sheets.items(), key=lambda kv: kv[1].lower()):
+                    cb.addItem(sn, "cue:" + sp)
+            # 按稳定键恢复之前的选择；找不到（如那个包/那张表刚被删）就回「全部」
             idx = cb.findData(cur, Qt.UserRole) if cur else -1
             cb.setCurrentIndex(idx if idx >= 0 else 0)
         finally:
             cb.blockSignals(False)
-        # 把「全部/仅本机/早期导入」翻成当前语言（包名不在词表 ⇒ 原样保留）
+        # 把「全部/仅本机/早期导入/仅码表」翻成当前语言（包名/表名不在词表 ⇒ 原样保留）
         try:
             i18n_retranslate(cb)
         except Exception:                                          # noqa: BLE001
             pass
 
     @staticmethod
-    def _src_ok(path, imp, imp_lib, key):
-        """来源筛选判据：`全部` → 恒真；`仅本机` → 排除导入；`pack:X` → 只要该包。"""
+    def _src_ok(path, imp, imp_lib, key, cue=False, cue_lib=None):
+        """来源筛选判据：`全部` → 恒真；`仅本机` → 排除导入包与码表派生行；
+        `pack:X` → 只要该包；`__cue__` → 只要码表派生行；`cue:<表路径>` → 只要该表。"""
         if key in (None, "", "__all__"):
             return True
         if key == "__local__":
-            return not imp
+            return not imp and not cue
+        if key == "__cue__":
+            return bool(cue)
+        if isinstance(key, str) and key.startswith("cue:"):
+            if not cue:
+                return False
+            return (cue_lib or {}).get(path, {}).get("sheet_path", "") == key[4:]
         if isinstance(key, str) and key.startswith("pack:"):
             if not imp:
                 return False
@@ -1643,6 +1727,25 @@ class MusicLibraryPanel(QWidget):
             for r in _IL.display_rows(app_base_dir()):
                 out["@imported:%d" % int(r["sid"])] = r
             return out
+        except Exception:                                          # noqa: BLE001
+            return {}
+
+    def _cue_lib_rows(self):
+        """码表带来的曲库**派生行**：`{"@cue:<表路径>#<track_key>": 行数据}`。
+
+        ⚠ 每次 `refresh()` 现算 —— `CueIndex().load_cfg(cfg)` 是**纯内存、零 IO**；
+          包是否还在只做一次 `os.path.isfile`（几次 stat，可忽略）。
+        ⚠ **不要**在这里 `rescan()`：那是读包（几百 ms 的 IO），而 refresh 会被
+          切排序/切筛选/勾选后恢复频繁调用。
+        ⚠ **绝不**把结果写进 `cfg["music_library"]` / `cfg["music_meta"]` ——
+          「码表删了 ⇒ 曲库里的一起删」靠的就是**没有实体可删**
+          （详见 `cue_index.library_rows()` 的说明；别补级联删除）。
+        读不到/异常 ⇒ `{}`（曲库面板绝不能被码表问题拖挂）。
+        """
+        try:
+            import cue_index as _CI
+            idx = _CI.CueIndex().load_cfg(self.main.cfg)
+            return {r["key"]: r for r in _CI.library_rows(self.main.cfg, idx)}
         except Exception:                                          # noqa: BLE001
             return {}
 
@@ -1718,6 +1821,10 @@ class MusicLibraryPanel(QWidget):
           · **有勾选** ⇒ 一律以**勾选集**为操作对象（`checked_mode=True`）；
           · 无勾选 ⇒ 退回旧行为：右键项在选中集里就用整个选中集，否则只用它自己。
         返回 `(loc, imp, checked_mode)`：loc=本机路径、imp=导入伪路径。
+
+        ⚠ **码表派生行（`@cue:`）不进这两组**：它们没有实体，
+          删了下次 refresh 又回来（"删掉"只是自欺）。要让它消失，
+          正确做法是到「码表」页删除那张表 —— 派生行会跟着消失。
         """
         if checked:
             src = list(checked)
@@ -1727,7 +1834,8 @@ class MusicLibraryPanel(QWidget):
             if path not in src:
                 src = [path]
             mode = False
-        loc = [p for p in src if not str(p).startswith("@imported:")]
+        loc = [p for p in src
+               if not str(p).startswith("@imported:") and not str(p).startswith("@cue:")]
         imp = [p for p in src if str(p).startswith("@imported:")]
         return loc, imp, mode
 
@@ -1742,6 +1850,12 @@ class MusicLibraryPanel(QWidget):
         checked = [x.data(Qt.UserRole) for x in self._checked_items()]
         selected = [x.data(Qt.UserRole) for x in self.list.selectedItems()]
         loc, imp, checked_mode = self._resolve_targets(path, checked, selected)
+        # ★ 码表派生行：**不可移除**（没有实体，删了下次 refresh 又回来）。
+        #   这里单独取一份，只提供「查看信息 + 跟随码表」的说明。
+        _pool = list(checked) if checked_mode else list(selected or ())
+        if not checked_mode and path not in _pool:
+            _pool = [path]
+        cue = [p for p in _pool if str(p).startswith("@cue:")]
         if not checked_mode and path not in selected:
             self.list.setCurrentItem(it)
         solo_loc = (not checked_mode) and (len(loc) == 1 and not imp)  # 单首本机歌=旧版完整菜单
@@ -1762,6 +1876,9 @@ class MusicLibraryPanel(QWidget):
                 act.setCheckable(True)
                 act.setChecked(px == cur)
                 act.triggered.connect(lambda _c=False, v=px: self.set_cover_size(v))
+        elif cue and not loc and not imp:
+            # 码表派生行：本机没有文件 ⇒ 只能看信息（以及被告知"跟随码表"）
+            info = menu.addAction(T("查看信息"))
         elif len(imp) == 1 and not loc and str(path).startswith("@imported:"):
             # 导入包的歌：本机没有文件 ⇒ 只给「查看信息」与删除
             # （⚠ 必须是**右键的那一项本身**是导入歌，否则信息框会拿本机路径去解析 sid）
@@ -1789,6 +1906,11 @@ class MusicLibraryPanel(QWidget):
                     theme.danger_icon(),
                     T("从导入库移除") if len(imp) == 1
                     else Tf("从导入库移除（{} 首）", len(imp)))
+        if cue:
+            # 明确告诉用户为什么这里没有"移除"（而不是让他以为菜单坏了）
+            menu.addSeparator()
+            _note = menu.addAction(T("码表曲目跟随码表：请到「码表」页删除该表"))
+            _note.setEnabled(False)
         i18n_retranslate(menu)      # 临时菜单：弹出前刷语言
         act = menu.exec(self.list.mapToGlobal(pos))
         if act is None:
@@ -1800,6 +1922,8 @@ class MusicLibraryPanel(QWidget):
         elif act == info:
             if solo_loc:
                 self.main.show_music_info(path)
+            elif str(path).startswith("@cue:"):
+                self._show_cue_info(path)
             else:
                 try:
                     self._show_imported_info(int(str(path).split(":", 1)[1]))
@@ -1887,6 +2011,34 @@ class MusicLibraryPanel(QWidget):
         lines.append("")
         lines.append(T("来自导入曲库分析包（本机没有该音频文件，靠指纹识别）"))
         QMessageBox.information(self, T("导入包曲目"), "\n".join(lines))
+
+    def _show_cue_info(self, fake_path):
+        """**码表派生行**的信息框（本机没有该文件，数据全部来自码表包）。
+
+        ⚠ 重新从 `cue_index.library_rows()` 取一遍，而不是把行数据塞进
+          `QListWidgetItem`：派生行的数据必须**永远来自当前码表**（表改了指纹，
+          这里要显示新指纹），缓存反而会显示过期信息。
+        """
+        r = self._cue_lib_rows().get(str(fake_path))
+        if not r:
+            return
+        lines = [
+            "%s: %s" % (T("曲名"), r.get("title") or r.get("file_name") or "-"),
+            "%s: %s" % (T("艺人"), r.get("artist") or "-"),
+            "%s: %s" % (T("码表"), r.get("sheet_name") or "-"),
+        ]
+        if r.get("bpm"):
+            lines.append("BPM: %.0f" % r["bpm"])
+        dur = r.get("duration_sec") or 0.0
+        if dur:
+            lines.append("%d:%02d" % (int(dur) // 60, int(dur) % 60))
+        if r.get("fp_id"):
+            lines.append("%s: %s" % (T("指纹"), r["fp_id"]))
+        if r.get("file_md5"):
+            lines.append("md5: %s" % r["file_md5"])
+        lines.append("")
+        lines.append(T("来自码表（本机曲库未收录；码表删除后这行自动消失）"))
+        QMessageBox.information(self, T("码表曲目"), "\n".join(lines))
 
 
 class LibraryGrid(MediaGrid):

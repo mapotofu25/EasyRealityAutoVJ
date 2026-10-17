@@ -1014,6 +1014,22 @@ ZH2EN = {
     "3–5 分钟": "3–5 min",
     "5–7 分钟": "5–7 min",
     "≥7 分钟": "≥7 min",
+    # ==================== 曲库里「码表带来的曲目」（2026-10-17）====================
+    # 派生行（青绿）：只列本机曲库没覆盖的码表曲目，跟随码表存在/消失。
+    "仅码表 · 未入库": "Cue sheets only · Not in library",
+    "码表：{}": "Cue sheet: {}",
+    "未入库": "Not in library",
+    "未命名": "Untitled",
+    "指纹": "Fingerprint",
+    "指纹 {}": "Fingerprint {}",
+    "码表": "Cue sheet",
+    "码表曲目": "Cue Sheet Track",
+    "   ｜ 含码表 {} 首": "   | incl. {} from cue sheets",
+    "码表曲目跟随码表：请到「码表」页删除该表":
+        "Cue-sheet tracks follow their sheet: delete the sheet on the “Cue Sheets” page",
+    "来自码表（本机曲库未收录；码表删除后这行自动消失）":
+        "From a cue sheet (not in the local library; this row disappears "
+        "when the sheet is deleted)",
     # ==================== 曲风映射「恢复默认」确认（2026-10-10 审计补齐）====================
     "确定恢复内置的默认曲风→画面标签映射吗？\n你保存过的自定义映射将被清除。":
         "Reset the built-in genre → visual-tag map?\n"
