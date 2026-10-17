@@ -27,6 +27,7 @@ from media_manager import make_player, _STALL_SECS
 from match_engine import match_clips
 from beatgrid import GridClock
 from fp import hint_window_frames
+from cue_seek_policy import CueSeekPolicy      # 码表 seek 策略（纯逻辑，见 tools/cue_should_seek_test.py）
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
                       DYNAMIC_FLICKER, DYNAMIC_TAGS)
 
@@ -609,6 +610,9 @@ class AutoVJEngine(QObject):
         self._cue_sid = -1          # 当前曲目 sid（换歌要重建 runtime）
         self._cue_jumped = False    # 本帧是否发生跳变重算
         self._cue_closed_last = 0   # 上次 clear 关掉的解码器数（自检/排障用）
+        _cue_cfg = (self.cfg.get("cue") if isinstance(self.cfg, dict) else None) or {}
+        # ★ 所有「该不该 seek / 阈值 / 落地 / 计速」的判断都在这个对象里（见 cue_seek_policy）
+        self._cue_policy = CueSeekPolicy(cfg=_cue_cfg)
         self._cue_tick_fail = 0     # _cuesheet_tick 连续失败次数（异常安全用）
         self._cue_err_at = 0.0      # 上次写码表错误日志的时刻（限流用）
         self.running = False
@@ -2780,6 +2784,11 @@ class AutoVJEngine(QObject):
             lay._cue_seek_state = {}
             lay._cue_sub_tmps = {}
         self._cue_closed_last = closed
+        try:
+            if getattr(self, "_cue_policy", None) is not None:
+                self._cue_policy.reset()   # 卸表/换歌：清 in-flight / degraded / target
+        except Exception:                                     # noqa: BLE001
+            pass
         return True
 
     def cuesheet_status(self):
@@ -2908,10 +2917,15 @@ class AutoVJEngine(QObject):
         return it
 
     def _cue_frame(self, lay, ps):
-        """取该子层当前应显示的帧（S5 版：**只取帧，不 seek**）。
+        """取该子层当前应显示的帧。
 
-        S6 会在这里接 `play_sec` / `src_in` / `src_ended`（seek + 冻结）。
-        现在只做三件事：激活 → 预热首帧 → 取帧；取不到就用上一帧兜底（不黑）。
+        ★★ 三段式（团队裁定，**别改**）：
+          ① **取数据**：item / player / `position()`（实际显示帧的素材内秒）；
+          ② **问 policy**：`settle()` 结算上次 seek、`should_seek()` 决定是否要 seek、
+             `on_seek()` 记账、`desired_speed()` 取该设的倍速 —— **判断一行都不在这里**；
+          ③ **执行**：`player.seek(play_sec)` / `player.set_speed(want)` / 取帧。
+        为什么必须这样：`tools/cue_should_seek_test.py` 用 26 个用例 + 5 个源码级变异
+        验的就是 `cue_seek_policy` 那套判断。若在这里另写一遍，两套逻辑迟早分叉。
         """
         try:
             item = self._cue_item(lay, ps.clip_path, ps.xform)
@@ -2922,19 +2936,55 @@ class AutoVJEngine(QObject):
             return None
         try:
             player.set_active(True)      # ⚠ 不激活时 current() 恒 None（历史坑：码表层一片黑）
-            if not getattr(player, "_cue_warmed", False):
-                player._cue_warmed = True
-                player.warm_up()
         except Exception:                                         # noqa: BLE001
             pass
-        try:
-            img = player.current()
-        except Exception:                                         # noqa: BLE001
-            img = None
+
+        pol = getattr(self, "_cue_policy", None)
+        st = None
+        if pol is not None:
+            try:
+                st = pol.state_for(ps)
+                pol.settle(ps, player, st)                     # ②-a 结算上次 seek（落地/超时）
+                if pol.should_seek(ps, item, player, st):      # ②-b 判定（全部在 policy 里）
+                    ok = False
+                    try:
+                        ok = bool(player.seek(ps.play_sec))    # ③ 只投递，不等待（解码线程执行）
+                    except Exception:                          # noqa: BLE001
+                        ok = False
+                    pol.on_seek(ps, st, ok, player.position())  # ②-c 记账（带起点，供落地判方向）
+                    if not ok:
+                        self._cue_health("码表 seek 失败，本片段降级为自由播放：%s"
+                                         % ps.clip_path)
+                want = pol.desired_speed(ps)                   # ②-d 计速取值（恒 ps.speed）
+                cur = float(getattr(player, "speed", 1.0) or 1.0)
+                if abs(cur - want) > 1e-6:
+                    player.set_speed(want)                     # ③ 执行
+            except Exception as e:                             # noqa: BLE001
+                # policy 自身出问题也不许把渲染线程带走
+                self._cue_health("码表 seek 策略异常（已跳过本帧的定位）：%s: %s"
+                                 % (type(e).__name__, e))
+
+        if not getattr(player, "_cue_warmed", False):
+            try:
+                player._cue_warmed = True
+                player.warm_up()
+            except Exception:                                     # noqa: BLE001
+                pass
+
         cache = getattr(lay, "_cue_last_frame", None)
         if not isinstance(cache, dict):
             cache = {}
             lay._cue_last_frame = cache
+
+        # ★ 到出点：**持最后一帧**（不 seek、不越过、不黑）—— 与 Cue 端 timeline A2 一致
+        if getattr(ps, "src_ended", False):
+            last = cache.get(ps.lyr_id)
+            if last is not None and not last.isNull():
+                return last
+        try:
+            img = player.current()
+        except Exception:                                         # noqa: BLE001
+            img = None
         if img is None or img.isNull():
             return cache.get(ps.lyr_id)
         cache[ps.lyr_id] = img            # 只存引用，不拷贝（解码线程每帧产出新 QImage）
