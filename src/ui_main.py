@@ -2319,6 +2319,13 @@ class MainWindow(QMainWindow):
         self.act_about = self._more_menu.addAction(tr("about"))
         self.act_about.setToolTip(T("版本信息、第三方组件、反馈渠道"))
         self.act_about.triggered.connect(self.open_about)
+        # ★ 码表（演出端）：入口放在「⋯ 更多」里（**不新增页签** —— 编排在 EasyRealityCue，
+        #   演出端只负责执行；历史上把编排搬进主程序导致过"码表把主程序拖垮"）。
+        self._more_menu.addSeparator()
+        self.act_cuesheet = self._more_menu.addAction("码表（演出端）…")
+        self.act_cuesheet.setToolTip(
+            T("导入 / 绑定 / 启停 .ercue 码表；不接管时画面仍走普通自动调度"))
+        self.act_cuesheet.triggered.connect(self.open_cuesheet)
         self.btn_more.setMenu(self._more_menu)
         tb.addWidget(self.btn_more)
         self._sync_more_menu()
@@ -5261,6 +5268,19 @@ class MainWindow(QMainWindow):
 
     def open_about(self):
         AboutDialog(self).exec()
+
+    def open_cuesheet(self):
+        """码表（演出端）：轻量对话框（导入 / 最近 / 状态 / 绑图层 / 手动起拍 / 卸下）。
+
+        UI 逻辑全在 `src/cue_ui.py`：这里只做"打开"，避免主窗继续膨胀。
+        失败必须可见（不许静默）—— 对话框打不开也要弹一句。
+        """
+        try:
+            import cue_ui
+            cue_ui.open_cuesheet_dialog(self)
+        except Exception as e:                                    # noqa: BLE001
+            QMessageBox.warning(self, "码表", "打开码表对话框失败：%s: %s"
+                                % (type(e).__name__, e))
 
     def switch_lang(self, i):
         """语言即时切换：不重启，直接重建全部界面文本。"""
