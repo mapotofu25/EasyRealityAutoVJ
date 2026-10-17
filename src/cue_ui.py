@@ -435,13 +435,14 @@ class CueSheetDialog(QDialog):
         if track is None:
             track = self._ask_track(sheet)
         self.track = track
-        # ★ 曲目没有 BPM ⇒ 拍长未知 ⇒ 码表只能按「1 拍 = 1 秒」退化播放，画面必然对不上拍。
-        #   这不是 bug 而是包里的数据缺字段，但**必须让用户看见**（否则会被当成"码表不跟拍"）。
+        # ★ BPM 只是「拍 ↔ 秒」的换算系数：编排端按 bpm 把秒写成 at_beats，演出端按
+        #   **同一个** bpm 把 at_beats 换回秒 ⇒ 两端一致就完全抵消，**填错/留空都不会错位**
+        #   （2026-10-17 复盘纠正：之前文案写"画面不会对拍"，把用户引向了错误结论）。
+        #   留空只是没法按小节看/对齐，所以这里只是**提示**，不是故障。
         try:
             if track is not None and float(getattr(track.identity, "bpm", 0.0) or 0.0) <= 0.0:
                 self.warnings.append(
-                    "这张码表的曲目没有 BPM（拍长未知）：只能按「1 拍 = 1 秒」播放，"
-                    "画面不会对拍 —— 请在 EasyRealityCue 里补上该曲目的 BPM 后重新导出。")
+                    "这张码表的曲目没填 BPM：按「1 拍 = 1 秒」换算（两端一致，位置不会因此错位）。想按小节查看或对齐时再补 BPM。")
         except Exception:                                        # noqa: BLE001
             pass
         layer = self._current_layer()
@@ -846,8 +847,7 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True):
         try:
             if float(getattr(track.identity, "bpm", 0.0) or 0.0) <= 0.0:
                 warnings.append(
-                    "这张码表的曲目没有 BPM（拍长未知）：只能按「1 拍 = 1 秒」播放，"
-                    "画面不会对拍 —— 请在 EasyRealityCue 里补上该曲目的 BPM 后重新导出。")
+                    "这张码表的曲目没填 BPM：按「1 拍 = 1 秒」换算（两端一致，位置不会因此错位）。想按小节查看或对齐时再补 BPM。")
         except Exception:                                        # noqa: BLE001
             pass
 

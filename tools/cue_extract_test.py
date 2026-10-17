@@ -161,10 +161,13 @@ def main():
         check("状态行显示「素材 4/4」", "素材 4/4" in dlg.lbl_status.text(),
               dlg.lbl_status.text()[:120])
         check("首次确实解压了（extract 调用 = 1）", calls["n"] == 1, calls["n"])
-        # ★ 这个真实包的曲目 bpm=0.0（上游缺字段）⇒ 必须有可见告警，否则会被当成"码表不跟拍"
+        # ★ 这个真实包的曲目 bpm=0.0（上游缺字段）⇒ 必须有一句**准确**的提示。
+        #   ⚠ 文案 2026-10-17 改过：原文写"画面不会对拍"是**错的**（BPM 只是拍↔秒换算系数，
+        #     两端用同一个值就抵消）。现在断言新文案，且断言不再出现旧的误导措辞。
         red = dlg.lbl_error.text()
-        check("曲目缺 BPM 时有可见告警（避免被误报为不跟拍）",
-              "没有 BPM" in red, red[:120])
+        check("曲目缺 BPM 时有可见提示（且措辞正确）",
+              "没填 BPM" in red, red[:120])
+        check("不再出现误导措辞「画面不会对拍」", "画面不会对拍" not in red, red[:120])
 
         # ③ 幂等：再导入一次 ⇒ 不再解压，文件 mtime 不变
         before = {f: os.path.getmtime(os.path.join(dest, f)) for f in files}

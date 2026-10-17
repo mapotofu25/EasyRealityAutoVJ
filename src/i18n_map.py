@@ -1047,10 +1047,10 @@ ZH2EN = {
         "Found {} duplicate hotkey group(s) ({}); only the first configured one takes "
         "effect — please change them to different keys in the hotkey settings.",
     # ==================== 码表 UI（2026-10-17 审计补齐）====================
-    "这张码表的该曲目没有 BPM：只能按「1 拍 = 1 秒」播放，画面不会对拍。请在 EasyRealityCue 里补上 BPM 后重新导出。":
-        "This track in the cue sheet has no BPM: it can only play at 1 beat = 1 second, "
-        "so the visuals will not land on the beat. Set the BPM in EasyRealityCue and "
-        "re-export.",
+    "这张码表的曲目没填 BPM：按「1 拍 = 1 秒」换算（两端一致，位置不会因此错位）。想按小节查看或对齐时再补 BPM。":
+        "This cue sheet has no BPM: positions are converted at 1 beat = 1 second "
+        "(both ends use the same factor, so timing stays correct). Add a BPM only "
+        "if you want to view or align by bar.",
     "这张码表包含以下曲目。选一首绑定到当前演出（已接入指纹认歌，之后会自动选表）：":
         "This cue sheet contains the following tracks. Pick one to bind to the current "
         "performance (fingerprint recognition is wired in, so the sheet is chosen "

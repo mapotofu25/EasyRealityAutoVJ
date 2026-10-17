@@ -605,6 +605,9 @@ class AutoVJEngine(QObject):
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
         self._cue_sheet = None      # 当前码表（cuesheet.CueSheet）
         self._cue_track = None      # 认到的曲目（TrackEntry）；None ⇒ 不接管
+        self._cue_bound_cache = None    # (track, song_id) 绑定曲目→song_id 的反查缓存
+        self._cue_bad_song_n = 0        # 「认到另一首歌」累计次数（限流日志用）
+        self._cue_bad_song_t = 0.0
         #   ★ 它同时是 `_cue_beat_len_for()` 的**第一优先**拍长来源（`identity.bpm`）：
         #     `match_track()` 五级链（含 md5/指纹）认出来的，不靠本机文件名猜。
         self._cue_rt = None         # cuesheet_runtime.CueRuntime
@@ -2747,6 +2750,8 @@ class AutoVJEngine(QObject):
             except Exception:                                     # noqa: BLE001
                 track = None
         self._cue_track = track
+        self._cue_bound_cache = None     # ★ 换表/换曲目 ⇒ 绑定关系变了，反查缓存必须失效
+        self._cue_bad_song_n = 0
         self._cue_rt = None
         if sheet is not None and track is not None:
             try:
@@ -2770,6 +2775,8 @@ class AutoVJEngine(QObject):
         """
         self._cue_sheet = None
         self._cue_track = None
+        self._cue_bound_cache = None     # ★ 卸表 ⇒ 反查缓存失效（铁律 11：两处独立复位）
+        self._cue_bad_song_n = 0
         self._cue_rt = None
         self._cue_media = {}
         self._cue_pos_beats = None
@@ -2913,6 +2920,100 @@ class AutoVJEngine(QObject):
         except Exception:                                        # noqa: BLE001
             return ""
 
+    def _cue_lookup_song_id(self, tr):
+        """码表里的**一条曲目** → 演出端 `song_id`（= 指纹库 id = `md5(路径)[:8]`）。
+
+        与 `CueSheet.match_track()` 同一套判据，但**方向相反**（从码表反查本机曲库）：
+          ① `identity.fp_id`     == `meta["fp_id"]`      （指纹签名，抗改名/换容器）
+          ② `identity.file_md5`  == `meta["file_md5"]`   （同一文件字节）
+          ③ basename(`file_name`) == basename(本机路径)   （老码表没有前两个字段时兜底）
+        取不到 ⇒ None（调用方据此**不启用**认错歌护栏，退回旧行为）。
+        """
+        idn = getattr(tr, "identity", None)
+        if idn is None:
+            return None
+        fp_id = str(getattr(idn, "fp_id", "") or "").strip()
+        fmd5 = str(getattr(idn, "file_md5", "") or "").strip().lower()
+        try:
+            meta = self.cfg["music_meta"] or {}
+            lib = self.cfg["music_library"] or []
+        except Exception:                                        # noqa: BLE001
+            meta, lib = {}, []
+        if fp_id or fmd5:
+            for p, m in meta.items():
+                if not isinstance(m, dict):
+                    continue
+                if fp_id and str(m.get("fp_id") or "").strip() == fp_id:
+                    return self._cue_song_id_of(p)
+                if fmd5 and str(m.get("file_md5") or "").strip().lower() == fmd5:
+                    return self._cue_song_id_of(p)
+        name = os.path.basename(str(getattr(idn, "file_name", "") or ""))
+        if name:
+            for p in lib:
+                if os.path.basename(str(p)) == name:
+                    return self._cue_song_id_of(p)
+        return None
+
+    def _cue_pos_beat_len(self):
+        """算 `pos_beats` 用的一拍秒数 —— **必须与 `CueRuntime.beat_len` 同源**。
+
+        结构上直接读 `self._cue_rt.beat_len`：它就是 `update()` 消费 `pos_beats` 的那个
+        对象，读它就不可能出现"算位置用一种拍长、选片段用另一种"。
+        表没装（rt 为 None）⇒ 退化值 `1.0`（= `cuesheet.DEGENERATE_BEAT_LEN`）。
+
+        ⚠ 别改回"从码表 bpm / 曲库网格 bpm 现算"：那正是 2026-10-17 那个
+          「bpm=0 的码表位置被放大 2.5 倍」bug 的来源（详见 `_cue_auto_position` 注释）。
+        """
+        rt = getattr(self, "_cue_rt", None)
+        try:
+            bl = float(getattr(rt, "beat_len", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            bl = 0.0
+        return bl if bl > 1e-6 else 1.0
+
+    def _cue_bound_song_id(self):
+        """当前绑定曲目 → `song_id`（带缓存；`set/clear_cue_sheet` 时清空）。"""
+        tr = getattr(self, "_cue_track", None)
+        if tr is None:
+            return None
+        cache = getattr(self, "_cue_bound_cache", None)
+        if cache is not None and cache[0] is tr:
+            return cache[1]
+        sid = self._cue_lookup_song_id(tr)
+        self._cue_bound_cache = (tr, sid)
+        return sid
+
+    def _cue_accept_pos(self, sid, pb):
+        """认错歌护栏：识别到的歌必须**就是本表绑定的那首**，否则本帧不接管（返回 None）。
+
+        背景（用户 2026-10-17 追问「识别错了怎么办」）：指纹会在重复段落 / 同曲不同版本 /
+        翻唱上认成另一首歌。照跟的话 `pos_beats` 是**那首歌**的秒数，码表会整段乱跳。
+        取不到绑定关系（`_cue_bound_song_id()` 为 None）⇒ **不启用护栏**，退回"照跟"，
+        绝不让护栏变成"永远不跟"的新故障。
+        """
+        if pb is None:
+            return None
+        want = self._cue_bound_song_id()
+        if want is not None and sid >= 0 and sid != want:
+            self._cue_bad_song_log(sid, want)
+            return None
+        self._cue_bad_song_n = 0
+        return pb
+
+    def _cue_bad_song_log(self, sid, want):
+        """限流记录「认到的是另一首歌 ⇒ 码表暂不跟位」（10s 一条，不刷屏）。"""
+        try:
+            n = int(getattr(self, "_cue_bad_song_n", 0) or 0) + 1
+            self._cue_bad_song_n = n
+            now = time.perf_counter()
+            if now - float(getattr(self, "_cue_bad_song_t", 0.0) or 0.0) < 10.0:
+                return
+            self._cue_bad_song_t = now
+            self._cue_health("认到另一首歌（song_id=%s，本表绑定 %s）⇒ 码表暂不跟位（累计 %d 次）"
+                             % (sid, want, n))
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def _cue_track_query(self, path):
         """由曲子路径拼"认歌查询参数"（有 meta 用 meta，没有就退化到文件名级）。
 
@@ -2939,7 +3040,16 @@ class AutoVJEngine(QObject):
         return q
 
     def _cue_beat_len_for(self, path, use_track=True):
-        """该曲子的拍长（秒/拍）。优先码表曲目里的 bpm，其次曲库元数据；都没有 ⇒ 1.0。
+        """⚠ **诊断用，不要再用它算 `pos_beats`**（2026-10-17 起）。
+
+        算位置必须用 `_cue_pos_beat_len()` —— 它直接读 `self._cue_rt.beat_len`，与
+        `CueRuntime.update()` 消费 `pos_beats` 时用的是**同一个对象**，结构上不可能不一致。
+        本方法是"四级回退"版本的旧实现：bpm=0 的码表上它会退到曲库网格 bpm，
+        而 `CueRuntime.beat_len` 是 1.0 ⇒ 位置被放大 2.5 倍、画面提前一大截。
+        保留原因：它把"这条曲子在本机有哪些 bpm 来源"打印出来很有用（排障/单测）。
+
+        ---- 以下为原说明 ----
+        该曲子的拍长（秒/拍）。优先码表曲目里的 bpm，其次曲库元数据；都没有 ⇒ 1.0。
 
         ★ 四级取值（可靠性从高到低）：
           ① `self._cue_track`：装表时 `match_track()` **五级链**（md5 → 指纹 → meta →
@@ -3088,18 +3198,52 @@ class AutoVJEngine(QObject):
         path = self._cue_song_path(sid)
         trk = self._cue_pos_tracker
         trk.rate = rate if rate > 0 else 1.0
-        # 认不到歌（sid<0 / 无票）时不用算 beat_len，避免多余 IO
-        # ⚠ `use_track=(sid == self._cue_pos_song)`：换歌的那一拍，`_cue_track` 还是
-        #   **上一首**的（换表发生在下面 `_cue_auto_bind`，比 `feed` 晚一拍）⇒ 这一拍
-        #   不能用它的 bpm（否则拍位按错拍长算，表现为换歌瞬间闪一下 + 一次多余 seek）。
-        bl = (self._cue_beat_len_for(path, use_track=(sid == self._cue_pos_song))
-              if (sid >= 0 and votes > 0) else None)
+        # ★★★ 拍长必须与「真正消费 pos_beats 的那个 runtime」**同一来源**（2026-10-17 复盘）
+        #
+        # 为什么 BPM 本身不影响对拍：整条链上它是**纯单位换算**，两端用同一个常数就完全抵消。
+        #   · 编排端模型内部坐标是**秒**（`CueItem.at_sec` 权威），导出时才用**当前** bpm
+        #     换算成文件里的 `at_beats = at_sec * bpm/60`；
+        #   · 演出端 `pos_beats = offset_sec / beat_len`（`CuePositionTracker.pos_beats_at`）；
+        #   · `CueRuntime.update()` 又用**同一个** `bl` 把 `(pos - at_beats)` 换回秒。
+        #   ⇒ 拍位与 at_beats 同时被同一个系数缩放，比较时互相抵消。
+        #   所以 BPM 填错 3、留 0、甚至一首歌里有几段不同 BPM，都**不会**让画面对不上
+        #   （位置来自指纹算出的**原曲秒数**，不是靠拍钟累加推出来的）。
+        #
+        # 真正会坏的是**两个 beat_len 不一致**。旧写法用 `_cue_beat_len_for()` 做四级回退
+        #   （码表 bpm → 文件名猜 → meta.bpm → grid.bpm），而 `CueRuntime.beat_len` 只用
+        #   **码表自己的 bpm**（bpm≤0 ⇒ 1.0）。于是「bpm=0 的码表」上：
+        #     位置按 60/149.99 = 0.40 算、片段按 1.0 选 ⇒ 拍位被放大 2.5 倍
+        #     ⇒ 排在第 191 秒的片段在第 76 秒就触发（提前 115 秒）。
+        #   ⚠ 这与"用户没填 BPM"无关，是本模块**自己两处来源不一致** —— 上一轮把它误判成
+        #     "BPM 没填就会不对拍"，还加了个回退把 bug 放大，这里一并纠正。
+        #
+        # 修法：直接用 `self._cue_rt.beat_len`。它就是下面 `update()` 的那个对象，
+        #   结构上不可能不一致；表没装（rt 为 None）时给退化值 1.0（此时也没有片段可选）。
+        bl = self._cue_pos_beat_len() if (sid >= 0 and votes > 0) else None
         status, pb, song = trk.feed(sid, off, votes, now, beat_len=bl)
         if status in ("ok", "switch") and song != self._cue_pos_song:
             self._cue_pos_song = song
             q = self._cue_track_query(path) if path else {}
             if q:
                 self._cue_auto_bind(path, q)     # 换歌 ⇒ 换表/卸表（策略见 docstring）
+                # ★ 装表可能**刚换了拍长**（新表曲目 bpm 与旧表不同；或首次绑定时 rt 原先为
+                #   None ⇒ bl 用了退化 1.0）⇒ 必须用**新**的 `rt.beat_len` 重算本帧拍位。
+                #   否则这一帧的 pos 按旧拍长算、却喂给新 runtime 消费 ⇒ 换歌那一帧选错片段。
+                if bl is not None:
+                    nb = self._cue_pos_beat_len()
+                    if abs(float(nb) - float(bl)) > 1e-9:
+                        bl = nb
+                        trk.set_beat_len(nb)
+                        pb = trk.pos_beats_at(now)
+        # ★★ 认错歌的护栏（用户 2026-10-17 追问「识别错了怎么办」）：
+        #   指纹偶尔会认成另一首歌（重复段落 / 翻唱 / 同一首的不同版本）。若照跟，绘出来的
+        #   位置是**那首歌**的秒数，码表会整段乱跳。这里要求"识别到的 song_id 必须等于
+        #   当前这张码表绑定的那首"；不等 ⇒ 本帧不接管（保留上一帧），并限流记日志。
+        #   ⚠ 换歌流程不受影响：`_cue_auto_bind` 已在上面把表换成新歌的那张，
+        #     `_cue_bound_song_id()` 随之变成新歌 ⇒ 守卫自动放行。
+        #   ⚠ 取不到绑定关系（老码表没 fp_id、文件名也对不上）时返回 None ⇒ **不启用守卫**，
+        #     退回到"照跟"的旧行为，绝不让护栏变成"永远不跟"的新故障。
+        pb = self._cue_accept_pos(sid, pb)
         if pb is not None:
             self.set_cue_position(pb, "fp")
         else:

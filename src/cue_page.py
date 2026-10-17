@@ -352,8 +352,7 @@ class CueSheetDetailDialog(I18nDialog):
             for c, txt in enumerate(cells):
                 it = QTableWidgetItem(txt)
                 if c == 2 and bpm <= 0:
-                    it.setToolTip(T("这张码表的该曲目没有 BPM：只能按「1 拍 = 1 秒」播放，"
-                                    "画面不会对拍。请在 EasyRealityCue 里补上 BPM 后重新导出。"))
+                    it.setToolTip(T("这张码表的曲目没填 BPM：按「1 拍 = 1 秒」换算（两端一致，位置不会因此错位）。想按小节查看或对齐时再补 BPM。"))
                 self.tbl_tracks.setItem(r, c, it)
         _fit_columns(self.tbl_tracks)
 
