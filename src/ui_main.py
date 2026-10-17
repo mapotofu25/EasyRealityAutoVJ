@@ -2297,6 +2297,7 @@ class MainWindow(QMainWindow):
         # 实测占主窗口构造时间的四成以上。用批量模式合并成一次写。
         with self.cfg.batch():
             self._build_ui()
+            self._enforce_kv_top()      # ★ 读档顺序可能把 KV 挤下去 ⇒ 启动先纠正一次
             self._build_hotkeys()
             self._load_settings_to_ui()
             self._init_recognizer()
@@ -5351,7 +5352,58 @@ class MainWindow(QMainWindow):
             return
         ls[i], ls[j] = ls[j], ls[i]
         self._cur_layer = j
+        # ★ 交换可能把某个图层顶到 KV 上面 ⇒ 立刻纠正（表现为"KV 不能被越过"）
+        self._enforce_kv_top()
         self._sync_layers()
+
+    @staticmethod
+    def _layer_insert_index(is_kv, is_cue, n):
+        """新建图层的插入位置（None = 追加到末尾）。
+
+        · Kv 主视觉层   ⇒ 0（最上层）
+        · 码表图层      ⇒ 0（随后的 `_enforce_kv_top()` 把 KV 顶回 0，它就落在 **1**，
+                          也就是"除 KV 以外的最上层"）
+        · 其它图层      ⇒ None（追加到最底，保持原有习惯）
+
+        ★ 单独抽出来是为了能无头断言（`tools/cue_layer_order_test.py`），
+          否则这条规则只能靠"点开界面看一眼"。
+        """
+        if is_kv or is_cue:
+            return 0
+        return None
+
+    def _enforce_kv_top(self):
+        """KV 图层**永远**在 index 0（最上层），其余图层相对顺序不变。
+
+        为什么需要（用户 2026-10-17「kv 图层永远强制置顶」）：
+          只在新建时 `insert(0)` 是不够的 —— 复制、上移、删除、读档都能把它挤下去。
+          而 KV 是"待机层"（无声音切入 / 有声音切出），一旦被别的图层盖住就等于失效，
+          而且**从界面上看不出来**（图层还在，只是被压住了）。
+        ⚠ 用"按对象身份重定位 `_cur_layer`"的方式，避免搬运后选中项跳到别的层。
+        """
+        try:
+            ls = getattr(self.engine, "layers", None)
+            if not ls:
+                return
+            kv = -1
+            for i, l in enumerate(ls):
+                if getattr(l, "is_kv", False):
+                    kv = i
+                    break
+            if kv <= 0:              # 没有 KV（-1）或已在顶层（0）⇒ 什么都不做
+                return
+            cur = int(getattr(self, "_cur_layer", 0) or 0)
+            cur_obj = ls[cur] if 0 <= cur < len(ls) else None
+            ls.insert(0, ls.pop(kv))
+            if cur_obj is not None:
+                try:
+                    self._cur_layer = ls.index(cur_obj)
+                    return
+                except ValueError:
+                    pass
+            self._cur_layer = 0
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def _copy_layer_pool(self, idx):
         lay = self.engine.layers[idx]
@@ -5362,6 +5414,7 @@ class MainWindow(QMainWindow):
         new.pause_silent = lay.pause_silent
         new.fixed = lay.fixed
         self.engine.layers.insert(idx, new)
+        self._enforce_kv_top()
         self._sync_layers()
 
     def clip_menu(self, layer_idx, media, gpos):
@@ -5487,18 +5540,24 @@ class MainWindow(QMainWindow):
             lay.hide_silent = True
         if role == "fg" and not is_kv:
             lay.blend = "add"   # 前景（特效/覆盖）默认用"添加"混合，叠加发光才正常
-        if is_kv:
-            # Kv 图层默认置顶（列表 index 0 = 最上层），不参与自动/逐拍切换
-            self.engine.layers.insert(0, lay)
-            self.engine._kv_last_t = time.perf_counter()
+        _at = self._layer_insert_index(is_kv, is_cue, len(self.engine.layers))
+        if _at is None:
+            self.engine.layers.append(lay)   # 其它图层：新建在已有图层下面（最底层）
         else:
-            self.engine.layers.append(lay)   # 新建在已有图层下面（最底层）
+            self.engine.layers.insert(_at, lay)
+        if is_kv:
+            self.engine._kv_last_t = time.perf_counter()
+        # ★ KV 永远强制置顶（新建/复制/上移/删除/读档都会走这里兜底）
+        self._enforce_kv_top()
         if auto:
             # 立即匹配一次（绕过 3s 间隔），让新建自动图层马上有画面
             self.engine._last_genres = None
             self.engine._auto_refresh_t = 0.0
             self.engine._refresh_auto_layers(self.audio.state.snapshot())
-        self._cur_layer = 0 if is_kv else (len(self.engine.layers) - 1)
+        try:
+            self._cur_layer = self.engine.layers.index(lay)
+        except ValueError:
+            self._cur_layer = 0
         self._sync_layers()
         # 码表图层：装表（导入/校验/绑曲/素材目录/报错全走 cue_ui 的**唯一实现**）
         if is_cue and sheet_entry is not None:
@@ -5529,6 +5588,7 @@ class MainWindow(QMainWindow):
         lay = self.engine.layers.pop(self._cur_layer)
         lay.close_all()
         self._cur_layer = 0
+        self._enforce_kv_top()
         self._sync_layers()
 
     def layer_move(self, d):

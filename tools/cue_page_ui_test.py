@@ -173,11 +173,21 @@ def main():
         app.processEvents()
 
     check("新增了 1 个图层", len(w.engine.layers) == n_before + 1, len(w.engine.layers))
-    lay = w.engine.layers[-1]
+    # ★ 2026-10-17 规格变更（用户要求）：码表图层**新建即置顶**（但在 KV 之下），
+    #   不再"追加到最底" ⇒ 不能再按 `layers[-1]` 取新层，用"当前选中层"。
+    lay = w.engine.layers[w._cur_layer]
     check("新图层是码表图层", getattr(lay, "is_cuesheet", False) is True)
+    # 顺手把新规则钉住：KV 存在时 KV 在 0、码表层紧跟其后（=除 KV 外的最上层）
+    _kv = next((i for i, l in enumerate(w.engine.layers)
+                if getattr(l, "is_kv", False)), -1)
+    check("码表图层在 KV 之下、其它之上",
+          w._cur_layer == (1 if _kv == 0 else 0),
+          (_kv, w._cur_layer, [getattr(l, "name", "") for l in w.engine.layers]))
     check("cuesheet_id 指向选中的包",
           str(getattr(lay, "cuesheet_id", "")) == "测试码表.ercue", lay.cuesheet_id)
-    row = w.layers_panel.rows[-1][0] if w.layers_panel.rows else None
+    # 图层头也按"当前选中层"取（新规格下新层不在末尾）
+    row = (w.layers_panel.rows[w._cur_layer][0]
+           if getattr(w.layers_panel, "rows", None) else None)
     cmb = getattr(row, "_cmb_cue", None) if row is not None else None
     check("图层头有码表下拉", cmb is not None)
     if cmb is not None:
