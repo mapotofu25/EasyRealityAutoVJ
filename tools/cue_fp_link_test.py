@@ -276,7 +276,8 @@ def main():
     # ---------------- ⑧ 拍长来源：_cue_track 优先，卸表后复位 ----------------
     print("\n⑧ _cue_beat_len_for：优先 _cue_track.identity.bpm（不靠 basename），卸表复位")
     local = os.path.join(tmp, "本机改名后的文件.flac")
-    cfg["music_meta"][local] = {"bpm": 90.0}          # 兜底来源：故意给错的值
+    # 兜底来源：真实曲库**没有** `meta["bpm"]` 键，bpm 只在 `meta["grid"]["bpm"]` 里
+    cfg["music_meta"][local] = {"grid": {"bpm": 90.0, "beat_len": 60.0 / 90.0}}
     # 装表（track 是 match_track 认出来的那条，identity.file_name 与本机文件名**不一致**）
     eng._cue_sheet = sheet
     eng._cue_track = sheet.tracks[0]                  # bpm=128
@@ -285,12 +286,22 @@ def main():
           % (bl, 60.0 / 128.0, 60.0 / 90.0))
     check("用了码表 bpm 128 而不是 music_meta 的 90",
           abs(bl - 60.0 / 128.0) < 1e-9, bl)
-    # 卸表 ⇒ 复位 ⇒ 回落 music_meta
+    # 换歌那一拍：use_track=False ⇒ 跳过（还是上一首的）_cue_track，用本曲 grid bpm
+    bl_sw = eng._cue_beat_len_for(local, use_track=False)
+    check("use_track=False（换歌那一拍）跳过码表 bpm，用本曲 grid bpm（60/90）",
+          abs(bl_sw - 60.0 / 90.0) < 1e-9, bl_sw)
+    # 卸表 ⇒ 复位 ⇒ 回落 music_meta(grid.bpm)
     eng.clear_cue_sheet(silent=True)
     check("clear_cue_sheet 后 _cue_track 复位为 None",
           getattr(eng, "_cue_track", "missing") is None, getattr(eng, "_cue_track", "missing"))
     bl2 = eng._cue_beat_len_for(local)
-    check("卸表后回落到 music_meta（60/90）", abs(bl2 - 60.0 / 90.0) < 1e-9, bl2)
+    check("卸表后回落到 music_meta['grid']['bpm']（60/90）",
+          abs(bl2 - 60.0 / 90.0) < 1e-9, bl2)
+    # 顶层 bpm（手工/旧键）优先于 grid
+    cfg["music_meta"][local] = {"bpm": 100.0, "grid": {"bpm": 90.0}}
+    check("meta['bpm'] 优先于 meta['grid']['bpm']（60/100）",
+          abs(eng._cue_beat_len_for(local) - 60.0 / 100.0) < 1e-9,
+          eng._cue_beat_len_for(local))
     # 完全没信息 ⇒ 1.0（退化态，绝不抛）
     bl3 = eng._cue_beat_len_for(os.path.join(tmp, "unknown.flac"))
     check("无任何 bpm 信息 ⇒ 1.0", abs(bl3 - 1.0) < 1e-9, bl3)

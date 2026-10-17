@@ -2938,28 +2938,37 @@ class AutoVJEngine(QObject):
             pass
         return q
 
-    def _cue_beat_len_for(self, path):
+    def _cue_beat_len_for(self, path, use_track=True):
         """该曲子的拍长（秒/拍）。优先码表曲目里的 bpm，其次曲库元数据；都没有 ⇒ 1.0。
 
-        ★ 三级取值（可靠性从高到低）：
+        ★ 四级取值（可靠性从高到低）：
           ① `self._cue_track`：装表时 `match_track()` **五级链**（md5 → 指纹 → meta →
              名+艺人 → 文件名）认定出来的那一条，`set_cue_sheet(track=...)` 时记下。
              它**不依赖本机文件名**——码表里写的是对方的文件名，用户改名/换目录后
              basename 猜不到，旧实现就会退回 `music_meta` 的 bpm（**拍长错 ⇒ 画面整体不对拍**）。
+             ⚠ 这里**必须是码表自己的 bpm**：`pb`（拍位）要喂给 `rt.update()` 与码表里
+               `at_beats` 直接比较，两端必须同一坐标系；用本机网格 bpm（可能 155.03 vs
+               155.0，甚至半/双速检测差）会让码表相对自己的 authored 拍位缓慢漂移。
           ② basename 猜测（老路径）：`_cue_track` 为空但表已装（例如只装了表没认曲目）
              时保留，行为与改动前一致。
-          ③ `music_meta` 的 bpm。
+          ③ `music_meta`：先 `meta["bpm"]`（旧键/手工填的），再 `meta["grid"]["bpm"]`
+             —— ★ 实测真实曲库**只有 `grid` 里那份**（`meta["bpm"]` 从来不存在），
+             所以只读 `meta["bpm"]` 等于永远拿不到 ⇒ 退化 1.0。
+        `use_track=False`：**换歌那一拍**专用 —— 那时 `_cue_track` 还是上一首的
+          （装表发生在 `feed()` 之后的 `_cue_auto_bind` 里），用它的 bpm 会按错拍长
+          算出拍位（换歌瞬间闪一下 + 一次多余 seek）。
         ⚠ `_cue_track` 的复位点（至少两处，铁律 11）：
           `__init__`（None）、`set_cue_sheet()`（先 clear 再赋值）、`clear_cue_sheet()`（None）
           ⇒ 换歌/卸表不会留下上一首的 track 污染下一首。
         """
         bpm = 0.0
-        try:
-            _ct = getattr(self, "_cue_track", None)
-            if _ct is not None:
-                bpm = float(getattr(_ct.identity, "bpm", 0.0) or 0.0)
-        except Exception:                                        # noqa: BLE001
-            bpm = 0.0
+        if use_track:
+            try:
+                _ct = getattr(self, "_cue_track", None)
+                if _ct is not None:
+                    bpm = float(getattr(_ct.identity, "bpm", 0.0) or 0.0)
+            except Exception:                                    # noqa: BLE001
+                bpm = 0.0
         if bpm <= 0.0:
             try:
                 if self._cue_sheet is not None:
@@ -2974,6 +2983,10 @@ class AutoVJEngine(QObject):
             try:
                 m = (self.cfg["music_meta"] or {}).get(path) or {}
                 bpm = float(m.get("bpm") or 0.0)
+                if bpm <= 0.0:
+                    g = m.get("grid")
+                    if isinstance(g, dict):
+                        bpm = float(g.get("bpm") or 0.0)
             except Exception:                                    # noqa: BLE001
                 bpm = 0.0
         return (60.0 / bpm) if bpm > 0 else 1.0
@@ -3076,7 +3089,11 @@ class AutoVJEngine(QObject):
         trk = self._cue_pos_tracker
         trk.rate = rate if rate > 0 else 1.0
         # 认不到歌（sid<0 / 无票）时不用算 beat_len，避免多余 IO
-        bl = self._cue_beat_len_for(path) if (sid >= 0 and votes > 0) else None
+        # ⚠ `use_track=(sid == self._cue_pos_song)`：换歌的那一拍，`_cue_track` 还是
+        #   **上一首**的（换表发生在下面 `_cue_auto_bind`，比 `feed` 晚一拍）⇒ 这一拍
+        #   不能用它的 bpm（否则拍位按错拍长算，表现为换歌瞬间闪一下 + 一次多余 seek）。
+        bl = (self._cue_beat_len_for(path, use_track=(sid == self._cue_pos_song))
+              if (sid >= 0 and votes > 0) else None)
         status, pb, song = trk.feed(sid, off, votes, now, beat_len=bl)
         if status in ("ok", "switch") and song != self._cue_pos_song:
             self._cue_pos_song = song
