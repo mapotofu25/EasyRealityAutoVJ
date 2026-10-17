@@ -1251,6 +1251,15 @@ class AudioEngine:
         # 用 numpy 环形缓冲（原来 deque + tolist，读取端每 0.5 秒复制 38 万元素 → 0.78 核）
         self._genre_buf = _AudioRing(48000 * 8)
         self._genre_sr = 48000
+        # ★★ 指纹专用缓冲（2026-10-17）：**必须与建库时的单声道口径一致**。
+        #   建库（`ui_main._one`）用 `np.mean(data, axis=1)`（左右平均）；
+        #   而曲风缓冲用的是 `data[:, 0]`（只取左声道）。实测同一段现场音频：
+        #       左右平均 → 54 票 ；只取左声道 → 22 票（确认门槛 20 票）
+        #   ⇒ 用左声道等于让认歌**贴着门槛抖**（时认时不认）。
+        #   为什么不直接改曲风缓冲：曲风分类器一直吃左声道，改它会牵动自动配画面；
+        #   多开一条 12s 缓冲只多 ~2.3MB，风险为零。
+        self._fp_buf = _AudioRing(48000 * 8)
+        self._fp_sr = 48000
         self._genre_lock = threading.Lock()
         self._genre_stop = threading.Event()
         self._genre_thread = threading.Thread(
@@ -1497,9 +1506,34 @@ class AudioEngine:
                 return
             self._rec_diag_t = now
             st = self.state
-            filled = int(getattr(self._genre_buf, "filled", 0) or 0)
-            sr = int(getattr(self, "_genre_sr", 0) or 0)
-            line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f"
+            filled = int(getattr(self._fp_buf, "filled", 0) or 0)
+            sr = int(getattr(self, "_fp_sr", 0) or 0)
+            # ★ 每 10s 做一次「查询哈希命中率」自检 —— 这是区分
+            #   「送进来的音频不对」与「投票/选取有 bug」的**唯一判据**：
+            #     n_hash 正常(~300~500) 且 hit≈0    ⇒ 音频不是库里那首（声道/重采样/源不对）
+            #     hit 很多但 votes 恒 0             ⇒ 匹配器/选取逻辑有问题
+            hit, n_hash, seg_rms, seg_n = -1, -1, -1.0, -1
+            try:
+                if now - float(getattr(self, "_rec_hash_t", 0.0) or 0.0) >= 10.0:
+                    self._rec_hash_t = now
+                    from fp import fingerprint_audio as _fa
+                    with self._genre_lock:
+                        _seg = self._fp_buf.last(int(self._fp_sr * 4.5))
+                    _seg = np.asarray(_seg, dtype=np.float32)
+                    seg_n = int(_seg.size)
+                    seg_rms = float(np.sqrt(np.mean(_seg ** 2))) if seg_n else 0.0
+                    _hs = _fa(_seg, self._fp_sr)
+                    n_hash = len(_hs)
+                    if n_hash and fp_db is not None:
+                        _uni = list({h for h, _o in _hs})[:400]
+                        _ph = ",".join("?" * len(_uni))
+                        hit = int(fp_db.conn.execute(
+                            "SELECT COUNT(DISTINCT hash) FROM fingerprints "
+                            "WHERE hash IN (%s)" % _ph, _uni).fetchone()[0])
+            except Exception:                                    # noqa: BLE001
+                hit, n_hash = -1, -1
+            line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f "
+                    "hit=%d/%d seg=%.3f/%d"
                     % (time.strftime("%H:%M:%S"),
                        1 if fp_db is not None else 0,
                        1 if eng is not None else 0,
@@ -1508,7 +1542,8 @@ class AudioEngine:
                        float(getattr(st, "silent_sec", -1.0) or 0.0),
                        float(getattr(st, "level", 0.0) or 0.0),
                        float(getattr(st, "energy", 0.0) or 0.0),
-                       float(getattr(st, "bpm_display", 0.0) or 0.0)))
+                       float(getattr(st, "bpm_display", 0.0) or 0.0),
+                       hit, n_hash, seg_rms, seg_n))
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
@@ -1552,10 +1587,10 @@ class AudioEngine:
                     self.state.recognized_votes = 0
                 continue
             with self._genre_lock:
-                if self._genre_buf.filled < 16000:
+                if self._fp_buf.filled < 16000:
                     continue
                 # 只要最近 4.5 秒（指纹匹配窗口）；numpy 切片拷贝，不再 list(deque) 全量复制
-                buf = self._genre_buf.last(int(self._genre_sr * FP_WIN_SEC))
+                buf = self._fp_buf.last(int(self._fp_sr * FP_WIN_SEC))
                 # 窗口末端的挂钟时刻：识别结果对应的"当前时刻"（给引擎网格时钟对齐用）
                 t_read = _t.perf_counter()
             try:
@@ -1574,7 +1609,7 @@ class AudioEngine:
                 # hint 窗口（帧）：引擎按该歌 beat_len 换算后写入；缺省 None ⇒ fp 用缺省 HINT_W
                 _hint_w = (float(_pred_w) if (_hint is not None and _pred_w is not None
                                              and float(_pred_w) > 0.0) else None)
-                sid, votes, off = fp_db.match(sig, self._genre_sr,
+                sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
@@ -1967,6 +2002,9 @@ class AudioEngine:
                 need = int(sr * 12)
                 if self._genre_buf.cap < need:
                     self._genre_buf = _AudioRing(need)
+                self._fp_sr = sr
+                if self._fp_buf.cap < need:
+                    self._fp_buf = _AudioRing(need)
             while self._gen == gen:   # 只在自己这一代有效；切换设备后立即退出
                 try:
                     # ★★ 变化触发诊断（2026-10-07）：把 NDI 音频门控两个量写进取证日志。
@@ -2162,6 +2200,11 @@ class AudioEngine:
                         mono_sig = data[:, 0] if data.ndim == 2 else data
                         with self._genre_lock:
                             self._genre_buf.write(mono_sig)
+                        # ★ 指纹用**左右平均**（与建库同口径）；曲风继续用左声道（不动它）
+                        fp_sig = (np.asarray(data).mean(axis=1)
+                                  if getattr(data, "ndim", 1) == 2 else data)
+                        with self._genre_lock:
+                            self._fp_buf.write(fp_sig)
                     except Exception:
                         pass
                 except Exception as e:
