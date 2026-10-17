@@ -3159,9 +3159,13 @@ class AutoVJEngine(QObject):
                 return
             self._cue_diag_t = now
             st = getattr(getattr(self, "audio", None), "state", None)
+            # ⚠ 不能用 `getattr(..., -1.0) or -1.0`：`silent_sec == 0.0`（**有声音**）会被
+            #   `or` 变成 -1.0 ⇒ 日志显示"没见过声音"，与事实相反（本行第一版就踩了这个）。
             silent = -1.0
             try:
-                silent = float(getattr(st, "silent_sec", -1.0) or -1.0)
+                _v = getattr(st, "silent_sec", None)
+                if _v is not None:
+                    silent = float(_v)
             except (TypeError, ValueError):
                 pass
             rt = getattr(self, "_cue_rt", None)
@@ -3179,6 +3183,9 @@ class AutoVJEngine(QObject):
                        str(getattr(self, "_cue_pos_src", "") or "-")))
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
+            _d = os.path.dirname(path)
+            if _d and not os.path.isdir(_d):
+                os.makedirs(_d, exist_ok=True)      # 兜底：目录不在也能写（不在热路径，每 2s 一次）
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
             # 环形：超过 400 行就砍掉前一半（与 layer_health 同风格，绝不无界增长）

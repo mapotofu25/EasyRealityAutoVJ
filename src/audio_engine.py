@@ -12,6 +12,7 @@ soundcard 库导入时会在【当前线程】一次性 CoInitializeEx(MTA)，�
 系统文件对话框（IFileDialog 需要 COM STA）会直接卡死。
 """
 import math
+import os          # `_rec_diag` 写 cue_health.log 用（本模块原先没有，漏了会 NameError）
 import time
 import queue
 import threading
@@ -1473,6 +1474,59 @@ class AudioEngine:
             from charge_engine import ChargeBarEngine
             self._recognizer_engine = ChargeBarEngine()
 
+    _REC_DIAG_MIN_SEC = 2.0
+
+    def _rec_diag(self, fp_db, eng):
+        """`cue_health.log`：识别门控取证（2s 一行，前缀 `[R]`）。
+
+        用户报"认不出歌"时，`engine._cue_diag` 只能看到**输出**（sid/votes 恒 -1/0），
+        看不到**为什么**。这一行补上四个门：
+
+            db  = 指纹库有没有接上（0 ⇒ `set_recognizer` 没生效，认歌线程空转）
+            eng = 电荷条引擎（0 ⇒ 同上）
+            run = state.running（0 ⇒ 引擎没启动，采集也没跑）
+            buf = 采集环形缓冲已填样本数（`<16000` ⇒ 音频根本没进来）
+            silent = 连续静音秒数（`>10` ⇒ 会主动回待机、清识别结果）
+            lvl/eng = 当前 RMS / 综合能量（判断"有信号"还是"真有音乐"）
+
+        ⚠ 与 `engine._cue_diag` 写**同一个文件**，用前缀区分；都做了环形裁剪。
+        """
+        try:
+            now = time.perf_counter()
+            if now - float(getattr(self, "_rec_diag_t", 0.0) or 0.0) < self._REC_DIAG_MIN_SEC:
+                return
+            self._rec_diag_t = now
+            st = self.state
+            filled = int(getattr(self._genre_buf, "filled", 0) or 0)
+            sr = int(getattr(self, "_genre_sr", 0) or 0)
+            line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f"
+                    % (time.strftime("%H:%M:%S"),
+                       1 if fp_db is not None else 0,
+                       1 if eng is not None else 0,
+                       1 if getattr(st, "running", False) else 0,
+                       filled, (filled / float(sr)) if sr else 0.0,
+                       float(getattr(st, "silent_sec", -1.0) or 0.0),
+                       float(getattr(st, "level", 0.0) or 0.0),
+                       float(getattr(st, "energy", 0.0) or 0.0),
+                       float(getattr(st, "bpm_display", 0.0) or 0.0)))
+            path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
+                                "cue_health.log")
+            _d = os.path.dirname(path)
+            if _d and not os.path.isdir(_d):
+                os.makedirs(_d, exist_ok=True)      # 兜底：目录不在也能写（不在热路径，每 2s 一次）
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            try:
+                if os.path.getsize(path) > 120 * 1024:
+                    with open(path, "r", encoding="utf-8") as f:
+                        rows = f.readlines()
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.writelines(rows[-200:])
+            except OSError:
+                pass
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def _recognize_loop(self):
         """现场识别：每 0.5s 取最近 4.5s 音频 → 指纹匹配 → 电池引擎确认 → 发布 song_id"""
         import time as _t
@@ -1482,6 +1536,7 @@ class AudioEngine:
             _t.sleep(0.5)
             fp_db = self._fp_db
             eng = self._recognizer_engine
+            self._rec_diag(fp_db, eng)
             if fp_db is None or eng is None or not self.state.running:
                 continue
             # 静音超时 → 回待机（清空识别）
