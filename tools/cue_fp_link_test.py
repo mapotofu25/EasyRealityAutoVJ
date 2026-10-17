@@ -17,7 +17,11 @@
 3. `FingerprintDB.add_song(..., hashes=, want_sig=)`：扫描流程要同时拿"入库行"和
    "签名"，不能对整首歌做两遍全曲 STFT。第 ⑥ 项断言复用 `hashes` 时**不再算指纹**，
    且**旧调用方（不传 `want_sig`）拿到的仍是 `int`**。
-4. `_cue_beat_len_for()` 的拍长来源：`_cue_track`（`match_track` 认出来的那条）
+4. ⓪ 级（文件字节 md5）与 ① 级（指纹签名）**互补**，两个字段都必须在
+   `cfg["music_meta"]` 里被写出来。待办判据 `fp.meta_needs_fp()` 是"缺任一个都算待办"：
+   第 ⑨ 项用 `legacy=True`（旧判据，只看 `fp_id`）做**反向复现**——证明新判据真的在
+   起作用，而不是摆设；第 ⑩ 项断言同一条 track 双判据同时命中时**仍是 md5 优先**。
+5. `_cue_beat_len_for()` 的拍长来源：`_cue_track`（`match_track` 认出来的那条）
    优先，不再靠 basename 猜；卸表后必须复位（否则上一首的 bpm 污染下一首）。
 
 夹具全部用 `tempfile.mkdtemp()` 自造，**绝不读写用户真实 config / 指纹库**。
@@ -312,12 +316,77 @@ def main():
     check("_cue_track 为空时退回 basename 猜测（b.flac ⇒ 126bpm）",
           abs(bl4 - 60.0 / 126.0) < 1e-9, bl4)
 
+    # ---------------- ⑨ 「缺任一个都算待办」的判据（`fp.meta_needs_fp`） ----------------
+    print("\n⑨ fp.meta_needs_fp：缺 fp_id 或 缺 file_md5 **都算待办**；legacy 判据反向复现")
+    both = {"fp_id": FP_ID, "file_md5": FILE_MD5}
+    only_fp = {"fp_id": FP_ID}
+    only_md5 = {"file_md5": FILE_MD5}
+    check("两个都有 ⇒ 不是待办", fp.meta_needs_fp(both) is False, fp.meta_needs_fp(both))
+    check("只有 fp_id ⇒ 是待办（缺 file_md5 ⇒ ⓪ 级是空白）",
+          fp.meta_needs_fp(only_fp) is True, fp.meta_needs_fp(only_fp))
+    check("只有 file_md5 ⇒ 是待办（缺 fp_id）",
+          fp.meta_needs_fp(only_md5) is True, fp.meta_needs_fp(only_md5))
+    check("空记录 ⇒ 是待办", fp.meta_needs_fp({}) is True, fp.meta_needs_fp({}))
+    check("记录不存在（None）⇒ 不是待办（那条走全量分析，不归本阶段管）",
+          fp.meta_needs_fp(None) is False, fp.meta_needs_fp(None))
+    # ★ 反向复现：旧判据（只看 fp_id）会把"有 fp_id、缺 file_md5"当成已补完 ⇒ ⓪ 级永远空白。
+    #   这一条证明新判据**真的在起作用**，不是摆设（`legacy=True` 保留在正式代码里，
+    #   供回归对照/排障；不靠"临时改源码再还原"那种做法，源码里不留任何临时标记）。
+    check("legacy 旧判据确实会漏掉「只有 fp_id」那条（⇒ 新判据是必须的）",
+          fp.meta_needs_fp(only_fp, legacy=True) is False,
+          fp.meta_needs_fp(only_fp, legacy=True))
+    check("legacy 与真判据在「两个都缺」时一致（都是待办）",
+          fp.meta_needs_fp({}, legacy=True) is True, fp.meta_needs_fp({}, legacy=True))
+    check("legacy 与真判据在「两个都有」时一致（都不是待办）",
+          fp.meta_needs_fp(both, legacy=True) is False, fp.meta_needs_fp(both, legacy=True))
+    check("meta_fp_fields 只读这两个键（song_id 不参与）",
+          fp.meta_fp_fields({"song_id": 1234567, "fp_id": FP_ID,
+                             "file_md5": FILE_MD5}) == (FP_ID, FILE_MD5),
+          fp.meta_fp_fields({"song_id": 1234567, "fp_id": FP_ID, "file_md5": FILE_MD5}))
+    check("meta_fp_fields 非 dict ⇒ ('','')", fp.meta_fp_fields(None) == ("", ""),
+          fp.meta_fp_fields(None))
+    check("meta_fp_fields 缺键 ⇒ ('','')", fp.meta_fp_fields({"title": "x"}) == ("", ""),
+          fp.meta_fp_fields({"title": "x"}))
+
+    # ---------------- ⑩ 同一条 track 双判据 ⇒ 仍是 md5 优先（⓪ 不被 ① 抢） ----------------
+    print("\n⑩ 同一条 track 同时带 fp_id + file_md5 ⇒ 级别仍是 'md5'")
+    MD5_D = "0123456789abcdef0123456789abcdef"
+    pkg2 = os.path.join(tmp, "both.ercue")
+    cuesheet.save(make_sheet("双判据表", [
+        ("Song D", "Artist D", 180.0, 128.0, MD5_D, FP_ID, "d.flac"),
+    ]), pkg2, app_version="2026.10.17.12")
+    idx.add(pkg2)
+    idx.save_cfg(cfg)
+    s_both = cuesheet.load(pkg2, meta_only=True)[0]
+    trx, lvlx = s_both.match_track(fp_id=FP_ID, file_md5=MD5_D,
+                                   title="Song D", artist="Artist D")
+    check("同一 track 双判据 ⇒ level == 'md5'", lvlx == "md5", lvlx)
+    check("命中同一条 track（Song D）",
+          trx is not None and trx.identity.title == "Song D",
+          trx.identity.title if trx else None)
+    _trx2, lvlx2 = s_both.match_track(fp_id=FP_ID, file_md5="deadbeef")
+    check("md5 不匹配时降级到 'fingerprint'（① 级兜住）", lvlx2 == "fingerprint", lvlx2)
+    # 端到端：meta 带两个字段 ⇒ `_cue_track_query` 两个都传出去；索引按可靠性排序
+    p4 = os.path.join(tmp, "songD.flac")
+    cfg["music_meta"][p4] = {"title": "Song D", "artist": "Artist D",
+                             "duration_sec": 180.0,
+                             "fp_id": FP_ID, "file_md5": MD5_D}
+    q4 = eng._cue_track_query(p4)
+    check("查询参数里 fp_id 与 file_md5 **都非空**",
+          bool(q4.get("fp_id")) and bool(q4.get("file_md5")),
+          (q4.get("fp_id"), q4.get("file_md5")))
+    lv4 = [h[1] for h in eng.cue_sheets_for_track(**q4)]
+    print("      命中级别（按可靠性排序）：%s" % lv4)
+    check("端到端 ⓪ 级生效：'md5' 排第一", lv4[:1] == ["md5"], lv4)
+    check("同一首的另一张表靠 ① 级命中（md5 优先、fingerprint 次之）",
+          lv4 == ["md5", "fingerprint"], lv4)
+
     print("")
     if fails:
         print("FP_LINK_FAIL  %d 项不通过：%s" % (len(fails), "、".join(fails)))
         return 1
-    print("FP_LINK_OK  码表指纹 ① 级接线 / 反向复现 / md5 优先 / 三 md5 不混用 / "
-          "add_song 复用 hashes / 拍长来源 全过")
+    print("FP_LINK_OK  码表认歌 ⓪ md5 + ① 指纹两级接线 / 反向复现 / md5 优先 / 三 md5 不混用 / "
+          "add_song 复用 hashes / 待办判据(缺任一个) / 拍长来源 全过")
     print("结论：OK")
     return 0
 

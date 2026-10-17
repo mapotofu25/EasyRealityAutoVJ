@@ -218,6 +218,44 @@ def file_md5(path, chunk=1 << 20):
         return ""
 
 
+# ==========================================================================
+# `cfg["music_meta"][path]` 里与「码表认歌」有关的两个字段
+# ==========================================================================
+#: 指纹签名键（`fp2-<16hex>` ⇒ 码表 `identity.fp_id`，认歌 **① 级**）
+META_KEY_FP = "fp_id"
+#: 音频文件字节 md5 键（32 hex ⇒ 码表 `identity.file_md5`，认歌 **⓪ 级**）
+META_KEY_MD5 = "file_md5"
+
+
+def meta_fp_fields(rec):
+    """`music_meta` 的一条记录 → `(fp_id, file_md5)`；非 dict / 缺键 ⇒ `""`。
+
+    ⚠ 只读**这两个键**。`song_id`（路径哈希）不在这套语义里；`legacy` 的 `md5`
+      键只在 `engine._cue_track_query()` 里做旧配置兼容，本函数不回写它。
+    """
+    if not isinstance(rec, dict):
+        return "", ""
+    return (str(rec.get(META_KEY_FP) or ""), str(rec.get(META_KEY_MD5) or ""))
+
+
+def meta_needs_fp(rec, legacy=False):
+    """这条 `music_meta` 记录**是否还缺认歌字段**（缺任一个 ⇒ `True`）。
+
+    ★ 为什么是"缺任一个"而不是只看 `fp_id`：⓪ 级（文件字节 md5）与 ① 级（指纹签名）
+      是**互补**的两级 —— ① 级抗改名/换容器（同一段音频重编码仍命中），⓪ 级抗
+      "指纹算不出来 / 指纹算法版本变了"（同一个文件是确定判据）。少写一个等于少一条命。
+    ★ 非 dict / 记录不存在 ⇒ `False`（它不在"已有元数据"之列，由别处的"全量分析"负责）。
+    :param legacy: `True` = **旧判据**（只看 `fp_id`）。仅供回归对照与排障：
+                   `tools/cue_fp_link_test.py` 用它做"反向复现"，证明新判据真的在起作用。
+    """
+    if not isinstance(rec, dict):
+        return False
+    fp_id, fmd5 = meta_fp_fields(rec)
+    if legacy:
+        return not fp_id
+    return not (fp_id and fmd5)
+
+
 class FingerprintDB:
     """指纹库：add_song 建库，match 现场匹配（返回对齐票数，供音乐电池引擎消费）"""
 

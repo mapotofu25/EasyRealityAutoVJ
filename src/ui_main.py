@@ -1757,18 +1757,19 @@ class MusicScanThread(QThread):
         todo = [p for p in items if self.force or p not in meta]
         todo_grid = [p for p in items
                      if not (self.force or p not in meta) and _need_grid(p)]
-        # ★ 第三类待办：**已有元数据、但缺 `fp_id`**（存量曲库）。
-        #   为什么必须有：引擎侧拼"认歌查询参数"的那一步（`engine._cue_track_query`）的
-        #   ① 级（指纹认歌）读 `meta["fp_id"]`，
-        #   而本轮之前扫过的歌**一个都没有**这个字段 ⇒ 码表认歌的 ⓪ md5 / ① 指纹两级
-        #   **永不命中**，只剩最容易误判的"标题+艺人 / 文件名"在撑。用户不重扫就永远拿不到。
-        #   这类只做「解码 → 指纹 → 签名 → 写 fp_id」，**不重跑**联网曲风 / 本地 AI / 封面 /
-        #   节拍网格（已有就保留）。
+        # ★ 第三类待办：**已有元数据、但缺认歌字段**（存量曲库）。
+        #   为什么必须有：引擎侧拼"认歌查询参数"的那一步（`engine._cue_track_query`）里
+        #   ① 级（指纹认歌）读 `meta["fp_id"]`、⓪ 级（同一文件确定判据）读 `meta["file_md5"]`，
+        #   而本轮之前扫过的歌**一个都没有**这两个字段 ⇒ 码表认歌的 ⓪/① 两级**永不命中**，
+        #   只剩最容易误判的"标题+艺人 / 文件名"在撑。用户不重扫就永远拿不到。
+        #   这类只做「解码 → 指纹 → 签名 → 写 fp_id」与「读文件字节算 md5 → 写 file_md5」，
+        #   **不重跑**联网曲风 / 本地 AI / 封面 / 节拍网格（已有就保留）。
+        #   ⚠ 判据在 `fp.meta_needs_fp()`（零 Qt，可无头单测）：缺任一个都算待办。
+        #   ⚠⚠ **不要改成"启动即自动补"**：这个补算是几十分钟级别的 CPU/磁盘活
+        #      （65 首 ≈ 30s，上千首 ≈ 十几分钟），必须由用户在「扫描分析」里**显式触发**。
+        #      启动时抢 CPU/IO 会直接影响演出渲染与音频回调（本项目铁律：现场稳定性优先）。
         def _need_fp(p):
-            m = meta.get(p)
-            if not isinstance(m, dict):
-                return False
-            return not str(m.get("fp_id") or "")
+            return fpvj.meta_needs_fp(meta.get(p))
 
         todo_fp = [p for p in items
                    if not (self.force or p not in meta) and _need_fp(p)]
@@ -1776,20 +1777,23 @@ class MusicScanThread(QThread):
         if todo_grid:
             _log("网格增量补算：%d 首缺网格（已有元数据）只补网格，不重跑指纹/联网" % len(todo_grid))
         if todo_fp:
-            _log("指纹签名增量补算：%d 首缺 fp_id（已有元数据）只补签名，不重跑曲风/封面/网格"
-                 % len(todo_fp))
+            _log("认歌字段增量补算：%d 首缺 fp_id / file_md5（已有元数据）只补这两项，"
+                 "不重跑曲风/封面/网格" % len(todo_fp))
 
-        # 老曲库已算过的 `fp_id` 快照（**主线程先取好**，worker 里不再并发读 `cfg["music_meta"]`）
-        old_fp = {}
-        for _p in items:
-            try:
-                _m = meta.get(_p)
-            except Exception:                                        # noqa: BLE001
-                _m = None
-            if isinstance(_m, dict):
-                _v = str(_m.get("fp_id") or "")
-                if _v:
-                    old_fp[_p] = _v
+        # 老曲库已算好的 `fp_id` / `file_md5` 快照（**主线程先取好**，worker 里不再并发读
+        # `cfg["music_meta"]`）。⚠ `force`（全量重扫）时**一律不信旧值**：用户重扫常常
+        # 正是因为文件被重新编码/替换过，沿用旧 md5/签名会让 ⓪/① 级拿旧判据去认新文件。
+        old_fp, old_md5 = {}, {}
+        if not self.force:
+            for _p in items:
+                try:
+                    _fp_v, _md5_v = fpvj.meta_fp_fields(meta.get(_p))
+                except Exception:                                    # noqa: BLE001
+                    _fp_v, _md5_v = "", ""
+                if _fp_v:
+                    old_fp[_p] = _fp_v
+                if _md5_v:
+                    old_md5[_p] = _md5_v
 
         def _grid_one(p):
             """只算网格（已有元数据、缺网格）：解码一次 → grid_from_signal → 返回 grid。
@@ -1869,6 +1873,17 @@ class MusicScanThread(QThread):
                 # ★ 指纹签名（码表认歌 ① 级）。空串 = 这次没算出来（下次扫描会重试），
                 #   **绝不**退化成写 `song_id`（那是「路径」哈希，与文件内容无关 ⇒ 静默永不命中）。
                 r["fp_id"] = fp_sig
+                # ★ 文件字节 md5（码表认歌 ⓪ 级）：「同一个文件是确定判据」，与 ① 级**互补**
+                #   —— ① 抗改名/换容器（同一段音频重编码仍命中），⓪ 抗"指纹算不出来 /
+                #   指纹算法版本变了"。成本实测 0.079s/首（534 MB/s，38~51MB 的 flac）。
+                #   ⚠ 老歌已有就直接搬（`old_md5` 快照），重复扫描不重复读盘。
+                fmd5 = str(old_md5.get(p) or "")
+                if not fmd5:
+                    try:
+                        fmd5 = fpvj.file_md5(p)
+                    except Exception:                                # noqa: BLE001
+                        fmd5 = ""
+                r["file_md5"] = fmd5
                 # 段落分析已移除（用户反馈：不准，去掉曲库的段落分析与预览里的段落显示）
                 # ★ 节拍网格（BPM / 锚点 / 八拍乐句相位）—— 离线一次入库，演出中只查表。
                 #   复用刚解码的 sig：扫描已经为指纹读过一次盘，这里不再读第二遍。
@@ -2005,58 +2020,75 @@ class MusicScanThread(QThread):
             _log("阶段1c（补封面）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
                  % (len(todo_cover), okc, _tm.perf_counter() - tc0))
 
-        # ---- 阶段 1d：**补指纹签名 `fp_id`**（存量曲库：有元数据但没有 fp_id）----
-        # 只做「解码 → 指纹 → 签名 → 写 `fp_id`」（顺带把缺的指纹行补进库），
-        # **不重跑**联网曲风 / 本地 AI / 封面 / 节拍网格 —— 那些已有就保留。
+        # ---- 阶段 1d：**补认歌字段** `fp_id` / `file_md5`（存量曲库）----
+        # 只做「解码 → 指纹 → 签名 → 写 `fp_id`」与「读文件字节算 md5 → 写 `file_md5`」
+        # （顺带把缺的指纹行补进库），**不重跑**联网曲风 / 本地 AI / 封面 / 节拍网格。
+        # ⚠ 缺哪个补哪个：有 fp_id 只缺 file_md5 时**不重跑 STFT**（省 1.35s/首）。
         if todo_fp:
             tf0 = _tm.perf_counter()
             okf = 0
 
             def _fp_one(p):
-                """只补签名（已有元数据、缺 `fp_id`）；返回 `(path, fp_sig)`。
+                """补齐一首歌的认歌字段；返回 `(path, fp_id, file_md5)`。
 
+                只算**缺的那个**（老快照里有的直接搬）：
+                  · 缺 `file_md5` ⇒ `fpvj.file_md5(p)`（只读字节，不解码，~0.08s/首）；
+                  · 缺 `fp_id`   ⇒ 解码 → 指纹 → 签名（~1.6s/首）并确保指纹行在库里。
                 ⚠ 解码/声道混合必须与本文件 `_one()` **逐字一致**（整曲读、`np.mean(axis=1)`）：
                   签名是「指纹哈希序列」的 sha1，而哈希来自 PCM ⇒ 截断/重采样/单声道取法
                   只要差一点，算出来就是**另一串**，跨端比对会**静默永不命中**。
-                ⚠ 任何异常自己吞掉，返回 `(p, "")`（坏文件不能打断整轮扫描）。
+                ⚠ 任何异常自己吞掉，**已成功的那个字段照常返回**（坏文件不能打断整轮扫描，
+                  也不能因为 md5 成功而把已算出的签名丢掉）。
                 """
+                fp_sig = str(old_fp.get(p) or "")
+                fmd5 = str(old_md5.get(p) or "")
                 try:
                     if not _os.path.isfile(p):
-                        return p, ""
-                    data, sr = sf.read(p, dtype="float32", always_2d=True)
-                    sig = np.mean(data, axis=1)
-                    hs = fpvj.fingerprint_audio(sig, sr)
-                    fp_sig = fpvj.signature_from_hashes(hs)
+                        return p, fp_sig, fmd5
+                    if not fmd5:
+                        fmd5 = fpvj.file_md5(p)
                     if not fp_sig:
-                        return p, ""
-                    song_id = int(hashlib.md5(p.encode("utf-8")).hexdigest()[:8], 16)
-                    with db_lock:
-                        # 老曲库几乎**都已有指纹行**（本阶段只缺签名）⇒ 先查一次，
-                        # 有就跳过写库（`idx_song` 索引让这条 SELECT 是常数级），
-                        # 免得几千首全量重写几千万行。
-                        has_rows = False
-                        try:
-                            has_rows = db.conn.execute(
-                                "SELECT 1 FROM fingerprints WHERE song_id=? LIMIT 1",
-                                (song_id,)).fetchone() is not None
-                        except Exception:                            # noqa: BLE001
-                            has_rows = False
-                        if not has_rows:
-                            db.add_song(song_id, sig, sr, commit=False, hashes=hs)
-                            if db.pending() >= 6:
-                                db.commit_batch()
-                    return p, fp_sig
+                        data, sr = sf.read(p, dtype="float32", always_2d=True)
+                        sig = np.mean(data, axis=1)
+                        hs = fpvj.fingerprint_audio(sig, sr)
+                        fp_sig = fpvj.signature_from_hashes(hs)
+                        if fp_sig:
+                            song_id = int(hashlib.md5(
+                                p.encode("utf-8")).hexdigest()[:8], 16)
+                            with db_lock:
+                                # 老曲库几乎**都已有指纹行**（本阶段多数只缺签名）⇒ 先查一次，
+                                # 有就跳过写库（`idx_song` 索引让这条 SELECT 是常数级），
+                                # 免得几千首全量重写几千万行。
+                                has_rows = False
+                                try:
+                                    has_rows = db.conn.execute(
+                                        "SELECT 1 FROM fingerprints WHERE song_id=? LIMIT 1",
+                                        (song_id,)).fetchone() is not None
+                                except Exception:                # noqa: BLE001
+                                    has_rows = False
+                                if not has_rows:
+                                    db.add_song(song_id, sig, sr, commit=False, hashes=hs)
+                                    if db.pending() >= 6:
+                                        db.commit_batch()
+                    return p, fp_sig, fmd5
                 except Exception:                                    # noqa: BLE001
-                    return p, ""
+                    return p, fp_sig, fmd5
 
             try:
                 with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                    for p, fs in ex.map(_fp_one, todo_fp):
-                        if fs:
+                    for p, fs, md5v in ex.map(_fp_one, todo_fp):
+                        got = False
+                        if fs or md5v:
                             rec = dict(meta.get(p) or {})
-                            rec["fp_id"] = fs
-                            meta[p] = rec
-                            okf += 1
+                            if fs and not str(rec.get("fp_id") or ""):
+                                rec["fp_id"] = fs
+                                got = True
+                            if md5v and not str(rec.get("file_md5") or ""):
+                                rec["file_md5"] = md5v
+                                got = True
+                            if got:
+                                meta[p] = rec
+                                okf += 1
                         done += 1
                         self.progress.emit(done, total, p)
                         if done % 20 == 0:
@@ -2065,7 +2097,7 @@ class MusicScanThread(QThread):
                             except Exception:                        # noqa: BLE001
                                 pass
             except Exception as e:                                   # noqa: BLE001
-                _log("阶段1d（补指纹签名）异常终止：%s" % e)
+                _log("阶段1d（补认歌字段）异常终止：%s" % e)
             try:
                 db.commit_batch()
             except Exception:                                        # noqa: BLE001
@@ -2074,7 +2106,7 @@ class MusicScanThread(QThread):
                 self.main.cfg.save()
             except Exception:                                        # noqa: BLE001
                 pass
-            _log("阶段1d（补指纹签名）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
+            _log("阶段1d（补认歌字段）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
                  % (len(todo_fp), okf, _tm.perf_counter() - tf0))
 
         # ---- 阶段 2：**串行**补在线曲风（尊重限流；网络差就提前收手）----
