@@ -475,6 +475,36 @@ class Layer:
                 "clips": [c.path for c in self.clips]}
 
 
+def _crop_src_rect(image, crop):
+    """归一化 `crop=[x, y, w, h]`（0~1）→ 源图像素矩形 `QRectF`；非法/None ⇒ `None`。
+
+    取整与钳位**逐字对齐 Cue 端 `render/compositor._crop_src_rect`**（它当初也是照抄演出端）：
+      · `cw/ch` 四舍五入且至少 1 像素；`cx/cy` 钳到 `[0, iw-1]/[0, ih-1]`；
+      · 越界时收缩到 `iw-cx` / `ih-cy`（不越出图像）；
+      · 任何异常 ⇒ `None`（= 不裁），**绝不抛**（这是热路径）。
+    ⚠ 定义在**模块级**而不是方法：`_draw_layer` 可能被无 `self` 的测试直接调用
+      （`tools/cue_pixel_diff_guard.py` 就是这样做的）。
+    """
+    if image is None or image.isNull() or not crop:
+        return None
+    try:
+        if len(crop) != 4:
+            return None
+        fw, fh = image.width(), image.height()
+        cw = max(1, int(round(float(crop[2]) * fw)))
+        ch = max(1, int(round(float(crop[3]) * fh)))
+        cx = max(0, min(fw - 1, int(round(float(crop[0]) * fw))))
+        cy = max(0, min(fh - 1, int(round(float(crop[1]) * fh))))
+        cw = min(cw, fw - cx)
+        ch = min(ch, fh - cy)
+        if cw <= 0 or ch <= 0:
+            return None
+        return QRectF(cx, cy, cw, ch)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+
 class AutoVJEngine(QObject):
     # ⚠⚠ **只投递一个 int 序号，帧本身放在 `self._latest_frame`**（2026-09-26 内存雪崩修复）。
     # 旧写法是 `Signal(QImage)`，每帧把一个 8MB 的 1080p 副本投进主线程队列
@@ -3178,7 +3208,16 @@ class AutoVJEngine(QObject):
                 pass  # 单个图层失败就跳过它，不影响整帧
 
     def _draw_layer(self, p, lay, img, W, H, prog, tr, pulse, snap,
-                    drift_x=0.0, drift_y=0.0):
+                    drift_x=0.0, drift_y=0.0, crop=None):
+        """把一层画到画布上。
+
+        `crop`：码表（cue）用的**源矩形裁切**，归一化 `[x, y, w, h]`（0~1）；`None` = 不裁。
+        ★ 向后兼容铁律：`crop is None` ⇒ 走**与改动前一字不差**的 `drawImage(_tgt, image)`
+          ⇒ 普通图层（以及所有不传 crop 的调用点）**逐像素零变化**。
+          `crop` 非 None 时用「源矩形重载」绘制（**绝不 `image.copy()`**），
+          并把 cover/contain 的基准换成**裁切后的尺寸**（对齐 Cue 端 `compositor._target_src`：
+          先裁、再以裁后尺寸算适配，否则裁切区会被放大变形）。
+        """
         alpha = lay.opacity
         is_kv = getattr(lay, "is_kv", False)
         # 锁定画面：该图层不随能量脉冲缩放、不随氛围漂移（logo/字幕钉在原地）
@@ -3219,6 +3258,12 @@ class AutoVJEngine(QObject):
                 return
             custom, ux, uy, us, rot = _t(item)
             iw, ih = image.width(), image.height()
+            # ★ 裁切（码表 cue 的 crop = [x, y, w, h] 归一化；普通图层 crop=None）
+            #   用 drawImage 的「源矩形」重载，**不做每帧 copy**；
+            #   裁切后以**裁后尺寸**为 cover/contain 基准（否则裁切区会被放大变形）。
+            src = _crop_src_rect(image, crop)
+            if src is not None:
+                iw, ih = src.width(), src.height()
             if custom:
                 s = min(W / iw, H / ih) * scale * us   # 完整显示 + 用户缩放
             else:
@@ -3231,10 +3276,16 @@ class AutoVJEngine(QObject):
                 painter.translate(W / 2.0 + dx + ux, H / 2.0 + dy + uy)
                 painter.rotate(rot)
                 _tgt = QRectF(-tw / 2.0, -th / 2.0, tw, th)
-                painter.drawImage(_tgt, image)
+                if src is None:
+                    painter.drawImage(_tgt, image)
+                else:
+                    painter.drawImage(_tgt, image, src)
             else:
                 _tgt = QRectF((W - tw) / 2 + dx + ux, (H - th) / 2 + dy + uy, tw, th)
-                painter.drawImage(_tgt, image)
+                if src is None:
+                    painter.drawImage(_tgt, image)
+                else:
+                    painter.drawImage(_tgt, image, src)
             painter.restore()
 
         dx = drift_x * (0.5 + (lay.cur % 3) * 0.25)  # 各图层漂移相位不同
@@ -3265,15 +3316,21 @@ class AutoVJEngine(QObject):
             if prev is not None:
                 paint_cover(p, prev, prev_item, pulse, 0, 0, alpha)
             # 随机行错位（用源矩形绘制，避免每行 copy）
+            # ★ crop：在**裁切窗口内**按比例切；`src` 为 None 时与原式逐像素一致
+            src = _crop_src_rect(img, crop)
+            if src is None:
+                sx0, sy0, sw, sh_img = 0.0, 0.0, float(img.width()), float(img.height())
+            else:
+                sx0, sy0, sw, sh_img = (src.x(), src.y(),
+                                        src.width(), src.height())
             p.save()
             p.setOpacity(alpha)
             step = max(8, H // 24)
-            iw, ih = img.width(), img.height()
             for y in range(0, H, step):
                 off = rng.randint(-40, 40) if rng.random() < 0.35 else 0
-                sy = min(ih - 1, int(y / H * ih))
-                sh = max(1, int(step / H * ih))
-                p.drawImage(QRectF(off, y, W, step), img, QRectF(0, sy, iw, sh))
+                sy = sy0 + min(sh_img - 1, int(y / H * sh_img))
+                sh = max(1, int(step / H * sh_img))
+                p.drawImage(QRectF(off, y, W, step), img, QRectF(sx0, sy, sw, sh))
             p.restore()
         else:
             paint_cover(p, img, cur_item, pulse, dx, dy, alpha)
