@@ -1533,7 +1533,7 @@ class AudioEngine:
             except Exception:                                    # noqa: BLE001
                 hit, n_hash = -1, -1
             line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f "
-                    "hit=%d/%d seg=%.3f/%d raw=%d/hint=%d"
+                    "hit=%d/%d seg=%.3f/%d raw=%d/hint=%d adv=%d cur=%d cand=%d bar=%d hits=%d"
                     % (time.strftime("%H:%M:%S"),
                        1 if fp_db is not None else 0,
                        1 if eng is not None else 0,
@@ -1545,7 +1545,9 @@ class AudioEngine:
                        float(getattr(st, "bpm_display", 0.0) or 0.0),
                        hit, n_hash, seg_rms, seg_n,
                        int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[1]),
-                       int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[3])))
+                       int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[3]),
+                       int(getattr(self, "_last_adv", 0) or 0),
+                       *[int(x) for x in (getattr(self, "_eng_state", (0, -1, 0, 0)) or (0, -1, 0, 0))]))
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
@@ -1647,12 +1649,19 @@ class AudioEngine:
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
+                _prev_off = float(self._last_match[2]) if self._last_match else None
                 self._last_match = (sid, int(votes or 0), float(off or 0.0),
                                     1 if _hint is not None else 0)
                 self._last_match_t = _now
+                # 电荷条内部状态取证：adv = 本次 offset 是否比上次推进 0.5s±0.4（充电判据）
+                self._last_adv = (1 if (_prev_off is not None and
+                                        abs((float(off) - _prev_off) - 0.5) <= 0.4) else 0)
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
                 cur = eng.current_song_id
+                self._eng_state = (int(cur), int(getattr(eng, "tentative_song_id", -1)),
+                                   int(getattr(eng, "cand_bar", 0)),
+                                   int(getattr(eng, "cand_hits", 0)))
                 with self.state.lock:
                     self.state.recognized_song_id = cur
                     if cur >= 0 and sid == cur and votes > 0:
