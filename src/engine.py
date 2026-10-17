@@ -588,6 +588,8 @@ class AutoVJEngine(QObject):
         self._cue_sid = -1          # 当前曲目 sid（换歌要重建 runtime）
         self._cue_jumped = False    # 本帧是否发生跳变重算
         self._cue_closed_last = 0   # 上次 clear 关掉的解码器数（自检/排障用）
+        self._cue_tick_fail = 0     # _cuesheet_tick 连续失败次数（异常安全用）
+        self._cue_err_at = 0.0      # 上次写码表错误日志的时刻（限流用）
         self.running = False
         self.blackout = False
         self.freeze = False
@@ -1318,6 +1320,11 @@ class AutoVJEngine(QObject):
 
         # ★ 每层健康快照（每秒 1 行，只在 running 时）—— 卡了能直接回看那一刻每层状态。
         self._health_tick()
+
+        # 码表：先把「本帧拍位」解释成「每个码表图层该显示什么」（**只算，不画**）。
+        # · 没有码表图层时直接返回（实测 0.41µs/帧，见 tools/cue_tick_test.py）；
+        # · 内部异常已被吞掉（清空本帧 + 限流记日志），绝不影响下面的合成。
+        self._cuesheet_tick(snap)
 
         # 合成
         self._compose(snap)
@@ -2783,6 +2790,73 @@ class AutoVJEngine(QObject):
             if getattr(lay, "is_cuesheet", False) and getattr(lay, "visible", True):
                 return True
         return False
+
+    def set_cue_position(self, pos_beats, src="manual"):
+        """喂入本帧的**码内拍位**（Step3 的指纹定位会把结果写到这里）。
+
+        `None` ⇒ 表示"没有可靠位置" ⇒ 码表不接管（安全降级，绝不猜）。
+        本方法 O(1)：只赋值，不做任何计算。
+        """
+        self._cue_pos_beats = None if pos_beats is None else float(pos_beats)
+        self._cue_pos_src = str(src or "")
+        return self._cue_pos_beats
+
+    def _cue_health(self, msg):
+        """码表降级/失败写进图层健康日志（滚动保留），**限流**：默认 10s 最多 1 条。"""
+        now = time.perf_counter()
+        if (now - float(getattr(self, "_cue_err_at", 0.0) or 0.0)) < 10.0:
+            return
+        self._cue_err_at = now
+        try:
+            log = self._health_log
+            if log is None:
+                log = self._health_log = _LayerHealthLog()
+            log.write("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _cuesheet_tick(self, snap=None):
+        """每帧：把「当前拍位」解释成「每个码表图层此刻该显示什么」—— **只算，不画**。
+
+        三个"不接管"条件（任一 ⇒ 清空 `cs_states`，退回普通图层行为）：
+          ① 没有装载码表 / 没认到曲目（`_cue_rt is None`）；
+          ② 没有可靠拍位（`_cue_pos_beats is None`）—— 宁可不画，也绝不猜位置；
+          ③ 没有可见的码表图层（小眼睛关掉 ⇒ 连算都不算）。
+        **零副作用**：只调纯逻辑 `CueRuntime.update()`，不建解码器、不 seek、不做 IO（那些是 S6 的事）。
+        **异常安全**：内部任何异常都不冒泡（否则一帧崩=全线崩）⇒ 限流记一条 + 本帧清空 +
+        下一帧继续尝试（不做永久关闭）。
+        """
+        lays = [l for l in self.layers if getattr(l, "is_cuesheet", False)]
+        if not lays:
+            return                                    # ★ 没有码表图层：零成本直接返回
+        vis = [l for l in lays if getattr(l, "visible", True)]
+        rt = self._cue_rt
+        pos = self._cue_pos_beats
+        if rt is None or pos is None or not vis:
+            for lay in lays:
+                if lay.cs_states:
+                    lay.cs_states = []
+                lay.cs_active = False
+            return
+        try:
+            states = rt.update(pos)
+            self._cue_jumped = bool(getattr(rt, "jumped", False))
+            self._cue_tick_fail = 0
+        except Exception as e:                                    # noqa: BLE001
+            # ★ 绝不冒泡：清空本帧 + 限流记一次 + 下帧继续试（不永久关）
+            self._cue_tick_fail = int(getattr(self, "_cue_tick_fail", 0) or 0) + 1
+            self._cue_jumped = False
+            self._cue_health("码表解释失败（连续 %d 次，已跳过本帧）：%s: %s"
+                             % (self._cue_tick_fail, type(e).__name__, e))
+            for lay in lays:
+                lay.cs_states = []
+                lay.cs_active = False
+            return
+        on_any = bool(states)
+        for lay in lays:
+            on = bool(getattr(lay, "visible", True)) and on_any
+            lay.cs_states = states if on else []
+            lay.cs_active = on
 
     def _preload_clips(self, lay, clips=None, max_preload=3):
         """已废弃：预加载机制曾导致 decoder 线程堆积、CPU 20%→60%（详见 memory）。
