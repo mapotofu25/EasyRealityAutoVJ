@@ -44,6 +44,11 @@ FP_SCHEMA_VERSION = 2    # 峰值检测算法版本（v1=规则分块；v2=邻�
 #   引擎按当前歌 grid 的 beat_len 用 `hint_window_frames()` 换算后传 `hint_w`。
 HINT_W = 32
 
+#: hint 窗口内候选"够不够格赢"的最低票数比例（相对全局最高票）。
+#: 见 `_pick` 注释：同一段音频的两处出现票数同量级（实测 60%），纯噪声只有 1~3 票
+#: ⇒ 用 10% 这个**数量级**门槛把两者分开，不误伤"防重复段落挑错位置"的原有能力。
+HINT_WIN_MIN_RATIO = 0.10
+
 # 「连续性提示」窗口半宽的**受支持定义**（单位 = 拍）：跨 BPM 一致。
 # 依据（第三轮 fix：正确候选偏差 ≲0.5 拍；生产侧 hint 误差 ≲1 拍跟踪 + 0.5s 时滞；
 #   可触发硬重锚的错误候选下界 ≈3.5 拍）：
@@ -386,7 +391,20 @@ class FingerprintDB:
                 if lo <= key[1] <= hi and (best is None or cnt > best[1]):
                     best = (key, cnt)
             if best is not None:
-                return best
+                # ★★ 2026-10-17：**窗内候选还必须"够强"才准赢**。
+                #   现场实证（101719）：连续性提示窗里落进一个 **1 票**的杂散候选，
+                #   它把真实位置（182 票）挤掉 ⇒ `raw` 在 29/34/1 之间跳 ⇒
+                #   电荷条的"每拍 +0.5s"判据永远不成立 ⇒ 永不确认。
+                #   判据取 `max(3, 全局最高票 × 10%)`：
+                #     · 同一段音频在歌里出现两次 ⇒ 两处票数同量级（实测 35 vs 58 = 60%）
+                #       ⇒ 仍然会被选中，**原有"防重复段落挑错位置"的能力不受影响**；
+                #     · 纯噪声候选只有 1~3 票 ⇒ 被拒 ⇒ 退回全局众数（等于没有 hint）。
+                #   ⚠ 早先 QA 结论是"投票比区分不了 hint 正确但弱 / hint 错误"——
+                #     那研究的是"两者都是一个量级"的情形；这里卡的是**数量级差异**，
+                #     不是同一个问题。阈值取 10% 而不是 50%，正是为了不误伤前者。
+                _top = max(votes.values())
+                if best[1] >= max(3, int(_top * HINT_WIN_MIN_RATIO)):
+                    return best
         return max(votes.items(), key=lambda kv: kv[1])
 
     def match(self, sig, sr, hint_delta=None, hint_w=None):
