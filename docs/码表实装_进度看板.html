@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ERAVJ 码表实装 · 进度看板</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#1a1d21; --dim:#6b7280; --line:#e5e7eb;
+    --ok:#16a34a; --okbg:#dcfce7; --run:#2563eb; --runbg:#dbeafe; --wait:#9ca3af; --waitbg:#f3f4f6;
+    --warn:#d97706; --warnbg:#fef3c7; --bad:#dc2626;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;padding:28px}
+  .wrap{max-width:1000px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+  .bar{height:12px;background:var(--line);border-radius:6px;overflow:hidden;margin:14px 0 6px}
+  .bar>i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a);width:32%}
+  .barline{display:flex;justify-content:space-between;font-size:12px;color:var(--dim)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .card>h2{font-size:15px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .item{display:flex;gap:12px;padding:9px 0;border-top:1px dashed var(--line)}
+  .item:first-of-type{border-top:0}
+  .tag{flex:0 0 76px;text-align:center;font-size:12px;font-weight:600;border-radius:6px;padding:2px 0;height:22px}
+  .t-ok{background:var(--okbg);color:var(--ok)}
+  .t-run{background:var(--runbg);color:var(--run)}
+  .t-wait{background:var(--waitbg);color:var(--wait)}
+  .t-warn{background:var(--warnbg);color:var(--warn)}
+  .body{flex:1;min-width:0}
+  .name{font-weight:600}
+  .ev{color:var(--dim);font-size:12px;margin-top:2px;font-family:ui-monospace,Consolas,monospace;word-break:break-all}
+  .now{border-left:3px solid var(--run);background:#f8fbff;border-radius:0 8px 8px 0;padding-left:12px}
+  .note{font-size:12px;color:var(--dim);margin-top:8px}
+  .legend{display:flex;gap:14px;font-size:12px;color:var(--dim);margin-top:10px;flex-wrap:wrap}
+  .k{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:middle}
+  code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ERAVJ（演出端）实装「码表」· 进度看板</h1>
+  <div class="sub">任务：把 EasyRealityCue 导出的 .ercue 导入演出端并按拍自动执行 · 更新于 13:20</div>
+
+  <div class="bar"><i></i></div>
+  <div class="barline"><span>已落地：Step1 数据层 + S0 判定下沉 + S1 播放器 seek/position</span><span>约 88%</span></div>
+
+  <div class="card">
+    <h2>✅ 已完成（有证据）</h2>
+
+    <div class="item">
+      <span class="tag t-ok">完成</span>
+      <div class="body">
+        <div class="name">Step1 · 数据层（cuesheet + runtime + 两端对照）</div>
+        <div class="ev">PARITY_OK（Cue 参照 / AutoVJ / 交叉 2700 采样点，最大差 0.000e+00）· 变异测试 5/5 被抓</div>
+      </div>
+    </div>
+
+    <div class="item">
+      <span class="tag t-ok">完成</span>
+      <div class="body">
+        <div class="name">S0 · 判定下沉 cue_seek_policy.py（零 Qt）</div>
+        <div class="ev">26/26 用例 · 源码级变异 5/5 · 修掉"换片段后永久不校正"缺陷（degraded 残留）</div>
+      </div>
+    </div>
+
+    <div class="item">
+      <span class="tag t-ok">完成</span>
+      <div class="body">
+        <div class="name">S1 · 播放器加 seek / position（零调用）</div>
+        <div class="ev">落点误差 0.000（cv2 短片 / PyAV 长 GOP / DXV 三路实测）· PyAV 前向补齐生效</div>
+      </div>
+    </div>
+
+<div class="item">
+      <span class="tag t-ok">完成</span>
+      <div class="body">
+        <div class="name">S2 · <code>_draw_layer</code> 补 crop（第一次动渲染热路径）</div>
+        <div class="ev">守卫 exit 0（11 场景逐字节 0 差异）· crop 几何 14/14（A5 分界 960 证明"基准=裁后尺寸"、A6 差 0 证明不拉伸）</div>
+        <div class="ev">fps 33.993 → 33.949 ms（−0.13%）· 最大单场景 +0.95%（&lt;1%）· 解析上界 0.173µs（crop=None 早退）</div>
+        <div class="ev">commit <code>d428b73</code>（只含 src/engine.py，历史 M 文件未带入）</div>
+        <div class="note">顺带发现：备份版 glitch 分支根本没应用 crop（自相矛盾），本次一并修正。</div>
+      </div>
+    </div>
+
+    <div class="item">
+      <span class="tag t-ok">完成</span>
+      <div class="body">
+        <div class="name">设计与验收口径（设计 459 行 / 任务书 601 行 / 分步计划 314 行）</div>
+        <div class="ev">含 seek 契约 8 条 · 防自激 3 条 · 9 条停止红线 · 性能资源门槛（fps/CPU/内存/磁盘/活跃解码器≤8）</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🔄 正在做（卡在这里）</h2>
+    <div class="item now">
+      <span class="tag t-run">进行中</span>
+      <div class="body">
+        <div class="name">Step4 段验收汇总（7 个 commit 的门禁数字表）+ 代码入库</div>
+        <div class="ev">汇总 7 段门禁数字 · "照抄备份会错的 5 个地方" · 已知缺口 · 留给 QA 的验收项</div>
+        <div class="note">入库分 3 个 commit（Step1 三件 / docs / 验收工具+截图）；14MB 基准帧不入库（可再生）。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>⏳ 待做</h2>
+
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">S3 · <code>_CueSubLayer</code> 容器层 + 装载/卸载</div>
+        <div class="ev">依赖 Step2（引擎数据面）</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">S4 · <code>_cuesheet_tick</code> 接线（轻量，热路径）</div>
+        <div class="ev">判据：输出必须与 Step1 runtime 逐值一致</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">S5 · 画码表层 + 挂进 <code>_compose</code>（热路径）</div>
+        <div class="ev">判据：出画 / z 序 / α² / crop + fps 退化 &lt;1%</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">S6 · seek / position / 防自激接线（热路径）</div>
+        <div class="ev">判据：入点正确 / 出点冻结 / 漂移校正 / seek 次数上界</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">S7 · 解码器生命周期 + 资源收尾</div>
+        <div class="ev">判据：活跃解码器 ≤8 / 30 次启停 / 退出无残留</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">Step2 / Step3 · 引擎数据面 / 位置认歌（指纹→拍位）</div>
+        <div class="ev">S3 起依赖这两步</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">Step4.5 · 相邻同设置合并（run）</div>
+        <div class="ev">不补则"每个接缝闪一下"，判据以 Cue 端 group_runs 为唯一真源</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">Step5~8 · UI 入口 / 徽标 / 配置 / 异常收口</div>
+        <div class="ev">菜单「码表（演出端）…」+ 导入对话框 + 图层徽标</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-wait">待做</span>
+      <div class="body">
+        <div class="name">Step9 · QA 严格测试（功能 + bug + 性能 + 资源 + 30 分钟 soak）</div>
+        <div class="ev">独立验证者执行，不采信工程师自测</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>📌 你现在能用的是什么</h2>
+    <div class="item">
+      <span class="tag t-ok">可用</span>
+      <div class="body">
+        <div class="name">EasyRealityCue（编排端）—— 已交付可用</div>
+        <div class="ev">P:\ERAVJ\EasyRealityCue\dist_fix11\EasyRealityCue\EasyRealityCue.exe</div>
+      </div>
+    </div>
+    <div class="item">
+      <span class="tag t-warn">未装完</span>
+      <div class="body">
+        <div class="name">ERAVJ（演出端）的码表功能 —— 还不能用</div>
+        <div class="ev">数据层 + seek 已就绪，但"导入入口 / 引擎接线 / 渲染"还没完成（S2~S7 + Step2~8）</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="k" style="background:var(--ok)"></i>已完成（有实测证据）</span>
+    <span><i class="k" style="background:var(--run)"></i>进行中</span>
+    <span><i class="k" style="background:var(--wait)"></i>待做</span>
+    <span><i class="k" style="background:var(--warn)"></i>尚不可用</span>
+  </div>
+</div>
+</body>
+</html>
