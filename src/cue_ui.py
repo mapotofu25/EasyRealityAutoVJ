@@ -21,7 +21,8 @@ import os
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                               QDialogButtonBox,
                                QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                QPushButton, QVBoxLayout, QWidget)
 
@@ -290,6 +291,8 @@ class CueSheetDialog(QDialog):
                    ("%g" % bpm) if bpm > 0 else "无（退化 1 拍=1 秒）",
                    int(st.get("rt_items", 0) or 0),
                    "、".join(st.get("bound_layers") or []) or "无")
+                + ("　｜　素材 %d/%d" % (len(self.media_paths),
+                                        len(getattr(self.sheet, "media", None) or [])))
                 + ("　｜　覆盖 %d 首" % self._cover_count() if self._cover_count() else ""))
         err = []
         if self.warnings:
@@ -391,6 +394,12 @@ class CueSheetDialog(QDialog):
         self.media_paths = dict(info.get("present_media") or {})
         self.missing = list(info.get("missing_media") or [])
 
+        # ★★ 包内有内嵌 media/ ⇒ **先解压**（`<包路径>.media/`，幂等），再谈"缺不缺"。
+        #   这一步此前**从未被调用**（`grep extract_media src/cue_ui.py` = 0）⇒
+        #   内嵌素材的包导入后 `missing_media` = 全部 ⇒ 用户看到的是"有 4 个素材没找到"，
+        #   也就是"导入说没有文件"。设计 §2.2 明确要求这一步。
+        self._extract_embedded(self.pkg, sheet)
+
         # 缺素材：先按上次目录找；找不到再让用户指定
         if self.missing:
             c = cue_cfg(self.cfg) if self.cfg is not None else {}
@@ -426,6 +435,15 @@ class CueSheetDialog(QDialog):
         if track is None:
             track = self._ask_track(sheet)
         self.track = track
+        # ★ 曲目没有 BPM ⇒ 拍长未知 ⇒ 码表只能按「1 拍 = 1 秒」退化播放，画面必然对不上拍。
+        #   这不是 bug 而是包里的数据缺字段，但**必须让用户看见**（否则会被当成"码表不跟拍"）。
+        try:
+            if track is not None and float(getattr(track.identity, "bpm", 0.0) or 0.0) <= 0.0:
+                self.warnings.append(
+                    "这张码表的曲目没有 BPM（拍长未知）：只能按「1 拍 = 1 秒」播放，"
+                    "画面不会对拍 —— 请在 EasyRealityCue 里补上该曲目的 BPM 后重新导出。")
+        except Exception:                                        # noqa: BLE001
+            pass
         layer = self._current_layer()
         ok = False
         try:
@@ -454,6 +472,65 @@ class CueSheetDialog(QDialog):
         if not ok:
             self._error("已装载码表，但**没有绑定曲目** ⇒ 图层不接管（请选一首曲目）。")
         return ok
+
+    def _extract_embedded(self, pkg, sheet):
+        """把包内 `media/` 解到 `<包路径>.media/`，并把解出来的路径并进 `media_paths`。
+
+        **幂等（按 `cuesheet.extract_media` 的约定：由调用方保证）**：
+          · 目标目录已存在且**该有的文件都在** ⇒ **直接复用、不重复解压**（169MB 包重解要好几秒）；
+          · 只补"缺的那几个"（不整目录重解）。
+        **不做任何路径规范化**：包路径可能带中文/空格（用户的就是 `测试.ercue`）。
+        """
+        if sheet is None:
+            return
+        dest = str(pkg) + ".media"
+        names = [str(m.name) for m in (sheet.media or []) if m.name]
+        if not names:
+            return
+        have = set()
+        if os.path.isdir(dest):
+            try:
+                have = set(os.listdir(dest))
+            except OSError:
+                have = set()
+        need = [n for n in names if n not in have]
+
+        if not need:
+            # 已经解过：只把现成文件补进 media_paths（不再碰磁盘）
+            for m in (sheet.media or []):
+                if not m.name:
+                    continue
+                pth = os.path.join(dest, m.name)
+                if os.path.isfile(pth) and not self.media_paths.get(m.clip_id):
+                    self.media_paths[m.clip_id] = pth
+            self.missing = [n for n in self.missing if n not in have]
+            return
+
+        # 首次（或补缺）：给一句提示，避免 169MB 解压时界面像死了
+        self.lbl_error.setText(T("正在准备素材…（首次导入需要解压包内素材，请稍候）"))
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            found = cuesheet.extract_media(pkg, dest) or {}
+        except Exception as e:                                   # noqa: BLE001
+            self._error("解压包内素材失败（包可能损坏，或目标目录没写权限）：%s" % e)
+            return
+        for m in (sheet.media or []):
+            if not m.name:
+                continue
+            pth = found.get(m.name) or os.path.join(dest, m.name)
+            if os.path.isfile(pth) and not self.media_paths.get(m.clip_id):
+                self.media_paths[m.clip_id] = pth
+        got = set()
+        for m in (sheet.media or []):
+            if m.name and os.path.isfile(os.path.join(dest, m.name)):
+                got.add(m.name)
+        self.missing = [n for n in self.missing if n not in got]
+        self.lbl_error.setText("")
 
     def _auto_match(self, sheet):
         """先用"当前曲目信息"认歌。Step3 未落地 ⇒ 这里只能拿到空信息。
