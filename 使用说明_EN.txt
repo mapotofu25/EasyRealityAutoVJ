@@ -1,6 +1,6 @@
 Easy Reality AutoVJ — User Manual
 =================================
-Version 2026.10.10.01
+Version 2026.10.17.02
 A real-time auto-VJ engine that turns music into visuals
 
 This manual follows the real order of use — from install to showtime.
@@ -600,8 +600,68 @@ Q: Will my settings survive moving to another PC?
 A: Config and caches all live in the data folder — just copy it over.
 
 
+16. Cue Sheet (Show Mode)
 ────────────────────────────────────────
-16. Data Location
+A cue sheet is a **pre-edited show package** made in EasyRealityCue (visuals cut
+to the beat, with speed changes and crops). The show app only **plays it in
+sync with the beat** — it does no editing.
+
+[Where]
+Toolbar, far right: "⋯ More" -> "Cue Sheet (Show)…".
+
+[A complete run]
+1. Click "Import .ercue…" (multiple selection allowed; failures are explained
+   in red inside the dialog).
+2. **Bind a track**:
+   - one track inside the package -> bound automatically (a red note says so);
+   - several tracks -> pick one from the list (artist — title | BPM | clips).
+   - Track detection failing is fine — see "Manual beat start" below.
+3. **Bind a layer**: choose one in "Bind to:"; that layer's header then shows a
+   teal "码" badge.
+4. **Play**: start the song. If the song is recognized and has a cue sheet, it
+   takes over the visuals; otherwise normal auto scheduling continues.
+5. To disable: untick "Enable (take over)", or click the "码" badge ->
+   "Unload cue sheet from this layer".
+
+[Four rules (all measured)]
+- **Long-GOP media (HEVC / large keyframe interval)**: seeking can only land
+  near a keyframe, so alignment can be **up to ~1 s late**. That is a decoder
+  property, not a bug. **Prefer DXV or short-GOP H.264 for beat-critical parts.**
+- **Seek profile = Conservative** (Advanced): aligns **once on entry only**, no
+  drift correction while playing. Good for older machines / heavy shows; long
+  clips may drift slightly but **never stutter**.
+- **Manual beat start** (when the song is not recognized): assumes the song
+  **starts at 0:00** and counts beats by wall clock — it is an **estimate, not a
+  real position**. If the song did not start from the beginning, press it again.
+- **Out-point freeze**: at the out point the last frame is **held** (no black,
+  no overshoot).
+
+[Known limits]
+- Cue sheets contain **no editing features** — edit in EasyRealityCue and
+  re-import the package.
+- **Automatic song recognition** requires: (1) the song is in the music library;
+  (2) the fingerprint database has been built (see "7. Smart Matching").
+  Without them, "bind track manually + manual beat start" still works.
+- DXV inside cue sheets is **decoded in software** (GPU decode cannot report an
+  accurate position), so the first frame is slightly slower.
+
+[Troubleshooting]
+Q: Nothing shows after importing?
+A: (1) check that "Bind to" has a layer selected; (2) check the red area for
+   "missing media" and use "Set media folder…"; (3) if the song is not
+   recognized, press "Manual beat start".
+
+Q: The visuals always lag half a beat?
+A: (1) set "Seek profile" back to "Auto (per format)"; (2) for HEVC / long-GOP
+   media, see the first rule above.
+
+Q: After switching songs, the old cue sheet keeps playing?
+A: Cue sheets switch by recognized song; a switch needs **2 consecutive
+   confirmations** (~1 s) to avoid false switching. When the new song is not
+   recognized, the cue sheet is **unloaded** and normal auto scheduling resumes.
+
+────────────────────────────────────────
+17. Data Location
 ────────────────────────────────────────
 Config, thumbnail cache and the music fingerprint database live in:
     %LOCALAPPDATA%\AutoVJ\
