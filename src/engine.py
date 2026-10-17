@@ -3471,6 +3471,18 @@ class AutoVJEngine(QObject):
                 return d
 
         sid = _i(getattr(st, "recognized_song_id", -1), -1)
+        # ★★ 2026-10-17：`state.recognized_song_id` 会被**逐拍覆写**（换曲判定/异常路径都可能
+        #   让它短暂回 -1），而本函数是 0.2s 采样的旁路 ⇒ 采到 -1 就整拍不接管
+        #   （现场 `sheet=1 track=None rt=0`，本地已复现）。
+        #   电荷条引擎里的 `current_song_id` 才是**确认后稳定**的那个值 ⇒ 作为兜底。
+        if sid < 0:
+            _eng2 = getattr(getattr(self, "audio", None), "_recognizer_engine", None)
+            _cur2 = getattr(_eng2, "current_song_id", None)
+            if _cur2 is not None:
+                try:
+                    sid = int(_cur2)
+                except (TypeError, ValueError):
+                    sid = -1
         off = _f(getattr(st, "recognized_offset", -1.0), -1.0)
         votes = _i(getattr(st, "recognized_votes", 0), 0)
         rate = _f(getattr(st, "recognized_rate", 1.0), 1.0)
@@ -3528,6 +3540,15 @@ class AutoVJEngine(QObject):
         #     `_cue_bound_song_ids()` 随之变成新歌 ⇒ 守卫自动放行。
         #   ⚠ 集合为空（老码表没 fp_id、文件名也对不上）⇒ **不启用守卫**，
         #     退回到"照跟"的旧行为，绝不让护栏变成"永远不跟"的新故障。
+        # ★★ 2026-10-17（铁律 0）：**已认出歌但表/曲目仍未绑上** ⇒ 每 2s 重试一次。
+        #   一次绑定失败（包刚移动/索引未就绪/瞬时异常）不能永久停 —— 否则用户看到
+        #   `sheet=1 track=None rt=0` 一直不动，且没有任何日志。
+        if (song >= 0 and self._cue_rt is None and status != "lost"
+                and now >= float(getattr(self, "_cue_rebind_t", 0.0) or 0.0)):
+            self._cue_rebind_t = now + 2.0
+            _q2 = self._cue_track_query(path) if path else self._cue_track_query_by_sid(song)
+            if _q2:
+                self._cue_auto_bind(path, _q2)
         pb = self._cue_accept_pos(sid, pb)
         self._cue_diag(sid, votes, off, status, pb, now)
         if pb is not None:
