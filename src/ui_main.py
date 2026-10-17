@@ -2300,6 +2300,15 @@ class MainWindow(QMainWindow):
             self._build_hotkeys()
             self._load_settings_to_ui()
             self._init_recognizer()
+        # ★ 启动后**延迟**把上次绑定的码表重新装载回图层（不能在构造里做：load 要走 zip + 解包）。
+        #   ⚠ `is_cuesheet` / `cuesheet_id` 随图层持久化，但**表本身不持久化** ⇒ 不恢复的话，
+        #     重启后图层仍是"码表图层"却没有表（`_cue_sheet is None`）：既不出画，也没有任何
+        #     提示（`cue_health.log` 里 `sheet=0`）。用户会以为"码表丢了"。
+        try:
+            from PySide6.QtCore import QTimer as _QT
+            _QT.singleShot(300, self._restore_cue_sheets)
+        except Exception:                                        # noqa: BLE001
+            pass
 
         # 「开始自动VJ」未运行时慢速呼吸闪烁（一闪一闪；周期 2.2s，亮暗主题两套色）
         self._breath_t0 = time.perf_counter()
@@ -3958,6 +3967,54 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         return len(out)
+
+    def _restore_cue_sheets(self):
+        """启动 300ms 后：把 `cfg["cue"]["sheets"]` 里登记过、且图层仍记着 `cuesheet_id` 的表装载回去。
+
+        设计取舍：
+          · **只装表、不选曲目**（`track=None`）——曲目由认歌决定，那时会自动选；
+          · 表不在索引里 / 文件被移走 ⇒ 跳过并记一行，**绝不弹窗**（启动时打扰用户最讨厌）；
+          · 全程 try/except：一张表坏了不能影响别的图层，更不能影响启动。
+        """
+        try:
+            ents = []
+            try:
+                ents = list((self.cfg["cue"] or {}).get("sheets") or [])
+            except Exception:                                    # noqa: BLE001
+                ents = []
+            by_name = {}
+            for e in ents:
+                if isinstance(e, dict) and e.get("path"):
+                    by_name[os.path.basename(str(e["path"]))] = str(e["path"])
+            if not by_name:
+                return
+            try:
+                media_dir = str((self.cfg["cue"] or {}).get("media_dir") or "")
+            except Exception:                                    # noqa: BLE001
+                media_dir = ""
+            import cuesheet as _cs
+            n_ok = 0
+            for lay in (getattr(self.engine, "layers", None) or []):
+                if not getattr(lay, "is_cuesheet", False):
+                    continue
+                cid = str(getattr(lay, "cuesheet_id", "") or "").strip()
+                p = by_name.get(cid)
+                if not p or not os.path.isfile(p):
+                    if cid:
+                        print("[码表] 启动恢复跳过：%s（包不在索引/文件不存在）" % cid)
+                    continue
+                try:
+                    sheet, info = _cs.load(p, media_dir=media_dir or None)
+                    self.engine.set_cue_sheet(
+                        sheet, media_paths=info.get("present_media") or {},
+                        track=None, layer=lay, sheet_id=cid)
+                    n_ok += 1
+                except Exception as e:                            # noqa: BLE001
+                    print("[码表] 启动恢复失败：%s（%s: %s）" % (cid, type(e).__name__, e))
+            if n_ok:
+                print("[码表] 启动恢复 %d 张（等认歌后自动选曲目）" % n_ok)
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def _init_recognizer(self):
         """曲库就绪后启用现场识别：建指纹库 + song_id→meta 映射（无库则跳过）"""
