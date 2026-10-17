@@ -1247,6 +1247,15 @@ ZH2EN.update({
     "码表：{}（选择换表 /「（无码表）」卸下）":
         "Cue sheet: {} (pick another to change, or “(no cue sheet)” to unload)",
     "码表：{}（包：{}）": "Cue sheet: {} (package: {})",
+    # ==================== 码表详情：素材缩略图带（2026-10 新增）====================
+    "素材缩略图": "Clip thumbnails",
+    "素材缩略图（这张表没有用到素材）": "Clip thumbnails (this sheet uses no clips)",
+    "素材缩略图（{} 个素材 ｜ {} 张有图）":
+        "Clip thumbnails ({} clips, {} with a thumbnail)",
+    "无图": "No image",
+    "素材：{} ｜ 片段 ID：{}": "Clip: {} | Clip ID: {}",
+    "素材：{} ｜ 片段 ID：{}\n没有缩略图（老码表包可能不带 thumbs/）":
+        "Clip: {} | Clip ID: {}\nNo thumbnail (older packages may not include thumbs/)",
 })
 
 CATEGORY_EN = {

@@ -31,10 +31,12 @@ import os
 import time
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QDialogButtonBox, QFileDialog, QHBoxLayout,
                                QHeaderView, QLabel, QMenu, QMessageBox,
-                               QPushButton, QTableWidget, QTableWidgetItem,
+                               QPushButton, QScrollArea, QSizePolicy,
+                               QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
 import cuesheet
@@ -174,6 +176,183 @@ def sheet_label(entry):
 
 
 # ==========================================================================
+# 素材缩略图带（详情页用；零解码，只读已落盘的小 PNG）
+# ==========================================================================
+class SheetThumbStrip(QWidget):
+    """一条横向的素材缩略图带：**当前码表用到的**每个素材一格（等比缩放，不拉伸）。
+
+    数据来自 `cuesheet.load()` 解出的 `sheet.thumbs = {clip_id: png 绝对路径}`
+    （包内 `thumbs/<clip_id>.png`，长边 ≤256 的小图）。
+
+    三条硬约束（别改回去）
+    --------------------
+    1. **没有图就画占位**（灰底 +「无图」），不能留空洞 —— 老包整包都没有 `thumbs/`，
+       连占位都没有就变成"一条空白"，用户会以为界面坏了。
+    2. **主线程只读小 PNG**（`QPixmap(路径)`，毫秒级）。**绝不为了显示去解码视频**：
+       那会抢 GPU 解码器、卡住演出台。
+    3. **换表/删表/刷新必须先 `clear()`**（`set_sheet()` 内部已先清）：本项目反复出过
+       "上一张表的图还挂在上面"的残留 bug。
+    """
+
+    THUMB_W = 96            # 目标显示尺寸（等比缩放到这个框里，不拉伸）
+    THUMB_H = 54
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cells: list[QLabel] = []        # 每格一个 QLabel（有图 = pixmap，无图 = 文字占位）
+        self.clip_ids: list[str] = []        # 与 `cells` 一一对应
+        self._placeholder: list[bool] = []   # 与 `cells` 一一对应：True = 占位格
+        #: 当前码表用到的素材总数 / 其中有缩略图的数量（给外部断言与状态行用）
+        self.n_total = 0
+        self.n_with_thumb = 0
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._host = QWidget(self)
+        self._row = QHBoxLayout(self._host)
+        self._row.setContentsMargins(2, 2, 2, 2)
+        self._row.setSpacing(6)
+        self._row.addStretch(1)             # 格子插在 stretch 左边 ⇒ 左对齐、不铺满
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidget(self._host)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 只占一条的高度（横向滚动条 16 + 上下留白），不跟曲目表抢空间
+        self._scroll.setFixedHeight(self.THUMB_H + 20)
+        self._scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        outer.addWidget(self._scroll)
+
+    # ---------------- 查询 ----------------
+    def count(self):
+        """当前格子数（= 用到的素材数，含占位）。"""
+        return len(self.cells)
+
+    def placeholder_count(self):
+        """占位格数量（= 没有缩略图的素材数）。"""
+        return sum(1 for x in self._placeholder if x)
+
+    def pixmaps(self):
+        """各格的 `QPixmap`（占位格是空 QPixmap）；给自检断言"确实画出了图"。"""
+        out = []
+        for lb in self.cells:
+            try:
+                pm = lb.pixmap()
+            except Exception:                                    # noqa: BLE001
+                pm = None
+            out.append(pm if pm is not None else QPixmap())
+        return out
+
+    # ---------------- 构建 ----------------
+    def clear(self):
+        """清掉全部旧图控件（换表 / 删表 / 刷新前必调）。"""
+        for lb in self.cells:
+            try:
+                self._row.removeWidget(lb)
+                lb.setParent(None)
+                lb.deleteLater()
+            except Exception:                                    # noqa: BLE001
+                pass
+        self.cells = []
+        self.clip_ids = []
+        self._placeholder = []
+        self.n_total = 0
+        self.n_with_thumb = 0
+
+    def set_sheet(self, sheet):
+        """按码表重建整条带（`sheet=None` ⇒ 只剩空带）。返回格子数。"""
+        self.clear()
+        if sheet is None:
+            return 0
+        used = set()
+        try:
+            used = set(sheet.all_used_clip_ids() or set())
+        except Exception:                                        # noqa: BLE001
+            used = set()
+        for cid in self._ordered_clip_ids(sheet, used):
+            self._add_cell(sheet, cid)
+        self.n_total = len(self.cells)
+        self.n_with_thumb = self.n_total - self.placeholder_count()
+        return self.n_total
+
+    @staticmethod
+    def _ordered_clip_ids(sheet, used):
+        """用到的 clip_id 排序：先按素材清单顺序（用户视角最自然），再补漏网的。"""
+        order = []
+        for m in (getattr(sheet, "media", None) or []):
+            cid = str(getattr(m, "clip_id", "") or "")
+            if cid and cid in used and cid not in order:
+                order.append(cid)
+        for cid in sorted(c for c in used if c not in order):
+            order.append(cid)
+        return order
+
+    def _add_cell(self, sheet, clip_id):
+        """加一格：有缩略图 ⇒ 等比缩放后的图；没有 ⇒ 灰底「无图」占位。"""
+        name, path = self._clip_name_and_thumb(sheet, clip_id)
+        lb = QLabel(self._host)
+        lb.setFixedSize(self.THUMB_W, self.THUMB_H)
+        lb.setAlignment(Qt.AlignCenter)
+        lb.setScaledContents(False)          # ★ 关键：不拉伸，等比缩放（否则图会变形）
+        pm = self._load_pixmap(path)
+        if pm.isNull():
+            lb.setText(T("无图"))
+            lb.setStyleSheet("background:%s;color:%s;border:1px solid %s;"
+                             "font-size:11px;"
+                             % (_v("bg", "#1e1e1e"), _muted_color(),
+                                _v("border", "#3a3a3a")))
+            lb.setToolTip(Tf("素材：{} ｜ 片段 ID：{}\n没有缩略图（老码表包可能不带 thumbs/）",
+                             name or clip_id, clip_id))
+            self._placeholder.append(True)
+        else:
+            lb.setPixmap(pm.scaled(self.THUMB_W, self.THUMB_H,
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lb.setStyleSheet("background:%s;border:1px solid %s;"
+                             % (_v("panel", "#252525"), _v("border", "#3a3a3a")))
+            lb.setToolTip(Tf("素材：{} ｜ 片段 ID：{}", name or clip_id, clip_id))
+            self._placeholder.append(False)
+        self.cells.append(lb)
+        self.clip_ids.append(clip_id)
+        self._row.insertWidget(len(self.cells) - 1, lb)   # 插在 stretch 之前
+
+    @staticmethod
+    def _clip_name_and_thumb(sheet, clip_id):
+        """取 `(素材名, 缩略图路径)`；任何一步取不到都给安全默认值（"" / ""）。"""
+        name, path = "", ""
+        try:
+            fn = getattr(sheet, "thumb_path", None)
+            if callable(fn):
+                path = str(fn(clip_id) or "")
+        except Exception:                                        # noqa: BLE001
+            path = ""
+        try:
+            fn = getattr(sheet, "media_by_id", None)
+            m = fn(clip_id) if callable(fn) else None
+            name = str(getattr(m, "name", "") or "") if m is not None else ""
+        except Exception:                                        # noqa: BLE001
+            name = ""
+        return name, path
+
+    @staticmethod
+    def _load_pixmap(path):
+        """读**已落盘的小 PNG**（毫秒级）。文件不在 / 不是图 / 损坏 ⇒ 空 QPixmap。
+
+        ⚠ 只走 `QPixmap(路径)`（磁盘解码），**不碰视频解码器**。
+        """
+        p = str(path or "")
+        if not p or not os.path.isfile(p):
+            return QPixmap()
+        try:
+            pm = QPixmap(p)
+        except Exception:                                        # noqa: BLE001
+            return QPixmap()
+        return pm if pm is not None else QPixmap()
+
+
+# ==========================================================================
 # 「选一张表」——新建码表图层 / 右键绑到图层 共用
 # ==========================================================================
 def pick_sheet(owner, parent=None, prompt=""):
@@ -250,6 +429,12 @@ class CueSheetDetailDialog(I18nDialog):
         self.lbl_err.setStyleSheet("color:#c62828;")
         root.addWidget(self.lbl_err)
 
+        # ---- 素材缩略图（包内 `thumbs/<clip_id>.png`；老包没有 ⇒ 全占位，不报错）----
+        self.lbl_thumbs = QLabel(T("素材缩略图"))
+        root.addWidget(self.lbl_thumbs)
+        self.thumb_strip = SheetThumbStrip(self)
+        root.addWidget(self.thumb_strip)
+
         root.addWidget(QLabel(T("曲目（含 BPM 与每层片段数）")))
         self.tbl_tracks = QTableWidget(0, 6, self)
         self.tbl_tracks.setHorizontalHeaderLabels(
@@ -282,8 +467,39 @@ class CueSheetDetailDialog(I18nDialog):
         root.addWidget(bb)
 
     # ---------------- 填充 ----------------
+    def reload(self, path=None, entry=None):
+        """换一张表重读（换表 / 刷新用）：**先清旧图与旧表**，再整条重建。
+
+        返回新表的缩略图格子数。`path` 为空 ⇒ 重读当前路径（相当于"刷新这张表"）。
+        ⚠ 必须显式清：`tbl_tracks` / `tbl_media` 的 `setRowCount(0)` 与
+          `thumb_strip.clear()` 缺一不可，否则会残留上一张表的行与图。
+        """
+        if path:
+            self.path = os.path.abspath(str(path))
+        if entry is not None:
+            self.entry = dict(entry or {})
+            self.setWindowTitle(Tf("码表详情 — {}", sheet_label(self.entry)))
+            self.setProperty("_i18nDynamic", True)
+        self.sheet = None
+        self.err = ""
+        self.lbl_err.setText("")
+        self.lbl_head.setText("")
+        try:
+            self.tbl_tracks.setRowCount(0)
+            self.tbl_media.setRowCount(0)
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.thumb_strip.clear()
+        self.lbl_thumbs.setText(T("素材缩略图"))
+        self._load()
+        return self.thumb_strip.count()
+
     def _load(self):
         """全量读一次包（详情页允许慢一点：用户主动双击才会有这一步）。"""
+        # ★ 先清：任何一条失败分支都不许把上一张表的缩略图留在界面上
+        self.sheet = None
+        self.thumb_strip.clear()
+        self.lbl_thumbs.setText(T("素材缩略图"))
         if not os.path.isfile(self.path):
             self.err = Tf("文件不存在：{}", self.path)
             self._fill_head(0, 0)
@@ -305,8 +521,22 @@ class CueSheetDetailDialog(I18nDialog):
         self.err = "\n".join(warns)
         self._fill_head(int(getattr(self.sheet, "res_w", 0) or 0),
                         int(getattr(self.sheet, "res_h", 0) or 0))
+        self._fill_thumbs()
         self._fill_tracks()
         self._fill_media()
+
+    def _fill_thumbs(self):
+        """按 `sheet.thumbs` 重画缩略图带（`set_sheet` 内部已先 `clear()`）。"""
+        try:
+            n = self.thumb_strip.set_sheet(self.sheet)
+        except Exception:                                        # noqa: BLE001
+            self.thumb_strip.clear()
+            n = 0
+        if n <= 0:
+            self.lbl_thumbs.setText(T("素材缩略图（这张表没有用到素材）"))
+            return
+        n_with = int(getattr(self.thumb_strip, "n_with_thumb", 0) or 0)
+        self.lbl_thumbs.setText(Tf("素材缩略图（{} 个素材 ｜ {} 张有图）", n, n_with))
 
     def _fill_head(self, res_w, res_h):
         e = self.entry

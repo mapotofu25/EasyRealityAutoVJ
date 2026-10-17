@@ -9,7 +9,10 @@
   · **位置主坐标是"拍"**（`CueItem.at_beats`），`at_sec` 只是冗余备份。
     变速不改变拍/相位，只改变秒 —— 所以存拍天然免疫变速。
     ⇒ 演出端与位置源（指纹给的歌内秒 → 拍）**同一坐标系**，不再二次换算。
-  · **`.ercue` = zip 容器**：`cuesheet.json`（必需）+ `media/`（可选内嵌素材）+ `thumbs/`（可选，忽略）。
+  · **`.ercue` = zip 容器**：`cuesheet.json`（必需）+ `media/`（可选内嵌素材）
+    + `thumbs/`（可选缩略图，`thumbs/<clip_id>.png`，老包没有 ⇒ 当"无缩略图"）。
+    ⚠ `thumbs/` 是**向后兼容的可选新增**：缺它不报错、不影响导入与播放，
+      **不因此升 `FORMAT_VERSION`**（老演出端忽略它，新演出端没有它也能跑）。
   · **版本与能力分离**：
       `format_version`  文件结构版本，**只有结构变了才 +1**（可能一年一次）
       `min_app_version` 这张码表要求主程序 ≥ 某版本（由编辑器自动算）
@@ -360,6 +363,12 @@ class CueSheet:
     #   这是"画布/输出规格"，与几何变换（xform/crop）**正交**。
     res_w: int = DEFAULT_RES_W
     res_h: int = DEFAULT_RES_H
+    # ★ **运行期字段**（不写进 `cuesheet.json`、不参与序列化）：
+    #   `{clip_id: 缩略图绝对路径}`，由 `load()` 从包内 `thumbs/` 解出后填。
+    #   老包 / `meta_only=True` / 解压失败 ⇒ 恒为 `{}`（= "没有缩略图"，不是错误）。
+    #   ⚠ 必须是 dataclass 字段：`CueSheet` 是 dataclass，`setattr` 一个未声明的字段
+    #     会静默失败（或被 `__slots__` 拦下），下游就拿不到东西。
+    thumbs: dict = field(default_factory=dict)
 
     # ---- 便捷查询 ----
     def aspect(self):
@@ -374,6 +383,15 @@ class CueSheet:
             if isinstance(m, MediaRef) and m.clip_id == clip_id:
                 return m
         return None
+
+    def thumb_path(self, clip_id):
+        """该素材的缩略图绝对路径；**没有就返回 `""`**（老包 / 未解出 / 这张没图）。
+
+        ⚠ 返回 `""` 而不是 `None`：调用方一律"能拿到路径就显示，拿不到就画占位"，
+          不需要区分三种"没有"（`thumbs/` 缺失本来就是合法状态，不是错误）。
+        """
+        d = self.thumbs if isinstance(self.thumbs, dict) else {}
+        return str(d.get(str(clip_id or "")) or "")
 
     def track_by_identity(self, title="", artist="", duration_sec=0.0, fp_id=""):
         """旧接口（① 指纹 → ② meta_key 两级）。**新代码用 `match_track`。**"""
@@ -703,8 +721,11 @@ def load(path, media_dir=None, meta_only=False):
               "embedded": bool}
     **读失败抛 ValueError（调用方负责提示用户）；解析容错在 from_dict 里。**
 
-    `meta_only=True` ⇒ 只读表头（tracks + identity），**不做媒体检查**、不建 layers/items。
-      给"码表索引"用：只要"这张表覆盖哪几首歌"，不需要素材与片段。
+    `meta_only=True` ⇒ 只读表头（tracks + identity），**不做媒体检查**、不建 layers/items、
+      **不碰缩略图**（零增量 IO）。
+    `media_dir=None` ⇒ 用包内 `media/` 解出的 `<包路径>.media/`（原逻辑不变）。
+    包内 `thumbs/<clip_id>.png` ⇒ 幂等解到 `<包路径>.thumbs/` 并填 `sheet.thumbs`
+      （`{clip_id: 绝对路径}`；缺失/坏包/无权限 ⇒ `{}`，不报错、不阻断导入）。
     """
     if not path or not os.path.isfile(path):
         raise ValueError("找不到文件：%s" % path)
@@ -715,8 +736,18 @@ def load(path, media_dir=None, meta_only=False):
         raise ValueError("码表内容不是合法 JSON：%s" % e)
     sheet = from_dict(d, meta_only=meta_only)
     if meta_only:
+        # ★ 缩略图**完全不碰**：本路径要求零增量 IO（启动/索引都走它），
+        #   连 zip 名单都不再读一次；`sheet.thumbs` 保持 `{}`（= 没有缩略图）。
         return sheet, {"warnings": [], "missing_media": [], "present_media": {},
                        "embedded": bool(embed_dir and os.path.isdir(embed_dir))}
+    # ★ 可选：包内 `thumbs/<clip_id>.png` ⇒ `<包路径>.thumbs/`（幂等，见 extract_thumbs）。
+    #   任何异常（权限/坏包/磁盘满）都只意味着"没有缩略图"：`{}`，**绝不抛**。
+    #   ⚠ 只有 zip 包才有内嵌目录这一约定；裸 `cuesheet.json` ⇒ 无缩略图。
+    if embed_dir:
+        try:
+            sheet.thumbs = extract_thumbs(path, path + "." + THUMB_DIR) or {}
+        except Exception:                                        # noqa: BLE001
+            sheet.thumbs = {}
     md = media_dir if media_dir is not None else (
         embed_dir if embed_dir and os.path.isdir(embed_dir) else None)
     missing, present = check_media(sheet, md)
@@ -748,6 +779,99 @@ def extract_media(pkg_path, dest_dir):
                         break
                     f.write(b)
             out[base] = dst
+    return out
+
+
+#: 缩略图只接受这种扩展名（大小写不敏感）—— 包内混进 `a.jpg` 一律忽略
+_THUMB_EXT = ".png"
+
+
+def _thumb_member_stem(name):
+    """包成员名 → `clip_id`（合法）或 `None`（不安全/不是缩略图）。
+
+    只接受**一层**的 `thumbs/<clip_id>.png`：
+
+    * 拒绝 `..`（目录穿越）、绝对路径、反斜杠（Windows 分隔符）、盘符、
+      `/` 开头的名字 —— 这些是 zip-slip 的经典入口，绝不能写到包外；
+    * 拒绝子目录（`thumbs/x/y.png`）：`clip_id` 不含路径分隔符，多一层的包不是本格式；
+    * 只接受 `.png`（大小写不敏感）；空 stem 忽略。
+
+    ⚠ 这里只做**名字**层面的判断；落盘前还会再校验一次目标目录（双保险）。
+    """
+    if not isinstance(name, str) or not name.startswith(THUMB_DIR + "/"):
+        return None
+    if name.endswith("/"):                       # 目录项
+        return None
+    inner = name[len(THUMB_DIR) + 1:]
+    if not inner:
+        return None
+    # —— 安全检查（zip-slip）——
+    if ".." in inner or "\\" in inner or ":" in inner:
+        return None
+    if inner.startswith("/") or inner.startswith(".\\"):
+        return None
+    if "/" in inner:                             # 只允许一层
+        return None
+    stem, ext = os.path.splitext(inner)
+    if ext.lower() != _THUMB_EXT or not stem:
+        return None
+    return stem
+
+
+def _same_size(path, size):
+    """`path` 存在且大小等于 `size` ⇒ True（幂等判据；取不到就当 False）。"""
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) == int(size)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def extract_thumbs(pkg_path, dest_dir):
+    """把包内 `thumbs/<clip_id>.png` 解到 `dest_dir`，返回 `{clip_id: 绝对路径}`。
+
+    ★ **幂等**：目标文件已存在且**大小与包内一致** ⇒ 跳过（不读数据、不写盘、
+      mtime 不变）。判据用 `ZipInfo.file_size`，所以"跳过"是真的不 `z.open()`。
+      （与 `extract_media` 的"调用方保证幂等"不同：缩略图是**每次 `load()` 都会走**
+      的路径，必须自带幂等，否则每次双击详情都要重解压一遍。）
+    ★ **安全**：成员名先过 `_thumb_member_stem`（拒绝 `..` / 绝对路径 / 反斜杠 /
+      子目录 / 非 `.png`），落盘前再断言目标就在 `dest_dir` 里。
+    ★ **不抛**：任何单个成员写失败（无权限/磁盘满）只跳过它，不影响其余与调用方。
+    ★ 包里**没有**任何缩略图 ⇒ 连 `dest_dir` 都不创建，返回 `{}`（老包不留垃圾目录）。
+    """
+    out = {}
+    if not pkg_path or not os.path.isfile(pkg_path) or not zipfile.is_zipfile(pkg_path):
+        return out
+    root = os.path.abspath(dest_dir)
+    try:
+        with zipfile.ZipFile(pkg_path) as z:
+            members = []
+            for zi in z.infolist():
+                stem = _thumb_member_stem(zi.filename)
+                if stem:
+                    members.append((zi, stem))
+            if not members:
+                return out
+            os.makedirs(root, exist_ok=True)
+            for zi, stem in members:
+                dst = os.path.join(root, stem + _THUMB_EXT)
+                # —— 双保险：拼出来的路径必须**正好**在 root 下 ——
+                if os.path.dirname(os.path.abspath(dst)) != root:
+                    continue
+                if _same_size(dst, zi.file_size):
+                    out[stem] = dst                 # 已解过 ⇒ 真跳过（不读不写）
+                    continue
+                try:
+                    with z.open(zi) as src, open(dst, "wb") as f:
+                        while True:
+                            b = src.read(1 << 20)
+                            if not b:
+                                break
+                            f.write(b)
+                except (OSError, zipfile.BadZipFile, RuntimeError):
+                    continue                        # 单个坏成员不拖垮整张表
+                out[stem] = dst
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return out
     return out
 
 
