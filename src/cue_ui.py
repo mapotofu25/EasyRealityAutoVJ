@@ -39,21 +39,13 @@ RECENT_MAX = 10
 # 配置辅助
 # ==========================================================================
 def cue_cfg(cfg):
-    """取（并在缺失时初始化）`cfg["cue"]` 段。**未知键无害**，旧 cfg 直接可用。"""
-    try:
-        cur = cfg["cue"]
-    except Exception:                                            # noqa: BLE001
-        cur = None
-    if not isinstance(cur, dict):
-        cur = {}
-        try:
-            cfg["cue"] = cur
-        except Exception:                                        # noqa: BLE001
-            pass
-    for k, v in CUE_CFG_DEFAULTS.items():
-        if k not in cur:
-            cur[k] = list(v) if isinstance(v, list) else v
-    return cur
+    """取（并在缺失时初始化）`cfg["cue"]` 段。
+
+    ★ 实现委托 `cue_index.cue_cfg()`：`recent/media_dir/seek_profile/sheets` 的默认值
+      **只有一处**，避免两个模块各写一份 defaults 然后慢慢分叉。
+    """
+    import cue_index
+    return cue_index.cue_cfg(cfg)
 
 
 def add_recent(cfg, path):
@@ -251,7 +243,8 @@ class CueSheetDialog(QDialog):
                    if idn is not None else "**未绑定**（不接管）",
                    ("%g" % bpm) if bpm > 0 else "无（退化 1 拍=1 秒）",
                    int(st.get("rt_items", 0) or 0),
-                   "、".join(st.get("bound_layers") or []) or "无"))
+                   "、".join(st.get("bound_layers") or []) or "无")
+                + ("　｜　覆盖 %d 首" % self._cover_count() if self._cover_count() else ""))
         err = []
         if self.warnings:
             err.extend(self.warnings)
@@ -267,6 +260,21 @@ class CueSheetDialog(QDialog):
             self.lbl_clock.setText("拍位 %.2f（%.2fs @ %s BPM）"
                                    % (pos, pos * bl,
                                       ("%g" % (60.0 / bl)) if bl > 0 else "退化"))
+
+    def _cover_count(self):
+        """当前包在索引里覆盖多少首曲目（多曲目码表一眼可见）。"""
+        try:
+            idx = self.engine.cue_index() if callable(getattr(self.engine,
+                                                              "cue_index", None)) else None
+            if idx is None:
+                return 0
+            p = os.path.abspath(self.pkg) if self.pkg else ""
+            for e in idx.entries:
+                if e.get("path") == p:
+                    return int(e.get("n_tracks", 0) or 0)
+        except Exception:                                        # noqa: BLE001
+            pass
+        return 0
 
     def _fill_layers(self):
         cur = self.cmb_layer.currentIndex()
@@ -384,6 +392,15 @@ class CueSheetDialog(QDialog):
         if self.cfg is not None:
             add_recent(self.cfg, self.pkg)
             self._load_recent()
+        # ★ 建索引（只存摘要）：让引擎能回答"这首歌有哪些码表可用"（Step2/Step3 用）
+        try:
+            idx = self.engine.cue_index() if callable(getattr(self.engine,
+                                                              "cue_index", None)) else None
+            if idx is not None:
+                idx.add(self.pkg)
+                idx.save_cfg(self.cfg)
+        except Exception:                                        # noqa: BLE001
+            pass
         if self.chk_enable.isChecked():
             self._enable(True)
         self.refresh()

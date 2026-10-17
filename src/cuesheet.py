@@ -541,8 +541,11 @@ def to_dict(sheet):
     }
 
 
-def from_dict(d):
+def from_dict(d, meta_only=False):
     """容错解析：字段缺失/类型不对一律回落默认值，**绝不抛异常**（导入必须不崩）。
+
+    `meta_only=True`：**只建 tracks（含 identity），跳过 media / layers / items**。
+      给"码表索引"用（启动/扫描只要"这张表覆盖哪几首歌"），实测能省掉绝大部分构造成本。
 
     ★ **信任 `at_beats`（主坐标），忽略文件里的 `at_sec`（冗余）**，与 Cue 端一致：
       `at_sec` 由 `beats_to_sec(at_beats, bpm)` 重算。
@@ -564,7 +567,7 @@ def from_dict(d):
     s.res_w = _i(d.get("res_w"), DEFAULT_RES_W)
     s.res_h = _i(d.get("res_h"), DEFAULT_RES_H)
 
-    for m in _as_list(d.get("media")):
+    for m in ([] if meta_only else _as_list(d.get("media"))):
         if not isinstance(m, dict) or not m.get("clip_id"):
             continue
         s.media.append(MediaRef(
@@ -588,6 +591,9 @@ def from_dict(d):
                 key=str(ident.get("key") or ""), file_name=str(ident.get("file_name") or ""))
         te.identity.ensure_meta_id()
         bpm = te.bpm
+        if meta_only:
+            s.tracks.append(te)          # 只要 identity，不建 layers/items
+            continue
         comp = t.get("composition") or {}
         layers = comp.get("layers") if isinstance(comp, dict) else None
         for lyd in _as_list(layers):
@@ -689,13 +695,16 @@ def _read_json_text(path):
         return f.read(), None
 
 
-def load(path, media_dir=None):
+def load(path, media_dir=None, meta_only=False):
     """读 `.ercue`（也接受裸 `cuesheet.json`）。
 
     返回 (sheet, info)：
       info = {"warnings": [...], "missing_media": [...], "present_media": {clip_id: path},
               "embedded": bool}
     **读失败抛 ValueError（调用方负责提示用户）；解析容错在 from_dict 里。**
+
+    `meta_only=True` ⇒ 只读表头（tracks + identity），**不做媒体检查**、不建 layers/items。
+      给"码表索引"用：只要"这张表覆盖哪几首歌"，不需要素材与片段。
     """
     if not path or not os.path.isfile(path):
         raise ValueError("找不到文件：%s" % path)
@@ -704,7 +713,10 @@ def load(path, media_dir=None):
         d = json.loads(raw)
     except Exception as e:                                       # noqa: BLE001
         raise ValueError("码表内容不是合法 JSON：%s" % e)
-    sheet = from_dict(d)
+    sheet = from_dict(d, meta_only=meta_only)
+    if meta_only:
+        return sheet, {"warnings": [], "missing_media": [], "present_media": {},
+                       "embedded": bool(embed_dir and os.path.isdir(embed_dir))}
     md = media_dir if media_dir is not None else (
         embed_dir if embed_dir and os.path.isdir(embed_dir) else None)
     missing, present = check_media(sheet, md)

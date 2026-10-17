@@ -610,6 +610,7 @@ class AutoVJEngine(QObject):
         self._cue_sid = -1          # 当前曲目 sid（换歌要重建 runtime）
         self._cue_jumped = False    # 本帧是否发生跳变重算
         self._cue_closed_last = 0   # 上次 clear 关掉的解码器数（自检/排障用）
+        self._cue_index = None      # 码表索引（曲目→码表；**只存摘要**，见 src/cue_index.py）
         _cue_cfg = (self.cfg.get("cue") if isinstance(self.cfg, dict) else None) or {}
         # ★ 所有「该不该 seek / 阈值 / 落地 / 计速」的判断都在这个对象里（见 cue_seek_policy）
         self._cue_policy = CueSeekPolicy(cfg=_cue_cfg)
@@ -2816,6 +2817,38 @@ class AutoVJEngine(QObject):
             "active_layers": [l.name for l in lays if getattr(l, "cs_active", False)],
             "closed_last": int(getattr(self, "_cue_closed_last", 0) or 0),
         }
+
+    def cue_index(self, refresh=False):
+        """取码表索引（惰性建；`refresh=True` 时按 mtime/size 重读变了的包）。
+
+        **启动路径只调 `load_cfg()`**（纯内存、零 IO）⇒ 不加载整张表。
+        """
+        from cue_index import CueIndex
+        if getattr(self, "_cue_index", None) is None:
+            self._cue_index = CueIndex()
+            self._cue_index.load_cfg(self.cfg)
+        if refresh:
+            self._cue_index.rescan()
+        return self._cue_index
+
+    def cue_index_refresh(self):
+        """重读表头 + 落盘（导入/删包后调用）。返回索引。"""
+        idx = self.cue_index(refresh=True)
+        idx.save_cfg(self.cfg)
+        return idx
+
+    def cue_sheets_for_track(self, title="", artist="", duration_sec=0.0, fp_id="",
+                             file_name="", file_md5=""):
+        """**这首歌能用哪些码表** → `[(摘要, 命中级别)]`（按可靠性排序）。
+
+        ★ 命中判定复用 `CueSheet.match_track()`（五级链），这里只汇总，不重造匹配。
+        """
+        try:
+            return self.cue_index().match(title=title, artist=artist,
+                                          duration_sec=duration_sec, fp_id=fp_id,
+                                          file_name=file_name, file_md5=file_md5)
+        except Exception:                                        # noqa: BLE001
+            return []
 
     def cuesheet_wanted(self):
         """是否**有可见的码表图层**在等位置数据（小眼睛关掉 ⇒ 完全不检测）。"""
