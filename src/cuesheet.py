@@ -565,8 +565,10 @@ def from_dict(d, meta_only=False):
     `meta_only=True`：**只建 tracks（含 identity），跳过 media / layers / items**。
       给"码表索引"用（启动/扫描只要"这张表覆盖哪几首歌"），实测能省掉绝大部分构造成本。
 
-    ★ **信任 `at_beats`（主坐标），忽略文件里的 `at_sec`（冗余）**，与 Cue 端一致：
-      `at_sec` 由 `beats_to_sec(at_beats, bpm)` 重算。
+    ★ **时间以「秒」为权威**：文件里同时写了 `at_sec`（编排端模型的原生坐标）与
+      `at_beats`（按 bpm 换算的拍），这里**优先 `at_sec`**、`at_beats` 由它反推 ——
+      这样"什么时候触发"只取决于指纹算出的秒数，**与 bpm 无关**（bpm 在比较时结构性抵消）。
+      老包没有 `at_sec` 键 ⇒ 回落 `at_beats`（逐值不变）。
     """
     s = CueSheet()
     if not isinstance(d, dict):
@@ -623,14 +625,40 @@ def from_dict(d, meta_only=False):
             for itd in _as_list(lyd.get("items")):
                 if not isinstance(itd, dict):
                     continue
-                at_beats = _f(itd.get("at_beats"))
+                # ★★★ 2026-10-17：**时间以「秒」为权威**（= 指纹对齐的坐标系），拍是派生量。
+                #
+                # 为什么改（用户追问「不能按指纹对齐吗」）：
+                #   演出端的位置来自**指纹算出的原曲秒数**（`offset_sec`），拍位只是把它除以
+                #   `beat_len`（= 码表自己的 60/bpm）。所以只要 `at_beats` 也由**同一份秒**
+                #   按同一个 bpm 换算出来，比较时 bpm 会**结构性抵消**：
+                #       at_beats <= pos_beats   ⟺   at_sec <= offset_sec
+                #   ⇒ BPM 填错、留空、手改 `.ercue` 里的 bpm，都影响不到"什么时候触发"。
+                #
+                # 旧写法把 `at_beats` 当权威、按 bpm 反算秒 ⇒ 一旦 bpm 与写文件时用的不一致
+                # （改过 bpm / 第三方工具生成 / 手改），整张表的**秒坐标**就会整体缩放。
+                #   而编排端的模型内部本来就是秒（`CueItem.at_sec` 权威），文件里 `at_sec`
+                #   是它**原样写出来的**、没有换算误差 ⇒ 用它才是最忠实的。
+                #
+                # 兼容：老包/手写包没有 `at_sec` 键 ⇒ 回落 `at_beats` 换算（行为与改动前逐值一致）。
+                #   ⚠ 判"有没有"必须看**键**而不是值：`at_sec == 0.0` 是合法的（片段在 0 秒）。
+                if "at_sec" in itd:
+                    at_sec = max(0.0, _f(itd.get("at_sec")))
+                    at_beats = sec_to_beats(at_sec, bpm)
+                else:
+                    at_beats = _f(itd.get("at_beats"))
+                    at_sec = beats_to_sec(at_beats, bpm)
+                if "end_sec" in itd:
+                    _es = itd.get("end_sec")
+                    end_beats = (None if _es is None
+                                 else sec_to_beats(max(at_sec, _f(_es)), bpm))
+                else:
+                    end_beats = (None if itd.get("end_beats") is None
+                                 else _f(itd.get("end_beats")))
                 ly.items.append(CueItem(
                     item_id=str(itd.get("item_id") or ""), clip_id=str(itd.get("clip_id") or ""),
                     at_beats=at_beats,
-                    # 冗余字段按主坐标重算（Cue 端同样"信任 at_beats、不信任 at_sec"）
-                    at_sec=beats_to_sec(at_beats, bpm),
-                    end_beats=(None if itd.get("end_beats") is None
-                               else _f(itd.get("end_beats"))),
+                    at_sec=at_sec,
+                    end_beats=end_beats,
                     src_in_sec=_f(itd.get("src_in_sec")),
                     src_out_sec=(None if itd.get("src_out_sec") is None
                                  else _f(itd.get("src_out_sec"))),
