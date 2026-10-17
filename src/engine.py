@@ -11,6 +11,7 @@
 段落标签/能量趋势/人声占比 每秒打分，选最高分模式；手动模式可强制固定。
 """
 import collections
+import hashlib
 import math
 import os
 import random
@@ -2866,25 +2867,49 @@ class AutoVJEngine(QObject):
             self._cue_pos_tracker.reset()
         return self._cue_manual_clock
 
-    def _cue_song_path(self, song_id):
-        """`song_id` → 曲子路径（尽力而为；取不到返回 ""）。
+    @staticmethod
+    def _cue_song_id_of(path):
+        """路径 → 指纹库 id。**与 `ui_main` 建库处同一算法**：
+        `int(hashlib.md5(path.encode("utf-8")).hexdigest()[:8], 16)`。
 
-        约定：`fp_db.add_song(song_id, …)` 里的 song_id 由调用方给。这里兼容两种：
-          · 整数索引 ⇒ 查 `cfg["music_library"]` 列表；
-          · 字符串路径 ⇒ 直接用。
+        ⚠ 这条曾差点写错：我最初按"整数索引查 `music_library`"实现，而现场是**路径哈希**
+          ⇒ 真机上会"永远查不到歌"。已按建库处对齐（`ui_main.py:1791`）。
+          如果哪天建库算法变了，这里必须同步改（否则认歌链路静默失效）。
         """
         try:
-            if isinstance(song_id, str) and song_id:
-                return song_id
-            # ⚠ 不要加 `if isinstance(self.cfg, dict)` 这类前置判断：Config 是**包装对象**，
-            #   不是 dict ⇒ 那个判断会把正常配置也挡掉（表现为"永远查不到歌"）。
-            lib = self.cfg["music_library"]
-            i = int(song_id)
-            if isinstance(lib, (list, tuple)) and 0 <= i < len(lib):
-                return str(lib[i])
+            return int(hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8], 16)
         except Exception:                                        # noqa: BLE001
-            pass
-        return ""
+            return -1
+
+    def _cue_id_map(self):
+        """`song_id` → 路径 映射（按 `cfg["music_library"]` 现算；库变了自动重建）。"""
+        try:
+            lib = tuple(self.cfg["music_library"] or [])
+        except Exception:                                        # noqa: BLE001
+            lib = ()
+        cached = getattr(self, "_cue_id_cache", None)
+        if cached is not None and cached[0] == lib:
+            return cached[1]
+        m = {}
+        for p in lib:
+            sid = self._cue_song_id_of(p)
+            if sid >= 0:
+                m[sid] = str(p)
+        self._cue_id_cache = (lib, m)
+        return m
+
+    def _cue_song_path(self, song_id):
+        """`song_id` → 曲子路径（取不到返回 ""）。
+
+        现场约定（已核对 `ui_main.py:1791`）：`song_id = int(md5(path)[:8], 16)`。
+        额外兼容"直接给路径字符串"的调用方（便于测试/嵌入）。
+        """
+        if isinstance(song_id, str) and song_id:
+            return song_id
+        try:
+            return self._cue_id_map().get(int(song_id), "")
+        except Exception:                                        # noqa: BLE001
+            return ""
 
     def _cue_track_query(self, path):
         """由曲子路径拼"认歌查询参数"（有 meta 用 meta，没有就退化到文件名级）。"""
@@ -3064,6 +3089,28 @@ class AutoVJEngine(QObject):
             if getattr(lay, "is_cuesheet", False) and getattr(lay, "cs_active", False):
                 return 1.0
         return 0.0
+
+    def set_cue_seek_profile(self, name):
+        """设置「定位档位」：`auto` / `conservative` / `off`（立即生效，并落盘）。
+
+        · `conservative`：**只入场 + 预热**，不做运行中漂移校正 ⇒ seek 次数显著减少（抖动更少）；
+        · `off`：完全不 seek（现场排障用）。
+        """
+        n = str(name or "auto")
+        if n not in ("auto", "conservative", "off"):
+            n = "auto"
+        try:
+            self.cfg["cue"]["seek_profile"] = n
+            self.cfg.save()
+        except Exception:                                        # noqa: BLE001
+            pass
+        pol = getattr(self, "_cue_policy", None)
+        if pol is not None:
+            try:
+                pol.cfg["seek_profile"] = n
+            except Exception:                                    # noqa: BLE001
+                pass
+        return n
 
     def set_cue_position(self, pos_beats, src="manual"):
         """喂入本帧的**码内拍位**（Step3 的指纹定位会把结果写到这里）。

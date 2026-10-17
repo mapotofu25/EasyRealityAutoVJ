@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import sys
 import tempfile
@@ -201,6 +202,12 @@ def main():
             os.path.join(media, "b.mp4"): {"title": "SongB", "artist": "ArtistB",
                                            "duration": 180.0, "md5": "md5B", "bpm": BPM},
         }
+        # ★ 现场约定（已核对 ui_main.py:1791）：song_id = int(md5(path)[:8], 16)
+        pathA = os.path.join(media, "a.mp4")
+        pathB = os.path.join(media, "b.mp4")
+        SID_A = int(hashlib.md5(pathA.encode("utf-8")).hexdigest()[:8], 16)
+        SID_B = int(hashlib.md5(pathB.encode("utf-8")).hexdigest()[:8], 16)
+        print("      真实 song_id：A=%d  B=%d（md5 路径哈希）" % (SID_A, SID_B))
         lay = engine.Layer("码表层")
         lay.is_cuesheet = True
         eng = new_engine(cfg, [lay], images)
@@ -209,10 +216,21 @@ def main():
         idx.add(pkgB)
         idx.save_cfg(cfg)
 
+        # ---------------- ⓪ song_id 方案对齐（真机能否跑通的关键）----------------
+        print("⓪ song_id 约定：必须与建库处同算法（md5(path)[:8]）")
+        check("A 的 id 能解析回 A 的路径", eng._cue_song_path(SID_A) == pathA,
+              eng._cue_song_path(SID_A))
+        check("B 的 id 能解析回 B 的路径", eng._cue_song_path(SID_B) == pathB,
+              eng._cue_song_path(SID_B))
+        check("字符串路径原样可用（兼容测试/嵌入）", eng._cue_song_path(pathA) == pathA)
+        check("**库索引不再被当成 id**（0/1 解析不出东西，避免静默错配）",
+              eng._cue_song_path(0) == "" and eng._cue_song_path(1) == "",
+              (eng._cue_song_path(0), eng._cue_song_path(1)))
+
         # ---------------- ① 自动跟拍：3 个采样点 ----------------
         print("① 自动跟拍（模拟指纹 0.5s 一次）：3 个采样点偏差 ≤ 0.5 拍")
         st = eng.audio.state
-        st.recognized_song_id, st.recognized_votes, st.recognized_rate = 0, 5, 1.0
+        st.recognized_song_id, st.recognized_votes, st.recognized_rate = SID_A, 5, 1.0
         samples = []
         for i, off in enumerate((10.0, 12.0, 14.0)):
             st.recognized_offset = off
@@ -283,13 +301,13 @@ def main():
 
         # ---------------- ③ 切歌 A→B ----------------
         print("\n③ 切歌：A→B（B 有表 ⇒ 换表）")
-        st.recognized_song_id, st.recognized_votes, st.recognized_offset = 0, 5, 5.0
+        st.recognized_song_id, st.recognized_votes, st.recognized_offset = SID_A, 5, 5.0
         hold(eng, 0)
         eng._cuesheet_tick()
         sheetA = eng.cuesheet_status()["title"]
         autoA = os.path.basename(eng._cue_auto_sheet or "")
         # 切到 B：需要连续 2 次确认（CONFIRM_N=2）
-        st.recognized_song_id, st.recognized_offset = 1, 7.0
+        st.recognized_song_id, st.recognized_offset = SID_B, 7.0
         hold(eng, 0)
         mid = eng.cuesheet_status()["title"]
         hold(eng, 0)

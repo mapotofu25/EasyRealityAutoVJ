@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QPushButton, QVBoxLayout, QWidget)
 
 import cuesheet
+from i18n import T, lang as i18n_lang
 
 CUE_CFG_DEFAULTS = {
     "recent": [],            # 最近打开的包（最多 10 条，最新在前）
@@ -158,46 +159,46 @@ class CueSheetDialog(QDialog):
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        self.setWindowTitle("码表（演出端）")
+        self.setWindowTitle(T("码表（演出端）"))
         self.setMinimumWidth(620)
         root = QVBoxLayout(self)
 
         row1 = QHBoxLayout()
-        self.btn_import = QPushButton("导入 .ercue…", self)
+        self.btn_import = QPushButton(T("导入 .ercue…"), self)
         self.btn_import.clicked.connect(self.on_import_clicked)
         row1.addWidget(self.btn_import)
-        self.btn_media = QPushButton("指定素材目录…", self)
+        self.btn_media = QPushButton(T("指定素材目录…"), self)
         self.btn_media.clicked.connect(self.on_pick_media_dir)
         row1.addWidget(self.btn_media)
         row1.addStretch(1)
         root.addLayout(row1)
 
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("最近："))
+        row2.addWidget(QLabel(T("最近：")))
         self.cmb_recent = QComboBox(self)
         self.cmb_recent.setMinimumWidth(420)
         row2.addWidget(self.cmb_recent, 1)
-        self.btn_open_recent = QPushButton("打开", self)
+        self.btn_open_recent = QPushButton(T("打开"), self)
         self.btn_open_recent.clicked.connect(self.on_open_recent)
         row2.addWidget(self.btn_open_recent)
         root.addLayout(row2)
 
         row3 = QHBoxLayout()
-        row3.addWidget(QLabel("绑定到："))
+        row3.addWidget(QLabel(T("绑定到：")))
         self.cmb_layer = QComboBox(self)
         self.cmb_layer.setMinimumWidth(240)
         row3.addWidget(self.cmb_layer, 1)
-        self.chk_enable = QCheckBox("启用（接管画面）", self)
+        self.chk_enable = QCheckBox(T("启用（接管画面）"), self)
         self.chk_enable.setChecked(True)
         self.chk_enable.toggled.connect(self.on_toggle_enable)
         row3.addWidget(self.chk_enable)
-        self.btn_uninstall = QPushButton("卸下", self)
+        self.btn_uninstall = QPushButton(T("卸下"), self)
         self.btn_uninstall.clicked.connect(self.on_uninstall)
         row3.addWidget(self.btn_uninstall)
         root.addLayout(row3)
 
         row4 = QHBoxLayout()
-        self.btn_clock = QPushButton("手动起拍（临时位置源）", self)
+        self.btn_clock = QPushButton(T("手动起拍（临时位置源）"), self)
         self.btn_clock.setCheckable(True)
         self.btn_clock.setToolTip("Step3（指纹认歌）落地前用它验跟拍：按下即认为"
                                   "「这首歌从 0:00 开始」，按挂钟喂拍位。")
@@ -207,7 +208,31 @@ class CueSheetDialog(QDialog):
         row4.addWidget(self.lbl_clock, 1)
         root.addLayout(row4)
 
-        self.lbl_status = QLabel("（未装载码表）", self)
+        # ---- 高级：定位档位（seek 频率）与"清空最近" ----
+        from PySide6.QtWidgets import QGroupBox
+        adv = QGroupBox(T("高级"), self)
+        al = QHBoxLayout(adv)
+        al.addWidget(QLabel(T("定位档位（seek 频率）"), adv))
+        self.cmb_profile = QComboBox(adv)
+        for label, val in ((T("自动（按格式）"), "auto"),
+                           (T("保守（只入场，最省）"), "conservative"),
+                           (T("关闭（完全不 seek）"), "off")):
+            self.cmb_profile.addItem(label, val)
+        try:
+            cur = str((cue_cfg(self.cfg) or {}).get("seek_profile") or "auto")
+            i = max(0, [self.cmb_profile.itemData(k) for k in range(self.cmb_profile.count())]
+                    .index(cur))
+            self.cmb_profile.setCurrentIndex(i)
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.cmb_profile.currentIndexChanged.connect(self.on_profile_changed)
+        al.addWidget(self.cmb_profile, 1)
+        self.btn_clear_recent = QPushButton(T("清空最近文件"), adv)
+        self.btn_clear_recent.clicked.connect(self.on_clear_recent)
+        al.addWidget(self.btn_clear_recent)
+        root.addWidget(adv)
+
+        self.lbl_status = QLabel(T("（未装载码表）"), self)
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         root.addWidget(self.lbl_status)
@@ -222,6 +247,27 @@ class CueSheetDialog(QDialog):
         bb.clicked.connect(lambda _b: self.close())
         root.addWidget(bb)
 
+    def on_profile_changed(self, _idx=0):
+        """定位档位：立即生效（写 cfg + 改 policy），并在状态里提示一下。"""
+        val = self.cmb_profile.currentData() or "auto"
+        try:
+            fn = getattr(self.engine, "set_cue_seek_profile", None)
+            if callable(fn):
+                fn(val)
+            else:
+                cue_cfg(self.cfg)["seek_profile"] = val
+                self.cfg.save()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def on_clear_recent(self):
+        try:
+            cue_cfg(self.cfg)["recent"] = []
+            self.cfg.save()
+        except Exception:                                        # noqa: BLE001
+            pass
+        self._load_recent()
+
     # ---------------- 状态显示 ----------------
     def refresh(self):
         self._fill_layers()
@@ -231,7 +277,7 @@ class CueSheetDialog(QDialog):
         except Exception:                                        # noqa: BLE001
             st = {}
         if not st.get("loaded"):
-            self.lbl_status.setText("（未装载码表）")
+            self.lbl_status.setText(T("（未装载码表）"))
         else:
             idn = getattr(self.track, "identity", None) if self.track is not None else None
             bpm = float(getattr(idn, "bpm", 0.0) or 0.0) if idn is not None else 0.0

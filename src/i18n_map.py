@@ -1062,6 +1062,33 @@ def _inject_tag_labels():
         ZH2EN.setdefault(zh, en)
 
 
+# ---------------- 码表（演出端）对话框 ----------------
+ZH2EN.update({
+    "码表（演出端）…": "Cue Sheet (Show)…",
+    "码表（演出端）": "Cue Sheet (Show)",
+    "导入 .ercue…": "Import .ercue…",
+    "指定素材目录…": "Set media folder…",
+    "最近：": "Recent:",
+    "打开": "Open",
+    "绑定到：": "Bind to:",
+    "启用（接管画面）": "Enable (take over)",
+    "卸下": "Unload",
+    "手动起拍（临时位置源）": "Manual beat start (temp position source)",
+    "高级": "Advanced",
+    "定位档位（seek 频率）": "Seek profile (seek frequency)",
+    "自动（按格式）": "Auto (per format)",
+    "保守（只入场，最省）": "Conservative (entry only)",
+    "关闭（完全不 seek）": "Off (no seek)",
+    "清空最近文件": "Clear recent files",
+    "选择要绑定的曲目": "Choose a track to bind",
+    "这个图层用哪张码表": "Which cue sheet for this layer",
+    "换表 / 导入码表…": "Change / import cue sheet…",
+    "从这个图层卸下码表": "Unload cue sheet from this layer",
+    "关闭": "Close",
+    "（未装载码表）": "(no cue sheet loaded)",
+    "码表：这个图层由码表接管（点开可换表 / 卸下）": "Cue sheet: this layer is driven by a cue sheet (click to change/unload)",
+})
+
 CATEGORY_EN = {
     "颜色": "Color",
     "元素特效": "Effects",
