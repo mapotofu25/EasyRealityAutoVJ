@@ -1204,6 +1204,7 @@ ZH2EN.update({
         "After you confirm, you'll pick which cue sheet to apply — if you haven't "
         "imported one yet,\nuse “Add…” on the “Cue Sheets” tab first.",
     "（无码表）": "(no cue sheet)",
+    "（已绑定的码表）": "(bound cue sheet)",
     "导入新码表…": "Import new cue sheet…",
     "码表：（无码表）—— 选一张表让本图层由码表接管":
         "Cue sheet: (none) — pick one to let this layer be driven by it",

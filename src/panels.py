@@ -2758,7 +2758,9 @@ class LayerStackPanel(QWidget):
                 label_fn = cue_page.sheet_label
             except Exception:                                    # noqa: BLE001
                 entries = []
-            cur = str(getattr(lay, "cuesheet_id", "") or "")
+            # ⚠ strip：`cuesheet_id` 只有空白 = 脏数据 ⇒ 当成"没绑"（「（无码表）」），
+            #   绝不能让空白看起来像"绑了一张名字空白的表"
+            cur = str(getattr(lay, "cuesheet_id", "") or "").strip()
             sel = 0
             found = False
             for e in entries:
@@ -2772,10 +2774,18 @@ class LayerStackPanel(QWidget):
             # 绑着一张**不在索引里**的表（比如被手动移出列表 / 索引没建）⇒ 也要如实显示，
             # 不能假装"（无码表）"（否则用户看到的绑定状态是假的）
             if cur and not found:
-                cmb.addItem(os.path.splitext(os.path.basename(cur))[0] or cur, "__bound__")
+                # ⚠ 表名兜底链：去扩展名 → 原文件名 → 原字符串 →「（已绑定的码表）」
+                #   **绝不允许下拉出现空文本**（空文本会被读成"没绑"，与「（无码表）」混淆）
+                label = (os.path.splitext(os.path.basename(cur))[0]
+                         or os.path.basename(cur) or cur or "").strip()
+                cmb.addItem(label or T("（已绑定的码表）"), "__bound__")
                 sel = cmb.count() - 1
             cmb.addItem(T("导入新码表…"), "__import__")
             cmb.setCurrentIndex(sel if 0 <= sel < cmb.count() else 0)
+            # 最后一层保险：当前项文本为空/全空白 ⇒ 明确写成「（无码表）」，
+            # 绝不让"没绑"和"绑了一张名字空白的表"看起来一样
+            if not cmb.currentText().strip():
+                cmb.setItemText(cmb.currentIndex(), T("（无码表）"))
             # tooltip：完整表名（下拉只有 92px，长名字会被截断）
             txt = cmb.itemText(cmb.currentIndex())
             cmb.setToolTip(Tf("码表：{}（选择换表 /「（无码表）」卸下）", txt)
@@ -2806,16 +2816,27 @@ class LayerStackPanel(QWidget):
             self.refresh_playing()
             self._refresh_cue_page()
             return
+        new_path = ""
         if data == "__import__":
             paths, _ = QFileDialog.getOpenFileNames(
                 self, T("导入码表"), "", T("码表包 (*.ercue);;所有文件 (*)"))
             if not paths:
                 self._fill_cue_combo(cmb, lay)     # 取消 ⇒ 把下拉还原成当前绑定
                 return
-            data = paths[0]
+            new_path = paths[0]
+            data = new_path
         # 换表 / 导入并绑定：**唯一实现**在 cue_ui.load_and_bind
         _ok, msg = cue_ui.load_and_bind(self.main, data, lay, parent=self)
         self._fill_cue_combo(cmb, lay)
+        # ★ 刚从「导入新码表…」进来的：**自动选中刚导入的那张**（否则用户还得再点一次）
+        if new_path:
+            want = os.path.abspath(new_path)
+            for k in range(cmb.count()):
+                if os.path.abspath(str(cmb.itemData(k) or "")) == want:
+                    cmb.blockSignals(True)
+                    cmb.setCurrentIndex(k)
+                    cmb.blockSignals(False)
+                    break
         self.refresh_header(idx)
         self.refresh_playing()
         try:

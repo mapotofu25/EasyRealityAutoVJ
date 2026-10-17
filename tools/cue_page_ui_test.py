@@ -190,6 +190,21 @@ def main():
     print("      更多菜单 = %s" % acts)
     check("更多菜单里没有任何含「码表」的项", not any("码表" in a for a in acts), acts)
 
+    # ---------------- ⑤b 展开菜单截图（证据） ----------------
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    w.switch_page(0, save=False)
+    for _ in range(10):
+        app.processEvents()
+    w._more_menu.popup(
+        w.btn_more.mapToGlobal(w.btn_more.rect().bottomLeft()))
+    for _ in range(14):
+        app.processEvents()
+    pm = w._more_menu.grab()
+    w._more_menu.close()
+    p_menu = os.path.join(SHOT_DIR, "ui_more_menu_no_cue.png")
+    check("截图已落盘 ui_more_menu_no_cue.png（展开的「⋯ 更多」）",
+          pm.save(p_menu, "PNG"), p_menu)
+
     # ---------------- ⑥ 整幅截图 ----------------
     print("\n⑥ 整幅截图")
     os.makedirs(SHOT_DIR, exist_ok=True)

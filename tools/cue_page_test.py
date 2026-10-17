@@ -419,6 +419,96 @@ def main():
           cmb.currentText())
     check("卸下后下拉隐藏（普通图层布局不变）", cmb.isHidden(), cmb.isHidden())
 
+    # ================= ⑫ 下拉文本：未绑 / 名字空白的表 都要看得出区别 =================
+    print("\n⑫ 下拉文本防御：绝不能出现空文本（否则「没绑」和「绑了空名表」混不起来）")
+    lay_u = engine.Layer("未装表")
+    lay_u.is_cuesheet = True               # 是码表图层，但没装表
+    lay_u.cuesheet_id = ""
+    lay_v = engine.Layer("空名表")
+    lay_v.is_cuesheet = True
+    lay_v.cuesheet_id = "   "              # 脏数据：只有空白
+    eng.layers = [lay_u, lay_v, engine.Layer("普通层")]
+    lsp2 = panels.LayerStackPanel(po)
+    lsp2.rebuild()
+    c_u = lsp2.rows[0][0]._cmb_cue
+    c_v = lsp2.rows[1][0]._cmb_cue
+    check("未装表 ⇒ 显示「（无码表）」", c_u.currentText() == "（无码表）", c_u.currentText())
+    check("下拉文本非空", bool(c_u.currentText().strip()))
+    check("空白 cuesheet_id 也不显示成空", bool(c_v.currentText().strip()),
+          repr(c_v.currentText()))
+    check("空白 cuesheet_id ⇒ 归为「（无码表）」", c_v.currentText() == "（无码表）",
+          c_v.currentText())
+    ok_s, path_s = shot(lsp2, "page4_layer_combo_unbound.png", 940, 240)
+    check("截图已落盘 page4_layer_combo_unbound.png（未绑「（无码表）」）", ok_s, path_s)
+
+    # ================= ⑬ 「导入新码表…」⇒ 自动选中刚导入的那张 =================
+    print("\n⑬ 下拉里选「导入新码表…」⇒ 导入成功后自动选中新导入的那张")
+    pc = os.path.join(tmp, "第三张.ercue")
+    cuesheet.save(make_sheet("第三张", "第三首", n_items=1, media_name="a.mp4"), pc,
+                  app_version="2026.10.17.12")
+    eng.layers = [lay2, engine.Layer("普通层")]
+    lay2.is_cuesheet = True
+    lay2.cuesheet_id = os.path.basename(pa)
+    lsp3 = panels.LayerStackPanel(po)
+    lsp3.rebuild()
+    cmb3 = lsp3.rows[0][0]._cmb_cue
+    i_imp = [k for k in range(cmb3.count()) if cmb3.itemText(k) == "导入新码表…"]
+    check("下拉里有「导入新码表…」", bool(i_imp), [cmb3.itemText(k)
+                                                 for k in range(cmb3.count())])
+    real_open2 = panels.QFileDialog.getOpenFileNames
+    panels.QFileDialog.getOpenFileNames = staticmethod(lambda *a, **k: ([pc], ""))
+    try:
+        cmb3.setCurrentIndex(i_imp[0])
+        lsp3._on_cue_combo(0)
+    finally:
+        panels.QFileDialog.getOpenFileNames = real_open2
+    check("导入后下拉**自动选中**「第三张」", cmb3.currentText() == "第三张",
+          cmb3.currentText())
+    check("导入后下拉的 data 指向新包",
+          os.path.abspath(str(cmb3.currentData() or "")) == os.path.abspath(pc),
+          cmb3.currentData())
+    check("导入后图层 cuesheet_id = 新包名",
+          lay2.cuesheet_id == "第三张.ercue", lay2.cuesheet_id)
+    check("导入后引擎里的表 = 第三张",
+          (eng.cuesheet_status().get("title") or "") == "第三张",
+          eng.cuesheet_status().get("title"))
+
+    # ================= ⑪ 坏包防御：片段列 "—"，列表不崩 =================
+    print("\n⑪ 坏包防御：包在索引里但读不了 ⇒ 片段列「—」，列表照常列出")
+    pbad = os.path.join(tmp, "坏包.ercue")
+    cuesheet.save(make_sheet("坏包", "坏曲", n_items=2, media_name="a.mp4"), pbad,
+                  app_version="2026.10.17.12")
+    idxo2 = eng.cue_index()
+    idxo2.add(pbad)
+    idxo2.save_cfg(cfg)
+    panel.refresh()
+    n_before_bad = panel.tbl.rowCount()
+    # 索引建好之后再把包弄坏（模拟"用户硬盘上的包损坏/被覆盖"）
+    with open(pbad, "wb") as f:
+        f.write(b"\x00\x01\x02 this is not a zip \xff\xfe" * 20)
+    os.utime(pbad, None)
+    panel.refresh()
+    panel.ensure_frag_counts()
+    for _ in range(8):
+        app.processEvents()
+    names_all = [panel.tbl.item(r, 0).text() for r in range(panel.tbl.rowCount())]
+    check("坏包没有把列表搞崩（行数不减少）",
+          panel.tbl.rowCount() == n_before_bad, (n_before_bad, panel.tbl.rowCount()))
+    row_bad = names_all.index("坏包") if "坏包" in names_all else -1
+    check("坏包那一行还在（表名正常显示）", row_bad >= 0, names_all)
+    if row_bad >= 0:
+        check("坏包的片段列 = 「—」（不冒充 0）",
+              panel.tbl.item(row_bad, 2).text() == "—",
+              panel.tbl.item(row_bad, 2).text())
+        check("坏包的大小/时间列也没炸",
+              panel.tbl.item(row_bad, 3) is not None
+              and panel.tbl.item(row_bad, 4) is not None)
+    check("其他行的片段数仍正常（=3）",
+          any(panel.tbl.item(r, 2).text() == "3" for r in range(panel.tbl.rowCount())),
+          [panel.tbl.item(r, 2).text() for r in range(panel.tbl.rowCount())])
+    idxo2.remove(pbad)
+    idxo2.save_cfg(cfg)
+
     # 再绑回来，给"已绑图层"列截图
     lay2.is_cuesheet = True
     lay2.cuesheet_id = os.path.basename(pa)
@@ -430,11 +520,17 @@ def main():
 
     # ================= ③ 删除（只从列表移除，不删文件） =================
     print("\n③ 删除：从列表移除 ⇒ 行消失、磁盘文件仍在")
-    panel.tbl.selectRow(1)                       # 选「第二张」
+    r_b = next((r for r in range(panel.tbl.rowCount())
+                if panel.tbl.item(r, 0).text() == "第二张"), -1)
+    check("列表里能找到「第二张」待删", r_b >= 0)
+    if r_b >= 0:
+        panel.tbl.selectRow(r_b)                 # 按名字选，不按行号（行序会变）
     before = os.path.isfile(pb)
+    n_rows_before_del = panel.tbl.rowCount()
     panel.on_remove()
     names = [panel.tbl.item(r, 0).text() for r in range(panel.tbl.rowCount())]
-    check("列表只剩 1 行", panel.tbl.rowCount() == 1, panel.tbl.rowCount())
+    check("列表少了一行", panel.tbl.rowCount() == n_rows_before_del - 1,
+          (n_rows_before_del, panel.tbl.rowCount()))
     check("「第二张」已从列表移除", "第二张" not in names, names)
     check("磁盘上的 .ercue 仍在（未被删除）", before and os.path.isfile(pb), pb)
     panel.refresh()

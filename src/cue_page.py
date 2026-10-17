@@ -91,26 +91,32 @@ def _stat_key(path):
 
 
 def sheet_frag_count(path):
-    """这张码表一共有多少个片段（全曲所有层的 items 合计）。读不了返回 0。
+    """这张码表一共有多少个片段（全曲所有层的 items 合计）。
+
+    返回：
+      · `>= 0` = 真实片段数（`0` 是合法的"空表"）
+      · `-1`   = **读不了**（包损坏 / 被删 / 没权限）⇒ 界面显示 "—"，**绝不抛异常**
 
     ⚠ 只读**一次**并缓存：键是 `(mtime, size)`，包没变就直接返回缓存值。
       码表可能有上千片段，全量 `cuesheet.load()` 几十~几百 ms ⇒ 绝不每次刷新都读。
+    ⚠ **防御**：`load()` 抛异常时把这个包记成 `-1`（不冒充 0）——
+      否则一行坏包会让用户以为"这张表没有片段"，或者把整个列表带崩。
     """
     p = os.path.abspath(str(path or ""))
     key = _stat_key(p)
     if key is None:
-        return 0
+        return -1
     hit = _FRAG_CACHE.get(p)
     if hit is not None and hit[0] == key:
         return int(hit[1])
-    n = 0
     try:
         sheet, _info = cuesheet.load(p)
+        n = 0
         for t in (getattr(sheet, "tracks", None) or []):
             for ly in (getattr(t, "layers", None) or []):
                 n += len(getattr(ly, "items", None) or [])
     except Exception:                                            # noqa: BLE001
-        n = 0
+        n = -1                      # 读不了 ⇒ 记成"未知"，不冒充 0
     _FRAG_CACHE[p] = (key, n)
     return n
 
@@ -507,13 +513,14 @@ class CueSheetPanel(QWidget):
 
     @staticmethod
     def _frag_text(path, alive):
-        """「片段」列文本：只读缓存，未算过就是 "—"（见 refresh 的说明）。"""
+        """「片段」列文本：只读缓存，未算过 / 读不了都是 "—"（见 refresh 的说明）。"""
         if not alive:
             return "—"
         key = _stat_key(path)
         hit = _FRAG_CACHE.get(path)
         if hit is not None and key is not None and hit[0] == key:
-            return str(int(hit[1]))
+            n = int(hit[1])
+            return str(n) if n >= 0 else "—"     # -1 = 包读不了 ⇒ 未知
         return "—"
 
     def ensure_frag_counts(self):
