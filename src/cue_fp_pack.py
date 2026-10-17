@@ -42,7 +42,8 @@
 1. **零 Qt / 零 numpy**：只用 stdlib（`zipfile`/`zlib`/`struct`/`sqlite3`/`threading`）
    ⇒ 可无头单测（`tools/cue_fp_pack_test.py`）。
 2. **解包绝不抛**：`unpack_hashes()` 对任何坏数据（截断 / 错 magic / 错 version /
-   count 与长度不符 / 压缩炸弹）一律返回 `None`，让调用方"当作没有指纹"继续走。
+   count 与长度不符 / 压缩炸弹）一律返回 `None`；**空字节流返回 `[]`**（"空"与"坏"
+   是两个意思，见 `unpack_hashes()` docstring），让调用方"当作没有指纹"继续走。
 3. **绝不卡 GUI**：灌 5 万条要 0.3~0.6s ⇒ 一律走 `start_ingest()` 的后台线程；
    `ingest_sheet()` 本身是同步实现（供后台线程与单测直接调用）。
 """
@@ -121,15 +122,22 @@ def blob_name(fp_id) -> str:
 # 解包（★ 绝不抛）
 # ==========================================================================
 def unpack_hashes(blob):
-    """完整文件字节 → `[(hash_hex_str, offset_int), ...]`；**任何异常/校验失败 ⇒ `None`**。
+    """完整文件字节 → `[(hash_hex_str, offset_int), ...]`；**校验失败才 ⇒ `None`**。
 
-    校验链（任一不符 ⇒ `None`，绝不抛）：
+    ★ **空字节流 ⇒ 空列表（不是 `None`）；校验失败才返回 `None`。**
+      为什么要把"空"和"坏"分开（与编排端 `fp_pack.unpack_hashes` 同一语义）：
+        · 空 = **没有指纹**（编排端 `pack_hashes([]) == b""`，与这里互逆，两端一致）；
+        · `None` = **数据坏了**（magic/version/hash_hex_len/count/长度/zlib 任一不符）。
+      将来真读到空成员时，前者是"这首没导指纹"，后者是"包坏了、该提示用户重导"，
+      两者要能区分开 —— 混成一个 `None` 就永远查不出是哪一种。
+
+    校验链（任一不符 ⇒ `None`，**绝不抛**）：
       magic / version / hash_hex_len / count(≤上限) / `len(payload)-12 == count*14` /
-      zlib 能解开。空字节流、非 bytes、`None` 一并不认（`None`）——
-      "包里没有这个成员"才是"没有指纹"的正确表达（`read_from_package` 负责区分）。
+      zlib 能解开且**压缩流完整**（`decompressobj().eof`）。
+      非 bytes 的输入（除 `bytearray`/`memoryview` 外）也返回 `None`。
 
     :param blob: 文件字节（`bytes` / `bytearray` / `memoryview`）。
-    :return: `[(20 字符小写 hex, offset 帧)]`；坏数据 `None`。
+    :return: `[(20 字符小写 hex, offset 帧)]`；空字节流 `[]`；坏数据 `None`。
     """
     if blob is None:
         return None
@@ -140,7 +148,7 @@ def unpack_hashes(blob):
     if not isinstance(blob, bytes):
         return None
     if len(blob) == 0:
-        return None
+        return []                            # ★ 空 ⇒ "没有指纹"（与 pack_hashes([]) 互逆）
 
     # ---- 解压（带上限，防压缩炸弹）----
     try:
@@ -203,7 +211,13 @@ def _read_member(pkg_path, member):
 
 
 def read_from_package(pkg_path, fp_id):
-    """直接从包内读 `fp/<fp_id>.bin` 并解包；**成员不在 ⇒ `None`**（老包的正常情况）。"""
+    """直接从包内读 `fp/<fp_id>.bin` 并解包。
+
+    返回的三种情况要分清（调用方靠它们区分"老包 / 空指纹 / 坏包"）：
+      · **成员不存在 ⇒ `None`**（老包的正常情况：这首没导指纹，不是错误）；
+      · 成员存在但**是空字节流 ⇒ `[]`**（= 明确写了"没有指纹"）；
+      · 成员存在但**数据坏了 ⇒ `None`**（`unpack_hashes` 的容错契约）。
+    """
     name = blob_name(fp_id)
     if not name:
         return None

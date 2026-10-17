@@ -13,8 +13,9 @@
      —— 这一条证明"包里带的指纹真的能认出音频"
   3. `drop_sheet()` ⇒ 该 song_id 的行清零、`cfg["cue"]["fp_songs"]` 映射清空
   4. **去重守卫**：`cfg["music_meta"]` 里已有同 `fp_id` ⇒ `ingest_sheet` 跳过，库里 0 行
-  5. `unpack_hashes` 坏数据（截断 / 错 magic / 错 version / count 不符 / 非 zlib）
-     ⇒ 全部 `None`，**绝不抛**
+  5. `unpack_hashes` 坏数据（截断 / 错 magic / 错 version / count 不符 / 非 zlib /
+     短垃圾 / 非 bytes）⇒ 全部 `None`，**绝不抛**；而**空字节流 ⇒ `[]`**
+     （"空"= 没导指纹，"坏"= 包坏了，两者必须分得开 —— 与编排端同一语义）
   6. 老包（没有 `fp/` 成员）⇒ `ingest_sheet()` 返回 0 条，不报错
   7. `engine._cue_lookup_song_id` / `_cue_track_query_by_sid` / `_cue_accept_pos`
      三条（FakeCfg + 把引擎里那三个方法**原样**挂到普通类上，测的是正式代码）
@@ -354,7 +355,7 @@ def main():
     cue_fp_pack.drop_sheet(cfg2, db, pkg)
 
     # ================= ⑤ 坏数据 ⇒ None，绝不抛 =================
-    print("\n===== ⑤ unpack_hashes 坏数据（全部 None，不抛）=====")
+    print("\n===== ⑤ unpack_hashes 坏数据（None，不抛）+ 空字节流（[]）=====")
     good = pack_blob(s0["hashes"][:200])
     raw = bytearray(zlib.decompress(good))
     bad_magic = bytearray(raw)
@@ -373,8 +374,9 @@ def main():
         "count 不符": zlib.compress(bytes(bad_count), 6),
         "非 zlib 垃圾": b"\x00\x01\x02not-a-zlib-stream",
         "纯随机": bytes(range(64)),
-        "空字节流": b"",
+        "短垃圾 b'junk'": b"junk",
         "None": None,
+        "非 bytes（str）": "not-bytes",
     }
     for label, bad in bad_cases.items():
         try:
@@ -383,6 +385,12 @@ def main():
                 "实际 %r" % (None if got is None else len(got)))
         except Exception as e:                                   # noqa: BLE001
             chk(False, "坏数据 %s 抛异常了" % label, "%s: %s" % (type(e).__name__, e))
+    # ★ 空字节流 = "没有指纹"，**不是** None（与编排端 `fp_pack.unpack_hashes` 同一语义）。
+    #   "空"和"坏"要能区分：前者是"这首没导指纹"，后者是"包坏了、该提示重导"。
+    chk(cue_fp_pack.unpack_hashes(b"") == [], "空字节流 ⇒ []（不是 None）",
+        repr(cue_fp_pack.unpack_hashes(b"")))
+    chk(cue_fp_pack.unpack_hashes(b"junk") is None, "坏数据 b'junk' ⇒ None（与空区分开）")
+    chk(cue_fp_pack.unpack_hashes(bytearray(b"")) == [], "bytearray(b'') 也 ⇒ []")
     # 正向：手拼的 blob 能被解开，且逐条相等（含负数 offset）
     hs200 = [(h, int(o)) for h, o in s0["hashes"][:200]]
     hs200[0] = (hs200[0][0], -3)
@@ -390,6 +398,15 @@ def main():
         "正向往返：手拼 blob → unpack 逐条相等（含负 offset）")
     chk(cue_fp_pack.read_from_package(pkg, "fp2-nosuch") is None,
         "read_from_package：成员不存在 ⇒ None")
+    # 成员存在但内容为空 ⇒ []（与"成员不存在"区分开）
+    empty_pkg = os.path.join(TMP, "empty.ercue")
+    make_pkg(empty_pkg, [{"fp_id": "fp2-empty", "title": "E", "artist": "",
+                          "dur": 1.0, "bpm": 0.0, "md5": "", "name": "e.flac"}],
+             {"fp/fp2-empty.bin": b""})
+    chk(cue_fp_pack.read_from_package(empty_pkg, "fp2-empty") == [],
+        "read_from_package：空成员 ⇒ []（不是 None）")
+    chk(int(cue_fp_pack.ingest_sheet(cfg, db, empty_pkg).get("hashes", 0)) == 0,
+        "空成员的曲目 ⇒ 灌 0 条（不写库、不写映射）")
 
     # ================= ⑥ 老包（没有 fp/ 成员）=================
     print("\n===== ⑥ 老包（没有 fp/ 成员）⇒ 0 条，不报错 =====")
