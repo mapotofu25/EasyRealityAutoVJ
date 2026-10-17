@@ -880,8 +880,38 @@ class VideoPlayer(_DecoderHealth):
         self._max_w = 0        # 解码缩放上限（长边超过则缩到画布 1.5 倍，省 CPU/内存）
         self._max_h = 0
         self._t = None                  # 不再持有 Thread 对象（见 _start_decoder_thread 的说明）
+        # ---- 码表（cue）用的两个只读扩展：定位与读数（普通图层完全不用） ----
+        # `_pts`      当前**已发布帧**的素材内秒数（与 `_img` 同源；没有帧时为 None）
+        # `_seek_req` 待处理的定位请求（秒）：渲染线程写入、解码线程消费
+        self._pts = None
+        self._seek_req = None
         self._init_health()             # 产帧计数 / 卡帧判据（见 _DecoderHealth）
         _start_decoder_thread(self._loop, name="autovj-dec")
+
+    def seek(self, sec) -> bool:
+        """请求「下一次 `current()` 定位到 `sec`」（**解码线程执行**）。
+
+        只投递请求：不阻塞、不改 `_active/speed/_warmed`、**不重开容器**。
+        `cv2.set(CAP_PROP_POS_MSEC)` 的定位是**精确**的（实测落点误差 2~9ms），
+        所以这里不需要手工前向补齐（PyAV 路径才需要，见 `AvAlphaPlayer.seek`）。
+
+        返回 True = 请求已受理；False = 参数非法（调用方据此降级，画面保持旧帧）。
+        """
+        try:
+            t = float(sec)
+        except (TypeError, ValueError):
+            return False
+        if t < 0.0 or t != t:            # 负数 / NaN
+            return False
+        self._seek_req = t
+        return True
+
+    def position(self):
+        """当前**实际显示的那一帧**的素材内秒数（与 `current()` 同源，O(1) 只读）。
+
+        首帧还没出来 / 该后端不报位置 ⇒ `None`（调用方据此**跳过**漂移判断，不报错）。
+        """
+        return self._pts
 
     def set_max_size(self, w, h):
         """设置解码目标尺寸上限（画布分辨率 ×1.5 余量）：4K/5K 素材在解码线程里
@@ -958,6 +988,14 @@ class VideoPlayer(_DecoderHealth):
                             time.sleep(0.05)
                             continue
                         self._warm -= 1  # 预热：不活跃也只解这一帧，解完回到挂起
+                    # ★ cue 定位：请求由**解码线程**消费（绝不在渲染线程等，见 seek() 说明）
+                    req = self._seek_req
+                    if req is not None:
+                        self._seek_req = None
+                        try:
+                            self.cap.set(cv2.CAP_PROP_POS_MSEC, float(req) * 1000.0)
+                        except Exception:                      # noqa: BLE001
+                            pass
                     t0 = time.perf_counter()
                     ok, frame = self.cap.read()
                     if not ok or frame is None:
@@ -988,6 +1026,12 @@ class VideoPlayer(_DecoderHealth):
                         h, w, _ = rgb.shape
                         img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
                         self._img = img.copy()
+                        # ★ pts 与 _img 同源（position() 只读它；取不到就给 None）
+                        try:
+                            self._pts = float(
+                                self.cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
+                        except Exception:                  # noqa: BLE001
+                            self._pts = None
                         self._mark_frame()             # ★ 看门狗心跳
                         ever = True
                     wait = float(interval / self.speed - (time.perf_counter() - t0))
@@ -1107,6 +1151,10 @@ class AvAlphaPlayer(_DecoderHealth):
         self.c = None          # 由解码线程打开
         self.st = None
         self.fps = 30.0
+        # ---- 码表（cue）用的两个只读扩展（普通图层完全不用） ----
+        self._pts = None            # 已发布帧的素材内秒数（与 _img 同源）
+        self._seek_req = None       # 待处理定位请求（渲染线程写、解码线程消费）
+        self._skip_until = None     # PyAV 只能落到关键帧 ⇒ 前向补齐的目标位置（秒）
         # 不读 st.frames（PyAV 统计帧数可能触发扫描，切换卡顿；循环播放用不到）
         self.speed = 1.0
         self._img = None
@@ -1145,6 +1193,30 @@ class AvAlphaPlayer(_DecoderHealth):
         """预热：提前在解码线程里打开容器并解出首帧（切到时立即有画面）。
         实测 alpha 素材从构造到首帧 70~75ms ≈ 4~5 帧，预热后切换不再等。"""
         self._warm = 1
+
+    def seek(self, sec) -> bool:
+        """请求「下一次 `current()` 定位到 `sec`」（**解码线程执行**）。
+
+        ⚠ PyAV 的 `container.seek()` **只落到前一个关键帧**（实测落点误差 P50 0.17~1.7s、
+          max 2.4s）⇒ 必须**继续解到 `pts >= sec`**（`_skip_until` 就是这条边界）。
+          只 seek 不补齐 = 画面停在上一段，对卡点码表是致命的。
+        只投递请求；不阻塞、不改 `_active/speed/_warmed`、**不重开容器**。
+        """
+        try:
+            t = float(sec)
+        except (TypeError, ValueError):
+            return False
+        if t < 0.0 or t != t:
+            return False
+        self._seek_req = t
+        return True
+
+    def position(self):
+        """当前**实际显示的那一帧**的素材内秒数（与 `current()` 同源，O(1) 只读）。
+
+        取不到 pts（部分容器不报）⇒ `None`，调用方据此跳过漂移判断。
+        """
+        return self._pts
 
     def _iter_frames(self):
         # 正常素材每趟 demux 都应产出帧；连续空趟通常意味着容器/句柄已失效。
@@ -1228,6 +1300,17 @@ class AvAlphaPlayer(_DecoderHealth):
                         time.sleep(0.05)
                         continue
                     self._warm -= 1      # 预热：不活跃也只解这一帧
+                # ★ cue 定位：PyAV seek 只落到关键帧 ⇒ 置 `_skip_until`，由下面"前向补齐"
+                req = self._seek_req
+                if req is not None:
+                    self._seek_req = None
+                    try:
+                        tb = float(self.st.time_base)
+                        self.c.seek(int(float(req) / tb), backward=True)
+                        self._skip_until = float(req)
+                        frames = self._iter_frames()     # seek 之后重新取生成器
+                    except Exception:                    # noqa: BLE001
+                        self._skip_until = None
                 t0 = time.perf_counter()
                 try:
                     frame = next(frames)
@@ -1239,6 +1322,18 @@ class AvAlphaPlayer(_DecoderHealth):
                         break
                     time.sleep(0.03)
                     continue
+                # ★ 前向补齐：seek 落在关键帧上，目标帧之前的帧必须**丢弃继续解**
+                fsec = None
+                try:
+                    _pts = getattr(frame, "pts", None)
+                    if _pts is not None:
+                        fsec = float(_pts) * float(self.st.time_base)
+                except Exception:                          # noqa: BLE001
+                    fsec = None
+                if self._skip_until is not None and fsec is not None:
+                    if fsec < self._skip_until - 1e-6:
+                        continue                            # 还没到目标帧：丢弃、继续解
+                    self._skip_until = None
                 ok = False
                 try:
                     arr = frame.to_ndarray(format="bgra")   # BGRA，与 engine._np_view 一致
@@ -1252,6 +1347,7 @@ class AvAlphaPlayer(_DecoderHealth):
                             h, w = arr.shape[:2]
                     img = QImage(arr.data, w, h, 4 * w, QImage.Format_ARGB32)
                     self._img = img.copy()
+                    self._pts = fsec                      # ★ 与 _img 同源（可 None）
                     ok = True
                 except Exception:                              # noqa: BLE001
                     ok = False
@@ -1611,6 +1707,26 @@ _SOFT_EMPTY_GIVEUP = 30            # 连续空转这么多趟 ⇒ 放弃这个�
 # 用户 2026-10-01 报「素材会突然卡住不动，直到下一个切进来才恢复」就是因为它原来**一次
 # 失败就永久死亡**；现在会自愈重开，只有连续失败这么多次才放弃。
 _REOPEN_MAX = 6
+
+
+_CUE_GPU_SKIP_LOGGED = [False]          # 只打一次（别每次切素材刷屏）
+
+
+def _log_cue_gpu_skip(path):
+    """记一行：**cue 场景的 DXV 不走 GPU**（因为 GPU 路径的帧生成器没暴露 pts）。
+
+    为什么只有一次：这是"设计如此"的提示，不是错误；每次切素材都刷会盖住真问题。
+    走 `stallwatch.log_line`（与 `_log_decoder_giveup` 同一条通路），best-effort 不抛。
+    """
+    if _CUE_GPU_SKIP_LOGGED[0]:
+        return
+    _CUE_GPU_SKIP_LOGGED[0] = True
+    try:
+        import stallwatch
+        stallwatch.log_line("cue 场景的 DXV 使用软解播放器（GPU 路径未暴露 pts）：%s"
+                            % os.path.basename(str(path or "")))
+    except Exception:                                              # noqa: BLE001
+        pass
 
 
 def _log_decoder_giveup(path, why):
@@ -2194,8 +2310,16 @@ class GpuDxvPlayer(_DecoderHealth):
             self._cap = None
 
 
-def create_video_player(item):
+def create_video_player(item, cue=False):
     """视频播放器工厂：带 alpha 的视频用 PyAV 解码（保留透明），其余走 OpenCV。
+
+    `cue`（**关键字，默认 False**）：这是不是**码表（cue）场景**的播放器。
+      · `cue=True` 且素材是 DXV ⇒ **跳过 GPU 解码**（`GpuDxvPlayer`），落到 PyAV 软解路径。
+        原因：`GpuDxvPlayer` 的帧生成器（`_gpu_frames()/_soft_gen()`）**不暴露 pts**，
+        而码表要靠 `position()` 做漂移校正（否则 `src_in`/漂移/出点冻结全都做不到）。
+        实测软解 DXV 定位 **39ms / 落点误差 0**，够用。
+      · `cue=False`（普通图层/预览）⇒ **与原逻辑逐值一致**，一行不变。
+    ⚠ 不加全局开关、不改环境变量：**只有显式传 `cue=True` 才生效**。
 
     **这里绝不能打开容器做探测**：`_av_probe_alpha` 会 `av.open(path)`，对 4K/DXV 要几十
     到两百毫秒，而本函数是在渲染线程里调的（切素材那一下）→ 直接卡几帧。
@@ -2245,7 +2369,11 @@ def create_video_player(item):
         if dxv is None:
             _probe_codec_async(item)
         elif dxv:
-            return GpuDxvPlayer(item.path, avmod, out_alpha=bool(has))
+            if cue:
+                # 码表场景：GPU 播放器没有 pts ⇒ 无法 seek/position（见函数 docstring）
+                _log_cue_gpu_skip(item.path)
+            else:
+                return GpuDxvPlayer(item.path, avmod, out_alpha=bool(has))
     if has and avmod is not None:
         return AvAlphaPlayer(item.path, avmod)          # 构造不再阻塞（容器在解码线程开）
     return VideoPlayer(item.path)
@@ -2319,9 +2447,14 @@ class ImagePlayer:
         pass
 
 
-def make_player(item: MediaItem):
+def make_player(item: MediaItem, cue=False):
+    """按素材类型建播放器。`cue=True` 只影响视频的 GPU 选择（见 `create_video_player`）。
+
+    ⚠ 用**显式关键字参数**传"使用场景"，不把 `_cue_ctx` 这类标记挂到 `MediaItem` 上：
+      数据对象不该知道"自己正在被谁用"，否则以后每个调用方都会想挂自己的标记。
+    """
     if item.kind == "video":
-        return create_video_player(item)
+        return create_video_player(item, cue=cue)
     if item.kind == "gif":
         return GifPlayer(item.path)
     return ImagePlayer(item.path)
