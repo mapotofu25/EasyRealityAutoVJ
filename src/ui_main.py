@@ -2166,6 +2166,21 @@ class MusicScanThread(QThread):
             db.end_scan()         # 落盘 + 把 synchronous 恢复回原值
         except Exception:
             pass
+        # ★ 曲库扫描结束 ⇒ **对账一次**：把"码表包里灌进来的合成指纹"里、本机曲库
+        #   **现在也有了**的那几首清掉（`cfg["cue"]["fp_songs"]` ↔ `music_meta` 的 fp_id 撞车）。
+        #   为什么必须在这里做：用户的真实顺序常常是「先导码表包，后来才把歌加进曲库」，
+        #   那时同一段音频在指纹库里会有两份指纹（合成 id + 本机路径 id）⇒ 投票被拆成一半
+        #   ⇒ 症状是**"有时候认得出、有时候认不出"**，现场最难查的一类故障。
+        #   ⚠ 零重活：只比两个 dict（fp_songs 的键 / music_meta 的 fp_id 集合），
+        #     不解包、不解码；没有撞车时它 0 删除、0 写盘。
+        try:
+            import cue_fp_pack as _cfp
+            _rec = _cfp.reconcile_dupes(self.main.cfg, db)
+            if _rec.get("dropped"):
+                _log("码表指纹对账：清掉 %d 首与本机曲库撞车的合成指纹（%d 行）"
+                     % (len(_rec.get("dropped") or []), int(_rec.get("rows", 0) or 0)))
+        except Exception as _e:                                     # noqa: BLE001
+            _log("码表指纹对账失败（不影响扫描结果）：%s" % _e)
         db.close()
 
 
@@ -3993,6 +4008,19 @@ class MainWindow(QMainWindow):
                     pass
             self._fp_db = FingerprintDB(db_path)
             self.audio.set_recognizer(self._fp_db)
+            # ★ 启动时**一次性对账**（把历史遗留的"撞车"清掉）：以前"先导码表、后加曲库"
+            #   会在库里留下两份指纹（合成 id + 路径 id）⇒ 票数被拆一半 ⇒ 时认时不认。
+            #   ⚠ 启动路径**必须零重活**：它只比 `cfg["cue"]["fp_songs"]` 的键与
+            #     `music_meta` 的 fp_id 集合，撞车才动库；**不解包、不解码音频**。
+            #     没有撞车时 0 删除、0 写盘（所以不会"每次启动都改一次配置"）。
+            try:
+                import cue_fp_pack as _cfp
+                _rec = _cfp.reconcile_dupes(self.cfg, self._fp_db)
+                if _rec.get("dropped"):
+                    print("[码表] 启动对账：清掉 %d 首与本机曲库撞车的合成指纹（%d 行）"
+                          % (len(_rec.get("dropped") or []), int(_rec.get("rows", 0) or 0)))
+            except Exception:                                    # noqa: BLE001
+                pass
         except Exception as e:                                   # noqa: BLE001
             # ⚠ 2026-10-10 审计：以前这里是 `pass` —— 指纹库打不开（损坏/被占用/路径异常）时
             #   现场识别**静默失效**（认不出歌 → 拿不到精确曲风与离线八拍网格），

@@ -92,7 +92,7 @@ __all__ = [
     "FP_DIR", "FP_EXT", "MAGIC", "VERSION", "HASH_HEX_LEN", "HASH_BYTES",
     "HEADER_SIZE", "RECORD_SIZE", "SONG_ID_SALT",
     "blob_name", "unpack_hashes", "read_from_package", "fp_song_id",
-    "ingest_sheet", "drop_sheet", "default_db_path", "resolve_db",
+    "ingest_sheet", "drop_sheet", "reconcile_dupes", "default_db_path", "resolve_db",
     "start_ingest", "start_drop", "poll_jobs", "pending_jobs",
 ]
 
@@ -130,6 +130,11 @@ def unpack_hashes(blob):
         · `None` = **数据坏了**（magic/version/hash_hex_len/count/长度/zlib 任一不符）。
       将来真读到空成员时，前者是"这首没导指纹"，后者是"包坏了、该提示用户重导"，
       两者要能区分开 —— 混成一个 `None` 就永远查不出是哪一种。
+      ⚠ **历史备注（别以为两边分叉了就是 bug）**：本实现一度对空字节流返回 `None`
+        （更严），2026-10-18 按团队裁定与编排端 `fp_pack.unpack_hashes()` 统一成 `[]`。
+        两份实现同名同格式，语义必须一致；而且两边**从不生产空成员**
+        （编排端 `pack_hashes([]) == b""` 时直接不写这个成员），所以真实数据上
+        这条差异永远不会出现 —— 统一它纯粹是为了读代码的人不被误导。
 
     校验链（任一不符 ⇒ `None`，**绝不抛**）：
       magic / version / hash_hex_len / count(≤上限) / `len(payload)-12 == count*14` /
@@ -269,6 +274,22 @@ def _fp_songs(cfg):
         m = {}
         cur[FP_SONGS_KEY] = m
     return m
+
+
+def _fp_songs_ro(cfg):
+    """**只读**版 `_fp_songs`：不创建、不写 cfg（启动/对账路径要求零副作用）。
+
+    区别很重要：`reconcile_dupes()` 在**启动**路径上会被调用，若它顺手把
+    `cfg["cue"]["fp_songs"] = {}` 写进内存，就等于"每次启动都改一次配置"。
+    """
+    try:
+        cur = cfg["cue"]
+    except Exception:                                            # noqa: BLE001
+        return {}
+    if not isinstance(cur, dict):
+        return {}
+    m = cur.get(FP_SONGS_KEY)
+    return m if isinstance(m, dict) else {}
 
 
 def _local_fp_ids(cfg):
@@ -427,9 +448,17 @@ def resolve_db(host, create=True):
     `host.engine._fp_db` → `host.engine.audio._fp_db`。
 
     `create=True` 且确实一个都没有时：在默认路径上开一个 `FingerprintDB`，
-    挂到 `host._fp_db` 并**立刻**接给 `audio.set_recognizer()` ——
-    否则"这台机器本来没有指纹库 ⇒ 识别器根本没启用"，灌进去的指纹永远不会被用到
-    （`ui_main._init_recognizer` 在 `fingerprints.db` 不存在时是直接 return 的）。
+    挂到 `host._fp_db` 并**立刻**接给 `audio.set_recognizer()`。
+
+    ★ **这条因果必须留住（否则就是"白灌"）**：
+      1. `ui_main._init_recognizer()` 在 `fingerprints.db` 文件不存在时是**直接 return**
+         （`if not os.path.exists(db_path): return`）⇒ 全新机器上根本没有识别器；
+      2. `audio_engine._recognize_loop()` 在 `self._fp_db is None` 时每轮都 `continue`
+         ⇒ 一条指纹都不会被查到；
+      3. 于是"导入码表 → 指纹进了库"但识别器从未启用 ⇒ 放歌**永远认不出**，而且
+         任何报错都没有（静默失效，最难查）。
+      所以：**建库** 与 **set_recognizer(建出来的那个库)** 必须成对出现，
+      只做前者等于把指纹灌进了一个没人读的文件。
 
     ⚠ 本函数会开 sqlite 连接（毫秒级），**请在 GUI 线程调用**；真正的写库交给后台作业。
     """
@@ -492,6 +521,9 @@ def ingest_sheet(cfg, db, pkg_path) -> dict:
     ⚠ **会写库**：5 万条 ≈ 0.3~0.6s ⇒ 必须放后台线程（`start_ingest()`）；
       本函数本身不碰 Qt，可以安全地在工作线程里跑。
 
+    ★ 开头会先调一次 `reconcile_dupes()`：把"本机曲库后来也有了的"合成指纹清掉，
+      免得同一首歌在库里留下两份指纹（票数被拆一半 ⇒ 时认时不认）。
+
     :param cfg:      `Config`（包装对象，没有 `.get()`）。
     :param db:       `fp.FingerprintDB` 或 `sqlite3.Connection`；`None` ⇒ 自己按默认路径开。
     :param pkg_path: `.ercue` 路径。
@@ -514,6 +546,13 @@ def ingest_sheet(cfg, db, pkg_path) -> dict:
         return res
 
     local_fp = _local_fp_ids(cfg)
+    # ★ 先对账一次（撞车的合成指纹清掉）：用户可能"先导过这张包、后来才把歌加进曲库"，
+    #   那种残留只靠下面的逐首判据是清不掉的（它只看本包，不看历史）。
+    #   幂等且零成本：没有撞车时它不碰数据库、也不写配置。
+    try:
+        reconcile_dupes(cfg, db)
+    except Exception:                                            # noqa: BLE001
+        pass
     fp_songs = _fp_songs(cfg)
     conn, own = _conn_of(db)
     if conn is None:
@@ -617,6 +656,83 @@ def drop_sheet(cfg, db, pkg_path) -> int:
         fp_songs.pop(fp_id, None)
     _save_cfg(cfg)
     return removed
+
+
+def reconcile_dupes(cfg, db) -> dict:
+    """把「本机曲库后来也有了」的码表指纹清掉 → `{"dropped": [fp_id...], "rows": n}`。
+
+    **为什么必须有它（`drop_sheet` 覆盖不到的那一半）**
+      `drop_sheet()` 按**包路径**删（用户移除码表时）；本函数按 **fp_id 撞车**删
+      （用户先导码表、后把同一首歌加进本机曲库时）。两者互补，都要留着。
+      不清的话同一段音频在指纹库里有两份指纹（合成 id + 本机路径 id）⇒ 投票被拆成
+      两半 ⇒ 低于 `charge_engine.CONFIRM_VOTES` 就表现为**"有时候认得出、有时候认不出"**，
+      这是现场最难查、最浪费时间的一类故障。
+
+    **判据**：`cfg["cue"]["fp_songs"]` 的每个 `fp_id`，若 `cfg["music_meta"]` 里
+      某首歌的 `fp_id` 与它相同 ⇒ 该合成 id 的指纹行必须删掉（本机曲库优先）。
+
+    **幂等 + 零副作用**（所以能挂在启动路径上）：
+      · 没有 `fp_songs` / 没有本机 fp_id / 没有撞车 ⇒ **0 删除、不碰数据库、不写配置**；
+      · 只有真删到东西才 `cfg.save()` 一次（绝不会"每次启动都写一遍配置"）。
+
+    **零重活**：只扫两个 dict（`fp_songs` 的键、`music_meta` 的 fp_id 集合），
+      **不解包、不解码音频**。
+
+    **绝不抛**：任何异常都只是"这次没对账成"，返回已完成的部分。
+
+    :param cfg: `Config`（包装对象，**没有 `.get()`**）。
+    :param db:  `fp.FingerprintDB` / `sqlite3.Connection` / `None`（⇒ 按默认路径开）。
+    :return: `{"dropped": [被清掉的 fp_id...], "rows": 删掉的指纹行数}`
+    """
+    out = {"dropped": [], "rows": 0}
+    try:
+        fp_songs = _fp_songs_ro(cfg)
+        if not fp_songs:
+            return out                          # 没导过带指纹的码表 ⇒ 什么都不用做
+        local = _local_fp_ids(cfg)
+        if not local:
+            return out                          # 本机曲库一首带 fp_id 的都没有 ⇒ 不可能撞车
+        victims = [(fid, rec) for fid, rec in list(fp_songs.items())
+                   if fid in local and isinstance(rec, dict)]
+        if not victims:
+            return out                          # ★ 没有撞车 ⇒ 0 删除、**不写盘**
+        conn, own = _conn_of(db)
+        if conn is None:
+            return out                          # 打不开库：不删也不清映射（清了就再也清不掉行）
+        try:
+            for _fid, rec in victims:
+                try:
+                    sid = int(rec.get("song_id", -1))
+                except (TypeError, ValueError):
+                    sid = -1
+                if sid < 0:
+                    continue                    # 映射坏了：只清映射（下面），没有行可删
+                try:
+                    cur = conn.execute("DELETE FROM fingerprints WHERE song_id=?", (sid,))
+                    out["rows"] += max(0, int(cur.rowcount or 0))
+                except Exception:                                    # noqa: BLE001
+                    continue
+            try:
+                conn.commit()
+            except Exception:                                        # noqa: BLE001
+                pass
+        finally:
+            if own:
+                try:
+                    conn.close()
+                except Exception:                                    # noqa: BLE001
+                    pass
+        # 清映射：即使 song_id 坏了也要清（留着引擎会去找一个用不了的 id）
+        for fid, _rec in victims:
+            try:
+                fp_songs.pop(fid, None)
+            except Exception:                                        # noqa: BLE001
+                pass
+            out["dropped"].append(fid)
+        _save_cfg(cfg)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
 
 
 # ==========================================================================

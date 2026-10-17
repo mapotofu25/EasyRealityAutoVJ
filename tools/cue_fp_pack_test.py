@@ -19,6 +19,9 @@
   6. 老包（没有 `fp/` 成员）⇒ `ingest_sheet()` 返回 0 条，不报错
   7. `engine._cue_lookup_song_id` / `_cue_track_query_by_sid` / `_cue_accept_pos`
      三条（FakeCfg + 把引擎里那三个方法**原样**挂到普通类上，测的是正式代码）
+  8. **持续对账** `reconcile_dupes()`：先导包、后把同一首歌加进本机曲库 ⇒ 只清那一首
+     （另一首原样保留）、幂等（再调 0 删除**不写盘**）、无撞车 0 写盘、
+     **反向复现**（判据换成"路径相等" ⇒ 撞车判不出来）、对账后另一首仍能认出音频
 
 ⚠ 真实素材：`Y:\\EasyRealityAutoVJ\\码表素材\\揽月 - Dreamira.flac`（+ Supa7onyz 那首）。
   找不到时退回**合成音频**（正弦 + 噪声），报告里会明确标注用的是生成素材。
@@ -200,6 +203,18 @@ def rows_of(db, song_id):
         "SELECT COUNT(*) FROM fingerprints WHERE song_id=?", (int(song_id),)).fetchone()[0])
 
 
+def slice_of(song, at):
+    """某首"歌"的 4.5s 切片 → `(mono, sr, at)`；真素材读文件，生成素材按种子重算。"""
+    if song.get("seed") is None:
+        seg, sr = read_slice(song["path"], at)
+        return seg, sr, at
+    sr = int(song.get("sr") or 44100)
+    mono, sr = synth_song(int(song["seed"]))
+    seg = np.ascontiguousarray(mono[int(at * sr): int(at * sr) + int(SLICE_WIN * sr)],
+                               dtype=np.float32)
+    return seg, sr, at
+
+
 def main():
     real = os.path.isfile(MAT_A)
     print("=" * 78)
@@ -225,6 +240,7 @@ def main():
                 "hashes": hs,
                 "fp_id": fpvj.signature_from_hashes(hs),
                 "md5": fpvj.file_md5(path),
+                "seed": None,
             })
     else:
         for i in (11, 22):
@@ -234,7 +250,7 @@ def main():
                 "path": "<生成素材#%d>" % i, "sr": sr, "dur": len(mono) / float(sr),
                 "name": "synth%d.flac" % i, "title": "生成素材 %d" % i,
                 "artist": "synth", "hashes": hs,
-                "fp_id": fpvj.signature_from_hashes(hs), "md5": "",
+                "fp_id": fpvj.signature_from_hashes(hs), "md5": "", "seed": i,
             })
     print("算指纹耗时 %.1fs；两首：%s / %s" % (
         time.perf_counter() - t0,
@@ -283,15 +299,7 @@ def main():
     print("\n===== ② 同一首歌 4.5s 切片 → db.match()（证明包里的指纹真能认音频）=====")
     s0 = songs[0]
     sid0 = cue_fp_pack.fp_song_id(s0["fp_id"])
-    if real:
-        seg, seg_sr = read_slice(s0["path"], SLICE_AT)
-        at = SLICE_AT
-    else:
-        # 生成素材：从内存信号里切（同一坐标系：整段指纹的 offset 是 hop 帧）
-        mono, seg_sr = synth_song(11)
-        at = 20.0
-        seg = np.ascontiguousarray(mono[int(at * seg_sr): int(at * seg_sr)
-                                        + int(SLICE_WIN * seg_sr)], dtype=np.float32)
+    seg, seg_sr, at = slice_of(s0, SLICE_AT if real else 20.0)
     chk(seg is not None and len(seg) > int(3.0 * seg_sr),
         "取到 4.5 秒切片（位置 %.1fs）" % at,
         "%d 采样点 @%dHz" % (len(seg) if seg is not None else 0, seg_sr))
@@ -487,6 +495,83 @@ def main():
     chk(e2._cue_lookup_song_id(tr) is None, "没有 fp_songs 且名/艺人-md5 都对不上 ⇒ None（旧行为）")
     chk(e2._cue_accept_pos(12345, 3.0) == 3.0, "绑定未知 ⇒ 不启用护栏（照跟，旧行为）")
     chk(e2._cue_track_query_by_sid(sid) == {}, "没有 fp_songs ⇒ 反查为空")
+
+    # ================= ⑧ 持续对账：本机后来也有了同一首 =================
+    # 场景（用户真实顺序）：先导入码表包（库里只有合成指纹）→ 后来把同一首歌加进本机曲库
+    # ⇒ 同一段音频两份指纹 ⇒ 票数被拆一半 ⇒ **时认时不认**。靠 `reconcile_dupes()` 清掉。
+    print("\n===== ⑧ reconcile_dupes：撞车只清那一首（另一首原样保留）=====")
+    cfg8 = FakeCfg({"music_meta": {}, "music_library": [], "cue": {}})
+    r8 = cue_fp_pack.ingest_sheet(cfg8, db, pkg)
+    rows0_before = rows_of(db, sid0)
+    rows1_before = rows_of(db, sid1)
+    print("      前置：%r；库里 %d / %d 行" % (r8, rows0_before, rows1_before))
+    chk(rows0_before == len(s0["hashes"]) and rows1_before == len(songs[1]["hashes"]),
+        "前置：两首的合成指纹都在库里", (rows0_before, rows1_before))
+    # ⇩ 之后本机曲库也有了第一首（同一个 fp_id）
+    cfg8["music_meta"]["/local/lumoon.flac"] = {"fp_id": s0["fp_id"],
+                                                 "title": s0["title"]}
+    saves_before = cfg8.saves
+    rec8 = cue_fp_pack.reconcile_dupes(cfg8, db)
+    print("      reconcile_dupes → %r（cfg.save +%d）" % (rec8, cfg8.saves - saves_before))
+    chk(rows_of(db, sid0) == 0, "撞车那首的指纹行清零", rows_of(db, sid0))
+    chk(int(rec8.get("rows", 0)) == rows0_before, "返回 rows == 该首原有行数",
+        "%s vs %s" % (rec8.get("rows"), rows0_before))
+    chk(s0["fp_id"] in (rec8.get("dropped") or []), "dropped 里报出被清掉的 fp_id",
+        rec8.get("dropped"))
+    chk(rows_of(db, sid1) == rows1_before, "**另一首原样保留**（没有误删）",
+        "%d vs %d" % (rows_of(db, sid1), rows1_before))
+    chk(list((cfg8["cue"].get("fp_songs") or {}).keys()) == [songs[1]["fp_id"]],
+        "fp_songs 只剩另一首", cfg8["cue"].get("fp_songs"))
+    chk(cfg8.saves == saves_before + 1, "真删到东西 ⇒ 才 save 一次",
+        "%d → %d" % (saves_before, cfg8.saves))
+
+    # ---- 幂等：再调一次 ⇒ 0 删除、**不写盘** ----
+    saves_before = cfg8.saves
+    rec8b = cue_fp_pack.reconcile_dupes(cfg8, db)
+    chk(rec8b.get("rows") == 0 and not (rec8b.get("dropped") or []),
+        "幂等：再调 ⇒ 0 删除 / dropped 为空", rec8b)
+    chk(cfg8.saves == saves_before, "幂等：没有撞车 ⇒ **不写盘**（绝不每次启动都 save）",
+        "%d → %d" % (saves_before, cfg8.saves))
+
+    # ---- 无撞车（本机曲库为空）⇒ 0 删除 / 0 写盘 ----
+    cfg9 = FakeCfg({"music_meta": {}, "music_library": [], "cue": {}})
+    cue_fp_pack.ingest_sheet(cfg9, db, pkg)          # 两首都还在库里、但没有本机 fp_id
+    saves_before = cfg9.saves
+    rec9 = cue_fp_pack.reconcile_dupes(cfg9, db)
+    chk(rec9.get("rows") == 0 and not (rec9.get("dropped") or []),
+        "无撞车（本机曲库为空）⇒ 0 删除", rec9)
+    chk(cfg9.saves == saves_before, "无撞车 ⇒ 0 写盘", "%d → %d" % (saves_before, cfg9.saves))
+
+    # ---- 反向复现：把判据临时换成"路径相等" ⇒ 第 1 条必须挂 ----
+    # （真实实现是按 `fp_id` 相等判撞车；若有人误写成"比较路径"，撞车就永远判不出来）
+    cfg10 = FakeCfg({"music_meta": {}, "music_library": [], "cue": {}})
+    cue_fp_pack.ingest_sheet(cfg10, db, pkg)
+    cfg10["music_meta"]["/local/lumoon.flac"] = {"fp_id": s0["fp_id"]}
+    rows0_before = rows_of(db, sid0)
+    _orig_local = cue_fp_pack._local_fp_ids
+    try:
+        # 变异：本机"fp_id 集合"换成"路径集合"（典型误写：拿 song_id/路径去比 fp_id）
+        cue_fp_pack._local_fp_ids = lambda _cfg: {"/local/lumoon.flac"}
+        rec_bad = cue_fp_pack.reconcile_dupes(cfg10, db)
+        chk(rec_bad.get("rows") == 0 and rows_of(db, sid0) == rows0_before,
+            "反向复现：判据换成**路径相等** ⇒ 撞车判不出来（0 删除）",
+            "rows=%s 实际还剩 %d" % (rec_bad.get("rows"), rows_of(db, sid0)))
+    finally:
+        cue_fp_pack._local_fp_ids = _orig_local
+    rec_ok = cue_fp_pack.reconcile_dupes(cfg10, db)
+    chk(int(rec_ok.get("rows", 0)) == rows0_before and rows_of(db, sid0) == 0,
+        "还原成 fp_id 判据 ⇒ 同一场景立刻清掉那一首", rec_ok.get("rows"))
+
+    # ---- 撞车清完之后，另一首的指纹必须仍然能认出音频 ----
+    s1 = songs[1]
+    seg1, seg1_sr, at1 = slice_of(s1, 60.0 if real else 20.0)
+    got1_sid, got1_votes, got1_off = db.match(seg1, seg1_sr)
+    print("      match(另一首 @%.1fs) → song_id=%s votes=%s offset=%.3f"
+          % (at1, got1_sid, got1_votes, got1_off))
+    chk(got1_sid == sid1, "对账后另一首**仍然认得出**（没误删）",
+        "%s vs %s" % (got1_sid, sid1))
+    chk(abs(got1_off - at1) <= 0.5, "对账后另一首 offset 仍准确",
+        "off=%.3f want=%.3f" % (got1_off, at1))
 
     # ================= 耗时汇总 =================
     print("\n" + "=" * 78)
