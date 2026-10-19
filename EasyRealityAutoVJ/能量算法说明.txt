@@ -1,0 +1,202 @@
+================================================================================
+Easy Reality AutoVJ —— 能量（energy）算法完整说明
+来源：src/audio_engine.py，_Analyzer.__init__ / _Analyzer.feed()（2026-09-24 当前版本）
+说明：本文是「当前实际在跑的代码」的逐行梳理，不含任何未启用的实验分支。
+================================================================================
+
+【一】一句话公式
+--------------------------------------------------------------------------------
+    E = clip01( 平滑_不对称( (0.4×响度项 + 0.6×低频证据项) × 人声惩罚 ) ^ energy_scale )
+
+    低频证据项 = max(kick冲击, 低频能量, 低频起伏)
+
+    逐块（BLOCK=1024 采样 ≈ 21ms @48k）计算，输出 0~1。
+
+
+【二】数据流总览
+--------------------------------------------------------------------------------
+  采集块(1024×Nch)
+     │  ① 单声道化 + RMS
+     ▼
+  2048 点 Hann 窗 FFT（补零）→ 幅度谱 spec
+     │
+     ├─② 三频段均值：bass 20~160Hz / mid 160~2000Hz / high 2000~12000Hz
+     ├─③ 低频通量 bflux（20~200Hz 谱上升差）= kick 冲击
+     ├─④ 低频能量起伏 fluct（相邻块 bass 上升差，1s 累计）
+     ├─⑤ 中频占比 → vocalness（人声估计）
+     └─⑥ 全频通量 flux → 节拍/onset（不参与能量，供拍钟用）
+     │
+     ▼
+  ⑧ 响应速度：响度项（慢自适应基线） / ⑨ kick 映射（全曲慢峰 + 死区 + 可信度保护）
+     │
+     ▼
+  融合 0.4/0.6 → 人声惩罚 → 两级不对称平滑 → 伽马 → E
+
+
+【三】逐步代码与参数（audio_engine.py）
+
+── 0. 常量 ─────────────────────────────────────────────────────────────────
+    BLOCK = 1024                     每块采样数（约 21ms @48k）
+    self.win = np.hanning(2048)      FFT 窗
+    self.block_sec = BLOCK / sr
+
+── 1. 单声道化与 RMS ───────────────────────────────────────────────────────
+    sig = np.mean(data, axis=1) if data.shape[1] > 1 else data[:, 0]
+    rms = sqrt(mean(sig**2))
+    ※ 多声道是直接平均（不是能量相加）——若两声道反相会抵消低频，属于已知理论风险点，
+      现场系统若做了「反相/环绕扩展」处理需注意。
+
+── 2. FFT 与三频段 ─────────────────────────────────────────────────────────
+    buf = zeros(2048); buf[:n] = sig[:n]
+    spec = abs(rfft(buf * win)) / 1024.0
+    bass = mean(spec[20Hz,160Hz))
+    mid  = mean(spec[160Hz,2000Hz))
+    high = mean(spec[2000Hz,12000Hz))
+    平滑（α=0.25 一阶 EMA）：
+    smooth[bass|mid|high] = smooth*0.75 + 当前*0.25
+
+── 3. 响度项（e_loud）：相对「本曲自己」的响度 ──────────────────────────────
+    weighted = bass*0.6 + mid*0.25 + high*0.15          # 低频主导的宽带电平
+    wdb      = 20*log10(weighted + 1e-9)                # 转 dB
+    # 慢速自适应基线（≈10s 量级：τ=80s 的指数追踪）
+    若 wdb_base <= -59.9：wdb_base = wdb                # 冷启动：锚定第一声
+    否则：wdb_base += (wdb - wdb_base) * (1 - exp(-block_sec/80))
+    rel = wdb - wdb_base
+    e_loud = 0.5*(1 + rel/6)        当 rel < 0            # 低于基线：0~0.5
+    e_loud = 0.5 + 0.5*rel/6        当 rel >= 0           # 高于基线：0.5~1
+    e_loud = clip01(e_loud)
+    ※ 基线自适应 = 自动跟随母带音量：整首歌都录得很响也不会一直给 1.0；
+      代价是「持续很响」的段落会长期停在 0.5+（Euclid Number 这类段落的来源之一）。
+
+── 4. kick 冲击项（kick_e）：低频频谱通量 ───────────────────────────────────
+    bass_mask = 20Hz <= f <= 200Hz；bass_spec = spec[bass_mask]
+    bflux = sum(max(bass_spec - prev_bass_spec, 0))     # 只取上升沿
+    bflux_ref = max(bflux_ref*0.999, bflux)             # 慢衰减基准（半衰期≈15s）
+    kick_density = sum(最近 1s 的 bflux)                # 1s 窗口累计（不是 4s！
+                                                        # 4s 会把 kick 脉冲和贝斯慢起伏平均掉）
+    kick_peak = max(kick_peak, kick_density)            # 全曲慢峰，只升不降
+
+    # 「锚定保护」：VDJ 接歌无缝混播时不会触发换歌重置，新歌常从 breakdown 进入，
+    # kick_peak 会被锚死在低值 → 后面所有 kick_rel 虚高。用「peak 可信度」处理：
+    self._peak_age += block_sec
+    若 未确认 且 (kick_density > kick_peak*1.18 或 _peak_age > 90s)：确认 = True
+    peak_eff = kick_peak * (1.0 if 已确认 else 1.54)     # 未确认时分母放大 1.54
+    kick_rel = kick_density / peak_eff
+    kick_e   = clip01((kick_rel - 0.48) / 0.30)          # 死区 0.48、斜率 0.30
+    # 持续打击平滑（τ=1.2s 对称 EMA）：真鼓点连续多秒高；钢琴低音伴奏是短促敲击
+    # → 不平滑会让能量在 0.2↔0.6 反复横跳（Black Warrior 钢琴段的教训）
+    _kick_e_smooth += (kick_e - _kick_e_smooth) * (1 - exp(-block_sec/1.2))
+    kick_e = _kick_e_smooth
+
+── 5. 低频能量项（bass_factor）：录屏/压缩削瞬态时的兜底 ────────────────────
+    bass_peak = max(bass_peak, bass)                    # 全曲慢峰
+    bass_rel  = bass / max(bass_peak, 1e-6)
+    bass_factor = clip01((bass_rel - 0.45) / 0.22)      # 死区 0.45、斜率 0.22
+    ※ 存在意义：NVIDIA 录制/系统压缩会抹平 kick 频谱瞬态（kick_rel 掉进死区），
+      但低频**持续能量**还在 → 用它兜住 drop，不至于把高潮判成安静。
+
+── 6. 低频起伏项（fluct_factor） ───────────────────────────────────────────
+    _bdelta_recent 存 1s 内每块的 max(bass - prev_bass, 0)
+    fluct_density = sum(该 1s 窗口)；fluct_peak = max(fluct_peak, fluct_density)
+    fluct_rel    = fluct_density / fluct_peak
+    fluct_factor = clip01((fluct_rel - 0.45) / 0.22)
+    fluct_factor *= min(1.0, bass_factor*2.0)           # 门控：低频水平不足时不参与
+    ※ 门控是为了防止「钢琴/人声段起伏均匀但低频不高」被起伏量误抬。
+
+── 7. 融合与人声惩罚 ───────────────────────────────────────────────────────
+    loud_term = e_loud                                  # 响度项 0~1
+    ev_term   = max(kick_e, bass_factor, fluct_factor)  # 低频证据项 0~1
+    e = 0.4*loud_term + 0.6*ev_term
+    ※ 用 max 而不是固定加权：正常 drop 靠 kick；kick 被削时靠 bass 兜底。
+      固定加权会两头不讨好（kick 权重低则"靠 kick 撑 drop"的歌被压到 0.5）。
+    # 人声惩罚：中频占比高 → 砍能量（压缩/响度均衡不改变频谱形状，所以这个判据鲁棒）
+    v = mid / (bass + mid + high + 1e-6)
+    voc_smooth = voc_smooth*0.98 + v*0.02               # 慢平滑
+    vocalness_now  = min(1.0, voc_smooth * 1.6)
+    vocal_factor   = 1.0 - 0.6 * clip01((vocalness_now - 0.25) / 0.35)
+    e *= vocal_factor                                   # 最多砍 60%（2026-09-24 用户要求由 70% 削弱）
+
+── 8. 两级不对称平滑 ───────────────────────────────────────────────────────
+    # 第一级：τ 升 0.5s / 降 2.5s（压秒级波动）
+    tau = 0.5 if e > e_loud_smooth else 2.5
+    e_loud_smooth += (e - e_loud_smooth) * (1 - exp(-block_sec/tau))
+    e = clip01(e_loud_smooth)
+    # 第二级：逐块固定系数，升 0.4 / 降 0.05（attack 跟 kick 上升沿，release 慢回落）
+    if e > prev: smooth_energy = prev + (e - prev)*0.40
+    else:        smooth_energy = prev + (e - prev)*0.05
+
+── 9. 伽马校正（唯一的实验性可调项） ───────────────────────────────────────
+    sc = self.energy_scale          # 默认 1.0，范围 0.5~2.0，cfg["auto"]["energy_scale"]
+    E  = clip01(smooth_energy ** sc)
+    ※ 设计意图：现场系统低频增强会把人声段抬到接近鼓点段，>1 压中段、几乎不动 0.8+；
+      注意它压不动接近 1.0 的值（0.9²=0.81），所以「拉到 2.0 也没用」是数学必然。
+
+── 10. 写共享状态（其他模块读这些） ────────────────────────────────────────
+    st.energy = E
+    st.lv_db  = 20*log10(max(rms,1e-5))                 # Kv 待机层静音判定用它
+    st.level  = clip01((lv_db + 30) / 24)               # 电平表（dB 刻度）
+    st.bass   = min(1, smooth_bass*8)                   # 脉冲缩放/频谱特效用
+    st.mid    = min(1, smooth_mid*12)
+    st.high   = min(1, smooth_high*16)
+    st.dbg    = {loud, kick_e, bass_f, fluct_f, vocal_f, ev, rel, kick_rel, bass_rel, pre}
+                # 只给「能量诊断工具」看，主程序不读
+
+── 11. 换歌 / 静音重置（写状态时顺带处理） ────────────────────────────────
+    静音 > 3s 后又有声（大概率换歌）→ 重置：
+        wdb_base（重新锚定）、bass_peak、_peak_confirmed/_peak_age、
+        _kick_e_smooth、fluct_peak、prev_bass_e、e_loud_smooth、
+        smooth[energy/bass/mid/high]、flux_ref、bflux_ref、strike_times、downbeat 证据
+    静音 > 10s 后又有声 → 再清 BPM 投票与锁定（阈值 10s 防搓碟误清）
+
+
+【四】可调参数总表
+--------------------------------------------------------------------------------
+  参数                 位置                             默认    作用
+  -------------------  -------------------------------  ------  ----------------------
+  energy_scale         cfg["auto"]["energy_scale"]      1.0     伽马（0.5~2.0）
+  （响度项权重）        代码常量 0.4                     0.4     改需用户同意
+  （低频证据权重）      代码常量 0.6                     0.6     改需用户同意
+  kick 死区/斜率        代码常量 0.48 / 0.30             —       改需用户同意
+  bass 死区/斜率        代码常量 0.45 / 0.22             —       改需用户同意
+  fluct 死区/斜率       同 bass                          —       改需用户同意
+  人声惩罚强度          代码常量 0.6（2026-09-24 由 0.7 削弱）  —   改需用户同意
+  wdb 基线时长          代码常量 τ=80s                   —       改需用户同意
+  kick 平滑             代码常量 τ=1.2s                  —       改需用户同意
+  peak 可信度倍数        代码常量 1.54 / 1.18 / 90s       —       改需用户同意
+  ※ 约定：动这些常量必须 grep 所有 energy 消费点，核对下游阈值是否还匹配新分布。
+
+
+【五】谁在用这个 E（下游消费点，2026-09-24 现状）
+--------------------------------------------------------------------------------
+  src/match_engine.py  match_clips(genres, energy, …)      智能匹配选材（高/中/低动态档）
+  src/engine.py:341    _refresh_auto_layers                曲风变化时重算自动图层素材池
+  src/engine.py:398    _energy_tier_switch                 能量跨档即时切换
+                       档位：低 <0.50 / 中 0.50~0.65 / 高 >0.65，
+                       滞回：进高 ≥0.70、退中 <0.58；进低 <0.45、退中 >0.55 + 稳定 2s
+  src/engine.py:622    _update_mode                        行为模式自动打分
+  src/engine.py:688    _current_interval                   切换间隔（常规 16 拍 / 快切 8 拍取端点）
+  src/engine.py:770    _auto_switch_tick                   过渡时长微调
+  src/engine.py:803    _candidate_indices                  选材偏好（≥0.65 高动态、<0.50 低动态）
+  src/engine.py:1317   _apply_postfx（自动模式）            强度 = E × 全局强度 × 60%
+  src/engine.py:1410   _auto_pick_effects                  E>0.75 加曝光脉冲、E<0.3 加柔焦
+  src/colorfx.py:134   颜色渲染                            染色强度分档（低 0.40 / 高 0.65，与切换档位不是同一套）
+
+
+【六】已知边界情况（现场会遇到的）
+--------------------------------------------------------------------------------
+  1) 「持续很响但没有鼓组」的段落（如钢琴 + 长 bass 的 drop）：响度项长期 0.5+，
+     低频能量/起伏也能到 0.6~0.8 → 能量 0.8~0.9。实测 6 个判据（节奏感/低频泵动/
+     频谱形状/响度/动态/自相关）都无法把它和真 drop 分开 —— 需要音色维度才能根治。
+  2) 播放器/系统音效（网易云音频增强、QQ音乐音效、Spotify 均衡器、foobar EQ、
+     VDJ 的 EQ/限幅）**会直接污染能量读数**，因为分析的是系统回环：谁在放就分析谁。
+     校准/调参前必须先关掉这些。
+  3) 录屏（NVIDIA/ShadowPlay）或系统压缩会抹平 kick 瞬态 → 靠 bass_factor 兜底。
+  4) 采样率：默认「自动=设备原生采样率」，固定到低于设备的采样率会走 WASAPI 重采样，
+     轻微抹平瞬态 → 能量偏低。
+
+【七】变更记录
+--------------------------------------------------------------------------------
+  2026-09-24  人声惩罚系数 0.7 → 0.6（用户要求「削弱一点人声惩罚」）。
+              影响：人声段能量整体抬高 0~15%（人声越明显抬得越多），鼓点段不受影响；
+              下游档位阈值（0.50/0.65）与后处理强度会跟着略偏高，属预期内。
+================================================================================

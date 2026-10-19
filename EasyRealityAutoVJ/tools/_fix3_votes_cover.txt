@@ -1,0 +1,31 @@
+素材 21 首；前 200s，hop=1s，窗=4.5s
+  Rolling Contact - Alcohol Duper -Hardstyle V 窗=196
+  Rolling Contact - Black Warrior (2025 Remast 窗=196
+  Rolling Contact - Can We Believe That.flac   窗=196
+  Rolling Contact - Cosmic String.flac         窗=196
+  Rolling Contact - Crescent Horizon (Rebuild) 窗=196
+  Rolling Contact - Demon's Mischief.flac      窗=196
+  Rolling Contact - Devote Oneself.flac        窗=196
+  Rolling Contact - Dust.flac                  窗=196
+  Rolling Contact - Endless & Limitless.flac   窗=196
+  Rolling Contact - Euclid Number.flac         窗=196
+  Rolling Contact - Euphoria In Mind (Buchiage 窗=196
+  Rolling Contact - In The Atmosphere.flac     窗=196
+  Rolling Contact - Leviathan.flac             窗=196
+  Rolling Contact - One Night In Imperishable. 窗=196
+  Rolling Contact - Outburst Oxygen (Sharp Rem 窗=196
+  Rolling Contact - Phantom Summer -Sharp Refi 窗=196
+  Rolling Contact - Raccoon Memes.flac         窗=196
+  Rolling Contact - Raver Stone.flac           窗=196
+  Rolling Contact - Sexy Edge.flac             窗=196
+  Rolling Contact - The Lost (135 Extended).fl 窗=196
+  Rolling Contact - Unbreakable Life.flac      窗=196
+
+=== 汇总：21 首，4116 个 4.5s 窗 ===
+（原始逐窗结果已写 tools/_fix3_votes_rows.json 与 _fix3_votes_seq.json，便于复核/重放）
+  T=180：覆盖率  10.2%（窗数 421）；错歌接受 3（0.713%）；位置错>1.2s 24（5.701%）；其中偏差≥3.5拍可触发重锚 24
+  T=150：覆盖率  15.6%（窗数 642）；错歌接受 7（1.090%）；位置错>1.2s 54（8.411%）；其中偏差≥3.5拍可触发重锚 54
+  T=120：覆盖率  23.1%（窗数 949）；错歌接受 9（0.948%）；位置错>1.2s 106（11.170%）；其中偏差≥3.5拍可触发重锚 106
+  votes 分位: p10=12 p25=26 p50=56 p75=113 p90=181 max=448
+  最长连续 <180 的时长 ≈ 196 秒（hop=1s）
+  最长连续 <120 的时长 ≈ 196 秒（hop=1s）
