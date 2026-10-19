@@ -1,0 +1,27 @@
+========================================================================
+Task F 判据验证：4K 取帧缩放 + 有界多线程解码
+素材库 = Y:\EasyRealityAutoVJ\素材库
+出货配置：thread_type='AUTO' thread_count=2  取帧盒=画布×1.5
+========================================================================
+  [PASS] ① 4K 取帧 P95 ≤ 20ms
+        改前 p50=14.8 p95=16.8 ⇒ 改后 p50=12.1 p95=18.1 ms（AUTO/2 + 1.5×，阈 20ms）
+  [PASS] ① 1080p 取帧更快（< 4K）
+        1080p p50=6.9 p95=15.2 ms  vs  4K p50=12.1 ms
+  [PASS] ③ 画质不明显下降（截图对比）
+        平均像素差：全幅=0.45（阈 3.0） / crop 放大2×=1.20（阈 6.0）；截图 P:\ERAVJ\EasyRealityCue\_shots\m7_scale_compare.png
+  [PASS] ② 端到端播放 2~3 层 ≥ 24fps
+        2 层同入点：改前=29.5 → 改后=32.2 fps；3 层同入点：改前=18.7 → 改后=32.1 fps；3 层异入点（有界池已修复）：32.2 fps
+  [PASS] ⑤ 未动 waveform.py / timeline_widget.py
+        越界命中=无；frames.py 含 Task F 符号=True；两文件 mtime 更早=True
+  [PASS] ④ 不退化（compileall + selftest + tests + 两验证）
+        compileall=True selftest7/7=True tests失败=无 timeline6/6=True wave6/6=True
+
+========================================================================
+  [PASS] ① 4K 取帧 P95 ≤ 20ms
+  [PASS] ① 1080p 取帧更快（< 4K）
+  [PASS] ③ 画质不明显下降（截图对比）
+  [PASS] ② 端到端播放 2~3 层 ≥ 24fps
+  [PASS] ⑤ 未动 waveform.py / timeline_widget.py
+  [PASS] ④ 不退化（compileall + selftest + tests + 两验证）
+========================================================================
+汇总：6/6 通过  ⇒  全绿 ✓

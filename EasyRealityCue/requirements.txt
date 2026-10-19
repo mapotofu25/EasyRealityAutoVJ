@@ -1,0 +1,43 @@
+# EasyRealityCue 运行/打包依赖
+# ---------------------------------------------------------------------------
+# 版本以 docs/技术选型.md 的实测结论为准；"用途"一栏是逐文件扫 src/ercue/ 的
+# import 得出的，**只列真正用到的**。
+#
+# ⚠ 明确不装（技术选型已论证）：
+#   · onnxruntime / soundfile  —— M0~M5 未使用（BPM 目前手填，没有接 Beat This 节拍识别）
+#   · opencv-python            —— PyAV 全覆盖且更快，且省约 97 MB；且 DXV 拿不到 alpha
+#   · librosa / aubio / madmom / scipy / numba —— 节拍识别用不到
+#   · tinytag                  —— 项目已定 GPL-3.0-or-later，沿用已验证的 mutagen
+#
+# 安装：
+#   venv\Scripts\python -m pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+# —— 运行时（打进 exe）——
+
+# 界面框架 / 自绘时间轴 / QPainter 预览合成（只用 QtCore / QtGui / QtWidgets）
+# 用 Essentials（不含 Addons），比完整 PySide6 小约 100 MB。许可 LGPL-3.0-only。
+PySide6-Essentials==6.11.2
+# PySide6 的绑定运行时，必须与 PySide6 同版本（作为 Essentials 的依赖自动装）
+shiboken6==6.11.2
+
+# 视频 / 音频解码、随机 seek、alpha、取帧（media/probe.py、media/frames.py、
+# media/thumbs.py、audio/player.py、ui/window.py 都有 import av）
+# 许可 BSD-3；wheel 内含 GPL 的 libx264/libx265（项目按 GPL-3.0-or-later 分发，兼容）
+av==18.1.0
+
+# 数值运算：合成里的 subtract 饱和减、缩略图打分（render/compositor.py 等）
+numpy==2.5.3
+
+# 音频标签与时长（ui/window.py 用 mutagen.File(easy=True) 读 title/artist/length）
+mutagen==1.48.1
+
+# 音频走带（audio/player.py 惰性 import sounddevice；自带 portaudio DLL，打包需 --collect-all）
+sounddevice==0.5.6
+
+# —— 仅打包期（不随 exe 分发）——
+
+# 打 Windows 独立 onedir exe。许可 GPL-2.0-or-later WITH bootloader-exception（允许打包）
+pyinstaller==6.22.2
+# PyInstaller 的第三方库 hook（av / mutagen 等）。2026.7 为技术选型实测版本
+pyinstaller-hooks-contrib==2026.7

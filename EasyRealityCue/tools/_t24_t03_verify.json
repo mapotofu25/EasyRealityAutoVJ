@@ -1,0 +1,44 @@
+{
+ "#6_seek": {
+  "click_last": 11.97,
+  "click_ok": true,
+  "drag_emits": 2,
+  "drag_last": 14.97,
+  "drag_ok": true,
+  "no_pan": true,
+  "view_unchanged": true
+ },
+ "#9_cursor": {
+  "handle_is_SizeHor": true,
+  "mid_is_Arrow": true
+ },
+ "#10_blank_clear": {
+  "sel_empty": true,
+  "picked_empty": true,
+  "paint_ok": true
+ },
+ "#13_blank_menu": {
+  "count": true,
+  "item_empty": true
+ },
+ "#13_sec_at_global_delta": 0.0,
+ "#14_snap": {
+  "snapped_to_20": true,
+  "target": 20.0,
+  "guide_px_increase": 157,
+  "neighbor_untouched": true
+ },
+ "#18_dup": {
+  "menu_when_unselected": 1,
+  "sel_after_menu": [
+   "L1",
+   "i1"
+  ],
+  "dup_on_selected": 1,
+  "dup_mode": true,
+  "cursor_DragCopy": true
+ },
+ "#18_esc_exit_mode": false,
+ "real_paint_ok": true,
+ "verdict": "T03_OK"
+}

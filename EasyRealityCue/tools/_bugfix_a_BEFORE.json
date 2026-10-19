@@ -1,0 +1,37 @@
+{
+ "bug1_trim_drag_blank": {
+  "normal_content_px": 73707,
+  "during_drag_content_px": -1,
+  "after_release_content_px": 73707,
+  "paint_exceptions": [],
+  "during_grab_error": "TypeError: Error calling Python override of QWidget::paintEvent(): 'NoneType' object is not subscriptable",
+  "trim_preview_at_press": "None",
+  "content_loss_ratio": null,
+  "bug": true
+ },
+ "bug2_clip_audio_not_following": {
+  "spike_x_rest": 414,
+  "spike_x_during_drag": 415,
+  "block_shift_px": 150.0,
+  "wave_shift_px": 1,
+  "tracked": false,
+  "bug": true
+ },
+ "bug3_speed_length_not_recomputed": {
+  "len_at_1x": 10.0,
+  "len_at_0.5x": 10.0,
+  "len_after_pull_20s": 20.0,
+  "len_after_speed_back_1x": 20.0,
+  "src_span": 10.0,
+  "speed_after": 1.0,
+  "expected_len_after": 10.0,
+  "playable_sec": 10.0,
+  "bug": true
+ },
+ "_summary": {
+  "bug1_trim_drag_blank": true,
+  "bug2_clip_audio_not_following": true,
+  "bug3_speed_length_not_recomputed": true
+ },
+ "_verdict": "BUGS_PRESENT"
+}
