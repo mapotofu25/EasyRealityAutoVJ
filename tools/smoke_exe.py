@@ -1,0 +1,213 @@
+"""新 exe 启动冒烟（发布流程第 5 步，每次 build 后必跑）
+
+做的事：删掉旧的 `startup_error.log` → 启动刚打出来的 exe → 等 N 秒 →
+检查「进程还活着」且「没有新生成 startup_error.log」→ 收尾结束进程。
+
+为什么不能省：项目里吃过这个亏 —— 没被执行过的代码路径藏着版本兼容 bug
+（全局热键那一支从没跑过，一启用就启动即崩），而**崩在窗口出现之前时用户只看到
+「任务管理器里有进程、没有窗口」**。这一条 40 秒的冒烟能拦住绝大多数这类问题。
+
+用法：
+  venv\\Scripts\\python.exe tools\\smoke_exe.py [等待秒数=40]
+  venv\\Scripts\\python.exe tools\\smoke_exe.py 40 --isolated
+
+⚠ 默认模式会 `taskkill` 掉**所有** EasyRealityAutoVJ.exe（含用户正在跑的实例）。
+  如果用户正在使用软件（例如演出中），**必须加 `--isolated`**：
+  它把新实例的 `LOCALAPPDATA` **和 `TEMP`/`TMP`** 都指到临时目录 ——
+  既绕开单实例锁、又不动用户数据，结束时也只关掉自己启动的那个进程。
+  （顺带等于测了一遍「全新用户首次启动」。）
+
+⚠⚠ 为什么必须连 `TEMP` 一起隔离（2026-10-07 实测踩到）：单实例锁文件
+  `EasyRealityAutoVJ.lock` 落在 `tempfile.gettempdir()`（= `TEMP`），**不在 LOCALAPPDATA**。
+  只隔离 LOCALAPPDATA 时，用户开着软件（或从源码跑 main.py）就会占着这把锁，
+  新 exe 一启动就判定「已在运行」→ 立刻 exit 0 ⇒ 冒烟被误报成「结果不可信」，
+  而真实产物其实是好的。隔离 TEMP 才真正绕开锁。
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ⚠ 与 build_exe.py / make_zip.py 保持同一套口径：支持 `AUTOVJ_DIST` 指定另一个产物目录。
+#   为什么需要它（2026-09-28 实测）：`dist/EasyRealityAutoVJ` 偶尔会被某个进程按住目录句柄
+#   （改不了名、删不掉，WinError 32），此时**新产物只能先落到另一个目录**，
+#   否则打包直接失败。`_dist_pids()` 也用 EXE 反推目录，所以这里一改就一起生效。
+DIST_NAME = os.environ.get("AUTOVJ_DIST", "dist")
+EXE = os.path.join(ROOT, DIST_NAME, "EasyRealityAutoVJ", "EasyRealityAutoVJ.exe")
+
+
+def _default_log():
+    return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                        "AutoVJ", "startup_error.log")
+
+
+def _dist_pids():
+    """列出 **exe 路径就在 `dist/` 下** 的 EasyRealityAutoVJ 进程 PID。
+
+    ⚠ 只认 dist 里那份 —— 用户自己那份装在别的目录（例如 `Y:\\EasyRealityAutoVJ\\`），
+      **绝不能误杀**，所以必须按「可执行文件路径」判断，不能只按进程名。
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wt.HANDLE
+    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq EasyRealityAutoVJ.exe",
+                          "/FO", "CSV", "/NH"],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace").stdout
+    want = os.path.dirname(EXE).lower()
+    pids = []
+    for line in out.splitlines():
+        parts = [x.strip('"') for x in line.split('","')]
+        if len(parts) < 2 or not parts[0].lower().startswith("easyreality"):
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        h = k32.OpenProcess(0x1000, False, pid)
+        if not h:
+            continue
+        buf = ctypes.create_unicode_buffer(2048)
+        size = ctypes.c_ulong(2048)
+        try:
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                if os.path.dirname(buf.value).lower() == want:
+                    pids.append(pid)
+        finally:
+            k32.CloseHandle(h)
+    return pids
+
+
+def _reap_dist_instances(quiet=False):
+    """兜底清理：杀掉 dist 里残留的实例。返回清掉的 PID 列表。
+
+    ★ 2026-09-27 补：光靠 `Popen.terminate()` **实测偶尔会残留**一个实例占住 `dist/`，
+      后果是**下次打包 `os.rename(dist/…)` 报 `WinError 32 另一个程序正在使用此文件`**，
+      排查一次要几分钟。这里按路径再兜一遍，把这个问题挡在冒烟阶段。
+    """
+    pids = _dist_pids()
+    for pid in pids:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, encoding="utf-8", errors="replace")
+    if pids and not quiet:
+        print("★ 冒烟收尾：清掉 dist 里残留的实例 %s（否则下次打包会 WinError 32）"
+              % ", ".join(str(x) for x in pids))
+    return pids
+
+
+def main():
+    args = sys.argv[1:]
+    isolated = "--isolated" in args
+    secs = 40
+    for a in args:
+        if a.isdigit():
+            secs = int(a)
+
+    print("=" * 80)
+    print("启动冒烟  %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 80)
+    if not os.path.exists(EXE):
+        print("★ 找不到 %s（先跑 tools/build_exe.py）" % EXE)
+        return 2
+
+    env = None
+    if isolated:
+        # ⚠ 隔离目录落在**真实** TEMP 下（用户那里一定可写），用真实 TEMP 路径建目录。
+        _real_tmp = tempfile.gettempdir()
+        data_root = os.path.join(_real_tmp, "autovj_smoke_%d" % os.getpid())
+        os.makedirs(data_root, exist_ok=True)
+        env = os.environ.copy()
+        env["LOCALAPPDATA"] = data_root
+        # ★★ 关键：单实例锁在 `tempfile.gettempdir()`（= TEMP/TMP）里，不在 LOCALAPPDATA。
+        #   不隔离它，用户正开着的实例就会挡住冒烟 ⇒ 进程秒退、误报「结果不可信」。
+        env["TEMP"] = data_root
+        env["TMP"] = data_root
+        log = os.path.join(data_root, "AutoVJ", "startup_error.log")
+        print("隔离模式：临时数据目录 = %s" % data_root)
+        print("  ★ 不结束你正在运行的实例；结束时只关本次启动的进程")
+        print("  ★ 已隔离 TEMP/TMP ⇒ 单实例锁不与用户实例冲突")
+    else:
+        log = _default_log()
+        # 先确认没有残留进程占着 dist
+        subprocess.run(["taskkill", "/F", "/IM", "EasyRealityAutoVJ.exe"],
+                       capture_output=True, encoding="utf-8", errors="replace")
+
+    if os.path.exists(log):
+        try:
+            os.remove(log)
+            print("已删除旧的 startup_error.log")
+        except OSError as e:
+            print("⚠ 删不掉旧日志（可能被占用）：%s" % e)
+
+    # ★ 单实例锁：从源码跑的实例（python main.py）也占这把锁，而它**不叫**
+    #   EasyRealityAutoVJ.exe ⇒ 上面的 taskkill 清不掉它 ⇒ 新 exe 会以为"已在运行"
+    #   直接退出，冒烟就误报失败。这里先探一下，让结论别被误读。
+    # ★ 隔离模式下锁也被隔离 ⇒ 探测路径必须跟着走，否则会误报「锁已存在」。
+    _lock_root = (env or {}).get("TEMP") or tempfile.gettempdir()
+    _lock = os.path.join(_lock_root, "EasyRealityAutoVJ.lock")
+    lock_held = os.path.exists(_lock)
+    if lock_held:
+        print("⚠ 单实例锁已存在（%s）" % _lock)
+        print("  ⇒ 若本机还有『从源码跑的实例』或旧实例，新 exe 会判定"
+              "「已在运行」并立刻退出 —— 那不是打包失败！")
+
+    print("启动 exe，等待 %d 秒…" % secs)
+    p = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env)
+    alive, t0 = True, time.time()
+    while time.time() - t0 < secs:
+        if p.poll() is not None:
+            alive = False
+            print("★ 进程提前退出，返回码 %s（%.1f 秒）" % (p.returncode, time.time() - t0))
+            break
+        time.sleep(1)
+    if alive:
+        print("进程存活超过 %d 秒 ✓" % secs)
+
+    err = ""
+    if os.path.exists(log):
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                err = fh.read()
+        except Exception as e:                                        # noqa: BLE001
+            err = "（读取失败：%s）" % e
+    print("新生成的 startup_error.log：%s" % ("**有**" if err else "无 ✓"))
+    if err:
+        print("-" * 80)
+        print(err[:2000])
+        print("-" * 80)
+
+    # 收尾：隔离模式只杀自己启动的那个 PID，默认模式清掉全部同名进程
+    if isolated:
+        try:
+            p.terminate()
+        except Exception:                                             # noqa: BLE001
+            pass
+        try:
+            p.wait(timeout=10)
+        except Exception:                                             # noqa: BLE001
+            subprocess.run(["taskkill", "/F", "/PID", str(p.pid)],
+                           capture_output=True, encoding="utf-8", errors="replace")
+    else:
+        subprocess.run(["taskkill", "/F", "/IM", "EasyRealityAutoVJ.exe"],
+                       capture_output=True, encoding="utf-8", errors="replace")
+    time.sleep(1)
+    # ★ 兜底：按「可执行文件路径」清掉 dist 里的残留（只动 dist 那份，不碰用户的实例）
+    _reap_dist_instances()
+
+    ok = alive and not err
+    print("")
+    if not ok and lock_held and not err:
+        print("结论：⚠ 结果不可信 —— 进程提前退出，但单实例锁在冒烟前就已存在，")
+        print("      极可能是被『另一个实例（含从源码跑的 python main.py）』挡住了。")
+        print("      请先关掉所有实例再重跑本脚本，再下结论。")
+        return 2
+    print("结论：%s" % ("✅ 冒烟通过" if ok else "★ 冒烟失败，别发这个包"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
