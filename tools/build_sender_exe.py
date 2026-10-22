@@ -90,6 +90,14 @@ def _build_spec():
     #   而写反斜杠要经过两层转义（模板 → 文件 → Python 解析），极易出错。
     src_dir = os.path.join(ROOT, "src").replace("\\", "/")
     script = os.path.join(ROOT, "lan_audio_sender.pyw").replace("\\", "/")
+    # ★ 应用图标（仅图标相关）：exe 文件图标 + 随包资源（供运行时 setWindowIcon）。
+    #   文件缺失 ⇒ icon=None、datas 不含它（打包照常，不影响业务）。
+    icon = os.path.join(ROOT, "assets", "send.ico")
+    if os.path.isfile(icon):
+        icon_lit = repr(icon.replace("\\", "/"))
+        datas_lit = "(%r, 'assets')" % icon.replace("\\", "/")
+    else:
+        icon_lit, datas_lit = "None", ""
     spec = '''# -*- mode: python ; coding: utf-8 -*-
 # 本文件由 tools/build_sender_exe.py 自动生成，请勿手改。
 import os, sys
@@ -98,10 +106,13 @@ a = Analysis(
     ["@@SCRIPT@@"],
     pathex=["@@SRCDIR@@"],
     binaries=[],
-    datas=[],
+    datas=[
+        @@DATAS@@
+    ],
     hiddenimports=[
         "soundcard", "soundcard.mediafoundation",
         "wasapi_capture", "lan_audio", "lan_audio_send",
+        "appicon",
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -151,12 +162,13 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-    icon=None,
+    icon=@@ICON@@,
 )
 '''
     for k, v in (("@@SCRIPT@@", script), ("@@SRCDIR@@", src_dir),
                  ("@@EXCLMOD@@", excl_mod), ("@@EXCLBIN@@", excl_bin),
-                 ("@@EXE@@", EXE)):
+                 ("@@EXE@@", EXE), ("@@ICON@@", icon_lit),
+                 ("@@DATAS@@", datas_lit)):
         spec = spec.replace(k, v)
     path = os.path.join(ROOT, "build_sender", "sender.spec")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -170,15 +182,20 @@ def main():
     if not os.path.isfile(pyi):
         print("找不到 PyInstaller：%s" % pyi)
         return 1
+    # ★ 构建/输出目录支持环境变量覆盖（与 build_exe.py / build_erlib_exe.py 同一约定）：
+    #   默认仍是 dist_sender / build_sender；要打去别处（避让正在运行/被占用的旧产物）时
+    #   用 `SENDER_DIST=dist_icon SENDER_BUILD=build_icon`。
+    build = os.environ.get("SENDER_BUILD", "build_sender")
+    dist = os.environ.get("SENDER_DIST", "dist_sender")
     spec = _build_spec()
     args = [
         pyi, "--noconfirm", "--clean",
-        "--distpath", os.path.join(ROOT, "dist_sender"),
-        "--workpath", os.path.join(ROOT, "build_sender"),
+        "--distpath", os.path.join(ROOT, dist),
+        "--workpath", os.path.join(ROOT, build),
         spec,
     ]
     r = subprocess.run(args, cwd=ROOT)
-    out = os.path.join(ROOT, "dist_sender", EXE + ".exe")
+    out = os.path.join(ROOT, dist, EXE + ".exe")
     if os.path.isfile(out):
         print("\n构建完成：%s（%.1f MB）" % (out, os.path.getsize(out) / 1048576.0))
     else:

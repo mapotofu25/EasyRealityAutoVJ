@@ -39,7 +39,7 @@ class LayerPlayState:
     """某一层当前的播放状态（合成器直接消费）。"""
     __slots__ = ("lyr_id", "z", "blend", "opacity", "clip_id", "clip_path", "missing",
                  "item_id", "src_in_sec", "src_out_sec", "play_sec", "crop", "xform",
-                 "speed", "active", "alpha", "trans", "trans_p", "note", "ended",
+                 "speed", "active", "alpha", "trans", "trans_p", "note", "ended", "dur",
                  "src_ended")
 
     def __init__(self, lyr_id="", z=0, blend="normal", opacity=1.0):
@@ -62,6 +62,7 @@ class LayerPlayState:
         self.trans = "fade"
         self.trans_p = 0.0
         self.note = ""
+        self.dur = 0.0               # 素材自身时长（秒）；0 = 未知
         self.ended = False           # 片段区间已结束（end_beats 到期且本层无后继）
         self.src_ended = False       # ★ 素材已放到出点（play_sec 钳在 src_out，冻结该帧）
 
@@ -115,6 +116,16 @@ class CueRuntime:
             for ly in track.sorted_layers():           # z 小 → 大（后画在上）
                 items = sorted([it for it in ly.items], key=lambda x: (x.at_beats, x.item_id))
                 self._lyrs.append((ly, items))
+        # ★ 素材时长表（clip_id → 秒）：用来**钳住**播放位置，见 `update()` 里的说明
+        self._dur = {}
+        for _m in (getattr(sheet, "media", None) or []):
+            try:
+                _c, _d = (str(getattr(_m, "clip_id", "") or ""),
+                          float(getattr(_m, "duration_sec", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if _c and _d > 0.0:
+                self._dur[_c] = _d
         self._state = {}                               # lyr_id -> 内部状态
         self.jumped = False                            # 本帧是否发生了"跳转重算"
         for ly, _items in self._lyrs:
@@ -208,7 +219,18 @@ class CueRuntime:
                 a_out = max(0.0, left / float(it.trans_out_beats))
                 if a_out < a_in:            # 淡出优先（正在收尾）
                     trans = it.trans_out
-                    trans_p = 1.0 - a_out
+                    # ★★★ 2026-10-17（用户："编排结束后看不见淡出的过渡效果"）：
+                    #   `fade` 的 `trans_p` 必须是**剩下的亮度**（a_out），不是"过渡进度"。
+                    #   为什么：合成是 `opacity × alpha × trans_p`，而 alpha 本身就是 a_out
+                    #     ⇒ 旧写法 trans_p = 1-a_out 时有效 α = **a_out(1-a_out)**：
+                    #       淡出**刚开始**（a_out=1）就变 0 ⇒ 画面**瞬间消失**，
+                    #       中间又冒出个 0.25 的鬼影 ⇒ 现场看就是"没有淡出，直接切掉"。
+                    #   改 a_out 后有效 α = **a_out²**，与淡入的 a_in² 完全对称（契约②）。
+                    #   ⚠ slide/zoom/glitch 的 `trans_p` 是**几何进度**（0→1 越走越远），
+                    #     必须仍然是 1-a_out；所以只替换 `trans_out == "fade"` 这一种。
+                    #   ⚠⚠ 编排端（EasyRealityCue `timeline._alpha_for`）必须同步改，
+                    #     否则预览与演出不一致（契约②两端口径）。
+                    trans_p = (a_out if it.trans_out == "fade" else 1.0 - a_out)
         return min(a_in, a_out), trans, trans_p
 
     # ------------------------------------------------------------------
@@ -263,17 +285,45 @@ class CueRuntime:
                 #   `media_manager` 的 `interval / speed` 也是"倍速"⇒ 两端同向。
                 dt_beats = max(0.0, pos - it.at_beats)
                 spd = max(1e-6, float(it.speed or 1.0))
-                ps.speed = spd
+                # ★★★ 2026-10-18：**播放器倍速还要乘输入音乐的播放速率**。
+                #   为什么（现场实测）：`play_sec` 由 `pos`（指纹算出的原曲秒）推出来，
+                #   所以它天然按**音乐的实际速率**前进；而播放器默认只按 `it.speed` 走。
+                #   音乐一旦不是 1.0 倍（DJ 降速/keylock/录音设备时钟差），两边就**结构性**
+                #   差一个恒定比例 ⇒ 越放越远（实测某一场音乐速率 ≈ 0.861，1 分钟差 8 秒）。
+                #   靠 `rate_for()` 的 ±15% 只能勉强兜住 0.85，再慢就没救了。
+                #   ⇒ 直接把输入速率乘进播放器倍速，让"位置源"和"播放器"用同一个时间基。
+                #   ⚠ `play_sec` 本身**不能**再乘一次（`pos` 里已经含速率）——那是双重计速。
+                _r = 1.0
+                try:
+                    _r = float(rate)
+                except (TypeError, ValueError):
+                    _r = 1.0
+                if not (_r > 0.05):
+                    _r = 1.0
+                ps.speed = spd * max(0.5, min(2.0, _r))
                 raw_play = ps.src_in_sec + dt_beats * bl * spd
                 # ★ 规则 5b：到达出点冻结最后一帧（不黑、不越过），直到本片段被替换。
                 ps.src_out_sec = (None if it.src_out_sec is None
                                   else float(it.src_out_sec))
-                if ps.src_out_sec is not None and raw_play >= ps.src_out_sec:
-                    ps.play_sec = ps.src_out_sec
+                # ★★★ 2026-10-18（真机联调抓到的）：**按素材时长钳位**。
+                #   现场 `dmax=19.89s` 的单帧尖峰就是这么来的：LOGO 素材只有 20s，
+                #   而这一段的 `play_sec` 走到了 20s 以上 ⇒ 解码器**回卷到 0**
+                #   ⇒ `position()` 与 `play_sec` 相关 20 秒 ⇒ 控制器以为"差 20 秒"
+                #   ⇒ 猛减速（spd 掉到 0.75）甚至 seek ⇒ **画面一跳**。
+                #   正确语义与 `src_out_sec` 一致：**超过素材长度就冻结最后一帧**，
+                #   绝不去追一个已经回卷的位置。
+                _dur = self._dur.get(str(getattr(it, "clip_id", "") or ""), 0.0)
+                _lim = ps.src_out_sec
+                if _dur > 0.0 and (_lim is None or _dur < _lim):
+                    _lim = _dur
+                if _lim is not None and raw_play >= _lim:
+                    ps.play_sec = float(_lim)
                     ps.src_ended = True
+                    ps.src_out_sec = float(_lim)
                 else:
                     ps.play_sec = raw_play
                     ps.src_ended = False
+                ps.dur = float(self._dur.get(str(getattr(it, "clip_id", "") or ""), 0.0) or 0.0)
                 ps.crop = list(it.crop) if it.crop else None
                 # 恒给 dict：全默认 = cover（契约①）；None 会让下游"是否默认"判断分叉
                 ps.xform = dict(it.xform) if it.xform else dict(_DEFAULT_XFORM)

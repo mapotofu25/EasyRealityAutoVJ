@@ -14,7 +14,10 @@ try:
 except Exception:                      # 源码模式 / 未经打包
     BUILD_DATE, BUILD_SEQ, BUILD_VER, ZIP_NAME = "", 0, "dev", ""
 
-APP_VERSION = BUILD_VER                # 2026.09.23.07 / dev
+# ★ 2026-10-22：RC2 → RC3。识别防误报（白名单+峰值门槛+id 自愈）、ASIO 开放、码表 GIF 修复。
+#   打包版显示 2026.10.19.xx-RC1；源码运行显示 dev-RC1。
+APP_CHANNEL = "RC3"
+APP_VERSION = ((BUILD_VER + "-RC3") if BUILD_VER and BUILD_VER != "dev" else "dev-RC3")
 APP_BUILD = BUILD_DATE or ""           # 2026-09-23
 APP_SEQ = BUILD_SEQ                    # 7
 APP_ZIP_NAME = ZIP_NAME                # EasyRealityAutoVJ_测试版092307.zip
@@ -22,6 +25,8 @@ APP_ZIP_NAME = ZIP_NAME                # EasyRealityAutoVJ_测试版092307.zip
 # 作者与反馈渠道
 AUTHOR = "麻婆豆腐"
 CONTACT = "QQ 1793170435"
+# 项目主页（「关于」界面显示为可点击链接）
+PROJECT_URL = "https://github.com/mapotofu25/EasyRealityAutoVJ"
 # 测试群（关于界面显示，链接可点击直接拉起 QQ 加群）
 GROUP_NAME = "ERAVJ测试"
 GROUP_NO = "543643838"

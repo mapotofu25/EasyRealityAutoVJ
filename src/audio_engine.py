@@ -12,6 +12,7 @@ soundcard 库导入时会在【当前线程】一次性 CoInitializeEx(MTA)，�
 系统文件对话框（IFileDialog 需要 COM STA）会直接卡死。
 """
 import math
+import io
 import os          # `_rec_diag` 写 cue_health.log 用（本模块原先没有，漏了会 NameError）
 import time
 import queue
@@ -136,6 +137,12 @@ def _band_mean(spec, rg):
     return float(np.mean(spec[i0:i1]))
 
 
+FP_USE_HINT = False   # 见 `_recognize_loop` 里的对照实验说明
+
+
+FP_USE_HINT = False   # 见 `_recognize_loop` 里的对照实验说明
+
+
 class RateEstimator:
     """由相邻两次指纹识别的 (offset_orig, wall_t) 估计输入音乐的播放速率 r。
 
@@ -144,20 +151,43 @@ class RateEstimator:
 
         r ≈ Δoff_原曲 / Δt_挂钟
 
-    做法：
+    做法（★ 2026-10-18 真机两轮迭代后的最终形状）：
       - 只在**同一首歌连续识别**时累计；换歌 / 识别丢失时 `reset()`；
-      - **EMA 平滑**（时间常数约 3s），并做范围钳位 [MIN_R, MAX_R]；
-      - 瞬时值越界视为不可信 → 不动 EMA（单次抖动不丢历史），返回当前估计，初值 1.0。
+      - **野值闸门**：单步速率越界（野匹配一步跳 30~250s）⇒ 该样本直接丢，不动锚点；
+      - **长基线**：用 `_hist` 里最早一条 ↔ 最新一条算速率（基线 ≥ `MIN_SPAN=2s`），
+        因为 offset 本身有 ±0.2~0.3s 抖动，**相邻两次**算出来的噪声 σ≈0.4（与信号同量级）；
+      - 长基线估计再走 `STEP_ALPHA` 跟随 + `MAX_STEP/OUT_N` 离群闸门（绝不死锁）。
 
     ⚠ 这是**输入侧**的速率，与引擎里 `speed`（输出端 VJ 素材倍速）完全是两回事，
       绝不可复用。
     """
 
-    MIN_R = 0.8          # 合理下限（-20%）
-    MAX_R = 1.25         # 合理上限（+25%）
+    MIN_R = 0.6          # 合理下限（-40%，覆盖 DJ 大幅降速）
+    MAX_R = 1.6          # 合理上限（+60%）
     MIN_DT = 0.2         # 挂钟增量下限（太小则噪声主导）
     MAX_DT = 2.0         # 挂钟增量上限（太大则视为不连续）
     MIN_DOFF = 0.05      # |Δoff| 下限（过小不可信）
+    # ★ 2026-10-18（变速真机）：**离群闸门**替掉原来收窄的量程。
+    #   原 `MIN_R/MAX_R = 0.8/1.25` 是拿"量程"当噪声过滤器 —— 副作用是 **±20% 变速本身
+    #   就落在闸门外**（0.8 恰好在边界，噪声一抖就 <0.8 ⇒ 样本被丢 ⇒ 前馈倍率永远停在 1.0
+    #   ⇒ 码表按 1.0 播而音乐按 0.8 播 ⇒ 稳态偏差 = 1.5×0.2 = 0.3s，再加抖动就够到 seek 门槛
+    #   ⇒ **每 2 秒强跳一次**，正是用户说的"一直跳"）。
+    #   改成：量程放宽到真·乐器范围，噪声交给"**单次离群不采信、连续 3 次才认**"处理
+    #   —— 既是噪声过滤器，又不会把真实变速挡在外面（且绝不会永久卡死，铁律 0）。
+    MAX_STEP = 0.30      # 单次与当前估计相差超过它 ⇒ 先当噪声
+    OUT_N = 3            # 连续这么多次都偏离 ⇒ 认定是真的变速，直接跟
+    # ★★★ 2026-10-18（第二轮真机，最关键的修正）：**必须用"多秒基线"估速率**。
+    #   识别每 0.5s 出一次 offset，而 offset 本身有 **±0.2~0.3s 抖动**
+    #   ⇒ 用"相邻两次"算速率，噪声 σ ≈ 0.2/0.5 = **0.4**（跟信号同量级！）
+    #   ⇒ EMA 无论怎么调都是"要么不收敛、要么抖"。实测 0.80× 跑 50s 只收到 r=0.958，
+    #     于是码表按 0.96 播而音乐按 0.80 播 ⇒ 系统性快了 16%。
+    #   实测数据（离线 4.5s 窗口）：0.80× 时 offset 每 **2s** 前进 1.44~2.00（真值 1.60）
+    #   ⇒ 基线拉到 2s 噪声立刻降到 0.1，4s 降到 0.05。
+    #   ⇒ 做法：只把"**合理步进**"的样本存进历史（野匹配一步 30~250s，直接判越界丢掉），
+    #     再用"历史里最早那条 ↔ 最新那条"的**长基线**算速率。
+    WIN_SEC = 8.0        # 历史窗口（长基线最多这么长；8s 才能把 4s 阶梯抹平）
+    MIN_SPAN = 3.0       # 至少跨这么久才算一次速率（比它短就等）
+    STEP_ALPHA = 0.6     # 长基线估计的跟随系数（估计本身已很平滑，可以跟得快）
 
     def __init__(self, tau=3.0):
         self._tau = float(tau)
@@ -170,6 +200,8 @@ class RateEstimator:
         self._last_t = None
         self.rate = 1.0
         self._ready = False
+        self._out_n = 0           # 连续离群次数（见 MAX_STEP/OUT_N）
+        self._hist = []           # [(t, off)] 只收"合理步进"的样本（长基线用）
 
     def update(self, song_id, off, wall_t):
         """喂一次识别结果，返回当前 r 估计（未收敛时 1.0）。"""
@@ -183,28 +215,71 @@ class RateEstimator:
             self._last_t = wall_t
             self.rate = 1.0
             self._ready = False
+            self._out_n = 0
+            self._hist = [(wall_t, off)]
             return self.rate
         if self._last_off is None or self._last_t is None:
             self._last_off = off
             self._last_t = wall_t
+            self._hist = [(wall_t, off)]
             return self.rate
         dt = wall_t - self._last_t
         doff = off - self._last_off
+        # ★ 不连续（识别断档）：**历史作废**，本次重新起锚。
+        #   跨断档算斜率会把"断档期间没走的秒数"当成走动 ⇒ 速率被系统性低估。
+        if not (self.MIN_DT <= dt <= self.MAX_DT):
+            self._last_off = off
+            self._last_t = wall_t
+            self._hist = [(wall_t, off)]
+            return self.rate
+        r_step = doff / dt
+        # ★ 野匹配一步就能跳 30~250s（r_step 几十上百）⇒ 直接丢样本。
+        #   ⚠⚠ **`_last_off` 和 `_last_t` 必须一起不动**：只更 `_last_t` 会让下一次
+        #   "Δoff 跨两步 / Δt 只算一步" ⇒ 速率被放大成 2 倍 ⇒ 之后全在量程外 ⇒ 永远收不到样本
+        #   （2026-10-18 单测 C/F 就是这么红的：1.10 一直停在 1.000、0.85 停在 1.018）。
+        #   保持两个都不动 ⇒ 下一次拿"上次可信 anchor"比，基线自动变长，反而更准。
+        if not (self.MIN_R <= r_step <= self.MAX_R) or abs(doff) < self.MIN_DOFF:
+            return self.rate
         self._last_off = off
         self._last_t = wall_t
-        if not (self.MIN_DT <= dt <= self.MAX_DT):
-            return self.rate       # 不连续：本次不采信，保留历史
-        if abs(doff) < self.MIN_DOFF:
+        self._hist.append((wall_t, off))
+        while len(self._hist) > 2 and (wall_t - self._hist[0][0]) > self.WIN_SEC:
+            self._hist.pop(0)
+        if len(self._hist) < 2:
             return self.rate
-        r_inst = doff / dt
-        if not (self.MIN_R <= r_inst <= self.MAX_R):
-            return self.rate       # 越界：单次抖动，不动 EMA
+        t0, o0 = self._hist[0]
+        span = wall_t - t0
+        if span < self.MIN_SPAN:
+            return self.rate          # 基线太短 ⇒ 噪声主导，先等
+        # ★★★ 2026-10-18：**最小二乘拟合**，不再用"两端相减"。
+        #   `off` 是 2~4 秒一格的阶梯，任一端点抖一格（±1s）在 4s 窗里就是 ±25% 的斜率误差，
+        #   而且端点噪声与"这条样本被接受"相关 ⇒ EMA 会被系统性地拉偏（实测 r=0.970 ⇒ 慢 1.7%）。
+        #   最小二乘用上全部历史点，单点噪声被摊薄，且**无偏**。
+        _n = len(self._hist)
+        if _n >= 3:
+            _mt = sum(p[0] for p in self._hist) / _n
+            _mo = sum(p[1] for p in self._hist) / _n
+            _num = sum((p[0] - _mt) * (p[1] - _mo) for p in self._hist)
+            _den = sum((p[0] - _mt) ** 2 for p in self._hist)
+            r_win = (_num / _den) if _den > 1e-9 else self.rate
+        else:
+            r_win = (off - o0) / span
+        if not (self.MIN_R <= r_win <= self.MAX_R):
+            return self.rate
+        # ★ 离群闸门：单次偏离不采信，**连续 OUT_N 次**才认定是真变速（绝不死锁）
+        if self._ready and abs(r_win - self.rate) > self.MAX_STEP:
+            self._out_n = int(getattr(self, "_out_n", 0) or 0) + 1
+            if self._out_n < self.OUT_N:
+                return self.rate
+            self.rate = r_win       # 真的在变速：直接跟过去
+            self._out_n = 0
+            return self.rate
+        self._out_n = 0
         if not self._ready:
-            self.rate = r_inst     # 首个可信样本：直接采用（响应快）
+            self.rate = r_win       # 首个可信样本：直接采用（响应快）
             self._ready = True
         else:
-            alpha = 1.0 - math.exp(-dt / self._tau)
-            self.rate += alpha * (r_inst - self.rate)
+            self.rate += self.STEP_ALPHA * (r_win - self.rate)
         return self.rate
 
 
@@ -1487,6 +1562,10 @@ class AudioEngine:
             except Exception:
                 pass
 
+    def set_allowed_provider(self, fn):
+        """注册"有效 song_id 集合"的提供者；识别线程每 10 秒刷新一次白名单。"""
+        self._allowed_provider = fn
+
     def set_recognizer(self, fp_db):
         """启用现场识别（main 在曲库就绪后调用）。fp_db=None 禁用。"""
         self._fp_db = fp_db
@@ -1494,7 +1573,9 @@ class AudioEngine:
             from charge_engine import ChargeBarEngine
             self._recognizer_engine = ChargeBarEngine()
 
-    _REC_DIAG_MIN_SEC = 2.0
+    # ★ 2026-10-19：可由环境变量覆盖（默认 2.0 不变）。
+    #   排查「切歌要十几秒」时需要 0.5s 粒度逐 tick 观测：set AUTOVJ_REC_DIAG_SEC=0.5
+    _REC_DIAG_MIN_SEC = float(os.environ.get("AUTOVJ_REC_DIAG_SEC", "2.0") or 2.0)
 
     def _rec_diag(self, fp_db, eng):
         """`cue_health.log`：识别门控取证（2s 一行，前缀 `[R]`）。
@@ -1535,14 +1616,16 @@ class AudioEngine:
                     seg_rms = float(np.sqrt(np.mean(_seg ** 2))) if seg_n else 0.0
                     _hs = _fa(_seg, self._fp_sr)
                     n_hash = len(_hs)
+                    _n_uni = 0
                     if n_hash and fp_db is not None:
                         _uni = list({h for h, _o in _hs})[:400]
+                        _n_uni = len(_uni)
                         _ph = ",".join("?" * len(_uni))
                         hit = int(fp_db.conn.execute(
                             "SELECT COUNT(DISTINCT hash) FROM fingerprints "
                             "WHERE hash IN (%s)" % _ph, _uni).fetchone()[0])
             except Exception:                                    # noqa: BLE001
-                hit, n_hash = -1, -1
+                hit, n_hash, _n_uni = -1, -1, -1
             line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f "
                     "hit=%d/%d seg=%.3f/%d sig=%d/%.3f raw=%d/hint=%d adv=%d cur=%d cand=%d bar=%d hits=%d"
                     % (time.strftime("%H:%M:%S"),
@@ -1554,13 +1637,29 @@ class AudioEngine:
                        float(getattr(st, "level", 0.0) or 0.0),
                        float(getattr(st, "energy", 0.0) or 0.0),
                        float(getattr(st, "bpm_display", 0.0) or 0.0),
-                       hit, n_hash, seg_rms, seg_n,
+                       hit, _n_uni, seg_rms, seg_n,
                        int((getattr(self, "_last_sig", (-1, -1.0)) or (-1, -1.0))[0]),
                        float((getattr(self, "_last_sig", (-1, -1.0)) or (-1, -1.0))[1]),
                        int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[1]),
                        int((getattr(self, "_last_match", (0, 0, 0.0, 0)) or (0, 0, 0.0, 0))[3]),
                        int(getattr(self, "_last_adv", 0) or 0),
                        *[int(x) for x in (getattr(self, "_eng_state", (0, -1, 0, 0)) or (0, -1, 0, 0))]))
+            # ★ 2026-10-18 审计：补 sid / off（数据本来就在 `_last_match` 里，之前没打）。
+            #   现场两类高频故障靠它定案：认成相似曲（那 180 票投给了谁）、位置卡住/跳变（off 是多少）。
+            _lmv = getattr(self, "_last_match", None) or (0, 0, 0.0, 0)
+            line += " sid=%d off=%.2f" % (int(_lmv[0]), float(_lmv[2]))
+            # ★ 白名单规模（None=未限制；0=空集=谁都不认，属异常）
+            try:
+                _al = getattr(fp_db, "allowed", None)
+                line += " allow=%s" % ("-" if _al is None else len(_al))
+            except Exception:
+                pass
+            # ★ 白名单规模（None=未限制；0=空集=谁都不认，属异常）
+            try:
+                _al = getattr(fp_db, "allowed", None)
+                line += " allow=%s" % ("-" if _al is None else len(_al))
+            except Exception:
+                pass
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
@@ -1585,12 +1684,33 @@ class AudioEngine:
         import numpy as _np
         from charge_engine import FpResult
         while not self._genre_stop.is_set():
-            _t.sleep(0.5)
+            # ★ 2026-10-19 排查：每轮实际耗时 + 缓冲样本数（判断'循环慢'还是'采集停'）
+            try:
+                _nowp = time.perf_counter() if os.environ.get('AUTOVJ_REC_PROBE') else 0.0
+                _prevp = float(getattr(self, '_loop_t_prev', 0.0) or 0.0)
+                self._loop_t_prev = _nowp
+                if _prevp > 0.0 and _nowp > 0.0:
+                    _lp2 = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'AutoVJ', 'loop_timing.log')
+                    _n2 = int(getattr(self._fp_buf, 'filled', 0) or 0)
+                    with io.open(_lp2, 'a', encoding='utf-8') as _f2:
+                        _f2.write('%.3f' % _nowp + ' ' + '%.3f' % (_nowp - _prevp) + ' ' + '%d' % _n2 + chr(10))
+            except Exception:
+                pass
+            _t.sleep(0.3)
             fp_db = self._fp_db
             eng = self._recognizer_engine
             self._rec_diag(fp_db, eng)
             if fp_db is None or eng is None or not self.state.running:
                 continue
+            # ★ 每 10 秒刷新一次"有效曲目白名单"（曲库增删后无需重启）
+            try:
+                _prov = getattr(self, "_allowed_provider", None)
+                _now2 = _t.time()
+                if _prov is not None and _now2 - float(getattr(self, "_allow_t", 0.0) or 0.0) >= 10.0:
+                    self._allow_t = _now2
+                    fp_db.set_allowed(_prov())
+            except Exception:                                    # noqa: BLE001
+                pass
             # 静音超时 → 回待机（清空识别）
             with self.state.lock:
                 silent = self.state.silent_sec
@@ -1665,8 +1785,38 @@ class AudioEngine:
                 except Exception:                                # noqa: BLE001
                     _sig_n, _sig_rms = -1, -1.0
                 self._last_sig = (_sig_n, _sig_rms)      # 取证：真正喂给 match 的信号
+                # ★★★ 2026-10-18 对照实验开关：hint 会把识别**锁死在拍钟预测附近**
+                #   （实测 off 连续 8~10 秒不动、位置落后 8~14 秒）。默认关闭，靠全局众数
+                #   + 位置层的大跳变闸门（含"低票距离闸门"）来挡野匹配。
+                if not FP_USE_HINT:
+                    _hint, _hint_w = None, None
+                # ★★★ 2026-10-18 对照实验开关：hint 会把识别**锁死在拍钟预测附近**
+                #   （实测 off 连续 8~10 秒不动、位置落后 8~14 秒）。默认关闭，靠全局众数
+                #   + 位置层的大跳变闸门（含"低票距离闸门"）来挡野匹配。
+                if not FP_USE_HINT:
+                    _hint, _hint_w = None, None
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
+                # ★★ 2026-10-19：**证据门槛（防误识别）**。
+                #   `votes` 只是"某一个对齐位置"的票；重复/相似段落会把票摊到多个位置，
+                #   单点票低不代表不是这首歌。这里再用「该曲总票」把关：
+                #   实测真歌总票 93~740，白噪 ≤62 ⇒ 门槛取 80。
+                #   低于门槛一律按"没匹配到"处理（宁可不认，也不认错）。
+                # ★★ 2026-10-19：**门槛只用于"初次锁定"，不拦"换歌证据"**。
+                #   切歌瞬间 4.5s 窗口里新旧混杂，新歌总票常掉到 80 以下；
+                #   如果这时也拦，换歌证据根本进不了引擎 ⇒ 只能等纯新歌窗口 ⇒ 多花数秒。
+                #   防误识别由 charge_engine 的"3 秒累计 ≥120 且 ≥2 拍"负责，足够。
+                _locked = int(getattr(eng, "current_song_id", -1)) >= 0
+                if sid >= 0 and not _locked:
+                    try:
+                        _tot = int((getattr(fp_db, "last_song_votes", {}) or {}).get(sid, 0))
+                    except Exception:                            # noqa: BLE001
+                        _tot = int(votes or 0)
+                    # ★★ 2026-10-22：**初次锁定还要求"单拍峰值 ≥80 票"**。
+                    #   实测真歌峰值 124~227，跨歌误认（同专辑相似曲）峰值 30~61；
+                    #   只看总票会放过后者（总票被多位置摊高）。这条把误认压到 0。
+                    if _tot < 80 or int(votes or 0) < 80:
+                        sid, votes, off = -1, 0, 0.0
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
                 _prev_off = float(_lm0[2]) if _lm0 else None
@@ -1679,6 +1829,19 @@ class AudioEngine:
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
                 cur = eng.current_song_id
+                # ★ 2026-10-19：**锁定事件**精确时间戳（毫秒），供真机测速脚本读。
+                #   `[R]` 是 2s（或按环境变量）节流，测速误差太大；这一行只在"锁定歌变了"
+                #   时写一次，开销可忽略，却能精确到 10ms。
+                try:
+                    _prev_cur = int(getattr(self, "_lock_evt_sid", -2))
+                    if int(cur) != _prev_cur and os.environ.get('AUTOVJ_REC_PROBE'):
+                        self._lock_evt_sid = int(cur)
+                        _lp = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ", "lock_events.log")
+                        with io.open(_lp, "a", encoding="utf-8") as _lf:
+                            _lf.write("%.3f\t%d\t%d\t%.2f\n"
+                                      % (time.time(), int(cur), int(votes or 0), float(off or 0.0)))
+                except Exception:                                # noqa: BLE001
+                    pass
                 self._eng_state = (int(cur), int(getattr(eng, "tentative_song_id", -1)),
                                    int(getattr(eng, "cand_bar", 0)),
                                    int(getattr(eng, "cand_hits", 0)))
@@ -1691,7 +1854,13 @@ class AudioEngine:
                         # off 是识别窗口起点在**原曲**时间轴上的秒数，窗口末端≈当前播放秒。
                         # ⚠ 变速倍率 r≠1 时，窗口秒数对应 FP_WIN_SEC*r 秒原曲
                         #   —— 旧写法固定 +4.5（且与切窗各写一份）是错的。
-                        self.state.recognized_offset = off + FP_WIN_SEC * r
+                        # ⚠⚠ 2026-10-22 回退：这里曾默认 +1.5s「采集延迟补偿」，
+                        #   但**码表层本身已有 CUE_LEAD_SEC=0.5 的提前量**
+                        #   ⇒ 两者叠加 ≈2s，现场表现为「画面比音乐快很多」（用户实测）。
+                        #   现在默认 **0.0**（恢复原行为）；确需补偿时用环境变量微调：
+                        #     set AUTOVJ_REC_LATENCY=0.3   （单位秒，正数=画面更早，负数=更晚）
+                        self.state.recognized_offset = (off + FP_WIN_SEC * r
+                                                        + float(os.environ.get('AUTOVJ_REC_LATENCY', '0.0') or 0.0))
                         self.state.recognized_t = t_read
                         # 对齐票数交给引擎：低于门槛时 offset 不可信，网格时钟不做任何校正
                         self.state.recognized_votes = int(votes)
@@ -2089,6 +2258,17 @@ class AudioEngine:
                 self._fp_sr = sr
                 if self._fp_buf.cap < need:
                     self._fp_buf = _AudioRing(need)
+            # ★ 2026-10-19 审计修复：记录"最后一次收到音频包"的时刻（**循环外初始化一次**，
+            #   否则每圈都重置 ⇒ 断流计时永远不触发）。
+            #   原来 `data is None` 分支只计数 + 退避、**不写任何状态** ⇒ 断流后
+            #   level/energy/spectrum 冻在最后一格、`running` 仍 True、界面还显示
+            #   "对端 x.x.x.x | 丢包 0" ⇒ 用户以为软件卡死。
+            _lan_last_t = time.perf_counter()
+            _lan_gap_cleared = False
+            _lan_gap_warned = False
+            # ⚠ 这个 capture 循环是**所有音源共用**的 ⇒ 断流告警只能对局域网音源生效，
+            #   否则用声卡时也会误报"没收到局域网音频包"。
+            _is_lan_mic = isinstance(mic, lan_audio_recv.LanDevice)
             while self._gen == gen:   # 只在自己这一代有效；切换设备后立即退出
                 try:
                     # ★★ 变化触发诊断（2026-10-07）：把 NDI 音频门控两个量写进取证日志。
@@ -2132,12 +2312,45 @@ class AudioEngine:
                         #   ⚠ 判据：**空转的次数越多，睡得越久**（1ms→3ms 封顶），
                         #     有数据立刻归零 ⇒ 稳态零代价、异常时自动降速。
                         _empty_streak += 1
+                        # ★ 2026-10-19：断流检测（**双向写**：来包时清、断流时写）
+                        #   ⚠ 仅局域网音源 —— 这个 capture 循环是**所有音源共用**的，
+                        #     不判类型的话用声卡时也会误报"没收到局域网音频包"。
+                        if _is_lan_mic:
+                            try:
+                                _gap = time.perf_counter() - _lan_last_t
+                                if _gap >= 1.5 and not _lan_gap_cleared:
+                                    _lan_gap_cleared = True
+                                    with st.lock:
+                                        st.level = 0.0
+                                        st.energy = 0.0
+                                        _sp = getattr(st, "spectrum", None)
+                                        if _sp is not None:
+                                            try:
+                                                _sp[:] = 0.0
+                                            except Exception:          # noqa: BLE001
+                                                pass
+                                if _gap >= 3.0 and not _lan_gap_warned:
+                                    _lan_gap_warned = True
+                                    with st.lock:
+                                        st.lan_failed = (
+                                            "已经 %.0f 秒没有收到局域网音频包了。"
+                                            "请检查 A 机是否还在放、两台机器是否还在同一网络、"
+                                            "以及防火墙是否放行 UDP。" % _gap)
+                                        st.lan_info = ""
+                            except Exception:                          # noqa: BLE001
+                                pass
                         if _empty_streak > 3:
                             time.sleep(0.003 if _empty_streak > 30 else 0.001)
                         continue
                     err_streak = 0
                     _empty_streak = 0
                     _blk_ok += 1
+                    _lan_last_t = time.perf_counter()
+                    if _is_lan_mic and (_lan_gap_warned or _lan_gap_cleared):
+                        _lan_gap_cleared = _lan_gap_warned = False
+                        with st.lock:
+                            if st.lan_failed:
+                                st.lan_failed = ""      # 恢复 ⇒ 立刻清掉告警
                 except Exception as e:
                     # ---- 采集段异常（设备 I/O）----
                     # 只有这里才累加 err_streak、连续 5 次才停采集（设备真断开时停止 +

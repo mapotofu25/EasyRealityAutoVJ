@@ -65,8 +65,15 @@ def build(mono, cfg, db):
             if callable(f):
                 ns[m] = staticmethod(f) if m == "_cue_song_id_of" else f
     eng = type("FakeEngine", (), ns)()
-    eng.cfg = cfg; eng.audio = ae
-    eng.layers = []
+    # ★★★ 2026-10-17：**必须与生产接线一致** —— 生产里
+    #   `AutoVJEngine(cfg, self.audio.state, lib)` 传的是 **AudioState**，
+    #   所以 `engine.audio` 是状态对象；音频引擎本体走 `set_audio_engine()`。
+    #   这里原来写 `eng.audio = ae`（完整 AudioEngine，自带 .state），于是 engine.py 里
+    #   `getattr(self.audio, "state", None)` 的错写法在这个夹具下**恰好能work** ⇒
+    #   测试全绿而现场 `sid=-1` 永远不接管。夹具失真比没有测试更危险。
+    eng.audio = ae.state
+    eng._audio_engine = ae
+    eng.cfg = cfg
     eng._cue_sheet = None; eng._cue_track = None; eng._cue_rt = None
     eng._cue_media = {}; eng._cue_pos_tracker = CuePositionTracker()
     eng._cue_pos_song = -1; eng._cue_pos_src = ""; eng._cue_pos_beats = None
@@ -97,6 +104,19 @@ def run_case(db, cfg, name, path, want_sid, want_sheet):
             ae._fp_buf.write(mono[pos:pos + CHUNK]); pos += CHUNK
 
     threading.Thread(target=feeder, daemon=True).start()
+    # ★★★ 2026-10-17：**必须校验「引擎看见了什么」**，而不只是「状态里有什么」。
+    #   真实故障：`state.recognized_song_id` 正确（`[R] cur=346225955`），但
+    #   `_cue_auto_position()` 因为读错对象（`self.audio.state` ⇒ None）恒读 -1
+    #   ⇒ 码表永不接管。只断言 state 的测试**全绿也发现不了**。
+    #   这里给 `_cue_diag` 装探针，把它**实际读到的** sid 记下来。
+    seen = []
+    _orig_diag = eng._cue_diag
+
+    def _spy(sid, votes, off, status, pb, now):
+        seen.append((int(sid), int(votes), float(off), str(status)))
+        return _orig_diag(sid, votes, off, status, pb, now)
+
+    eng._cue_diag = _spy
     threading.Thread(target=AE.AudioEngine._recognize_loop, args=(ae,), daemon=True).start()
 
     t0 = time.perf_counter(); got, bound, t_done = -1, None, None
@@ -117,14 +137,22 @@ def run_case(db, cfg, name, path, want_sid, want_sheet):
                 t_done = time.perf_counter() - t0
                 break
     stop.set(); ae._genre_stop.set()
+    # ★ 引擎侧实际读到的最大 sid / 是否出现 ok·switch / 是否有过非零 off
+    seen_sid = max([s[0] for s in seen], default=-1)
+    seen_ok = any(s[3] in ("ok", "switch") for s in seen)
+    seen_off = max([s[2] for s in seen], default=-1.0)
     # want_sheet=False 的歌（曲库里有、但没有码表）应"认出来但不装表"——这也是正确结果
     ok = (got == want_sid
-          and ((bound and bound > 0) if want_sheet else (eng._cue_sheet is None)))
-    print("  %-30s sid=%-11s %s | 表=%-9s items=%s  %.1fs  %s"
+          and ((bound and bound > 0) if want_sheet else (eng._cue_sheet is None))
+          # ★★ 关键：引擎**自己**必须读到这首歌（旧写法恒 -1 ⇒ 这里必红）
+          and seen_sid == want_sid
+          and seen_ok
+          and seen_off > 0.0)
+    print("  %-30s sid=%-11s %s | 表=%-9s items=%s  %.1fs  %s  [引擎侧 sid=%s ok=%s off=%.1f/%d样本]"
           % (name[:30], got,
              "✅" if got == want_sid else "❌(期望 %s)" % want_sid,
              ("是" if eng._cue_sheet else "否"), bound, t_done or -1,
-             "✅" if ok else "❌"))
+             "✅" if ok else "❌", seen_sid, seen_ok, seen_off, len(seen)))
     return ok
 
 

@@ -145,8 +145,19 @@ def new_engine(cfg, layers, images):
     eng._cue_index = None
     eng._cue_rt = None
     eng.layers = list(layers)
-    eng.audio = types.SimpleNamespace(state=FakeState())
+    # ★ 2026-10-17：**必须与生产接线一致** —— 生产传的是 `self.audio.state`，
+    #   所以 `engine.audio` 是**状态对象本身**。原来这里包了一层 SimpleNamespace(state=…)
+    #   ⇒ engine.py 里 `getattr(self.audio, 'state', None)` 的错写法在这个夹具下能work
+    #   ⇒ 测试全绿而现场 `sid=-1` 永不接管（真实故障持续了两轮）。
+    eng.audio = FakeState()
+    eng._audio_engine = None
     eng._cue_pos_tracker = cue_position.CuePositionTracker()
+    # ★ 2026-10-18：自由运行（freewheel）状态 —— **必须与 `__init__` 同步**，
+    #   否则 `_cue_auto_position` 走到外推分支会 AttributeError（铁律 24）。
+    eng._cue_fw_pos = None
+    eng._cue_fw_t = 0.0
+    eng._cue_fw_rate = 1.0
+    eng._cue_fw_on = False
     eng._cue_pos_next_t = 0.0
     eng._cue_pos_song = -1
     eng._cue_auto_sheet = ""
@@ -229,10 +240,13 @@ def main():
 
         # ---------------- ① 自动跟拍：3 个采样点 ----------------
         print("① 自动跟拍（模拟指纹 0.5s 一次）：3 个采样点偏差 ≤ 0.5 拍")
-        st = eng.audio.state
+        st = eng.audio
         st.recognized_song_id, st.recognized_votes, st.recognized_rate = SID_A, 5, 1.0
         samples = []
-        for i, off in enumerate((10.0, 12.0, 14.0)):
+        # ★ 2026-10-18：采样间隔 0.5s ⇒ 偏移也必须每次 +0.5s（= 1 倍速播放）。
+        #   原值 12/14（+2s/0.5s = 4 倍速）其实是"每半秒跳两秒"，防抖会**滑移**去追，
+        #   断言"立刻相等"就不再成立。1 倍速才是要验证的真实场景。
+        for i, off in enumerate((10.0, 10.5, 11.0)):
             st.recognized_offset = off
             hold(eng, i * 0.5)
             eng._cuesheet_tick()
@@ -240,15 +254,27 @@ def main():
             want = off / BL
             got = lay.cs_states[0].play_sec if lay.cs_states else None
             samples.append((off, want, pb, got, (pb or -9) - want))
-            time.sleep(0.02)
+        # ★ 必须**真的等 0.5 秒**：位置层是按挂钟在两次识别之间插值的。
+        #   以前这里只 sleep 0.02 ⇒ 等于"偏移每 0.02 秒跳 0.5 秒"（25 倍速），
+        #   任何防抖都会把它当跳变；真实播放必须让挂钟走够。
+        time.sleep(0.5)
         for off, want, pb, got, err in samples:
             print("      offset=%.1fs ⇒ 期望 pos_beats=%.1f ；实测 %.2f（偏差 %+.2f 拍）；"
                   "play_sec=%.2f" % (off, want, pb or -1, err, got if got is not None else -1))
-        check("3 个采样点 pos_beats 偏差都 ≤0.5 拍",
-              all(abs(e) <= 0.5 for _o, _w, _p, _g, e in samples), samples)
-        check("画面随之出画（play_sec 非空且≈offset）",
-              all(g is not None and abs(g - o) <= 0.5 for o, _w, _p, g, _e in samples),
-              samples)
+        # ★ 2026-10-18（用户要"防抖"）：位置层现在会对"识别结果突变"做**滑移**
+        #   （每次喂 ≤0.06s），而不是瞬间对齐 —— 这正是"不跳"的代价：**允许短暂落后**，
+        #   但必须 ① 单调 ② 每点偏差有界 ③ **最后一个采样点收敛**。
+        check("pos_beats 单调不减（防抖不允许倒走）",
+              all((samples[i][2] or 0) >= (samples[i - 1][2] or 0)
+                  for i in range(1, len(samples))), samples)
+        check("每个采样点偏差 ≤2 拍（滑移追赶中的合理上界）",
+              all(abs(e) <= 2.0 for _o, _w, _p, _g, e in samples), samples)
+        # ⚠ 不在这里断言"追平到某个绝对值"：挂钟一直在走，`want` 是**采样那一刻**的期望，
+        #   再等几秒位置本来就该更靠前。收敛性由 `_cue_pos_smooth_test.py` 的
+        #   "卡顿 2 秒后一次性跳 5.7 秒 ⇒ 必须滑移追上" 那条专门覆盖。
+        check("画面随之出画（play_sec 非空且逐点前进）",
+              all(g is not None for o, _w, _p, g, _e in samples)
+              and samples[-1][3] > samples[0][3], samples)
         check("自动装表成功（表A）", "A.ercue" in (eng._cue_auto_sheet or ""),
               eng._cue_auto_sheet)
         check("位置来源标记为 fp", eng._cue_pos_src == "fp", eng._cue_pos_src)
@@ -267,11 +293,19 @@ def main():
         print("      丢票 3 次：%s" % holds)
         check("容忍期内状态为 hold 且位置不丢",
               all(s == "hold" and keep for s, keep in holds), holds)
-        st.recognized_votes, st.recognized_offset = 5, 16.0
+        st.recognized_votes, st.recognized_offset = 60, 16.0
+        # ★ 2026-10-18（速度式伺服 + 3 秒防抖）：+6s 这类"严重不符"必须先持续 3 秒，
+        #   期满才允许重锚（用户："超过这个时间指纹还是严重对不上才切"）。
+        #   所以这里要喂够 4 秒，而不是两次。
+        import time as _t
+        for _ in range(10):          # 真实等 3.5 秒（防抖按真实时间计）
+            _t.sleep(0.35)
+            hold(eng, 0)
         status, pb = hold(eng, 0)
         eng._cuesheet_tick()
-        check("恢复后立刻回到 ok 并继续跟",
-              status == "ok" and abs((eng._cue_pos_beats or -1) - 16.0 / BL) <= 0.5,
+        # 新契约：先按 ±12% 平滑收敛/防抖期满重锚，判据是"朝目标走且已接近"
+        check("防抖期满（>3s）后朝目标收敛",
+              status == "ok" and 20.0 <= (eng._cue_pos_beats or -1) <= 16.0 / BL + 1.0,
               (status, eng._cue_pos_beats))
         # 超过容忍期 ⇒ 不接管
         for _ in range(6):
@@ -279,7 +313,27 @@ def main():
             hold(eng, 0)
             time.sleep(0.01)
         eng._cuesheet_tick()
-        check("超过容忍期 ⇒ 状态 lost、pos 置空、cs_states 清空（不接管）",
+        # ★★ 2026-10-18（用户："码表图层偶尔突然消失零点几秒"）：
+        #   短时丢票**不再立刻卸画面** —— 引擎侧有"自由运行（freewheel）"窗口，
+        #   保持最后位置并按速率外推，最多 CUE_FREEWHEEL_SEC 秒。
+        from engine import CUE_FREEWHEEL_SEC as _FW
+        check("自由运行窗口内仍继续出画（不再闪一下黑）",
+              eng._cue_pos_beats is not None and bool(lay.cs_states),
+              (eng._cue_pos_beats, len(lay.cs_states)))
+        # ★ 2026-10-18 真机实测后改契约：**只要还是同一首歌、还有声音，就一直滑行**
+        #   （识别卡 2~4 秒不能闪画面）。真正的释放条件只有：没歌 / 静音太久 / 超上限。
+        time.sleep(_FW + 0.3)
+        hold(eng, 0)
+        eng._cuesheet_tick()
+        check("同曲丢票超窗口 ⇒ 仍继续滑行（不再闪出画面）",
+              eng._cue_pos_beats is not None and bool(lay.cs_states),
+              (eng._cue_pos_beats, len(lay.cs_states)))
+        # 真的没歌了（sid=-1 + 静音）⇒ 必须释放
+        st.recognized_song_id = -1
+        st.silent_sec = 5.0
+        hold(eng, 0)
+        eng._cuesheet_tick()
+        check("没歌/静音 ⇒ 才卸画面（状态 lost、cs_states 清空）",
               eng._cue_pos_beats is None and not lay.cs_states,
               (eng._cue_pos_beats, len(lay.cs_states)))
         check("丢歌时**表与徽标保留**（回来能立刻继续）", eng._cue_sheet is not None,

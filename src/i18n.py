@@ -110,7 +110,7 @@ STRINGS = {
     "output_window": {"zh": "输出窗口", "en": "Output Window"},
     "show_output": {"zh": "显示输出窗口", "en": "Show Output Window"},
     "resolution": {"zh": "分辨率", "en": "Resolution"},
-    "aspect_lock": {"zh": "锁定 16:9", "en": "Lock 16:9"},
+    "aspect_lock": {"zh": "锁定比例", "en": "Lock aspect ratio"},
     "borderless": {"zh": "无边框", "en": "Borderless"},
     "always_top": {"zh": "窗口置顶", "en": "Always on Top"},
     "fullscreen": {"zh": "全屏", "en": "Fullscreen"},

@@ -248,3 +248,6 @@ tools/_erlib_splash.png
 /_audit_*/
 # 2026-10-10：工具包 zip 也是发行产物，走 Release 不走仓库
 ERAVJ工具包*.zip
+
+# 发布产物（体积大，不进仓库）
+发行版/

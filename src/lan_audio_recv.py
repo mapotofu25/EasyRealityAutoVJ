@@ -32,6 +32,7 @@ A 机渲染卡一下可能晚到 50ms。若收到就立刻交出去，下游看�
 """
 
 import collections
+import os
 import threading
 import time
 
@@ -414,7 +415,12 @@ class LanDevice:
             #   - 先过自滤（自己的回声绝不认）；
             #   - 对端**允许被更新**（发送端换 IP / 换机重连时能自动跟上），
             #     但只在 DATA 来源真的变了时才改，避免抖动。
-            is_self = addr[0] in self._my_ips
+            # ★ 2026-10-19：**仅供同机联调**。设 AUTOVJ_LAN_ALLOW_SELF=1 时不再丢弃
+            #   "源地址属于本机"的包 —— 否则发送端和演出端装在同一台电脑上永远收不到
+            #   （这是"双方显示已握手但没声音/连上又断"的常见原因）。
+            #   生产环境**不要设这个变量**：同机时不丢弃会把自己的广播回声当成对端。
+            _allow_self = str(os.environ.get("AUTOVJ_LAN_ALLOW_SELF", "")).strip() in ("1", "true", "yes")
+            is_self = (addr[0] in self._my_ips) and not _allow_self
 
             # ★ 自己的回声**最先丢**（在 peer_hint 过滤之前）：否则本机广播的 DATA
             #   会被算进「对端地址不符」计数，界面会误导用户"填的 IP 错了"。

@@ -37,6 +37,7 @@ _MODELS = ("discogs", "beat_this")
 _HIDDEN = [
     "erlib", "erlib.format", "erlib.scanner", "erlib.app", "erlib.transfer",
     "erlib.cover",
+    "appicon",                                     # ★ 应用图标定位（惰性 import）
     "fp", "beatgrid", "phrase_bt", "music_meta",
     "audio_genre", "genre_lookup", "genre_keywords", "genre_visual_default",
     "config", "soundfile", "mutagen", "onnxruntime",
@@ -111,7 +112,7 @@ def _make_splash():
     return p
 
 
-def _spec_text(datas, splash_png=None):
+def _spec_text(datas, splash_png=None, icon_lit="None"):
     ds = ",\n        ".join("(%r, %r)" % (p.replace("\\", "/"),
                                           d.replace("\\", "/"))
                             for p, d in datas)
@@ -157,6 +158,7 @@ exe = EXE(
     a.datas,
     [],
     name=%r,
+    icon=%s,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -165,7 +167,7 @@ exe = EXE(
     disable_windowed_traceback=False,
 )
 ''' % (ENTRY.replace("\\", "/"), SRC.replace("\\", "/"), ds, hs, es,
-       sp, sp_arg, OUT_NAME)
+       sp, sp_arg, OUT_NAME, icon_lit)
 
 
 def main():
@@ -183,8 +185,17 @@ def main():
           if splash else "启动画面：跳过（PIL 不可用）")
 
     spec = os.path.join(ROOT, "tools", "_erlib.spec")
+    # ★ 应用图标（仅图标相关）：exe 文件图标 + 随包资源（供运行时 setWindowIcon）。
+    icon = os.path.join(ROOT, "assets", "erlib.ico")
+    if os.path.isfile(icon):
+        datas = datas + [(icon, "assets")]
+        icon_lit = repr(icon.replace("\\", "/"))
+        print("图标：%s" % icon)
+    else:
+        icon_lit = "None"
+        print("★ 图标缺失，跳过（%s）" % icon)
     with open(spec, "w", encoding="utf-8") as f:
-        f.write(_spec_text(datas, None))
+        f.write(_spec_text(datas, None, icon_lit))
 
     build = os.environ.get("AUTOVJ_BUILD", "build_erlib")
     dist = os.environ.get("AUTOVJ_DIST", "dist_erlib")

@@ -284,7 +284,8 @@ class Driver:
             self.log.append(("settle", res))
         # ③ 判定 + 发请求
         if self.policy.should_seek(ps, self.item, p, st):
-            ok = p.seek(ps.play_sec)
+            ok = p.seek(self.policy.seek_target(ps)
+                         if hasattr(self.policy, "seek_target") else ps.play_sec)
             self.policy.on_seek(ps, st, ok)
             self.log.append(("seek", ps.play_sec))
         # ④ 计速
@@ -324,6 +325,15 @@ class Runner:
         if self.verbose:
             print("  [ ok ] %s" % name)
 
+
+def _seek2(pol, ps, it, pl, st):
+    """硬阈值现在要求**连续 2 帧**（抗单帧毛刺），单测要按 2 帧判。"""
+    hit = False
+    for _ in range(3):
+        if pol.should_seek(ps, it, pl, st):
+            hit = True
+            break
+    return hit
 
 def _assert(cond, msg=""):
     if not cond:
@@ -379,12 +389,23 @@ def build_suite(Policy, verbose=False):
     R.case("② src_ended ⇒ False（防自激）")(c02_src_ended)
 
     def c03_degraded():
+        """熔断**可恢复**（铁律 0）：冷却期内不 seek，到期必须放行一次。
+
+        ⚠ 旧契约是"置 degraded 就整段不再 seek" —— 那正是"一次失败永久停"；
+          现场后果：某次 seek 超时后本片段再也不校正 ⇒ 位置一路漂到片尾。
+        """
         clk = Clock(); pol = _mk(Policy, clk)
         pl = FakePlayer(pos=0.0); it = FakeItem()
-        ps = FakePS(play_sec=10.0)
-        st = pol.state_for(ps); st["item_id"] = ps.item_id; st["degraded"] = True
-        _assert(pol.should_seek(ps, it, pl, st) is False, "第3条失败：degraded 后不应再 seek")
-    R.case("③ degraded ⇒ False（降级后不再 seek）")(c03_degraded)
+        ps = FakePS(play_sec=10.0)          # 漂移 10s，远超阈值
+        st = pol.state_for(ps); st["item_id"] = ps.item_id
+        st["degraded"] = True
+        st["retry_at"] = clk() + 4.0        # 冷却中（还剩 4 秒）
+        _assert(pol.should_seek(ps, it, pl, st) is False, "第3条失败：冷却期内不应 seek")
+        clk.tick(5.0)                        # 冷却到期
+        _assert(_seek2(pol, ps, it, pl, st) is True,
+                "第3条失败：冷却到期后必须恢复尝试（否则整段永久不跟拍）")
+        _assert(st["degraded"] is False, "第3条失败：放行时要把熔断标记清掉")
+    R.case("③ 熔断可恢复：冷却期内 False / 到期 True")(c03_degraded)
 
     def c04_inflight():
         clk = Clock(); pol = _mk(Policy, clk)
@@ -438,25 +459,39 @@ def build_suite(Policy, verbose=False):
         ps = FakePS(play_sec=50.0)
         st = pol.state_for(ps)
         st["item_id"] = ps.item_id; st["last_req"] = clk()   # 刚发过
-        _assert(pol.should_seek(ps, it, pl, st) is False,
+        # 偏差放在**软阈值**（0.70）：节流窗口内不跳
+        pl2 = FakePlayer(pos=pol.seek_target(ps) - 0.70)
+        _assert(pol.should_seek(ps, it, pl2, st) is False,
                 "第9条失败：距上次 < MIN_INTERVAL 时应节流")
         clk.tick(MIN_INTERVAL_SEC + 0.01)
-        _assert(pol.should_seek(ps, it, pl, st) is True,
-                "第9条失败：超过节流窗口后应恢复判定")
+        _assert(pol.should_seek(ps, it, pl2, st) is False,
+                "第9条失败：刚过节流只开始计滞留，不该当场跳")
+        # 硬阈值（≥1.20）：**绕过节流**立即跳
+        try:
+            from cue_seek_policy import SEEK_HARD_SEC as _hard
+        except Exception:                              # noqa: BLE001
+            _hard = 1.20
+        pl3 = FakePlayer(pos=pol.seek_target(ps) - _hard - 0.1)
+        _assert(_seek2(pol, ps, it, pl3, st) is True,
+                "第9条失败：大跳变应绕过节流立即落地")
     R.case("⑨ 节流窗口内 ⇒ False；超出 ⇒ 恢复")(c09_throttle)
 
     def c10_drift_detects_real_position():
         """★ 最重要：漂移必须用 position()（实际显示帧），不是请求目标。"""
         clk = Clock(); pol = _mk(Policy, clk)
         it = FakeItem()
-        # 情形A：实际位置落后 1.0s（> 0.35）⇒ 必须 seek
-        pl = FakePlayer(pos=9.0)
+        # 情形A：实际位置落后 2.0s（> SEEK_HARD_SEC 1.2）⇒ 必须 seek
+        #   ★ 2026-10-17：阈值从 0.35 抬到 1.2 —— 0.35~1.2 这一段改由**倍速对齐**
+        #     （`rate_for`）处理，不再 seek（seek 一次画面冻 53~848ms ⇒ 用户报"一卡一卡"）。
+        #     本用例要钉的是**"漂移用 position() 而不是 target"**，与阈值无关 ⇒ 把漂移
+        #     拉到硬阈值之上，语义不变。
+        pl = FakePlayer(pos=8.0)
         ps = FakePS(play_sec=10.0)
         st = pol.state_for(ps)
         st["item_id"] = ps.item_id; st["last_req"] = -1e9
         st["target"] = 10.0        # ← 上次请求目标 = play_sec：用目标值算漂移会得 0
-        _assert(pol.should_seek(ps, it, pl, st) is True,
-                "第10条失败：|position()-play_sec|=1.0 > 0.35 必须 seek；"
+        _assert(_seek2(pol, ps, it, pl, st) is True,
+                "第10条失败：|position()-play_sec|=2.0 > 1.2 必须 seek；"
                 "若这里返回 False，说明漂移用了『请求目标』（自己跟自己比，永远不触发）")
         # 情形B：实际位置只差 0.1s（< 0.35）⇒ 不 seek
         pl2 = FakePlayer(pos=9.9)
@@ -483,6 +518,78 @@ def build_suite(Policy, verbose=False):
         _assert(pol.should_seek(ps, it, pl, st) is False,
                 "第11条失败：漂移未超阈值时应返回 False")
     R.case("⑪ 漂移未超阈值 ⇒ False")(c11_default_false)
+
+    # ---------------- 1b. 实时变速对齐（2026-10-17 用户要求）----------------
+    try:
+        from cue_seek_policy import (RATE_MAX as _RMAX, RATE_DEADBAND_SEC as _RDB,
+                                     SEEK_HARD_SEC as _RHS)
+        P_HARD = _RHS
+    except Exception:                                        # noqa: BLE001
+        _RMAX, _RDB, _RHS = 0.15, 0.03, 1.20
+
+    def _rate_cases_ok(Policy):
+        return hasattr(Policy, "desired_speed_for")
+
+    def c_rate_catchup():
+        """★ 核心：小幅漂移 ⇒ **不 seek**，改用倍速追（画面连续、不跳帧）。"""
+        clk = Clock(); pol = _mk(Policy, clk)
+        it = FakeItem()
+        ps = FakePS(play_sec=10.0)
+        pl = FakePlayer(pos=9.7)                 # 落后 0.30s
+        st = pol.state_for(ps); st["item_id"] = ps.item_id; st["last_req"] = -1e9
+        _assert(pol.should_seek(ps, it, pl, st) is False,
+                "0.3s 漂移不该 seek（旧策略会每秒 seek 一次 ⇒ 卡顿）")
+        w = pol.desired_speed_for(ps, it, 9.7)
+        _assert(w > 1.0, "落后 ⇒ 倍速必须 > 名义（实际 %.4f）" % w)
+        _assert(w <= 1.0 + _RMAX + 1e-9, "倍速修正必须钳在 +%.0f%%（实际 %.4f）"
+                % (_RMAX * 100, w))
+    R.case("㉖ 小幅漂移 ⇒ 不 seek，倍速追（≤ ±15%）")(c_rate_catchup)
+
+    def c_rate_ahead():
+        clk = Clock(); pol = _mk(Policy, clk)
+        it = FakeItem(); ps = FakePS(play_sec=10.0)
+        w = pol.desired_speed_for(ps, it, 10.4)
+        _assert(w < 1.0 and w >= 1.0 - _RMAX - 1e-9, "超前 ⇒ 减速且钳位（%.4f）" % w)
+    R.case("㉗ 超前 ⇒ 减速（倍速 < 名义）")(c_rate_ahead)
+
+    def c_rate_deadband():
+        clk = Clock(); pol = _mk(Policy, clk)
+        it = FakeItem(); ps = FakePS(play_sec=10.0)
+        _t = pol.seek_target(ps)
+        _assert(abs(pol.desired_speed_for(ps, it, _t - _RDB * 0.5) - 1.0) < 1e-9,
+                "deadband 内必须是名义倍速（否则每帧都在 1.0 附近抖）")
+    R.case("㉘ deadband 内 ⇒ 名义倍速（不抖）")(c_rate_deadband)
+
+    def c_rate_hard_seek():
+        clk = Clock(); pol = _mk(Policy, clk)
+        it = FakeItem(); ps = FakePS(play_sec=10.0)
+        pl = FakePlayer(pos=10.0 - _RHS - 0.3)
+        st = pol.state_for(ps); st["item_id"] = ps.item_id; st["last_req"] = -1e9
+        _assert(_seek2(pol, ps, it, pl, st) is True,
+                "漂移超硬阈值（>%.2fs）必须 seek —— 倍速追不回来" % _RHS)
+    R.case("㉙ 漂移超硬阈值 ⇒ seek（大跳变才落地）")(c_rate_hard_seek)
+
+    def c_rate_speed_base():
+        """变速要对 `ps.speed`（素材自身速度）**乘**，不能覆盖它。"""
+        clk = Clock(); pol = _mk(Policy, clk)
+        it = FakeItem(); ps = FakePS(play_sec=10.0, speed=2.0)
+        w = pol.desired_speed_for(ps, it, 9.0)
+        _assert(w > 2.0, "慢于编排 ⇒ 应比 2.0 更快（实际 %.4f）" % w)
+        _assert(abs(pol.desired_speed_for(ps, it, pol.seek_target(ps)) - 2.0) < 1e-9,
+                "无漂移时必须**恰好**是 ps.speed（2.0）")
+    R.case("㉚ 变速以 ps.speed 为基准（乘，不覆盖）")(c_rate_speed_base)
+
+    def c_rate_degraded():
+        """seek 降级后**仍然**用倍速对齐（倍速不依赖解码器 seek 能力，铁律 0）。"""
+        clk = Clock(); pol = _mk(Policy, clk)
+        it = FakeItem(); ps = FakePS(play_sec=10.0)
+        pl = FakePlayer(pos=9.6)
+        st = pol.state_for(ps); st["item_id"] = ps.item_id
+        st["degraded"] = True; st["last_req"] = -1e9
+        _assert(pol.should_seek(ps, it, pl, st) is False, "降级后不 seek")
+        _assert(pol.desired_speed_for(ps, it, 9.6) > 1.0,
+                "降级后**必须仍然**倍速纠正（否则整段永久不跟拍）")
+    R.case("㉛ 降级后仍倍速对齐（不跟着一起停）")(c_rate_degraded)
 
     # ---------------- 2. 防自激三连 ----------------
     def c12_src_ended_freeze_no_seek():
@@ -578,7 +685,7 @@ def build_suite(Policy, verbose=False):
         pl = FakePlayer(pos=0.0, seek_delay=0.2, clock=clk); it = FakeItem()
         ps = FakePS(play_sec=5.0)
         st = pol.state_for(ps)
-        ps_ok = pl.seek(5.0)
+        ps_ok = pl.seek(pol.seek_target(ps) if hasattr(pol, "seek_target") else 5.0)
         pol.on_seek(ps, st, ps_ok)
         _assert(st["inflight"] is True, "on_seek 后应置 in-flight")
         clk.tick(0.1)
@@ -752,7 +859,10 @@ def build_suite(Policy, verbose=False):
         for _ in range(int(10.0 * FPS)):
             ps.play_sec += dt * 2.0
             drv.frame(ps)
-            pl.advance(dt * 2.0)
+            # ★ `advance()` 内部已经乘了 `self.speed`（= 2.0）⇒ 这里只能传 dt。
+            #   旧写法传 dt*2 ⇒ 位置按 **4 倍**前进 ⇒ 人为造出漂移；
+            #   它一直靠旧的"degraded 永久熔断"把多余 seek 吞掉，才显示成通过。
+            pl.advance(dt)
             clk.tick(dt)
         _assert(pl.seek_count() == 1,          # 只有入场那一次
                 "speed=2 完美跟随时应只有入场 1 次 seek，实际 %d 次" % pl.seek_count())

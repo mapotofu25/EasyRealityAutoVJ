@@ -60,6 +60,17 @@ class I18nDialog(QDialog):
         super().showEvent(ev)
 
 
+class I18nWidget(QWidget):
+    """内嵌面板基类：首次显示与运行中切语言时都刷新文案（与 I18nDialog 同思路）。"""
+
+    def showEvent(self, ev):
+        try:
+            i18n_retranslate(self)
+        except Exception:                                        # noqa: BLE001
+            pass
+        super().showEvent(ev)
+
+
 class StayOpenMenu(QMenu):
     """checkable 动作点击后不关闭菜单（用于角色多选等场景）"""
     def mouseReleaseEvent(self, e):
@@ -86,7 +97,7 @@ class NewLayerDialog(I18nDialog):
 
     def __init__(self, parent=None, default_name="图层 1"):
         super().__init__(parent)
-        self.setWindowTitle("新建图层")
+        self.setWindowTitle( T("新建图层"))
         self.setMinimumWidth(360)
         self._default_name = default_name
         self._name_touched = False     # 用户是否手动改过名字（改过就不自动覆盖）
@@ -148,8 +159,8 @@ class NewLayerDialog(I18nDialog):
         self._on_type()
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Ok).setText("确定")
-        bb.button(QDialogButtonBox.Cancel).setText("取消")
+        bb.button(QDialogButtonBox.Ok).setText( T("确定"))
+        bb.button(QDialogButtonBox.Cancel).setText( T("取消"))
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
@@ -158,14 +169,14 @@ class NewLayerDialog(I18nDialog):
         auto = self.rb_auto.isChecked()
         self._role_box.setVisible(auto)
         if auto:
-            self._hint.setText("自动图层会随曲风实时替换画面，手动拖入的素材不生效")
+            self._hint.setText( T("自动图层会随曲风实时替换画面，手动拖入的素材不生效"))
         elif self.rb_cue.isChecked():
-            self._hint.setText("码表图层：画面由码表接管（片段入点/出场都按码表走）。\n"
-                               "确定后会让你选择「应用哪一张码表」——还没导入码表的话，\n"
-                               "请先到「码表」页签点「添加…」。")
+            self._hint.setText(T("码表图层：画面由码表接管（片段入点/出场都按码表走）。\n"
+                                 "确定后会让你选择「应用哪一张码表」——还没导入码表的话，\n"
+                                 "请先到「码表」页签点「添加…」。"))
         elif self.rb_kv.isChecked():
-            self._hint.setText("Kv 主视觉图层：没有声音时把待机画面带进来、有声音时带出去。\n"
-                               "全局只能有一个，添加后自动置顶；参数在右侧设置区顶部单独配置。")
+            self._hint.setText(T("Kv 主视觉图层：没有声音时把待机画面带进来、有声音时带出去。\n"
+                                 "全局只能有一个，添加后自动置顶；参数在右侧设置区顶部单独配置。"))
         else:
             self._hint.setText("")
         # 名字跟着类型走：选 Kv 时默认名换成「Kv 主视觉」、选码表时换成「码表图层」
@@ -457,7 +468,7 @@ class TagEditDialog(I18nDialog):
         self._sync_extra()
 
     def _add_custom(self, cat):
-        text, ok = QInputDialog.getText(self, T("新建词条"),
+        text, ok = QInputDialog.getText(self, T( T("新建词条")),
                                         Tf("在「{}」分类下新建标签：", T(cat)))
         if not ok:
             return
@@ -504,7 +515,7 @@ class TagFilterDialog(I18nDialog):
 
     def __init__(self, main, selected):
         super().__init__(main)
-        self.setWindowTitle("标签筛选（可多选）")
+        self.setWindowTitle( T("标签筛选（可多选）"))
         self.resize(620, 560)
         self.selected = set(selected or [])
         lay = QVBoxLayout(self)
@@ -690,7 +701,7 @@ class GenreVisualEditDialog(I18nDialog):
         self.map = {g: set(t) for g, t in get_genre_visual_map().items()}
         self.custom = {k: list(v) for k, v in (main.cfg["custom_genres"] or {}).items()}
         self.cur_genre = None
-        self.setWindowTitle("曲风 → 画面标签映射")
+        self.setWindowTitle( T("曲风 → 画面标签映射"))
         self.resize(840, 620)
         lay = QVBoxLayout(self)
         hint = QLabel("左侧按大类选一个曲风（每个大类末尾有「+ 新建曲风」），"
@@ -883,7 +894,7 @@ class GenreVisualEditDialog(I18nDialog):
     # ---------- 新建 / 删除 / 恢复 ----------
     def _add_genre(self, group):
         name, ok = QInputDialog.getText(
-            self, "新建曲风", Tf("在「{}」里新建曲风的英文名（如 Frenchcore）：", group))
+            self, T("新建曲风"), Tf("在「{}」里新建曲风的英文名（如 Frenchcore）：", group))
         if not ok or not name.strip():
             return
         name = name.strip()
@@ -915,7 +926,7 @@ class GenreVisualEditDialog(I18nDialog):
     def _reset_defaults(self):
         from PySide6.QtWidgets import QMessageBox
         ret = QMessageBox.question(
-            self, T("恢复默认"),
+            self, T( T("恢复默认")),
             T("确定恢复内置的默认曲风→画面标签映射吗？\n你保存过的自定义映射将被清除。"),
             QMessageBox.Yes | QMessageBox.Cancel)
         if ret != QMessageBox.Yes:
@@ -961,7 +972,7 @@ class MusicLibraryDialog(I18nDialog):
     def __init__(self, main):
         super().__init__(main)
         self.main = main
-        self.setWindowTitle("音乐曲库")
+        self.setWindowTitle( T("音乐曲库"))
         self.resize(660, 540)
         lay = QVBoxLayout(self)
 
@@ -1943,7 +1954,7 @@ class MusicLibraryPanel(QWidget):
         if len(paths) > 6:
             names += Tf("\n…等共 {} 首", len(paths))
         ret = QMessageBox.question(
-            self, T("从曲库移除"),
+            self, T( T("从曲库移除")),
             Tf("从曲库移除这 {} 首？\n\n{}\n\n"
                "只从曲库列表移除（连同曲风/网格等分析数据）；"
                "音频文件本身不会被删除。", len(paths), names),
@@ -1958,7 +1969,7 @@ class MusicLibraryPanel(QWidget):
             #   用户点了"移除"却什么都没发生、无从排查。失败时不 refresh（避免掩盖）。
             print("[曲库] 从曲库移除失败：%s" % e)
             QMessageBox.warning(
-                self, T("从曲库移除"),
+                self, T( T("从曲库移除")),
                 Tf("移除失败，这 {} 首未从曲库移除：\n{}", len(paths), e))
 
     def _remove_imported(self, fake_paths):
@@ -1972,7 +1983,7 @@ class MusicLibraryPanel(QWidget):
         if not sids:
             return
         ret = QMessageBox.question(
-            self, T("从导入库移除"),
+            self, T( T("从导入库移除")),
             Tf("从导入库移除这 {} 首？\n\n"
                "它们的曲风、封面与指纹会一起删除 —— "
                "删除后就不再认得这些歌；本机自己扫描的曲目不受影响。", len(sids)),
@@ -1989,7 +2000,7 @@ class MusicLibraryPanel(QWidget):
             #   （旧实现失败也照样 refresh，让"没删掉"看起来像"删掉了"）。
             print("[曲库] 从导入库移除失败：%s" % e)
             QMessageBox.warning(
-                self, T("从导入库移除"),
+                self, T( T("从导入库移除")),
                 Tf("移除失败，这 {} 首未从导入库移除：\n{}", len(sids), e))
             return
         self.refresh()
@@ -2010,7 +2021,7 @@ class MusicLibraryPanel(QWidget):
             lines.append("%d:%02d" % (int(r["dur"]) // 60, int(r["dur"]) % 60))
         lines.append("")
         lines.append(T("来自导入曲库分析包（本机没有该音频文件，靠指纹识别）"))
-        QMessageBox.information(self, T("导入包曲目"), "\n".join(lines))
+        QMessageBox.information(self, T( T("导入包曲目")), "\n".join(lines))
 
     def _show_cue_info(self, fake_path):
         """**码表派生行**的信息框（本机没有该文件，数据全部来自码表包）。
@@ -2038,7 +2049,7 @@ class MusicLibraryPanel(QWidget):
             lines.append("md5: %s" % r["file_md5"])
         lines.append("")
         lines.append(T("来自码表（本机曲库未收录；码表删除后这行自动消失）"))
-        QMessageBox.information(self, T("码表曲目"), "\n".join(lines))
+        QMessageBox.information(self, T( T("码表曲目")), "\n".join(lines))
 
 
 class LibraryGrid(MediaGrid):
@@ -2869,7 +2880,7 @@ class LayerStackPanel(QWidget):
             blend.setCurrentIndex(BLEND_MODES.index(getattr(lay, "blend", "normal")))
         except ValueError:
             blend.setCurrentIndex(0)
-        blend.setToolTip("混合模式")
+        blend.setToolTip("混合模式：决定这一层怎么和下面的层叠在一起。正常=直接盖住；相加=提亮；相减=抠掉黑底；正片叠底=压暗，适合光效/花纹")
         h.addWidget(blend)
 
         # 自动图层专属：角色按钮（前景/背景，点击切换，自动匹配按此挑素材）
@@ -3030,7 +3041,7 @@ class LayerStackPanel(QWidget):
             pass
         self._refresh_cue_page()
         if msg:
-            QMessageBox.warning(self, T("码表"), msg)
+            QMessageBox.warning(self, T( T("码表")), msg)
 
     def _refresh_cue_page(self):
         """绑/换/卸之后：第 4 页签的「已绑图层」列要跟着变。"""
@@ -3646,7 +3657,7 @@ class AudioSourceDialog(I18nDialog):
     def __init__(self, main):
         super().__init__(main)
         self.main = main
-        self.setWindowTitle("音源设置")
+        self.setWindowTitle( T("音源设置"))
         self.setMinimumWidth(460)
         self._devs = {"system": [], "mic": [], "asio": []}
         self._scanner = None
@@ -3656,29 +3667,39 @@ class AudioSourceDialog(I18nDialog):
         g = QGridLayout()
         g.addWidget(QLabel("音源类型"), 0, 0)
         self.source = QComboBox()
+        # ★ 2026-10-22：麦克风 / 线路输入 是**同一套 WASAPI 录音端点**，但端点类型不同。
+        #   以前两个条目都列出**全部**端点 ⇒ 内容一模一样（用户指出"这两个该一样吗"）。
+        #   现在仍分两项，但**按端点类型过滤**：麦克风只列麦克风类，线路只列线路/混音类。
         self.source.addItems(["系统声音（WASAPI Loopback）", "麦克风", "线路输入/声卡"])
-        # ★ ASIO（低延迟）：本机没有注册任何 ASIO 驱动时**加进去但不让选**，
-        #   并把原因写进 tooltip —— 比"菜单里干脆没有这一项"更容易解释清楚。
-        self._asio_ok, self._asio_why = False, ""
-        try:
-            import asio_engine
-            self._asio_ok, self._asio_why = asio_engine.available()
-        except Exception as e:                                 # noqa: BLE001
-            self._asio_why = str(e)
-        self.source.addItem("ASIO（低延迟 · 未完成）")
+        # ★ ASIO（低延迟）：2026-10-22 起**按驱动可用性开放**。
+        #   10-18 曾因"功能未完成"永久禁用；现已用真实声卡（Donner USB）
+        #   验证采集可用（48k / 8 帧 / 1.7ms）⇒ 有驱动就允许选。
+        #   注意：下拉项的类别靠**索引**取（_src_key() 里 3 = ASIO），
+        #   所以条的**位置不能变**。
+        self.source.addItem("ASIO（低延迟 · 声卡）")
         self._asio_idx = 3
-        if not self._asio_ok:
-            try:
-                self.source.model().item(self._asio_idx).setEnabled(False)
-            except Exception:                                  # noqa: BLE001
-                pass
-            self.source.setItemData(self._asio_idx,
-                                    T("不可用：") + (self._asio_why or ""), Qt.ToolTipRole)
-        else:
+        _asio_drv = []
+        try:
+            import asio_engine as _ae
+            if _ae.available()[0]:
+                _asio_drv = _ae.list_drivers() or []
+        except Exception:                                  # noqa: BLE001
+            _asio_drv = []
+        if _asio_drv:
             self.source.setItemData(self._asio_idx, T(
-                "绕过系统混音器直连声卡驱动，延迟 1~10ms。"
-                "⚠ 同一驱动同时只允许一个程序使用 —— VirtualDJ / DAW 占着时会连不上，"
-                "此时会自动回退到系统声音。"), Qt.ToolTipRole)
+                "低延迟声卡输入：选本项后，在「设备」里选 ASIO 驱动（如 %s），"
+                "再用右侧「输入通道」选第几路输入。ASIO 抓不到别的程序播放的声音，"
+                "只录声卡输入。") % _asio_drv[0], Qt.ToolTipRole)
+        else:
+            try:
+                _asio_item = self.source.model().item(self._asio_idx)
+                if _asio_item is not None:
+                    _asio_item.setEnabled(False)
+            except Exception:                              # noqa: BLE001
+                pass
+            self.source.setItemData(self._asio_idx, T(
+                "未检测到 ASIO 驱动：请先安装声卡自带的 ASIO 驱动"
+                "（或 ASIO4ALL），再回到本页点「刷新」。"), Qt.ToolTipRole)
 
         # ★ 局域网音频（自研轻量协议，2026-10-08 新增）：
         #   A 机跑独立采集发送小 exe，B 机选这一项接收。
@@ -3783,8 +3804,8 @@ class AudioSourceDialog(I18nDialog):
         lay.addWidget(self.lbl_hint)
 
         btns = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Apply).setText("应用")
-        btns.button(QDialogButtonBox.Cancel).setText("取消")
+        btns.button(QDialogButtonBox.Apply).setText( T("应用"))
+        btns.button(QDialogButtonBox.Cancel).setText( T("取消"))
         btns.clicked.connect(self._on_btn)
         self._btnbox = btns
         lay.addWidget(btns)
@@ -3802,6 +3823,11 @@ class AudioSourceDialog(I18nDialog):
     # ---- 配置载入/应用 ----
     #                   下拉索引 → 设备类别（线路输入并入 mic；索引 3 = ASIO；索引 4 = 局域网）
     SOURCE_KEYS = ("system", "mic", "mic", "asio", "lan")
+
+    def _mic_category(self):
+        """当前是「麦克风」(1) 还是「线路输入/声卡」(2)？两者共用 mic 通道，列表要分开。"""
+        i = self.source.currentIndex()
+        return "mic" if i == 1 else ("line" if i == 2 else "")
 
     def _src_key(self):
         return self.SOURCE_KEYS[max(0, min(4, self.source.currentIndex()))]
@@ -4057,6 +4083,17 @@ class AudioSourceDialog(I18nDialog):
             self._ensure_ch_items(devs.get("asio_ch"), devs.get("asio_ch_err") or "")
         kind = self._src_key()
         items = self._devs.get(kind, [])
+        # ★ 麦克风 / 线路 同为 "mic" 通道，但**列出的端点要分开**：
+        #   麦克风类看名字含「麦克风 / Microphone」，其余（线路、立体声混音、采集卡）归线路。
+        if kind == "mic":
+            _cat = self._mic_category()
+            if _cat == "mic":
+                _f = [n for n in items if any(k in n.lower() for k in ("麦克风", "microphone", "webcam"))]
+            elif _cat == "line":
+                _f = [n for n in items if not any(k in n.lower() for k in ("麦克风", "microphone", "webcam"))]
+            else:
+                _f = items
+            items = _f or items          # 过滤后为空 ⇒ 退回全部（不让用户卡死）
         self.device.blockSignals(True)
         self.device.clear()
         self.device.addItems(items or [T("（未找到设备）")])
@@ -4166,6 +4203,28 @@ class AudioSourceDialog(I18nDialog):
         for k, b in self.bars.items():
             b.setValue(int(max(0.0, min(1.0, snap.get(k, 0.0))) * 100))
         self.lbl_dev.setText(T("当前采集设备: ") + (snap.get("device_desc") or "-"))
+        # ★★ 2026-10-22：**ASIO 状态必须显式显示**。
+        #   旧行为：ASIO 打开失败会静默回退到系统声音，界面没有任何提示
+        #   ⇒ 用户只看到"切到 ASIO 没反应/切不过去"。现在把成功/失败原因写在提示行。
+        try:
+            if self._src_key() == "asio":
+                _fail = str(snap.get("asio_failed") or "")
+                _info = str(snap.get("asio_info") or "")
+                if _fail:
+                    self.lbl_hint.setText(T("⚠ ASIO 打开失败：") + _fail + T("（已回退到系统声音）"))
+                    self.lbl_hint.setStyleSheet("color:#e0a030;font-size:11px;")
+                elif snap.get("asio_active"):
+                    self.lbl_hint.setText(T("✅ ASIO 已启用：") + _info)
+                    self.lbl_hint.setStyleSheet("color:#4fc3f7;font-size:11px;")
+                else:
+                    self.lbl_hint.setText(T("ASIO：尚未启动（点「应用」后开始采集）"))
+                    self.lbl_hint.setStyleSheet("color:#e0a030;font-size:11px;")
+                self._asio_hint_on = True
+            elif getattr(self, "_asio_hint_on", False):
+                self.lbl_hint.setText("")
+                self._asio_hint_on = False
+        except Exception:                                        # noqa: BLE001
+            pass
         # ★ 局域网音频状态行：对端 IP + 缓冲深度 + 抖动 + 丢包
         if self._src_key() == "lan":
             self.lbl_lan.show()
@@ -4175,7 +4234,7 @@ class AudioSourceDialog(I18nDialog):
                 self.lbl_lan.setText("⚠ " + fail)
                 self.lbl_lan.setStyleSheet("color:#e0a030;font-size:11px;")
             elif info:
-                self.lbl_lan.setText("局域网：" + info)
+                self.lbl_lan.setText( T("局域网：") + info)
                 self.lbl_lan.setStyleSheet("color:#4fc3f7;font-size:11px;")
             else:
                 # 还没拿到状态：可能是还没点「应用」，或正在等待对端首包
@@ -4264,7 +4323,7 @@ class PreviewSettingsDialog(I18nDialog):
         super().__init__(main)
         self.main = main
         self.panel = panel
-        self.setWindowTitle("预览画面设置")
+        self.setWindowTitle( T("预览画面设置"))
         self.setMinimumWidth(430)
         p = panel.pic_cfg()
         outer = QVBoxLayout(self)

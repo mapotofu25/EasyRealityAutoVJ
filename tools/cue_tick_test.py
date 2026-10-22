@@ -30,6 +30,7 @@ import cuesheet                                        # noqa: E402
 import cuesheet_runtime as crt                         # noqa: E402
 
 TOL = 1e-6
+_LEAD = getattr(engine, 'CUE_LEAD_SEC', 0.5)
 CMP_FIELDS = ("lyr_id", "z", "item_id", "clip_id", "clip_path", "missing",
               "src_in_sec", "src_out_sec", "play_sec", "speed", "crop", "xform",
               "blend", "opacity", "alpha", "trans", "trans_p", "active",
@@ -126,7 +127,8 @@ def check_consistency():
         for pos in seq:
             eng.set_cue_position(pos)
             eng._cuesheet_tick()
-            want = ref.update(pos)
+            # ★ 引擎侧已加「演出提前量」CUE_LEAD_SEC（0.5s）⇒ 参考实现也要加，否则永远差 0.5
+            want = ref.update(pos + _LEAD / float(ref.beat_len))
             got = lay.cs_states
             n += 1
             if len(got) != len(want):
@@ -210,7 +212,9 @@ class _BoomRuntime:
     def __init__(self):
         self.calls = 0
 
-    def update(self, pos):
+    def update(self, pos, **kw):
+        # ⚠ 必须接 `**kw`：生产调用是 `rt.update(pos, rate=…)`（2026-10-18 起）。
+        #   写死 `update(self, pos)` 会抛 TypeError，把"异常安全"用例伪装成通过/失败。
         self.calls += 1
         raise RuntimeError("boom-%d" % self.calls)
 

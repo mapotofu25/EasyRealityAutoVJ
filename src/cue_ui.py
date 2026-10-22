@@ -96,11 +96,11 @@ def pick_track(sheet, parent=None, current_title=""):
     """
     tracks = list(getattr(sheet, "tracks", None) or [])
     if not tracks:
-        QMessageBox.warning(parent, "没有曲目",
+        QMessageBox.warning(parent, T("没有曲目"),
                             "这张码表里没有任何曲目（tracks 为空），无法绑定。")
         return None
     dlg = QDialog(parent)
-    dlg.setWindowTitle("选择要绑定的曲目")
+    dlg.setWindowTitle( T("选择要绑定的曲目"))
     lay = QVBoxLayout(dlg)
     lay.addWidget(QLabel("这张码表包含以下曲目。选一首绑定到当前演出（已接入指纹认歌，之后会自动选表）："))
     box = QComboBox(dlg)
@@ -321,6 +321,44 @@ class CueSheetDialog(QDialog):
         self._load_recent()
 
     # ---------------- 状态显示 ----------------
+    def _append_status(self, msg):
+        """把一行提示追加到状态区（不覆盖已有内容）。"""
+        try:
+            cur = self.lbl_status.text() or ""
+            self.lbl_status.setText((cur + "\n" + msg).strip())
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _check_fp_job(self):
+        """轮询灌库作业：完成后把结果写进状态区（成功/0 条/失败都要说）。"""
+        job = getattr(self, "_fp_job", None)
+        if job is None:
+            try:
+                self._fp_timer.stop()
+            except Exception:                                    # noqa: BLE001
+                pass
+            return
+        if not getattr(job, "done", False):
+            return
+        self._fp_job = None
+        try:
+            self._fp_timer.stop()
+        except Exception:                                        # noqa: BLE001
+            pass
+        err = getattr(job, "error", "") or ""
+        res = getattr(job, "result", None) or {}
+        if err:
+            self._append_status("码表指纹：导入失败（%s）" % err)
+            return
+        n = int(res.get("tracks", 0) or 0)
+        m = int(res.get("hashes", 0) or 0)
+        if n <= 0:
+            self._append_status(
+                "码表指纹：这张包里没有可用的指纹（0 首）。"
+                "若歌不在本机曲库，放歌仍认不出 —— 请在编排端重新导出。")
+        else:
+            self._append_status("码表指纹：已写入 %d 首 / %d 条指纹。" % (n, m))
+
     def refresh(self):
         self._fill_layers()
         st = {}
@@ -333,8 +371,7 @@ class CueSheetDialog(QDialog):
         else:
             idn = getattr(self.track, "identity", None) if self.track is not None else None
             bpm = float(getattr(idn, "bpm", 0.0) or 0.0) if idn is not None else 0.0
-            self.lbl_status.setText(
-                "码表：%s ｜ 画布 %dx%d ｜ 曲目：%s ｜ BPM：%s ｜ 片段：%d ｜ 已绑图层：%s"
+            self.lbl_status.setText( T("码表：%s ｜ 画布 %dx%d ｜ 曲目：%s ｜ BPM：%s ｜ 片段：%d ｜ 已绑图层：%s")
                 % (st.get("title") or "(无标题)", int(st.get("res", (1920, 1080))[0]),
                    int(st.get("res", (1920, 1080))[1]),
                    ("%s — %s" % (getattr(idn, "artist", ""), getattr(idn, "title", "")))
@@ -357,7 +394,7 @@ class CueSheetDialog(QDialog):
         if self._t0 is not None and self.track is not None:
             bl = self._beat_len()
             pos = (time.monotonic() - self._t0) / bl
-            self.lbl_clock.setText("拍位 %.2f（%.2fs @ %s BPM）"
+            self.lbl_clock.setText( T("拍位 %.2f（%.2fs @ %s BPM）")
                                    % (pos, pos * bl,
                                       ("%g" % (60.0 / bl)) if bl > 0 else "退化"))
 
@@ -519,10 +556,21 @@ class CueSheetDialog(QDialog):
             pass
         # ★ 包里的完整指纹哈希序列 → 演出端指纹库（**后台线程**，绝不卡对话框）。
         #   没有这一步，歌不在本机曲库时永远认不出（只有 16 hex 的 `fp_id` 摘要不够用）。
+        # ★★ 2026-10-19 审计修复：**灌库结果必须让用户看见**。
+        #   旧写法 try/except pass —— 坏包、0 条、sqlite 忙，全都不提示，
+        #   用户以为"导入完就能认出不在本机的歌"，实际永远认不出（只能翻日志）。
         try:
-            cue_fp_pack.start_ingest(self.cfg, self.engine, self.pkg)
-        except Exception:                                        # noqa: BLE001
-            pass
+            _job = cue_fp_pack.start_ingest(self.cfg, self.engine, self.pkg)
+            if _job is not None:
+                self._fp_job = _job
+                if not hasattr(self, "_fp_timer"):
+                    from PySide6.QtCore import QTimer
+                    self._fp_timer = QTimer(self)
+                    self._fp_timer.setInterval(400)
+                    self._fp_timer.timeout.connect(self._check_fp_job)
+                self._fp_timer.start()
+        except Exception as _e:                                  # noqa: BLE001
+            self._append_status("码表指纹：启动导入失败（%s）" % _e)
         if self.chk_enable.isChecked():
             self._enable(True)
         self.refresh()
@@ -759,7 +807,7 @@ class CueSheetDialog(QDialog):
         except Exception:                                        # noqa: BLE001
             self.stop_clock()
             return
-        self.lbl_clock.setText("拍位 %.2f（%.2fs @ %s）"
+        self.lbl_clock.setText( T("拍位 %.2f（%.2fs @ %s）")
                               % (pos, pos * bl,
                                  ("%g BPM" % (60.0 / bl)) if bl > 0 else "退化"))
 
@@ -825,6 +873,16 @@ class CueSheetDialog(QDialog):
     def closeEvent(self, ev):
         self.stop_clock()
         super().closeEvent(ev)
+
+    def reject(self):
+        """★ 2026-10-18 审计：Esc / 右上角 X 走的是 reject→hide，**不触发 closeEvent**
+        ⇒ 「手动起拍」的 30ms 定时器会一直往引擎灌 wallclock 位置，
+          码表从此不再跟歌、而且界面上看不出来。这里补掉。"""
+        try:
+            self.stop_clock()
+        except Exception:                                        # noqa: BLE001
+            pass
+        super().reject()
 
 
 def open_cuesheet_dialog(owner):

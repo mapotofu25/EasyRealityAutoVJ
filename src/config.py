@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from contextlib import contextmanager
 
 
@@ -32,11 +33,12 @@ DEFAULT_HOTKEYS = {
     "blackout": {"key": "B", "global": False, "enabled": True},
     "freeze": {"key": "F", "global": False, "enabled": True},
     "pause_auto": {"key": "P", "global": False, "enabled": True},
-    # 「下一素材」默认 = 仅窗口内（2026-09-24 用户改回）。
-    # 曾一度默认全局，但全局 RegisterHotKey 会**整个系统地吞掉 Right 键**
-    # （浏览器/编辑器/VDJ 里都翻不了页），代价太大。
-    # 需要演出时跨窗口触发，可在「快捷键设置」里把「范围」改成全局。
-    "next_scene": {"key": "Right", "global": False, "enabled": True},
+    # 「下一素材」默认 = **Ctrl+Right + 全局**（2026-10-18 用户要求）。
+    # 演出时主窗口常常没有焦点（VDJ / 播放器在前台），必须走全局 RegisterHotKey；
+    # 用 Ctrl+Right 而不是裸 Right —— 全局注册会整个系统吞掉该键，
+    # 裸 Right 会让浏览器 / 编辑器 / VDJ 里翻不了页。
+    # 需要改回只在本窗口生效，可在「快捷键设置」里把「范围」改成仅窗口。
+    "next_scene": {"key": "Ctrl+Right", "global": True, "enabled": True},
     # 注：「上一素材（Left）」已移除——它的实现与「下一素材」完全相同（都是随机切下一个），
     # 属于死键，留着只会让人以为能往回切。旧配置里的 prev_scene 项会被自动忽略。
     "toggle_order_mode": {"key": "Ctrl+R", "global": False, "enabled": True},
@@ -219,6 +221,9 @@ def deep_merge(base, override):
     return out
 
 
+SAVE_COALESCE_SEC = 0.40   # 合并窗口：0.4 秒内的多次 save 只真写一次
+
+
 class Config:
     def __init__(self):
         self.data = json.loads(json.dumps(DEFAULTS))  # deep copy
@@ -233,21 +238,16 @@ class Config:
     def _migrate(self):
         """一次性迁移：只在缺标记位时改，**不覆盖用户手动改过的值**。"""
         hk = self.data.setdefault("hotkeys", {})
-        # 「下一素材」默认范围 局部 → 全局（2026-09-24 用户要求）。
-        # 用标记位而不是每次启动都写 True：用户如果手动改回"仅窗口"，不该被改回来。
-        if not self.data.get("_hk_next_global_migrated"):
+        # 「下一素材」默认值升级（2026-10-18 用户要求）：Right/仅窗口 → Ctrl+Right/全局。
+        # ⚠ **只改仍是旧默认值的配置**（key 恰好是 "Right" 且 global 为 False）：
+        #   用户自己改过键位或范围，就一个字都不动（不强行覆盖已保存配置）。
+        #   用一次性标记位，之后用户手动改回"仅窗口"也不会被再改回来。
+        if not self.data.get("_hk_next_ctrl_right"):
             spec = hk.get("next_scene")
-            if isinstance(spec, dict):
+            if isinstance(spec, dict) and spec.get("key") == "Right" and not spec.get("global"):
+                spec["key"] = "Ctrl+Right"
                 spec["global"] = True
-            self.data["_hk_next_global_migrated"] = True
-            self.save()
-        # 回退：「下一素材」范围 全局 → 仅窗口（2026-09-24 用户改回；全局会吞掉 Right 键）。
-        # 同样用一次性标记：之后他在「快捷键设置」里把范围改成全局，不会再被改回来。
-        if not self.data.get("_hk_next_global_reverted"):
-            spec = hk.get("next_scene")
-            if isinstance(spec, dict):
-                spec["global"] = False
-            self.data["_hk_next_global_reverted"] = True
+            self.data["_hk_next_ctrl_right"] = True
             self.save()
 
     # ---------- IO ----------
@@ -274,6 +274,19 @@ class Config:
                         pass
         # 全部失败：保持默认值（软件照常能打开）
 
+    def flush(self):
+        """把合并窗口里还没落盘的改动立刻写掉（退出/导出/切页前调用）。
+
+        没有脏改动时是**零成本**的（不碰磁盘），可以随手调。
+        """
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.save(force=True)
+
+    def flush_if_dirty(self):
+        """别名：语义上更明确（供定时器调用）。"""
+        self.flush()
+
     def save(self, force: bool = False):
         """**原子写 + 多线程安全**：先写临时文件再替换，避免写一半被强杀 → 配置文件损坏。
 
@@ -287,10 +300,21 @@ class Config:
           现在：① 进程内 `_save_lock` 串行化；② 临时文件名带 pid + 线程 id 唯一化
           （即使将来去掉锁也不会撞名）；③ 异常时清理自己的临时文件。
         """
-        if not force and getattr(self, "_batch", 0) > 0:
-            self._dirty = True
-            return
+        if not force:
+            if getattr(self, "_batch", 0) > 0:
+                self._dirty = True
+                return
+            # ★★ 2026-10-19 审计修复：**合并写盘**。
+            #   滑条每动一格都调 save()，而单次真写=229KB dump+fsync+备份 ≈ 24~28ms
+            #   ⇒ 拖 2 秒卡 1.5~3 秒（现场调参一顿一顿）。
+            #   现在 0.4 秒窗口内的多次调用只标脏、不落盘；退出/导出前 flush() 保证不丢。
+            _now = time.monotonic()
+            if _now - float(getattr(self, "_last_write_t", 0.0)) < SAVE_COALESCE_SEC:
+                self._dirty = True
+                return
         with self._save_lock:
+            self._last_write_t = time.monotonic()
+            self._write_count = int(getattr(self, "_write_count", 0)) + 1
             tmp = "%s.tmp.%d.%d" % (CONFIG_FILE, os.getpid(), threading.get_ident())
             try:
                 with open(tmp, "w", encoding="utf-8") as f:

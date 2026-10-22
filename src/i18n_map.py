@@ -268,13 +268,6 @@ ZH2EN = {
         "release package again and retry.",
     "错误详情：": "Error details:",
     "NDI 源名称": "NDI Source Name",
-    "NDI 传输音频（48 kHz 立体声）": "Send NDI audio (48 kHz stereo)",
-    "把采集到的声音随 NDI 一起发出去（48 kHz 立体声）。默认关闭：接收端若本来就在监听同一路声音，会听到双声/回声；只在接收端需要单独取声音时才打开。":
-        "Send the captured sound along with NDI (48 kHz stereo). Off by default: if the receiver is "
-        "already monitoring the same sound, you will hear doubling/echo - only enable it when the "
-        "receiver needs the audio on its own.",
-    "Spout 只传画面，不含音频。需要音频请用 NDI 或虚拟声卡。":
-        "Spout carries video only - no audio. Use NDI or a virtual audio device if you need sound.",
     "全局": "Global",
     "仅窗口": "Window only",
     "不保存": "Don't Save",
@@ -305,7 +298,7 @@ ZH2EN = {
     "滑动": "Slide",
     "缩放": "Zoom",
     "故障": "Glitch",
-    "跟随模式：慢切/常规=淡入淡出，逐拍=硬切":
+    "跟随模式：常规=淡入淡出，逐拍=硬切":
         "Follow mode: Normal = Fade, Beat = Cut",
     "能量映射": "Energy Mapping",
     "BPM Sync 视频速度": "BPM Sync Video Speed",
@@ -338,12 +331,6 @@ ZH2EN = {
     "一对素材里 A↔B 每隔多久交替一次（默认每 1 拍交替）":
         "How often A↔B alternate within a pair (default: every beat)",
     "每对小节数(换素材周期)": "Bars per Pair (clip cycle)",
-    "能量校正": "Energy Correction",
-    "伽马校正：>1 压低人声段能量、鼓点段基本不动。本机系统低频增强导致人声段虚高时往右拉":
-        "Gamma: >1 lowers vocal-section energy while leaving kicks mostly unchanged. "
-        "Turn right if your system's bass boost inflates vocal sections.",
-    "实验性：现场系统低频增强导致能量虚高时用。默认 1.0 不校正。":
-        "Experimental: use when on-site bass boost inflates energy. Default 1.0 = no correction.",
 
     # ==================== 颜色渲染 ====================
     "启用颜色渲染": "Enable Color Rendering",
@@ -565,7 +552,16 @@ ZH2EN = {
     "基础": "Basics",
     # 工具条「⋯」收纳菜单
     "⋯ 更多": "⋯ More",
-    "更多：主题 / 语言 / 快捷键 / 关于": "More: theme / language / hotkeys / about",
+    "更多：主题 / 语言 / 快捷键 / 导出日志 / 关于":
+        "More: theme / language / hotkeys / export logs / about",
+    # 「导出全部日志…」（把日志 + config 打成 zip，方便用户回传排查）
+    "导出全部日志…": "Export all logs…",
+    "导出全部日志": "Export all logs",
+    "把日志与配置文件打包成 zip，方便反馈问题":
+        "Pack logs and the config file into a zip for bug reports",
+    "Zip 压缩包 (*.zip)": "Zip archive (*.zip)",
+    "导出失败：": "Export failed: ",
+    "已导出 %d 个日志/配置文件到：": "Exported %d log/config file(s) to:",
     # ==================== 右键菜单（2026-09-27 P4：长条目拆短，说明挪进悬停提示）====================
     # ⚠ 短标题也必须进词表：菜单是用 i18n.retranslate(menu) 遍历替换的，缺了就露中文。
     "Solo": "Solo",
@@ -753,7 +749,7 @@ ZH2EN = {
     "显示输出窗口": "Show Output Window",
     "先点「▶ 开始」后再使用输出设置":
         "Press “▶ Start” first, then use the output settings",
-    "锁定 16:9": "Lock 16:9",
+    "锁定比例": "Lock aspect ratio",
     "无边框": "Borderless",
     "窗口置顶": "Always on Top",
 
@@ -766,7 +762,7 @@ ZH2EN = {
     "常规": "Normal",
     "减少": "Subtract",
     "屏幕": "Screen",
-    "多层": "Multiply",
+    "正片叠底": "Multiply",
     "变亮": "Lighten",
     "变暗": "Darken",
 
@@ -943,11 +939,9 @@ ZH2EN = {
     # 音源下拉里的 ASIO 项（panels.AudioSourceDialog）。注意：下拉项的类别是靠
     # **索引**（SOURCE_KEYS / _src_key()）取的，文案改动不影响任何分支逻辑。
     "ASIO（低延迟 · 未完成）": "ASIO (low latency · not finished)",
-    # NDI 音频输出勾选框（ui_main.OutputPanel.chk_ndi_audio）。
-    "NDI 传输音频（48 kHz 立体声 · 未完成）":
-        "Send NDI audio (48 kHz stereo · not finished)",
-    "局域网：":
-        "LAN: ",
+    "暂不可用：ASIO 采集功能尚未完成（条目保留，稍后版本再开放）。当前请选「系统声音」或「线路输入/声卡」。":
+        "Not available yet: ASIO capture is not finished (the item stays for later). "
+        "Please choose “System audio” or “Line-in / sound card” for now.",
     "局域网：等待对端…（点「应用」后开始连接，最多等 5 秒）":
         "LAN: waiting for remote… (click Apply to connect, up to 5s)",
     "⚠ 局域网对端未找到 —— 请确认 B 机已选「局域网音频」，端口一致，防火墙放行 UDP":
@@ -1066,6 +1060,11 @@ ZH2EN = {
         "Engine or layer unavailable (cannot load the cue sheet).",
     "有 %d 个素材没找到，请指定素材目录（可取消）":
         "%d media file(s) not found. Please choose the media folder (you can cancel).",
+    "只显示本层（码表以外的图层全部隐藏）": "Show only this layer (hide everything else)",
+    "只清掉本次运行的码表（画面立刻交还给其它图层）；要永久移除请到「码表」页删除":
+        "Clears the cue sheet for this run only (picture hands back to the other layers); go to the Cue page to remove it permanently",
+    "清掉本次装载的码表，并把这个图层变回普通图层（会保存）；下次启动不会再自动装回来":
+        "Clears the loaded cue sheet and turns this layer back into a normal layer (saved; it will not be re-mounted on next launch)",
 }
 
 
@@ -1291,6 +1290,28 @@ ZH2EN.update({
     "素材：{} ｜ 片段 ID：{}": "Clip: {} | Clip ID: {}",
     "素材：{} ｜ 片段 ID：{}\n没有缩略图（老码表包可能不带 thumbs/）":
         "Clip: {} | Clip ID: {}\nNo thumbnail (older packages may not include thumbs/)",
+    "Kv 主视觉图层已存在":
+        "A KV main-visual layer already exists",
+    "Spout 不可用":
+        "Spout unavailable",
+    "删除失败":
+        "Delete failed",
+    "导入素材设置":
+        "Import settings",
+    "局域网：":
+        "LAN: ",
+    "没有曲目":
+        "No tracks",
+    "素材文件缺失":
+        "Media file missing",
+    "拍位 %.2f（%.2fs @ %s BPM）":
+        "Beat %.2f (%.2fs @ %s BPM)",
+    "拍位 %.2f（%.2fs @ %s）":
+        "Beat %.2f (%.2fs @ %s)",
+    "码表：%s ｜ 画布 %dx%d ｜ 曲目：%s ｜ BPM：%s ｜ 片段：%d ｜ 已绑图层：%s":
+        "Cue sheet: %s | Canvas %dx%d | Track: %s | BPM: %s | Clips: %d | Bound layer: %s",
+    "码表图层：画面由码表接管（片段入点/出场都按码表走）。\n":
+        "Cue layer: the cue sheet drives the picture (clip in/out follow the sheet).\n",
 })
 
 CATEGORY_EN = {
@@ -1302,3 +1323,10 @@ CATEGORY_EN = {
 }
 
 _inject_tag_labels()
+
+# ★ 2026-10-19：工具提示（含换行/长句）统一在这里补，避免插错到别的字典。
+ZH2EN["混合模式：决定这一层怎么和下面的层叠在一起。正常=直接盖住；相加=提亮；相减=抠掉黑底；正片叠底=压暗，适合光效/花纹"] = (
+    "Blend mode: how this layer stacks on the ones below. "
+    "Normal = cover; Add = brighten; Subtract = knock out black; Multiply = darken.")
+ZH2EN["勾选：按画面比例缩放，不够的地方留黑边（不拉伸、不变形）；不勾选：拉伸铺满输出尺寸（填满，但比例不对时会变形）。"] = (
+    "On: keep aspect ratio and letterbox (no stretching). Off: stretch to fill the output.")

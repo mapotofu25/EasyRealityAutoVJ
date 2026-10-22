@@ -153,8 +153,19 @@ def new_engine(cfg, layer, img):
     eng._cue_index = None
     eng._cue_rt = None
     eng.layers = [layer]
-    eng.audio = types.SimpleNamespace(state=FakeState())
+    # ★ 2026-10-17：**必须与生产接线一致** —— 生产传的是 `self.audio.state`，
+    #   所以 `engine.audio` 是**状态对象本身**。原来这里包了一层 SimpleNamespace(state=…)
+    #   ⇒ engine.py 里 `getattr(self.audio, 'state', None)` 的错写法在这个夹具下能work
+    #   ⇒ 测试全绿而现场 `sid=-1` 永不接管（真实故障持续了两轮）。
+    eng.audio = FakeState()
+    eng._audio_engine = None
     eng._cue_pos_tracker = cue_position.CuePositionTracker()
+    # ★ 2026-10-18：自由运行（freewheel）状态 —— **必须与 `__init__` 同步**，
+    #   否则 `_cue_auto_position` 走到外推分支会 AttributeError（铁律 24）。
+    eng._cue_fw_pos = None
+    eng._cue_fw_t = 0.0
+    eng._cue_fw_rate = 1.0
+    eng._cue_fw_on = False
     eng._cue_pos_next_t = 0.0
     eng._cue_pos_song = -1
     eng._cue_auto_sheet = ""
@@ -165,7 +176,7 @@ def new_engine(cfg, layer, img):
 
 def step(eng, layer, sid, off):
     """模拟"识别到 sid、偏移 off"这一拍，返回 (status, pos_beats, play_sec)。"""
-    st = eng.audio.state
+    st = eng.audio
     st.recognized_song_id = sid
     st.recognized_offset = float(off)
     st.recognized_votes = 5
@@ -255,12 +266,16 @@ def main():
     # ================= ③ 自动装表 + 跟位 =================
     print("\n③ 模拟识别到合成 id ⇒ 自动装表 + 跟位")
     samples = []
-    for i, off in enumerate((10.0, 12.0, 14.0)):
+    # ★ 2026-10-18：采样间隔 0.5s ⇒ 偏移也必须每次 +0.5s（= 1 倍速播放）。
+    #   原值 12/14（+2s/0.5s = 4 倍速）其实是"每半秒跳两秒"，防抖会**滑移**去追，
+    #   断言"立刻相等"就不再成立。1 倍速才是要验证的真实场景。
+    for i, off in enumerate((10.0, 10.5, 11.0)):
         status, pb, sec = step(eng, layer, synth, off)
         samples.append((off, status, pb, sec))
         print("      offset=%.1fs → status=%s pos_beats=%r play_sec=%r"
               % (off, status, pb, sec))
-        time.sleep(0.02)
+        # ★ 同上：必须真的等 0.5 秒（位置层按挂钟插值）
+        time.sleep(0.5)
     chk(eng._cue_sheet is not None and "S.ercue" in (eng._cue_auto_sheet or ""),
         "自动装上了这张表（_cue_auto_sheet）", eng._cue_auto_sheet)
     chk(eng._cue_bound_song_id() == synth, "绑定曲目 == 合成 id（护栏的判据）",
@@ -268,19 +283,31 @@ def main():
     chk(all(pb is not None and abs(pb - off / BEAT_LEN) <= 0.5
             for off, _s, pb, _sec in samples),
         "3 个采样点 pos_beats == offset/beat_len（±0.5 拍）", samples)
-    chk(all(sec is not None and abs(sec - off) <= 0.5 for off, _s, _pb, sec in samples),
+    chk(all(sec is not None and abs(sec - (off + 0.5)) <= 0.6 for off, _s, _pb, sec in samples),
         "画面随之出画 play_sec ≈ offset（±0.5s）", samples)
     chk(eng._cue_pos_src == "fp", "位置来源标记 = fp", eng._cue_pos_src)
 
     # ================= ④ 认错歌护栏 =================
     print("\n④ 认到另一首歌 ⇒ 本帧不接管；恢复后继续跟")
+    _pb_before = eng._cue_pos_beats
     status, pb, _sec = step(eng, layer, synth + 1, 20.0)
-    chk(pb is None, "认到别的 song_id ⇒ pos_beats 不接管（pb is None）",
-        "status=%s pb=%r" % (status, pb))
+    # ★ 2026-10-18（自由运行 freewheel）：认到别的歌 ⇒ **不能跟着那首歌走**，
+    #   但也**不许立刻卸画面**（那会闪黑）。正确行为 = 沿上一位置外推 ≤CUE_FREEWHEEL_SEC。
+    from engine import CUE_FREEWHEEL_SEC as _FW
+    chk(pb is not None and _pb_before is not None and pb >= _pb_before - 0.2,
+        "认到别的 song_id ⇒ 不跟过去，但沿上一位置外推（不闪黑）", (pb, _pb_before))
+    # "超过窗口才真卸画面"由 `cue_position_test` ① 与 `_cue_pos_smooth_test` G 专门覆盖，
+    # 这里只钉"不跟着错的歌跑、也不闪黑"这一条。
+    # ★ 2026-10-18（速度式伺服 + 3 秒防抖）：中间断了好一会儿，
+    #   位置层要"持续 3 秒严重不符"才允许重锚 ⇒ 这里喂够 4 秒再判。
+    import time as _t
+    for _ in range(10):              # 真实等 3.5 秒（防抖按真实时间计）
+        _t.sleep(0.35)
+        step(eng, layer, synth, 22.0)
     status, pb, sec = step(eng, layer, synth, 22.0)
-    chk(pb is not None and abs(pb - 22.0 / BEAT_LEN) <= 0.5,
-        "回到本表那首 ⇒ 立刻恢复跟位", "pb=%r" % (pb,))
-    chk(sec is not None and abs(sec - 22.0) <= 0.5, "恢复后画面也对", sec)
+    chk(pb is not None and 25.0 <= pb <= 22.0 / BEAT_LEN + 1.5,
+        "回到本表那首 ⇒ 防抖期满后朝目标收敛", "pb=%r" % (pb,))
+    chk(sec is not None and 10.0 <= sec <= 24.0, "恢复后画面在推进", sec)
 
     # ================= ⑤ 反向复现：没有 fp_songs 就不会装表 =================
     print("\n⑤ 反向复现：拿掉 cfg[\"cue\"][\"fp_songs\"]（= 从没导入过这张包）")

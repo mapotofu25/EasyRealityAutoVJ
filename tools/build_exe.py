@@ -52,6 +52,8 @@ cmd = [
     "--hidden-import", "i18n_map",
     "--hidden-import", "version",
     "--hidden-import", "_build_ver",
+    # ★ 应用图标定位（main.py 在 try 里惰性 `import appicon`，静态分析可能漏 ⇒ 显式给出）
+    "--hidden-import", "appicon",
     "--hidden-import", "ndi_out",
     "--hidden-import", "dxvnative",
     "--hidden-import", "asio_engine",
@@ -102,8 +104,16 @@ cmd = [
     #   （operator new/delete 在 asiohost.cpp 里自带垫片），所以不需要额外带 libstdc++。
     "--add-binary", os.path.join(SRC, "_asiohost.dll") + os.pathsep + ".",
     "--add-data", os.path.join(ROOT, "assets", "models") + os.pathsep + "assets" + os.path.sep + "models",
-    os.path.join(SRC, "main.py"),
 ]
+# —— 应用图标（★ 仅图标相关；文件缺失则自动跳过，绝不影响打包）——
+#   --icon 写入 exe 文件图标；--add-data 让运行时能在 _MEIPASS/assets/autovj.ico 取到。
+_icon = os.path.join(ROOT, "assets", "autovj.ico")
+if os.path.isfile(_icon):
+    cmd += ["--icon", _icon, "--add-data", _icon + os.pathsep + "assets"]
+    print("图标：%s" % _icon)
+else:
+    print("★ 图标缺失，跳过（%s）" % _icon)
+cmd.append(os.path.join(SRC, "main.py"))
 print(" ".join(cmd))
 rc = subprocess.call(cmd)
 

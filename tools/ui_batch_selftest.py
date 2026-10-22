@@ -7,7 +7,7 @@ r"""本轮 7 项改动的离屏自测（不连音频设备、不碰真实 config
   3) 低能量段模式打分偏好「常规切」
   4) 「下一素材」按下后重置切换倒计时（手动对齐）
   5) 快捷键设置：应用按钮 / 脏检测 / 关闭确认（保存 / 不保存两条路）
-  6) 「下一素材」默认范围 = 仅窗口（曾为全局，已回退）+ 旧配置回退
+  6) 「下一素材」默认 = Ctrl+Right + 全局（2026-10-18 用户要求；旧默认值一次性升级）
   7) 快捷键面板中英文覆盖度（切英文后不应残留中文）
 用法：venv\Scripts\python.exe tools\ui_batch_selftest.py
 """
@@ -187,7 +187,7 @@ def main():
         return -1
 
     r_next = row_of("next_scene")
-    check("「下一素材」默认范围显示为「仅窗口」", dlg.table.cellWidget(r_next, 2).currentIndex() == 1)
+    check("「下一素材」默认范围显示为「全局」", dlg.table.cellWidget(r_next, 2).currentIndex() == 0)
     check("新开面板脏标记为 False", dlg._dirty is False)
 
     dlg.table.item(r_next, 1).setText("Ctrl+N")
@@ -198,14 +198,14 @@ def main():
     check("应用后脏标记清除", dlg._dirty is False)
 
     sc = dlg.table.cellWidget(r_next, 2)
-    # 默认已是「仅窗口」(索引 1)，必须切到「全局」(0) 才算一次真实改动
-    sc.setCurrentIndex(0)
+    # 默认已是「全局」(索引 0)，必须切到「仅窗口」(1) 才算一次真实改动
+    sc.setCurrentIndex(1)
     check("改「范围」列会标脏（旧版这一列没接信号）", dlg._dirty is True)
     cb = dlg.table.cellWidget(r_next, 3)
     cb.setChecked(False)
     dlg._apply()
     check("「范围/启用」两列能真正写进配置",
-          sm.cfg["hotkeys"]["next_scene"]["global"] is True
+          sm.cfg["hotkeys"]["next_scene"]["global"] is False
           and sm.cfg["hotkeys"]["next_scene"]["enabled"] is False)
 
     dlg._reset()
@@ -230,7 +230,7 @@ def main():
     check("点过应用后面板不脏（关闭不再弹）", dlg2._dirty is False)
 
     w("")
-    w("[6]「下一素材」默认范围 = 仅窗口 + 旧配置回退")
+    w("[6]「下一素材」默认 = Ctrl+Right + 全局，旧默认值一次性升级")
 
     class FakeCfg:
         def __init__(self, data):
@@ -240,20 +240,21 @@ def main():
         def save(self, force=False):
             self.saved += 1
 
-    # 老配置：上一步迁移标记已有（曾是全局），但没有回退标记 → 应被改回「仅窗口」
-    old = FakeCfg({"hotkeys": {"next_scene": {"key": "Right", "global": True, "enabled": True}},
-                   "_hk_next_global_migrated": True})
+    # 老配置：仍是旧默认值（Right / 仅窗口）→ 应升级成 Ctrl+Right / 全局
+    old = FakeCfg({"hotkeys": {"next_scene": {"key": "Right", "global": False, "enabled": True}}})
     cfgmod.Config._migrate(old)
-    check("旧配置（全局）回退成「仅窗口」", old.data["hotkeys"]["next_scene"]["global"] is False)
-    check("回退写了一次配置", old.saved == 1)
-    # 用户之后自己手动改成全局 → 不该再被改回来
-    user = FakeCfg({"hotkeys": {"next_scene": {"key": "Right", "global": True, "enabled": True}},
-                    "_hk_next_global_migrated": True, "_hk_next_global_reverted": True})
+    check("旧默认值升级成 Ctrl+Right + 全局",
+          old.data["hotkeys"]["next_scene"] == {"key": "Ctrl+Right", "global": True, "enabled": True})
+    check("升级写了一次配置", old.saved == 1)
+    # 用户自己改过键位 → 一个字都不动
+    user = FakeCfg({"hotkeys": {"next_scene": {"key": "Ctrl+N", "global": False, "enabled": True}}})
     cfgmod.Config._migrate(user)
-    check("用户手动改成全局后不再被改回来", user.data["hotkeys"]["next_scene"]["global"] is True
-          and user.saved == 0)
-    check("DEFAULT_HOTKEYS 里 next_scene 是「仅窗口」",
-          cfgmod.DEFAULT_HOTKEYS["next_scene"]["global"] is False)
+    check("用户自定义键位不被覆盖",
+          user.data["hotkeys"]["next_scene"]["key"] == "Ctrl+N"
+          and user.data["hotkeys"]["next_scene"]["global"] is False)
+    check("DEFAULT_HOTKEYS 里 next_scene 是 Ctrl+Right + 全局",
+          cfgmod.DEFAULT_HOTKEYS["next_scene"]["key"] == "Ctrl+Right"
+          and cfgmod.DEFAULT_HOTKEYS["next_scene"]["global"] is True)
 
     w("")
     w("[7] 快捷键面板中英文覆盖度")

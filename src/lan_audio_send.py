@@ -20,6 +20,7 @@
 4. **丢包不重传**：UDP 语义。`seq` 只用于统计。
 """
 
+import os
 import threading
 import time
 
@@ -135,6 +136,13 @@ class Sender:
         self._stop.clear()
         self.stats = SendStats()
         self.error = ""
+        # ★★ P0 审计修复：缓存本机 IPv4。发送端用**同一个 socket** 既发 DATA 又收 HELLO，
+        #   而发给子网广播地址的包会被本机回环收回来 ⇒ 以前会把自己学成"对端"，
+        #   于是音频只发回自己（对端收不到），界面还显示"已握手"。
+        try:
+            self._my_ips = set(LA.local_ipv4_all())
+        except Exception:                                        # noqa: BLE001
+            self._my_ips = set()
         try:
             self._sock = LA.make_sender(self.port)
         except Exception as e:                                   # noqa: BLE001
@@ -200,6 +208,10 @@ class Sender:
             HELLO）就**回退广播**，并在下一轮 HELLO 里重新学。
             这是"带自愈的重试"，不是"关掉功能"。
         """
+        # ★ 自愈：万一 peer 已经被学成本机地址（旧版本写的配置/竞态），立刻丢掉
+        _block_self2 = str(os.environ.get("AUTOVJ_LAN_BLOCK_SELF", "")).strip() in ("1", "true", "yes")
+        if _block_self2 and self._peer and self._peer[0] in getattr(self, "_my_ips", ()):
+            self._peer = None
         if self._peer:
             # ★ 心跳超时 ⇒ 丢弃这个 peer，回退广播（等它再来 HELLO）
             age = time.perf_counter() - (self._peer_confirm_t or self._peer_t or 0.0)
@@ -219,12 +231,20 @@ class Sender:
         return _subnet_broadcasts(self.port)
 
     def _send(self, kind, seq, ch, sr, n, qpc, payload):
-        pkt = LA.pack(kind, seq, ch, sr, n, qpc, payload)
         tg = self._targets()
+        if not tg:                       # ★ 没有目标就别 pack（未握手时 ~100 次/秒，白烧 CPU）
+            return
+        pkt = LA.pack(kind, seq, ch, sr, n, qpc, payload)
+        sent = 0
         for a in tg:
-            self._sock.sendto(pkt, a)
+            try:
+                self._sock.sendto(pkt, a)
+                sent += 1
+            except OSError:
+                # ★ 单个目标失败（网卡消失/ARP 未解析）不能拖垮整批
+                self.stats.send_errors = int(getattr(self.stats, "send_errors", 0)) + 1
         self.stats.packets += 1
-        self.stats.bytes += len(pkt) * len(tg)
+        self.stats.bytes += len(pkt) * sent
 
     def _send_loop(self):
         """独立发送线程：只做 socket 发送，绝不阻塞采集。"""
@@ -295,6 +315,17 @@ class Sender:
                 return
             m = LA.unpack(buf)
             if not m:
+                continue
+            # ★ 闸⓪：**自己的包直接丢**（子网广播会被本机回环收回来）。
+            #   不丢的话 `self._peer` 会被学成本机地址 ⇒ 音频只发回自己。
+            # ★★ 2026-10-19 回退：**默认不做"丢自己"过滤**。
+            #   双机现场实测：本机 IP 列表若没覆盖全（多网卡/虚拟网卡/换网络），
+            #   真实对端会被误判成"自己"而丢弃 ⇒ 发送端显示已连上、对端却收不到，
+            #   且 peer 在"自己↔对端"之间跳 ⇒ 一会连上一会断。
+            #   默认恢复旧行为（能正常传输）；确实需要防自回声时设 AUTOVJ_LAN_BLOCK_SELF=1。
+            _block_self = str(os.environ.get("AUTOVJ_LAN_BLOCK_SELF", "")).strip() in ("1", "true", "yes")
+            if _block_self and (addr[0] in getattr(self, "_my_ips", ())):
+                self.stats.self_echo = int(getattr(self.stats, "self_echo", 0)) + 1
                 continue
             # ★ 闸①：源地址不可达 ⇒ 绝不认（这正是虚拟网卡坑的来源）
             if LA.is_unreachable_src(addr[0]):
@@ -400,8 +431,12 @@ class Sender:
             return False
         mic = cands[0]
         if self.device_name:
+            # ★ 容错：外部传了 device 对象也按名字比（否则 TypeError 打挂采集线程）
+            _dn = self.device_name
+            if _dn is not None and not isinstance(_dn, str):
+                _dn = getattr(_dn, "name", None)
             for m in cands:
-                if self.device_name in m.name or m.name in self.device_name:
+                if _dn and (str(_dn) in m.name or m.name in str(_dn)):
                     mic = m
                     break
         self._device_desc = mic.name

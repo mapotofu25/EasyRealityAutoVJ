@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QStatusBar, QDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QApplication, QProgressBar, QAbstractItemView, QInputDialog,
     QToolBox, QScrollArea, QMenu, QFrame, QSizePolicy, QLineEdit, QButtonGroup,
-    QRadioButton, QTabWidget,
+    QRadioButton, QTabWidget, QAbstractSpinBox,
 )
 
 import i18n
@@ -227,7 +227,7 @@ class SettingsPanel(QWidget):
         ga.addWidget(QLabel("过渡方式"), 1, 0)
         self.transition = QComboBox()
         self.transition.addItems(["跟随模式", "淡入淡出", "硬切", "滑动", "缩放", "故障"])
-        self.transition.setToolTip("跟随模式：慢切/常规=淡入淡出，逐拍=硬切")
+        self.transition.setToolTip(T("跟随模式：常规=淡入淡出，逐拍=硬切"))
         ga.addWidget(self.transition, 1, 1)
         self.energy_map = QCheckBox("能量映射")
         self.bpm_sync = QCheckBox("BPM Sync 视频速度")
@@ -474,23 +474,12 @@ class SettingsPanel(QWidget):
         gb.setRowStretch(4, 1)
         # 同上
 
-        # ---- 实验性（默认折叠）----
-        p5 = QWidget()
-        ef = QGridLayout(p5)
-        ef.setVerticalSpacing(3)
-        ef.addWidget(QLabel("能量校正"), 0, 0)
-        self.energy_scale = QSlider(Qt.Horizontal)
-        self.energy_scale.setRange(50, 200)   # 伽马 0.5 ~ 2.0
-        self.energy_scale.setValue(100)
-        self.energy_scale.setToolTip("伽马校正：>1 压低人声段能量、鼓点段基本不动。本机系统低频增强导致人声段虚高时往右拉")
-        self.energy_scale_lbl = QLabel("×1.0")
-        self.energy_scale_lbl.setMinimumWidth(48)
-        self.energy_scale_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        ef.addWidget(self.energy_scale, 0, 1)
-        ef.addWidget(self.energy_scale_lbl, 0, 2)
-        ef.addWidget(QLabel("实验性：现场系统低频增强导致能量虚高时用。默认 1.0 不校正。"), 1, 0, 1, 3)
-        ef.setRowStretch(2, 1)
+        # ---- 能量校正：**整个标签页已删除**（2026-10-18 用户要求）----
+        #   界面不再提供入口；底层 energy_scale（伽马）照旧保留在
+        #   audio_engine.energy_scale，默认 1.0 = 不校正，需要时改 config.json 的
+        #   auto.energy_scale 即可（启动时由 MainWindow.__init__ 读入）。
         # ================= 设置面板重组（2026-09-27）=================
+
         # 7 个折叠分区 → **4 个**，按"用途"归组、顺序按使用流程：
         #   · 「渲染帧率 / GPU 解码」原本混在「效果」里 —— 它们是**性能**项，独立成「性能」；
         #   · 「节拍网格 / 相位翻转」原本是效果的一部分 —— 它决定**切换怎么跟音乐走**，归「演出行为」；
@@ -524,8 +513,9 @@ class SettingsPanel(QWidget):
         _bv.addWidget(p3)
         self._add_section(box, "演出行为", _wrap(p1, self._beat_box))
         # ★ 2026-09-27 用户反馈：四组画面相关设置**堆在同一个折叠区里反而更乱**（一屏 20+ 项），
-        #   改成**子标签页**：基础（振幅/过渡/能量映射/BPM Sync）/ 颜色渲染 / 后处理 / 能量校正。
-        #   ⚠ 页面对象（p2/pc/p4/p5）**原样复用**，只是换了个容器 ⇒ 控件对象与信号连线一条都没动。
+        #   改成**子标签页**：基础（振幅/过渡/能量映射/BPM Sync）/ 颜色渲染 / 后处理。
+        #   （原第 4 页「能量校正」已于 2026-10-18 整页删除。）
+        #   ⚠ 页面对象（p2/pc/p4）**原样复用**，只是换了个容器 ⇒ 控件对象与信号连线一条都没动。
         self._fx_tabs = QTabWidget()
         self._fx_tabs.setDocumentMode(True)      # 扁平化，不再是「一坨嵌入式面板」
         # ★ 用户反馈（2026-09-27）：标签上方多出一条横线 ⇒
@@ -540,7 +530,6 @@ class SettingsPanel(QWidget):
         self._fx_tabs.addTab(p2, "基础")
         self._fx_tabs.addTab(pc, "颜色渲染")
         self._fx_tabs.addTab(p4, "后处理")
-        self._fx_tabs.addTab(p5, "能量校正")
         self._add_section(box, "画面效果", self._fx_tabs)
         self._add_section(box, "性能", p_perf)
 
@@ -565,9 +554,7 @@ class SettingsPanel(QWidget):
         self.energy_map.stateChanged.connect(lambda s: main.engine_cfg("auto", "energy_map", bool(s)))
         self.bpm_sync.stateChanged.connect(lambda s: main.engine_cfg("auto", "bpm_speed_sync", bool(s)))
         self.chk_beat_grid.stateChanged.connect(lambda s: main.engine_cfg("auto", "beat_grid", bool(s)))
-        self.energy_scale.valueChanged.connect(self._on_energy_scale)
-        # 注意：构造时绝不主动 emit（否则默认值 100 会把配置里存好的 energy_scale 覆盖成 1.0）；
-        # 初始化由 _load_settings_to_ui 的 setValue 触发 valueChanged 完成置换。
+        # 能量校正（gamma）已无 UI 入口，只由 config.json 的 auto.energy_scale 驱动。
         self.beat_pick.currentIndexChanged.connect(lambda i: main.beat_cfg("pick_mode", "seq" if i == 0 else "rand"))
         self.beat_interval.currentIndexChanged.connect(
             lambda i: main.beat_cfg("interval_beats", [0.25, 0.5, 1, 2, 4, 8, 16][i]))
@@ -600,10 +587,8 @@ class SettingsPanel(QWidget):
         box.addStretch(1)
         self.sync_beat_section()
 
-    def _on_energy_scale(self, v):
-        g = v / 100.0
-        self.energy_scale_lbl.setText("×%.1f" % g)
-        self.main.set_energy_scale(g)
+    # 能量校正（gamma）：原「实验性」滑条已从界面移除（2026-10-18）；
+    # 底层仍由 MainWindow.set_energy_scale / config 的 auto.energy_scale 生效。
 
     # ---- 颜色渲染回调 ----
     def _on_color_strength(self, v):
@@ -620,7 +605,7 @@ class SettingsPanel(QWidget):
 
     def _on_color_adv(self, on):
         self.color_adv.setVisible(bool(on))
-        self.btn_color_adv.setText("高级设置 ▾" if on else "高级设置 ▸")
+        self.btn_color_adv.setText(T("高级设置 ▾") if on else T("高级设置 ▸"))
 
     def sync_color_palette(self, name):
         """色卡高亮：无锁定时全部不高亮；有锁定则高亮对应色卡"""
@@ -673,7 +658,7 @@ class SettingsPanel(QWidget):
             self._kv_noise_timer.setInterval(100)
             self._kv_noise_timer.timeout.connect(self._nf_tick)
         self.btn_noise_floor.setEnabled(False)
-        self.btn_noise_floor.setText("检测中…")
+        self.btn_noise_floor.setText(T("检测中…"))
         self._kv_noise_timer.start()
 
     def _nf_tick(self):
@@ -687,7 +672,7 @@ class SettingsPanel(QWidget):
             return
         self._kv_noise_timer.stop()
         self.btn_noise_floor.setEnabled(True)
-        self.btn_noise_floor.setText("自动检测底噪")
+        self.btn_noise_floor.setText( T("自动检测底噪"))
         if self._nf_samples:
             import statistics
             base = statistics.median(self._nf_samples)
@@ -783,6 +768,8 @@ class OutputPanel(QWidget):
         self.btn_show_out.clicked.connect(main.show_output)
         go.addWidget(self.btn_show_out, 1, 0, 1, 2)
         self.chk_aspect = QCheckBox(tr("aspect_lock"))
+        self.chk_aspect.setToolTip(
+            "勾选：按画面比例缩放，不够的地方留黑边（不拉伸、不变形）；不勾选：拉伸铺满输出尺寸（填满，但比例不对时会变形）。")
         self.chk_border = QCheckBox(tr("borderless"))
         self.chk_top = QCheckBox(tr("always_top"))
         go.addWidget(self.chk_aspect, 2, 0)
@@ -817,22 +804,9 @@ class OutputPanel(QWidget):
         self.ndi_name = QLineEdit()
         self.ndi_name.setPlaceholderText("NDI 源名称")
         go.addWidget(self.ndi_name, 6, 1)
-        # ★ NDI 音频单独一个开关，**默认关**：把系统回环再发出去，若接收端同时
-        #   监听着同一路声音会听到**双声/回声**。NDI 输出没开时置灰。
-        self.chk_ndi_audio = QCheckBox("NDI 传输音频（48 kHz 立体声 · 未完成）")
-        self.chk_ndi_audio.setToolTip(
-            "把采集到的声音随 NDI 一起发出去（48 kHz 立体声）。默认关闭："
-            "接收端若本来就在监听同一路声音，会听到双声/回声；"
-            "只在接收端需要单独取声音时才打开。")
-        self.chk_ndi_audio.setEnabled(False)
-        go.addWidget(self.chk_ndi_audio, 7, 0, 1, 2)
-        # Spout 协议层面**没有音频**，必须写清楚，否则用户会以为勾了就有声音
-        self.lbl_spout_audio = QLabel(
-            "Spout 只传画面，不含音频。需要音频请用 NDI 或虚拟声卡。")
-        self.lbl_spout_audio.setWordWrap(True)
-        self.lbl_spout_audio.setStyleSheet(
-            "color:" + theme.V("muted") + ";font-size:11px;")
-        go.addWidget(self.lbl_spout_audio, 8, 0, 1, 2)
+        # ★ 2026-10-18 用户要求：**「NDI 传输音频」这一行从界面删除**（复选框 + 提示）。
+        #   NDI 音频转发后端（audio_engine 的 ndi_audio_on / ndi_out.send_audio）**原样保留**，
+        #   只是不再有 UI 入口；配置文件里 ndi_audio 仍按原逻辑生效。
         outer.addWidget(g)
         self.resolution.currentIndexChanged.connect(main.set_resolution)
         self.resolution.editTextChanged.connect(main.set_resolution_text)
@@ -844,7 +818,6 @@ class OutputPanel(QWidget):
         self.spout_name.editingFinished.connect(main.set_spout_name)
         self.chk_ndi.stateChanged.connect(main.set_ndi_enabled)
         self.ndi_name.editingFinished.connect(main.set_ndi_name)
-        self.chk_ndi_audio.stateChanged.connect(main.set_ndi_audio)
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
 
     def set_gate(self, running):
@@ -1000,7 +973,7 @@ class HotkeyDialog(I18nDialog):
         if _dups:
             # 文案复用 D 组已加进 i18n 的冲突词条（标题 T("快捷键冲突") + 正文 Tf(...)）。
             _ret = QMessageBox.question(
-                self, T("快捷键冲突"),
+                self, T( T("快捷键冲突")),
                 Tf("检测到 {} 组重复快捷键（{}）；只有先配置的那个会生效，"
                    "请在快捷键设置里改成不同的键。", len(_dups), "、".join(_dups)),
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)   # 默认按钮 = 否
@@ -1204,6 +1177,14 @@ class AboutDialog(I18nDialog):
         if _vseq:
             _vline += " · " + pick(f"当日第 {_vseq} 次生成", f"build #{_vseq} of the day")
 
+        # 项目地址（可点击；lbl_body 已开 openExternalLinks）
+        proj_url = getattr(version, "PROJECT_URL", "") or ""
+        proj_line = ""
+        if proj_url:
+            proj_line = (f'<p style="margin:2px 0 4px 0;">{pick("项目地址", "Project")}{_sp}'
+                         f'<a href="{proj_url}" style="color:#5aa9e6;">'
+                         f'{proj_url.replace("https://", "")}</a></p>')
+
         html = f"""
         <div style="font-family:system-ui,'Microsoft YaHei';">
           <h2 style="margin:0 0 2px 0;">{tr('app_name')}</h2>
@@ -1211,9 +1192,13 @@ class AboutDialog(I18nDialog):
             {_vline}
           </div>
           <p style="margin:8px 0 4px 0;">
-            {pick('把音乐变成画面的实时自动 VJ 引擎',
-                  'A real-time auto-VJ engine that turns music into visuals')}
+            {pick('把音乐变成画面的实时 VJ 引擎：识别正在放的歌，按码表自动切换/驱动素材，'
+                  '跟拍、跟情绪，DJ 只管放歌。',
+                  'A real-time VJ engine that turns music into visuals: it recognizes the '
+                  'track, then switches and drives clips from a cue sheet — on beat, on mood. '
+                  'The DJ just plays.')}
           </p>
+          {proj_line}
 
           <h3 style="margin:14px 0 4px 0;">{pick('本版亮点', 'Highlights')}</h3>
           <ul style="margin:0 0 0 18px;padding:0;">{hl}</ul>
@@ -1557,7 +1542,7 @@ class ScanOverlayWidget(QWidget):
     def update_progress(self, done, total):
         self.bar.setRange(0, max(1, total))
         self.bar.setValue(done)
-        self.lbl_title.setText(f"正在扫描素材库… {done}/{total}")
+        self.lbl_title.setText(T("正在扫描素材库… {}/{}").format(done, total))
 
     def finish(self):
         self.close()
@@ -2209,6 +2194,16 @@ def _probe_spout_once():
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # ★ 2026-10-19：**主窗口从来没设过图标** —— 标题栏/任务栏一直用 exe 的默认图标，
+        #   换了 assets/autovj.ico 也看不出来。这里显式设一次（找不到就跳过，绝不影响启动）。
+        try:
+            from PySide6.QtGui import QIcon
+            import appicon
+            _ic = appicon.icon_path("autovj")
+            if _ic:
+                self.setWindowIcon(QIcon(_ic))
+        except Exception:                                        # noqa: BLE001
+            pass
         self.setWindowTitle("Easy Reality AutoVJ")
         self.resize(1500, 900)
         self.cfg = Config()
@@ -2265,6 +2260,13 @@ class MainWindow(QMainWindow):
         from match_engine import set_custom_visual_map
         set_custom_visual_map(self.cfg["genre_visual_map"] or {})
         self.engine = AutoVJEngine(self.cfg, self.audio.state, self.library)
+        # ★ 2026-10-17：把**音频引擎本体**也给引擎（第二个参数只是它的 state）。
+        #   码表自动跟拍要读 `_recognizer_engine.current_song_id`（电荷条确认后稳定的 id），
+        #   `state.recognized_song_id` 会被逐拍覆写 ⇒ 只靠 state 会采到 -1 而永不接管。
+        try:
+            self.engine.set_audio_engine(self.audio)
+        except Exception as _e:                                  # noqa: BLE001
+            print("[码表] 注入音频引擎失败：%s" % _e)
         self.engine.rebuild_from_cfg()
         # 引擎主循环移入独立线程：合成/后处理不再与 GUI 抢线程（卡顿根因修复）。
         # frame_ready 跨线程自动变 queued 投递，GUI 只做贴图。
@@ -2292,6 +2294,8 @@ class MainWindow(QMainWindow):
         # 模态对话框打开时，临时解除输出窗口置顶，避免对话框被置顶输出窗口挡住导致卡死
         self._dialog_filter = _ModalDialogTopFilter(self)
         QApplication.instance().installEventFilter(self._dialog_filter)
+        # 全局禁用「滚轮切换」：见 MainWindow.eventFilter（下拉框/滑条/数值框吞掉 Wheel）
+        QApplication.instance().installEventFilter(self)
 
         # 这一段初始化会连着触发几十次配置落盘（每次 dump+fsync+备份 170KB），
         # 实测占主窗口构造时间的四成以上。用批量模式合并成一次写。
@@ -2333,7 +2337,7 @@ class MainWindow(QMainWindow):
         missing = sum(1 for p in self.library if not os.path.exists(p))
         if self.library and missing == len(self.library):
             QMessageBox.warning(
-                self, "素材文件缺失",
+                self, T("素材文件缺失"),
                 f"素材库里的 {len(self.library)} 个素材文件全部找不到。\n\n"
                 "换目录运行时请把旧目录里的「素材库」文件夹拷到本软件目录旁，\n"
                 "或右键素材库 → 设置素材库目录，指向已有素材的位置。\n"
@@ -2406,6 +2410,27 @@ class MainWindow(QMainWindow):
         self.grid.setStyleSheet(
             f"QListWidget{{background:{theme.V('panel2')};"
             f"border:1px solid {theme.V('border')};}}")
+
+    # ================= 全局事件过滤 =================
+    def eventFilter(self, obj, ev):
+        """全局禁用「滚轮切换」（2026-10-18 用户要求：滚轮误触太烦）。
+
+        下拉框（QComboBox）/ 滑条（QSlider）/ 数值框（QAbstractSpinBox）上的滚轮
+        **一律吞掉**，避免"想滚动页面，结果改了分辨率/强度/音量"。
+
+        ⚠ 为什么 `return True` 而不是 `ev.ignore()`：ignore 会把事件冒泡给父级 ⇒
+          外面那层 QScrollArea 接着滚，等于"滚一下页面跟着跳"，比误改数值还烦。
+        ⚠ 只拦这三类；QScrollArea / QListWidget / QTableWidget 的滚动完全不受影响
+          （QScrollBar 是 QAbstractSlider，不是 QSlider，故意不拦）。
+        ⚠ 禁用状态的控件不拦：让鼠标"路过"时父级滚动区照常滚。
+        """
+        if ev.type() == QEvent.Wheel:
+            try:
+                if isinstance(obj, (QComboBox, QSlider, QAbstractSpinBox)) and obj.isEnabled():
+                    return True
+            except Exception:                                  # noqa: BLE001
+                pass
+        return super().eventFilter(obj, ev)
 
     def _build_ui(self):
         self.main_view = QWidget()
@@ -2483,7 +2508,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(more_sep)
         self.btn_more = QPushButton("⋯ 更多")
         self.btn_more.setMinimumHeight(32)
-        self.btn_more.setToolTip("更多：主题 / 语言 / 快捷键 / 关于")
+        self.btn_more.setToolTip("更多：主题 / 语言 / 快捷键 / 导出日志 / 关于")
         self._more_menu = QMenu(self)
         self.act_theme = self._more_menu.addAction("")
         self.act_theme.triggered.connect(lambda: self.btn_theme.click())
@@ -2497,6 +2522,11 @@ class MainWindow(QMainWindow):
         self._more_menu.addSeparator()
         self.act_hotkey = self._more_menu.addAction(tr("hotkeys"))
         self.act_hotkey.triggered.connect(self.open_hotkeys)
+        # ★ 2026-10-18 用户要求：加「导出全部日志…」—— 现场出问题时不折腾用户找目录，
+        #   一键把日志 + config 打成一个 zip，直接发给作者。
+        self.act_export_logs = self._more_menu.addAction(T("导出全部日志…"))
+        self.act_export_logs.setToolTip(T("把日志与配置文件打包成 zip，方便反馈问题"))
+        self.act_export_logs.triggered.connect(self.export_logs)
         self.act_about = self._more_menu.addAction(tr("about"))
         self.act_about.setToolTip(T("版本信息、第三方组件、反馈渠道"))
         self.act_about.triggered.connect(self.open_about)
@@ -2755,8 +2785,9 @@ class MainWindow(QMainWindow):
         self.search_box2 = QLineEdit()
         self.search_box2.setPlaceholderText("搜索文件名 / 标签")
         self.search_box2.setClearButtonEnabled(True)
+        # ★ 2026-10-19：改走**防抖**（每敲一键重建整表，千级素材会顿）
         self.search_box2.textChanged.connect(
-            lambda t, s=None: self._on_search_changed(t, self.search_box2))
+            lambda t, s=None: self._on_search_debounced(t, self.search_box2))
         sbar.addWidget(self.search_box2, 1)
         b1 = QPushButton(tr("import_folder"))
         b1.clicked.connect(self.import_folder)
@@ -2788,6 +2819,35 @@ class MainWindow(QMainWindow):
                 f"border:1px solid {theme.V('border')};}}")
         except Exception:                                         # noqa: BLE001
             pass
+
+    def _on_search_debounced(self, text, src):
+        """搜索防抖：180ms 内连续输入只真正刷新一次。
+
+        旧行为是 `textChanged` 直连 `_on_search_changed` —— 每敲一个键就重建整张表
+        （千级素材时每次几十毫秒），连着敲五个字就卡五下。
+        失败时**降级直达**（宁可慢，也不能把搜索搞坏）。
+        """
+        try:
+            self._search_pending = (text, src)
+            t = getattr(self, "_search_timer", None)
+            if t is None:
+                from PySide6.QtCore import QTimer
+                t = QTimer(self)
+                t.setSingleShot(True)
+                t.setInterval(180)
+                t.timeout.connect(self._apply_search_pending)
+                self._search_timer = t
+            t.start()
+        except Exception:                                        # noqa: BLE001
+            self._on_search_changed(text, src)
+
+    def _apply_search_pending(self):
+        """防抖到期：把最后一次输入真正应用下去。"""
+        p = getattr(self, "_search_pending", None)
+        if not p:
+            return
+        self._search_pending = None
+        self._on_search_changed(p[0], p[1])
 
     def _on_search_changed(self, text=None, src=None):
         """任一页的搜索框改动 ⇒ 写进共享状态、同步另一页、刷新两份网格。
@@ -2938,7 +2998,7 @@ class MainWindow(QMainWindow):
         self.search_box.setClearButtonEnabled(True)
         # ⚠ 两页共用一个搜索词（`lib_kw`）；同步逻辑见 _on_search_changed/_sync_lib_controls
         self.search_box.textChanged.connect(
-            lambda t, s=None: self._on_search_changed(t, self.search_box))
+            lambda t, s=None: self._on_search_debounced(t, self.search_box))
         fbar.addWidget(self.search_box, 1)
         self.btn_scan = QPushButton("扫描打标")
         self.btn_scan.setToolTip("用本地视觉模型为素材自动打内容标签（后台、可续扫）")
@@ -2990,6 +3050,132 @@ class MainWindow(QMainWindow):
         self.hotkeys = HotkeyManager(self, actions, self.cfg)
 
     # ================= 音源 =================
+    def _heal_fp_ids_bg(self, db):
+        """把「旧路径 id」的指纹改挂到当前 id（仅在有确凿证据时）。"""
+        try:
+            import hashlib as _hl
+            import soundfile as _sf
+            import numpy as _np
+            allow = self._allowed_song_ids()
+            try:
+                rows = db.conn.execute(
+                    "SELECT song_id, COUNT(*) FROM fingerprints GROUP BY song_id "
+                    "HAVING COUNT(*)>1000").fetchall()
+            except Exception:                                    # noqa: BLE001
+                return
+            have = {int(s) for (s, _n) in rows}
+            orphans = sorted(have - allow)
+            if not orphans or len(orphans) > 8:
+                return
+            try:
+                lib = list(self.cfg["music_library"] or [])
+            except Exception:                                    # noqa: BLE001
+                return
+            fixed = 0
+            for path in lib:
+                try:
+                    sid = int(_hl.md5(str(path).encode("utf-8")).hexdigest()[:8], 16)
+                except Exception:                                # noqa: BLE001
+                    continue
+                if sid in have or not os.path.isfile(path):
+                    continue
+                try:
+                    info = _sf.info(path)
+                    d, sr = _sf.read(path, dtype="float32", always_2d=True,
+                                     start=int(30 * info.samplerate),
+                                     frames=int(6 * info.samplerate))
+                    d = d.mean(axis=1)
+                    if sr != 48000:
+                        n = int(len(d) * 48000 / sr)
+                        d = _np.interp(_np.linspace(0, len(d) - 1, n),
+                                       _np.arange(len(d)), d).astype(_np.float32)
+                except Exception:                                # noqa: BLE001
+                    continue
+                for old in list(orphans):
+                    try:
+                        db.set_allowed({old})
+                        _s, votes, off = db.match(d, 48000)
+                    except Exception:                            # noqa: BLE001
+                        continue
+                    if votes >= 100 and abs(float(off) - 30.0) < 2.0:
+                        try:
+                            db.conn.execute(
+                                "UPDATE fingerprints SET song_id=? WHERE song_id=?",
+                                (sid, old))
+                            db.conn.commit()
+                            fixed += 1
+                            orphans.remove(old)
+                            print("[识别] 指纹 id 自愈：%s ｜ %d → %d（票数 %d）"
+                                  % (os.path.basename(str(path))[:40], old, sid, votes))
+                        except Exception as e:                   # noqa: BLE001
+                            print("[识别] 指纹 id 自愈写入失败：%s" % e)
+                        break
+            if fixed:
+                print("[识别] 指纹 id 自愈完成：%d 首" % fixed)
+        except Exception as e:                                   # noqa: BLE001
+            print("[识别] 指纹 id 自愈异常：%s" % e)
+        finally:
+            try:
+                db.set_allowed(self._allowed_song_ids())
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    def _allowed_song_ids(self):
+        """当前**真实存在**的曲目 id：曲库（music_meta 记的 song_id）+ 码表内嵌曲目。
+
+        ⚠ `self.cfg` 是 `Config` 对象，**没有 .get()**，只能下标读取。
+        指纹库会残留历史条目（歌已从曲库移除、指纹还在）。不设白名单时，
+        放一首不在曲库的歌会被匹配到这些过期 id ⇒ 界面报出一首"不存在"的歌。
+        """
+        import hashlib as _hl
+        ids = set()
+        try:
+            _meta = self.cfg["music_meta"] or {}
+        except Exception:                                        # noqa: BLE001
+            _meta = {}
+        for _v in (_meta.values() if isinstance(_meta, dict) else []):
+            try:
+                ids.add(int(_v.get("song_id")))
+            except Exception:                                    # noqa: BLE001
+                pass
+        try:
+            _lib = self.cfg["music_library"] or []
+        except Exception:                                        # noqa: BLE001
+            _lib = []
+        for _p in _lib:
+            if isinstance(_p, str) and _p:
+                try:
+                    ids.add(int(_hl.md5(_p.encode("utf-8")).hexdigest()[:8], 16))
+                except Exception:                                # noqa: BLE001
+                    pass
+        try:
+            _fp = (self.cfg["cue"] or {}).get("fp_songs") or {}
+        except Exception:                                        # noqa: BLE001
+            _fp = {}
+        for _v in (_fp.values() if isinstance(_fp, dict) else []):
+            try:
+                ids.add(int(_v.get("song_id")))
+            except Exception:                                    # noqa: BLE001
+                pass
+        # ★★ 导入的曲库（ERLIB 曲库分析包）**也是有效曲目**：
+        #   它们的指纹在指纹库里，但 id 不在 music_meta 里。漏掉它们 =
+        #   导入的 50 首歌永远认不出（用户 2026-10-22 指出）。
+        try:
+            import imported_lib as _il
+            from config import app_base_dir as _abd
+            _cn = _il.open_meta(_abd())
+            try:
+                for (_sid,) in _cn.execute("SELECT song_id FROM songs"):
+                    try:
+                        ids.add(int(_sid))
+                    except Exception:                            # noqa: BLE001
+                        pass
+            finally:
+                _cn.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+        return ids
+
     def start_audio(self, silent=False):
         a = self.cfg["audio"]
         t = a.get("source_type", "system")
@@ -3127,7 +3313,19 @@ class MainWindow(QMainWindow):
         self.engine.lock_clip()
 
     def toggle_ui(self):
-        self.setVisible(not self.isVisible())
+        """Ctrl+H：隐藏/恢复界面。
+
+        ★ 2026-10-18 审计修复：旧实现 `setVisible(False)` 之后**无法恢复** ——
+          没有托盘图标、任务栏按钮一起消失，而热键是 WindowShortcut（窗口不可见就收不到），
+          默认还不是全局 ⇒ 一旦按下就只能去任务管理器结束进程。
+          改成"最小化"：任务栏还在，点一下/Alt+Tab 就能回来，语义对现场也是安全的。
+        """
+        if self.isVisible() and not self.isMinimized():
+            self.showMinimized()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
 
     def panic_reset(self):
         """紧急恢复：把配置与**运行时**一起复位到默认（Ctrl+Shift+R）。
@@ -3352,7 +3550,7 @@ class MainWindow(QMainWindow):
             ok, msg = mm.gpu_status()
             if not ok:
                 QMessageBox.information(
-                    self, T("GPU 解码"),
+                    self, T( T("GPU 解码")),
                     Tf("这台机器暂时用不了 GPU 解码，已自动回退软解：\n{}", msg))
 
     def set_mode_selection(self, i):
@@ -3369,8 +3567,12 @@ class MainWindow(QMainWindow):
         self.engine_cfg("mode", "transition", ["", "fade", "cut", "slide", "zoom", "glitch"][i])
 
     def set_resolution(self, i):
+        # ★ 2026-10-18 审计：可编辑下拉在"用户正在打字"时 currentIndex 会变成 -1，
+        #   而 Python 的 [-1] 会取到**最后一项** ⇒ 画布被改成 1080x1080（方形）。
+        if i is None or int(i) < 0 or int(i) > 3:
+            return
         try:
-            w, h = [(1280, 720), (1920, 1080), (1080, 1920), (1080, 1080)][i]
+            w, h = [(1280, 720), (1920, 1080), (1080, 1920), (1080, 1080)][int(i)]
         except (IndexError, ValueError):
             return
         self.set_custom_resolution(w, h)
@@ -3443,7 +3645,7 @@ class MainWindow(QMainWindow):
             ok, err = _probe_spout_once()
             if not ok:
                 QMessageBox.warning(
-                    self, "Spout 不可用",
+                    self, T("Spout 不可用"),
                     "无法启用 Spout 输出。\n\n%s\n\n"
                     "常见原因：显卡驱动不支持共享纹理（GL/DX 互操作）。\n"
                     "（NDI 输出不依赖这个，可改用 NDI）" % err)
@@ -3491,7 +3693,7 @@ class MainWindow(QMainWindow):
             ok, detail = probe_runtime()
             if not ok:
                 QMessageBox.warning(
-                    self, T("NDI 不可用"),
+                    self, T( T("NDI 不可用")),
                     T("NDI 运行时加载失败，无法启用 NDI 输出。") + "\n\n" +
                     T("运行时是随软件一起提供的，不需要单独安装。"
                       "常见原因是杀毒软件隔离了软件目录里的 Processing.NDI.Lib.x64.dll，"
@@ -3520,64 +3722,18 @@ class MainWindow(QMainWindow):
             if self.engine._ndi is not None:
                 self.engine._ndi.close()
                 self.engine._ndi = None
-        # NDI 音频：**必须 NDI 输出开着 + 用户另勾了「NDI 传输音频」**才发。
+        # NDI 音频：**必须 NDI 输出开着 + 配置里 ndi_audio 为真**才发。
         # 给采集循环同步一个布尔量：False 时它连每块的 asarray/reshape/copy 都省掉。
         try:
             self.audio.state.ndi_audio_on = bool(
                 s and self.cfg["output"].get("ndi_audio", False))
         except Exception:
             pass
-        try:
-            self.output_panel.chk_ndi_audio.setEnabled(bool(s))
-        except Exception:
-            pass
-        # 现场可查：勾选框 / cfg / 采集侧布尔量三者必须一致（见 _NDI音频诊断.md §6 验收判据）
-        try:
-            print("[NDI] enabled=%r  audio_cfg=%r  ndi_audio_on=%r  (checkbox=%r)"
-                  % (s, bool(self.cfg["output"].get("ndi_audio")),
-                     bool(self.audio.state.ndi_audio_on),
-                     bool(self.output_panel.chk_ndi_audio.isChecked())))
-        except Exception:                                          # noqa: BLE001
-            pass
 
     def set_ndi_name(self):
         self.cfg["output"]["ndi_name"] = self.output_panel.ndi_name.text().strip() or "EasyRealityAutoVJ"
         self.cfg.save()
         self.engine._ndi = None
-
-    def set_ndi_audio(self, s):
-        """「NDI 传输音频」开关（**默认关**）。
-
-        ⚠ 默认关是有意的：采集的是**系统回环**，接收端若本来就在监听同一路声音，
-          再发一遍会变成**双声/回声**。只有接收端需要单独取声音时才打开。
-        """
-        # 先保留**原始入参**（用户真实意图），再按"NDI 输出是否启用"改写生效值。
-        # 注意：本槽由 stateChanged 调用，入参可能是复选框状态 int/enum，先转 bool。
-        s_raw = bool(s)
-        s = s_raw and bool(self.cfg["output"].get("ndi_enabled"))
-        self.cfg["output"]["ndi_audio"] = s
-        self.cfg.save()
-        # ★ 把「真实生效值」回写勾选框：杜绝「看起来勾了、其实没开」
-        #   （信号被屏蔽后手动对齐，避免递归触发本槽）
-        try:
-            w = self.output_panel.chk_ndi_audio
-            if w.isChecked() != s:
-                w.blockSignals(True)
-                w.setChecked(s)
-                w.blockSignals(False)
-        except Exception:                                     # noqa: BLE001
-            pass
-        try:
-            self.audio.state.ndi_audio_on = s
-        except Exception:                                     # noqa: BLE001
-            pass
-        # 现场可查：这三个值必须永远一致
-        print("[NDI] ndi_audio=%r  cfg.ndi_enabled=%r  ndi_audio_on=%r"
-              % (s, bool(self.cfg["output"].get("ndi_enabled")), s))
-        # 追加原因说明：用户勾了音频但 NDI 输出没开 → 勾选被改写为 False，必须讲清原因，
-        # 否则现场只看到 ndi_audio=False 却不知道是"没开 NDI 输出"导致的（Bug 2 的观感来源）。
-        if s_raw and not s:
-            print("[NDI] NDI 输出未启用，音频勾选未生效（已自动取消，请先勾选'启用 NDI 输出'）")
 
     def _ndi_audio_feed(self, pcm, sr):
         """把采集到的 PCM 投递给 NDI 发送端（运行在**音频转发线程**里）。
@@ -3715,7 +3871,7 @@ class MainWindow(QMainWindow):
                 glctx.preinit()      # 主线程先 init glfw（解码线程只建窗口）
         except Exception:
             pass
-        self.settings.energy_scale.setValue(int(round(a.get("energy_scale", 1.0) * 100)))
+        # 能量校正滑条已无 UI（2026-10-18）；配置值在 __init__ 里直接写进 audio.energy_scale。
         m = self.cfg["mode"]
         manual = m.get("manual", "auto")
         if m.get("auto", True) or manual in (None, "auto"):
@@ -3817,20 +3973,14 @@ class MainWindow(QMainWindow):
             self.output_panel.screen_combo.setCurrentIndex(0)
         self.output_panel.chk_spout.setChecked(o.get("spout_enabled", False))
         self.output_panel.spout_name.setText(o.get("spout_name", "EasyRealityAutoVJ"))
-        # ⚠⚠ NDI / NDI 音频：用配置回填 UI **必须屏蔽信号**（2026-10-01 修，现场"没声音"的直接原因）
-        #   原来直接 `setChecked(ndi_audio)` 会触发 `set_ndi_audio()` 槽，而那个槽里
-        #   `s = bool(s) and cfg["output"]["ndi_enabled"]` —— 启动时 NDI 输出还没开，
-        #   于是**把已经存好的 ndi_audio=True 改写成 False**，而勾选框看起来仍是勾选的
-        #   ⇒ 用户以为"开了"，实际 `audio.state.ndi_audio_on=False`，
-        #     采集循环整块跳过、一个字节都不喂给 NDI，而且没有任何日志。
-        for _w, _v in ((self.output_panel.chk_ndi, o.get("ndi_enabled", False)),
-                       (self.output_panel.chk_ndi_audio, bool(o.get("ndi_audio", False)))):
-            _w.blockSignals(True)
-            _w.setChecked(bool(_v))
-            _w.blockSignals(False)
+        # ⚠⚠ NDI：用配置回填 UI **必须屏蔽信号**（2026-10-01 修，现场"没声音"的直接原因）
+        #   原来直接 `setChecked(ndi_enabled)` 会触发 `set_ndi_enabled()` 槽，而那个槽里会做
+        #   运行时探测 ⇒ 启动时弹「NDI 不可用」/把已存值改写。这里只回填、不触发槽。
+        _w = self.output_panel.chk_ndi
+        _w.blockSignals(True)
+        _w.setChecked(bool(o.get("ndi_enabled", False)))
+        _w.blockSignals(False)
         self.output_panel.ndi_name.setText(o.get("ndi_name", "EasyRealityAutoVJ"))
-        # NDI 输出开着才允许勾"传输音频"（否则勾了也没意义）
-        self.output_panel.chk_ndi_audio.setEnabled(bool(o.get("ndi_enabled", False)))
         # 信号被屏蔽了，槽不会再跑 ⇒ 这里显式同步一次采集侧的布尔量（不要在这里做运行时探测：
         # 启动时弹「NDI 不可用」会很烦；真正的探测交给 set_ndi_enabled）
         try:
@@ -3856,29 +4006,16 @@ class MainWindow(QMainWindow):
                     print("[NDI] 启动时运行时不可用，NDI 输出未启用：%s" % _detail)
                     self.cfg["output"]["ndi_enabled"] = False
                     # ⚠ 同步把 ndi_audio 配置也落回 False：否则 config 里仍是 True，
-                    #   下次启动回填时勾选框又会显示成"勾选态"（虽被置灰、也不发声），
-                    #   属于让用户困惑的脑裂残留。与下面的 UI/运行时状态回滚保持一致。
+                    #   下次启动会照旧喂音频（NDI 输出都没开，音频投递必然被门控拦下）。
                     self.cfg["output"]["ndi_audio"] = False
                     self.output_panel.chk_ndi.blockSignals(True)
                     self.output_panel.chk_ndi.setChecked(False)
                     self.output_panel.chk_ndi.blockSignals(False)
-                    # ⚠ 同步回滚音频侧，避免"勾选框显示开着、实际被静默丢弃"（Bug 2）：
-                    #   NDI 输出都没开，音频勾选既无意义也会误导用户（采集侧投递被门控拦下、
-                    #   一个字节都不发，而且现场无任何日志）。这里必须和 chk_ndi 一起回滚。
                     try:
                         self.audio.state.ndi_audio_on = False
                     except Exception:                          # noqa: BLE001
                         pass
-                    try:
-                        _wa = self.output_panel.chk_ndi_audio
-                        _wa.blockSignals(True)
-                        _wa.setChecked(False)
-                        _wa.blockSignals(False)
-                        _wa.setEnabled(False)
-                    except Exception:                          # noqa: BLE001
-                        pass
-                    print("[NDI] NDI 运行时不可用 → 已同步关闭 NDI 音频"
-                          "（避免'勾选框显示开着但实际不发声'）")
+                    print("[NDI] NDI 运行时不可用 → 已同步关闭 NDI 音频")
         except Exception as _e:                                    # noqa: BLE001
             print("[NDI] 启动恢复 NDI 失败：%s" % _e)
         # Kv 主视觉图层设置区显隐（按当前是否已存在 Kv 图层）
@@ -4017,6 +4154,45 @@ class MainWindow(QMainWindow):
         except Exception:                                        # noqa: BLE001
             pass
 
+    def _merge_cue_song_meta(self):
+        """把 `cfg["cue"]["fp_songs"]` 的曲目并入 `_song_meta_by_id`（HUD 歌名 / 曲风查表）。
+
+        为什么必须有它（2026-10-17 用户报「识别出来了 HUD 怎么不显示歌名」）：
+          码表包带来的歌**不在本机曲库**（`cfg["music_meta"]`）里 —— 它在指纹库里用的是
+          **合成 id** `int(md5("fp:"+fp_id)[:8],16)`（`cue_fp_pack.fp_song_id()`）。
+          而 `_song_meta_by_id` 原来只从 `music_meta` + `imported_lib` 构建
+          ⇒ 歌认出来了（`recognized_song_id` = 合成 id），查表却是空的
+          ⇒ HUD 退化到"只显示曲风"（码表歌连曲风都没有 ⇒ 整行空白）。
+          ⚠ 这是**同一件事的两套 id 空间**没打通，不是 HUD 绘制问题。
+
+        幂等：本机曲库已有同 id 的**不覆盖**（本机信息优先，与 `imported_lib` 的合并策略一致）。
+        返回新增条数（0 ⇒ 无变化、不写配置）。
+        """
+        n = 0
+        try:
+            songs = (self.cfg["cue"] or {}).get("fp_songs") or {}
+        except Exception:                                        # noqa: BLE001
+            songs = {}
+        for _fp, rec in list(songs.items()):
+            rec = rec or {}
+            try:
+                sid = int(rec.get("song_id"))
+            except (TypeError, ValueError):
+                continue
+            if sid in self._song_meta_by_id:
+                continue
+            self._song_meta_by_id[sid] = {
+                "path": "",
+                "title": str(rec.get("title") or "") or str(_fp),
+                "artist": str(rec.get("artist") or ""),
+                "genres": [],
+                "cue": True,        # 来源标记：HUD 据此显示艺人而不是曲风（码表歌没有曲风）
+            }
+            n += 1
+        if n:
+            print("[码表] 歌名映射 +%d 首（来自码表包）" % n)
+        return n
+
     def _init_recognizer(self):
         """曲库就绪后启用现场识别：建指纹库 + song_id→meta 映射（无库则跳过）"""
         from config import app_base_dir
@@ -4053,6 +4229,11 @@ class MainWindow(QMainWindow):
                 print("[曲库] 合并导入包：+%d 首曲风" % _added)
         except Exception:                                        # noqa: BLE001
             pass
+        # ★ 2026-10-17：码表包带来的歌（合成 id）也并入 —— 否则认出来但 HUD 查不到歌名
+        try:
+            self._merge_cue_song_meta()
+        except Exception as _e:                                  # noqa: BLE001
+            print("[码表] 合并歌名映射失败：%s" % _e)
         if not self._song_meta_by_id:
             return
         # 注入 song_id → 曲风映射给 engine（自动匹配优先用指纹识别歌的精确曲风）
@@ -4065,7 +4246,28 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self._fp_db = FingerprintDB(db_path)
+            # ★★ 只让"当前曲库里真实存在"的歌参与匹配（防假阳性）
+            try:
+                _n = self._fp_db.set_allowed(self._allowed_song_ids())
+                print("[识别] 有效曲目 %d 个（其余历史指纹不参与匹配）" % _n)
+            except Exception as _e:                              # noqa: BLE001
+                print("[识别] 白名单设置失败：%s" % _e)
             self.audio.set_recognizer(self._fp_db)
+            try:
+                self.audio.set_allowed_provider(self._allowed_song_ids)
+            except Exception:                                    # noqa: BLE001
+                pass
+            # ★★ 2026-10-22：**指纹 id 自愈**（后台线程，绝不卡启动）。
+            #   背景：历史扫描时若路径写法变过（`W://` vs `W:/`），同一条曲目在库里
+            #   会存成**旧的 song_id**；白名单只认"按当前路径算出的 id" ⇒ 该曲永远
+            #   命中哈希却 0 票（局域网实测：hit=208/217、raw=0）。
+            #   这里用库内文件实测一次，证据足够（票数≥100 且 offset≈取样点）才改挂。
+            try:
+                import threading as _th
+                _th.Thread(target=self._heal_fp_ids_bg, args=(self._fp_db,),
+                           name="fp-id-heal", daemon=True).start()
+            except Exception:                                    # noqa: BLE001
+                pass
             # ★ 启动时**一次性对账**（把历史遗留的"撞车"清掉）：以前"先导码表、后加曲库"
             #   会在库里留下两份指纹（合成 id + 路径 id）⇒ 票数被拆一半 ⇒ 时认时不认。
             #   ⚠ 启动路径**必须零重活**：它只比 `cfg["cue"]["fp_songs"]` 的键与
@@ -4169,7 +4371,7 @@ class MainWindow(QMainWindow):
         except Exception:                                        # noqa: BLE001
             n_now = 0
         QMessageBox.information(
-            self, "导入曲库分析包",
+            self, T("导入曲库分析包"),
             "导入完成：\n"
             "· 本包：%d 首 / 指纹 %d 条 / 封面 %d 张\n"
             "· 本机累计导入：%d 首\n\n"
@@ -4179,7 +4381,7 @@ class MainWindow(QMainWindow):
 
     def _on_erlib_failed(self, msg):
         print("[曲库] 导入失败：%s" % msg)
-        QMessageBox.warning(self, "导入曲库分析包",
+        QMessageBox.warning(self, T("导入曲库分析包"),
                             "导入失败：\n%s\n\n"
                             "常见原因：包的指纹/网格算法版本与本机不一致"
                             "（用新版 erlib 重新导出即可）。" % msg)
@@ -4208,11 +4410,11 @@ class MainWindow(QMainWindow):
 
     def scan_music(self, force=False):
         if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
-            QMessageBox.information(self, "扫描分析", "已有扫描在进行中，请稍候。")
+            QMessageBox.information(self, T("扫描分析"), "已有扫描在进行中，请稍候。")
             return
         if force:
             ret = QMessageBox.question(
-                self, "全量重扫",
+                self, T("全量重扫"),
                 "全量重扫将忽略已有结果，重新分析曲库里的全部歌曲（含指纹与曲风）。\n可能耗时较长，确定继续吗？",
                 QMessageBox.Yes | QMessageBox.Cancel)
             if ret != QMessageBox.Yes:
@@ -4240,7 +4442,7 @@ class MainWindow(QMainWindow):
 
         段落分析已移除（见 `_music_scan` 的说明），别再写「重算段落」。"""
         if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
-            QMessageBox.information(self, "重新分析", "已有扫描在进行中，请稍候。")
+            QMessageBox.information(self, T("重新分析"), "已有扫描在进行中，请稍候。")
             return
         self._music_scan = MusicScanThread(self, [path], True)
         dlg = getattr(self, "music_dialog", None)
@@ -4277,18 +4479,18 @@ class MainWindow(QMainWindow):
             f"指纹ID：{m.get('song_id') or '-'}\n"
             f"\n完整路径：\n{path}"
         )
-        QMessageBox.information(self, "曲目信息", text)
+        QMessageBox.information(self, T("曲目信息"), text)
 
     def show_clear_music_analysis(self):
         """清除全部已分析指纹与曲风（带二次确认，可选保留手动设置的曲风）"""
         if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
-            QMessageBox.information(self, "清除分析数据", "扫描正在进行中，请稍后再清除。")
+            QMessageBox.information(self, T("清除分析数据"), "扫描正在进行中，请稍后再清除。")
             return
         box = QMessageBox(self)
-        box.setWindowTitle("清除分析数据")
-        box.setText("将删除全部已建立的指纹与自动识别的曲风。\n音乐文件本身和曲库列表不会被删除。")
+        box.setWindowTitle( T("清除分析数据"))
+        box.setText( T("将删除全部已建立的指纹与自动识别的曲风。\n音乐文件本身和曲库列表不会被删除。"))
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-        box.button(QMessageBox.Yes).setText("清除")
+        box.button(QMessageBox.Yes).setText( T("清除"))
         cb = QCheckBox("保留手动设置过的曲风")
         box.setCheckBox(cb)
         if box.exec() != QMessageBox.Yes:
@@ -4419,7 +4621,7 @@ class MainWindow(QMainWindow):
             return
         self.cfg["output"]["library_dir"] = d
         self.cfg.save()
-        QMessageBox.information(self, "素材库目录",
+        QMessageBox.information(self, T("素材库目录"),
                                 f"已设置：\n{d}\n\n后续「复制/移动」导入的素材会放到这里。")
 
     def _get_import_strategy(self):
@@ -4430,7 +4632,7 @@ class MainWindow(QMainWindow):
 
     def _ask_import_strategy(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle("导入素材")
+        dlg.setWindowTitle( T("导入素材"))
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel("如何导入这些素材？"))
         rb_copy = QRadioButton("复制到素材库（原文件保留）")
@@ -4462,7 +4664,7 @@ class MainWindow(QMainWindow):
         """导入时发现素材库已有同名/同路径素材 → 询问处理方式。
         返回 "replace" / "skip" / "add"；关掉对话框视同"不添加"。"""
         dlg = QDialog(self)
-        dlg.setWindowTitle("发现重复素材")
+        dlg.setWindowTitle( T("发现重复素材"))
         lay = QVBoxLayout(dlg)
         names = "\n".join("· " + os.path.basename(p) for p in dupes[:8])
         if len(dupes) > 8:
@@ -4471,25 +4673,36 @@ class MainWindow(QMainWindow):
         rb_replace = QRadioButton("替换旧素材（保留原标签/角色，用新文件替换）")
         rb_skip = QRadioButton("不添加（保持素材库不变）")
         rb_add = QRadioButton("仍然加入（复制模式下会生成 \"名字 (1)\" 的独立新条目）")
-        rb_replace.setChecked(True)
+        # ★★ P0 审计修复：默认必须是「不添加」——原来默认「替换」，而 Esc/X 关闭
+        #   既没接返回值、又落到最后一行 `return "replace"`，会去删素材库里的源文件。
+        rb_skip.setChecked(True)
         for rb in (rb_replace, rb_skip, rb_add):
             lay.addWidget(rb)
         btns = QHBoxLayout()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(dlg.reject)
         ok = QPushButton("确定")
         ok.clicked.connect(dlg.accept)
+        ok.setDefault(True)
         btns.addStretch(1)
+        btns.addWidget(cancel)
         btns.addWidget(ok)
         lay.addLayout(btns)
-        dlg.exec()
-        if rb_skip.isChecked():
+        if dlg.exec() != QDialog.Accepted:      # Esc / X / 取消 ⇒ 不添加
             return "skip"
         if rb_add.isChecked():
             return "add"
-        return "replace"
+        if rb_replace.isChecked():
+            return "replace"
+        return "skip"
 
-    def _purge_for_replace(self, old_path):
-        """替换素材：移除旧条目（图层引用一并清理）；旧文件在素材库目录内则删除，
-        这样新文件落盘时复用原文件名，按路径记忆的标签/角色/摆位自动延续。"""
+    def _purge_for_replace(self, old_path, delete_file=False):
+        """替换素材：移除旧条目（图层引用一并清理）。
+
+        ⚠ 2026-10-18 审计修复：**默认不删文件**。旧实现在这里 `os.remove`，
+          而调用方紧接着让 ImportWorker 去 copy 同一个路径 —— 源文件已被删，
+          ⇒ 条目消失 + 文件丢失 + 导入失败（数据丢失级 P0）。
+          真要删文件必须显式传 `delete_file=True`，目前没有任何调用方这么做。"""
         it = self.library.pop(old_path, None)
         if it is not None:
             self.remove_from_all_layers(it)
@@ -4504,6 +4717,8 @@ class MainWindow(QMainWindow):
                         lay.cur = -1
                         lay.prev_idx = -1
                     self.layers_panel.sync_layer(i)
+        if not delete_file:                     # ★ 默认不删（见 docstring 说明）
+            return
         lib = os.path.abspath(self.library_dir())
         ap = os.path.abspath(old_path)
         if ap.startswith(lib + os.sep) and os.path.exists(ap):
@@ -4526,7 +4741,7 @@ class MainWindow(QMainWindow):
                 os.remove(src)
             return dst
         except Exception as e:
-            QMessageBox.warning(self, "导入失败", f"无法复制 {name}：{e}")
+            QMessageBox.warning(self, T("导入失败"), f"无法复制 {name}：{e}")
             return None
 
     def _import_paths(self, paths):
@@ -4555,8 +4770,18 @@ class MainWindow(QMainWindow):
                 if not paths:
                     return
             elif act == "replace":
-                for p in dupes:
-                    self._purge_for_replace(p)
+                # ★ P0 修复：dupes 都是"路径已在库里"的文件 ⇒ 它自己就是库里的那份，
+                #   "替换"在这里没有意义（不可能用一个文件替换它自己）。正确做法是：
+                #   保留原条目、把它从本次导入里剔除，绝不删文件、也绝不重拷。
+                _lib = os.path.abspath(self.library_dir())
+                _keep = []
+                for p in paths:
+                    if p in self.library and os.path.abspath(p).startswith(_lib + os.sep):
+                        continue                     # 库内的同一个文件 ⇒ 跳过（原样保留）
+                    _keep.append(p)
+                paths = _keep
+                if not paths:
+                    return
 
         from media_manager import ImportWorker
         self._import_new = []
@@ -4935,7 +5160,7 @@ class MainWindow(QMainWindow):
 
     def scan_tags(self, paths=None, force=False):
         if getattr(self, "_tag_scan", None) is not None and self._tag_scan.isRunning():
-            QMessageBox.information(self, "扫描打标", "已有扫描在进行中，请稍候。")
+            QMessageBox.information(self, T("扫描打标"), "已有扫描在进行中，请稍候。")
             return
         self._tag_scan = TagScanThread(self, paths, force=force)
         self._tag_scan.progress.connect(self._on_scan_progress)
@@ -4968,7 +5193,7 @@ class MainWindow(QMainWindow):
     def show_cache_info(self):
         from media_manager import thumb_cache_size, THUMB_DIR
         QMessageBox.information(
-            self, "缩略图缓存",
+            self, T("缩略图缓存"),
             f"缓存目录：\n{THUMB_DIR}\n\n占用：{thumb_cache_size():.2f} MB\n素材数：{len(self.library)}\n\n"
             "缩略图首次生成后写入磁盘，之后启动/重建都直接读缓存。")
 
@@ -4978,7 +5203,7 @@ class MainWindow(QMainWindow):
         self.refresh_grid(icons_only=True)
         # 清完立刻后台重生成，否则整个库都会变成「只有文字没有图」
         self._start_thumb_backfill()
-        QMessageBox.information(self, "缩略图缓存",
+        QMessageBox.information(self, T("缩略图缓存"),
                                 Tf("已清理 {} 个缓存文件，正在后台重新生成缩略图。", n))
 
     def remove_media(self, item):
@@ -5006,13 +5231,13 @@ class MainWindow(QMainWindow):
         if not items:
             return
         box = QMessageBox(self)
-        box.setWindowTitle("从素材库移除")
+        box.setWindowTitle( T("从素材库移除"))
         if len(items) == 1:
             box.setText(f"确定从素材库移除「{items[0].name[:40]}」吗？\n（图层中的该素材会一并移除，标签与摆位也会清除）")
         else:
             box.setText(f"确定从素材库移除 {len(items)} 个素材吗？\n（图层中的这些素材会一并移除，标签与摆位也会清除）")
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-        box.button(QMessageBox.Yes).setText("移除")
+        box.button(QMessageBox.Yes).setText( T("移除"))
         cb = QCheckBox("同时删除本地文件（仅限「素材库」文件夹内的文件）")
         box.setCheckBox(cb)
         if box.exec() != QMessageBox.Yes:
@@ -5027,7 +5252,7 @@ class MainWindow(QMainWindow):
                     try:
                         os.remove(ap)
                     except OSError as e:
-                        QMessageBox.warning(self, "删除失败", f"无法删除文件：\n{ap}\n{e}")
+                        QMessageBox.warning(self, T("删除失败"), f"无法删除文件：\n{ap}\n{e}")
 
     def open_import_settings(self):
         """打开导入方式设置（即使勾选了「记住我的选择」也可随时修改）"""
@@ -5037,7 +5262,7 @@ class MainWindow(QMainWindow):
         self.cfg["output"]["import_strategy"] = strat
         self.cfg.save()
         QMessageBox.information(
-            self, "导入素材设置",
+            self, T("导入素材设置"),
             {"copy": "已设置为：复制到素材库（原文件保留）",
              "move": "已设置为：移动到素材库（复制后删除原文件）",
              "link": "已设置为：仅引用（不复制，保留原路径）"}.get(strat, strat))
@@ -5183,11 +5408,96 @@ class MainWindow(QMainWindow):
     def on_layer_pick(self, idx):
         self._cur_layer = idx
 
+    def _cue_layer_menu(self, idx, lay, gpos):
+        """码表图层的右键菜单 —— 只列**对它真正生效**的项。
+
+        为什么单独一套（用户 2026-10-17：「码表图层的右键菜单应该和其他图层不一样」）：
+          码表图层的画面 100% 来自 `.ercue` —— 片段何时进出、转场、混合、不透明度、
+          crop、变速**全部在编排端定好**。ERA 这边只剩「容器级」的几个开关有意义。
+
+        生效（列出）：
+          · 重命名
+          · 无声音时隐藏本层 —— `_compose` 对码表层同口径处理
+          · Solo —— 同上
+          · 上移 / 下移 —— 决定它与其它 ERA 图层的合成顺序
+          · 卸下码表 —— 只清运行时（解码器全关），图层保留
+          · 删除图层
+
+        不生效或有害（**故意不列**）：
+          · 固定播放本层当前素材 —— 码表没有"当前素材"，一帧里可能同时有多个子层
+          · 自动匹配模式 / 图层角色 —— 会重建素材池，**直接把码表顶掉**
+          · 播放速度 —— 每段素材的 `speed` 在码表里；这里的 `lay.speed` 没人读
+          · 保留透明通道 —— 子层 alpha 由码表素材自身决定（`_CueSubLayer` 恒 True）
+          · 锁定画面 —— 码表本来就不吃能量脉冲/漂移（`_draw_layer` 的 pulse 恒 1.0）
+          · 复制素材池到新图层 / 重置本层设置 —— 没有素材池，语义不成立
+        """
+        m = QMenu(self)
+        m.setToolTipsVisible(True)
+        a_ren = m.addAction("重命名…")
+        a_sil = m.addAction("无声音时隐藏本层")
+        a_sil.setCheckable(True)
+        a_sil.setChecked(bool(lay.hide_silent))
+        a_solo = m.addAction("Solo")
+        a_solo.setToolTip(T("只显示本层（码表以外的图层全部隐藏）"))
+        a_solo.setCheckable(True)
+        a_solo.setChecked(bool(getattr(lay, "solo", False)))
+        m.addSeparator()
+        a_up = m.addAction("上移")
+        a_up.setToolTip(T("更靠上（合成顺序）"))
+        a_dn = m.addAction("下移")
+        a_dn.setToolTip(T("更靠下（合成顺序）"))
+        m.addSeparator()
+        a_unmount = m.addAction("卸下码表（变回普通图层）")
+        a_unmount.setToolTip(T("清掉本次装载的码表，并把这个图层变回普通图层（会保存）；"
+                              "下次启动不会再自动装回来"))
+        m.addSeparator()
+        a_del = m.addAction(theme.danger_icon(), "删除图层")   # ★ 红点标记危险项
+        a_del.setEnabled(len(self.engine.layers) > 1)
+
+        i18n.retranslate(m)     # 临时菜单：弹出前刷语言
+        act = m.exec(gpos)
+        if act is None:
+            return
+        if act == a_ren:
+            self._cur_layer = idx
+            self.layer_rename()
+        elif act == a_sil:
+            lay.hide_silent = not lay.hide_silent
+            self.layers_panel.refresh_header(idx)
+            self.save_layers()
+        elif act == a_solo:
+            self.set_solo(idx, not bool(lay.solo))
+        elif act == a_up:
+            self.refresh_layer_row(idx, idx - 1)
+        elif act == a_dn:
+            self.refresh_layer_row(idx, idx + 1)
+        elif act == a_unmount:
+            # ★ 走**同一条**卸下路径（`cue_ui.unbind_layer`）：它负责清运行时 +
+            #   `is_cuesheet=False` + 落盘。这里若自己去碰引擎的卸载方法，就成了"第二条
+            #   卸下路径"，两处行为迟早分叉（GUI 线程直接关解码器也不合铁律 13）。
+            try:
+                from cue_ui import unbind_layer
+                unbind_layer(self, lay)
+            except Exception as e:                               # noqa: BLE001
+                print("[码表] 卸下失败：%s: %s" % (type(e).__name__, e))
+            self.layers_panel.refresh_header(idx)
+        elif act == a_del:
+            self._cur_layer = idx
+            self.layer_del()
+
     def layer_menu(self, idx, gpos):
-        """图层右键菜单"""
+        """图层右键菜单（**码表图层走另一套**，见 `_cue_layer_menu`）。"""
         if not (0 <= idx < len(self.engine.layers)):
             return
         lay = self.engine.layers[idx]
+        # ★★★ 2026-10-17（用户："码表图层的右键菜单应该和其他图层不一样"）：
+        #   码表图层是**容器**，画面完全由码表决定（片段/转场/混合/不透明度都在 `.ercue` 里）。
+        #   普通图层那套「固定素材 / 自动匹配 / 角色 / 播放速度 / 保留 alpha / 复制素材池」
+        #   对它**要么无效、要么有害**（例如「自动匹配模式」会重建素材池 ⇒ 直接把码表顶掉）。
+        #   ⇒ 走独立菜单，只留真正对码表生效的项。
+        if getattr(lay, "is_cuesheet", False):
+            self._cue_layer_menu(idx, lay, gpos)
+            return
         m = QMenu(self)
         m.setToolTipsVisible(True)      # ★ 长条目拆短后，括号里的说明挪进悬停提示
         a_ren = m.addAction("重命名…")
@@ -5501,7 +5811,7 @@ class MainWindow(QMainWindow):
         # Kv 主视觉图层：全局唯一，已存在则提醒并中止
         if is_kv and self.engine.kv_layer() is not None:
             QMessageBox.information(
-                self, "Kv 主视觉图层已存在",
+                self, T("Kv 主视觉图层已存在"),
                 "Kv 主视觉图层全局只能有一个。\n请先删除现有的 Kv 图层，再添加新的。")
             return
         # ★ 码表图层：**先选表再建层**（用户要求：新建时就要能选"应用哪一张码表"）。
@@ -5513,7 +5823,7 @@ class MainWindow(QMainWindow):
                 sheet_entry = cue_page.pick_sheet(
                     self, self, T("新建「码表图层」—— 选择这张图层要应用的码表："))
             except Exception as e:                                # noqa: BLE001
-                QMessageBox.warning(self, T("码表"),
+                QMessageBox.warning(self, T( T("码表")),
                                     Tf("打开码表列表失败：{}", "%s: %s"
                                        % (type(e).__name__, e)))
                 return
@@ -5580,7 +5890,7 @@ class MainWindow(QMainWindow):
                 except Exception:                                 # noqa: BLE001
                     pass
             if msg:
-                QMessageBox.warning(self, T("码表"), msg)
+                QMessageBox.warning(self, T( T("码表")), msg)
 
     def layer_del(self):
         if len(self.engine.layers) <= 1 or not (0 <= self._cur_layer < len(self.engine.layers)):
@@ -5598,7 +5908,7 @@ class MainWindow(QMainWindow):
         if not (0 <= self._cur_layer < len(self.engine.layers)):
             return
         lay = self.engine.layers[self._cur_layer]
-        name, ok = QInputDialog.getText(self, "重命名图层", tr("layer_name"), text=lay.name)
+        name, ok = QInputDialog.getText(self, T("重命名图层"), tr("layer_name"), text=lay.name)
         if ok and name.strip():
             lay.name = name.strip()
             self.layers_panel.refresh_header(self._cur_layer)
@@ -5641,6 +5951,72 @@ class MainWindow(QMainWindow):
     def open_about(self):
         AboutDialog(self).exec()
 
+    def export_logs(self):
+        """「⋯ 更多 → 导出全部日志…」：把日志 + config 打成 zip（2026-10-18 用户要求）。
+
+        打包内容：
+          · `%LOCALAPPDATA%\\AutoVJ\\*.log`（存在的全打。源码运行时是项目根）
+          · config.json（现场设置是排障关键：音源 / 输出 / 快捷键都在里面）
+          · environment.txt（BUILD_VER / 导出时间 / 系统 / Python / 数据目录）
+        失败**必须弹窗**（不要静默 —— 用户会以为导出了、拿着空文件来回传）。
+        """
+        import platform as _platform
+        import sys as _sys
+        import zipfile
+
+        base = os.path.dirname(CONFIG_FILE)
+        stamp = time.strftime("%Y%m%d_%H%M")
+        # 默认目录 = 桌面。用 QStandardPaths 而不是 ~/Desktop：桌面被 OneDrive 重定向时
+        # 后者会指向一个空目录（用户找不到文件，还以为没导出）。
+        from PySide6.QtCore import QStandardPaths
+        desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        if not desktop or not os.path.isdir(desktop):
+            desktop = os.path.expanduser("~")
+        path, _sel = QFileDialog.getSaveFileName(
+            self, T("导出全部日志"),
+            os.path.join(desktop, "AutoVJ日志_%s.zip" % stamp),
+            T("Zip 压缩包 (*.zip)"))
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+
+        files = []
+        try:
+            if os.path.isdir(base):
+                for fn in sorted(os.listdir(base)):
+                    fp = os.path.join(base, fn)
+                    if fn.lower().endswith(".log") and os.path.isfile(fp):
+                        files.append(fp)
+            if os.path.exists(CONFIG_FILE):
+                files.append(CONFIG_FILE)
+            import version as _v
+            env = "\n".join([
+                "BUILD_VER: %s" % getattr(_v, "APP_VERSION", "dev"),
+                "BUILD_DATE: %s" % getattr(_v, "APP_BUILD", ""),
+                "EXPORTED_AT: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+                "OS: %s" % _platform.platform(),
+                "PYTHON: %s" % _platform.python_version(),
+                "FROZEN: %s" % bool(getattr(_sys, "frozen", False)),
+                "DATA_DIR: %s" % base,
+                "LOGS: %d" % len(files),
+            ]) + "\n"
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                for fp in files:
+                    try:
+                        z.write(fp, os.path.basename(fp))
+                    except Exception as _e:                    # noqa: BLE001
+                        # 单个日志被占用/权限不足不整包失败，但要把原因写进 zip
+                        z.writestr("SKIPPED_%s.txt" % os.path.basename(fp), str(_e))
+                z.writestr("environment.txt", env)
+        except Exception as e:                                 # noqa: BLE001
+            QMessageBox.warning(self, T( T("导出全部日志")),
+                                T("导出失败：") + "%s" % e)
+            return
+        QMessageBox.information(
+            self, T( T("导出全部日志")),
+            (T("已导出 %d 个日志/配置文件到：") % len(files)) + "\n\n" + path)
+
     def open_cuesheet(self):
         """码表（演出端）：轻量对话框（导入 / 最近 / 状态 / 绑图层 / 手动起拍 / 卸下）。
 
@@ -5654,7 +6030,7 @@ class MainWindow(QMainWindow):
             import cue_ui
             cue_ui.open_cuesheet_dialog(self)
         except Exception as e:                                    # noqa: BLE001
-            QMessageBox.warning(self, "码表", "打开码表对话框失败：%s: %s"
+            QMessageBox.warning(self, T("码表"), "打开码表对话框失败：%s: %s"
                                 % (type(e).__name__, e))
 
     def open_cuesheet_page(self):
@@ -5750,8 +6126,9 @@ class MainWindow(QMainWindow):
             self.act_lang_zh.setChecked(i18n.lang() == "zh")
             self.act_lang_en.setChecked(i18n.lang() != "zh")
             self.act_hotkey.setText(tr("hotkeys"))
+            self.act_export_logs.setText(T("导出全部日志…"))
             self.act_about.setText(tr("about"))
-            self.btn_more.setToolTip(T("更多：主题 / 语言 / 快捷键 / 关于"))
+            self.btn_more.setToolTip(T("更多：主题 / 语言 / 快捷键 / 导出日志 / 关于"))
         except Exception:
             pass
 
@@ -5892,12 +6269,27 @@ class MainWindow(QMainWindow):
             song_line = f"🎵 {title}"
             if genres:
                 song_line += f"  {'·'.join(genres[:3])}"
+            elif song_meta.get("artist"):
+                # 码表包带来的歌没有本机曲风 ⇒ 退而显示艺人（总比空白强）
+                song_line += f"  {song_meta['artist']}"
         else:
             genre = getattr(self.audio.state, "genre_tags", None) or []
             if genre:
                 song_line = f"🎵 {'·'.join(genre[:3])}"
         if song_line:
             hud += "\n" + song_line
+        # ★ 2026-10-18（用户："多层编排还是没在 era 里看见"）：
+        #   码表是**容器层**，一帧里可能同时画好几层，肉眼很难判断"是只有一层，还是多层都在"。
+        #   这里把实况直接写在 HUD 上：`🎬 码表 3层 · 2在播`。
+        #   `cuesheet_status()` 是**无锁只读快照**（白名单内），500ms 一次开销可忽略。
+        try:
+            _cs = self.engine.cuesheet_status() or {}
+            if _cs.get("loaded") and _cs.get("active_layers"):
+                hud += "\n🎬 %s %d层 · %d在播" % (
+                    T("码表"), int(_cs.get("sub_states", 0) or 0),
+                    int(_cs.get("sub_active", 0) or 0))
+        except Exception:                                        # noqa: BLE001
+            pass
         self.preview_panel.update_hud(hud)
         # 「节拍网格线」浮层（贴在 HUD 下方）：与切换对齐共用同一相位，
         # 所以看到的那条乐句头线就是切换实际踩的线。无拍位时自动隐藏。
@@ -5923,6 +6315,11 @@ class MainWindow(QMainWindow):
             self.lbl_warn.setText("")
 
     def closeEvent(self, ev):
+        # ★ 2026-10-19：合并写盘窗口里可能还有未落盘的改动 —— 退出前强制写一次。
+        try:
+            self.cfg.flush()
+        except Exception:                                        # noqa: BLE001
+            pass
         # ★ 2026-10-10 审计修复：**先把所有后台线程停下来，最后再落盘**。
         #   原来只停了 thumb_worker/thumb_backfill，其余后台扫描线程（dyn/tag/music/
         #   import/erlib/codec/alpha）未停未 join —— 退出时它们仍可能与主线程并发

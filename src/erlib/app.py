@@ -673,6 +673,15 @@ class ErlibWindow(QMainWindow):
             "erlib 分析包 (*.eravjlib)")
         if not p:
             return
+        # ★ 2026-10-19 审计修复：**这里先挡一次**，给即时反馈。
+        #   底层 `export_subset` 也会挡（线程里抛会被回成"导出失败"），
+        #   但用户选到工作库时应该在点确定的瞬间就知道，而不是等线程报错。
+        if os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(self.work)):
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "导出路径不能是工作库本身（那会先把工作库清空）。\n\n"
+                "请换一个文件名，例如放到桌面。")
+            return
         self.btn_export.setEnabled(False)
         self.bar.setRange(0, len(sids))
         self.bar.setValue(0)
@@ -704,6 +713,16 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
+    # ★ 应用图标（仅图标相关）：窗口 + 任务栏统一用品牌 ER 标。找不到文件就跳过，
+    #   绝不影响启动（打包后从 _MEIPASS/assets 取，源码运行从项目根 assets/ 取）。
+    try:
+        from PySide6.QtGui import QIcon
+        import appicon
+        _icon = appicon.icon_path("erlib")
+        if _icon:
+            app.setWindowIcon(QIcon(_icon))
+    except Exception:                                             # noqa: BLE001
+        pass
     w = ErlibWindow()
     w.show()
     return app.exec()

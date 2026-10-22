@@ -39,6 +39,11 @@ def export_subset(work, out_path, sids, on_progress=None, app_ver="erlib"):
     ⚠ 逐首 `commit` 攒 5 首一次，避免每首一次 fsync（大库导出快很多）。
     """
     sids = set(int(x) for x in sids)
+    # ★★ 2026-10-19 审计修复：**输出路径不能是工作库本身**。
+    #   `resume=False` 的 LibWriter 会先 DELETE 三张表；指向自身 ⇒ 先把正在读的库清空，
+    #   导出结果 0 首，而"扫了一小时"的成果已经没了（不可逆）。
+    if os.path.normcase(os.path.abspath(str(out_path))) == os.path.normcase(os.path.abspath(str(work))):
+        raise ValueError("导出路径不能是工作库本身，请换一个文件名 / 目录。")
     src = LibReader(work)
     try:
         root = (src.meta() or {}).get("root", "")

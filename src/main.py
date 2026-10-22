@@ -88,6 +88,17 @@ def main():
     font = QFont("Microsoft YaHei UI", 9)
     app.setFont(font)
 
+    # ★ 应用图标（仅图标相关）：窗口 + 任务栏统一用品牌 ER 标。找不到文件就跳过，
+    #   绝不影响启动（打包后从 _MEIPASS/assets 取，源码运行从项目根 assets/ 取）。
+    try:
+        from PySide6.QtGui import QIcon
+        import appicon
+        _icon = appicon.icon_path("autovj")
+        if _icon:
+            app.setWindowIcon(QIcon(_icon))
+    except Exception:
+        pass
+
     # 主题（亮/暗），读用户上次选择
     t = time.perf_counter()
     cfg = config.Config()

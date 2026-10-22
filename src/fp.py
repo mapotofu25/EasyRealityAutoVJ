@@ -45,9 +45,13 @@ FP_SCHEMA_VERSION = 2    # 峰值检测算法版本（v1=规则分块；v2=邻�
 HINT_W = 32
 
 #: hint 窗口内候选"够不够格赢"的最低票数比例（相对全局最高票）。
-#: 见 `_pick` 注释：同一段音频的两处出现票数同量级（实测 60%），纯噪声只有 1~3 票
-#: ⇒ 用 10% 这个**数量级**门槛把两者分开，不误伤"防重复段落挑错位置"的原有能力。
-HINT_WIN_MIN_RATIO = 0.10
+#: ★★★ 2026-10-18 真机定位（用户："码表视频还是慢 跟不上音频"）：
+#:   原值 0.10 太松 —— 提示窗里只要有 **3 票**就能压过全局 40 票的正确位置。
+#:   而 hint 来自**拍钟预测**，预测一旦滞后，匹配就被锁在旧位置附近、**自我强化**
+#:   ⇒ 实测 `off` 连续 **8~10 秒**卡在同一个值不动 ⇒ 码表位置落后 8~14 秒 ⇒ "一直慢"。
+#:   提到 0.5：同段重复段落的两处出现实测票数比 ≈60%（35 vs 58）仍能胜出，
+#:   而"滞后提示的弱候选"（10 vs 40 = 25%）被拒 ⇒ 退回全局众数，位置能自己纠回来。
+HINT_WIN_MIN_RATIO = 0.50
 
 # 「连续性提示」窗口半宽的**受支持定义**（单位 = 拍）：跨 BPM 一致。
 # 依据（第三轮 fix：正确候选偏差 ≲0.5 拍；生产侧 hint 误差 ≲1 拍跟踪 + 0.5s 时滞；
@@ -270,6 +274,12 @@ class FingerprintDB:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA journal_mode=WAL")   # WAL：扫描写/识别读可并发
         self._pending = 0          # 批量模式下"已写未 commit"的歌曲数（见 commit_batch）
+        self.last_song_votes = {}  # ★ 上一次 match 的「每曲总票」：{song_id: votes}
+        # ★★ 2026-10-19：**只允许当前曲库里真实存在的 song_id 参与匹配**。
+        #   背景：指纹库会残留「已从曲库移除」的历史条目；若不设白名单，放一首
+        #   不在曲库的歌，也会被匹配到这些过期 id ⇒ 界面报出一首不存在的歌（假阳性）。
+        #   None = 不限制（兼容旧行为 / 单元测试）。
+        self.allowed = None
         self._scan_orig_sync = None
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS fingerprints ("
@@ -380,6 +390,17 @@ class FingerprintDB:
         """
         if not votes:
             return None
+        # ★★★ 2026-10-18（真机"一直慢"的最终定位）：**只有"前两名票数接近"时才准用 hint**。
+        #   证据：关掉 hint 后，画面相对音频的最大偏离从 **71.5 秒降到 3.45 秒**；
+        #   而有 hint 时 `off` 会连续 8~10 秒卡在同一个值（拍钟预测滞后 ⇒ 匹配被锁在旧位置）。
+        #   但 hint 本身是有用的（重复段落要靠它挑对那处），所以保留它、只限制使用条件：
+        #     · 全局第一名**明显领先**（第二名 < 50% 第一名）⇒ 事实清楚，不需要 hint；
+        #     · 前两名接近（≥50%）⇒ 真有歧义，这时才用 hint 在两者间挑。
+        #   这样既不会被滞后预测带跑，也不会丢掉"重复段落挑对位置"的能力。
+        _rank = sorted(votes.values(), reverse=True)
+        _clear = len(_rank) >= 2 and _rank[0] >= 2 * _rank[1]
+        if hint_delta is not None and _clear:
+            hint_delta = None
         if hint_delta is not None:
             w = HINT_W if hint_w is None else float(hint_w)
             if w < 0.0:
@@ -403,9 +424,17 @@ class FingerprintDB:
                 #     那研究的是"两者都是一个量级"的情形；这里卡的是**数量级差异**，
                 #     不是同一个问题。阈值取 10% 而不是 50%，正是为了不误伤前者。
                 _top = max(votes.values())
-                if best[1] >= max(3, int(_top * HINT_WIN_MIN_RATIO)):
+                if best[1] >= max(6, int(_top * HINT_WIN_MIN_RATIO)):
                     return best
         return max(votes.items(), key=lambda kv: kv[1])
+
+    def set_allowed(self, ids):
+        """限定可匹配的 song_id 集合（None = 不限制）。返回设置后的规模。"""
+        try:
+            self.allowed = None if ids is None else set(int(x) for x in ids)
+        except Exception:                                        # noqa: BLE001
+            self.allowed = None
+        return 0 if self.allowed is None else len(self.allowed)
 
     def match(self, sig, sr, hint_delta=None, hint_w=None):
         """返回 (song_id, aligned_votes, offset_sec) 或 (-1, 0, 0.0)
@@ -427,6 +456,10 @@ class FingerprintDB:
             qoff_map.setdefault(h, []).append(qoff)
             hashes.append(h)
         votes = {}
+        # ★ 2026-10-19：同时统计「每个 song_id 的总票（跨所有对齐位置）」。
+        #   为什么要它：重复/相似段落会把票摊到多个 delta，单对齐票常只有个位数，
+        #   而整首歌的总票仍有几百 —— 只用单对齐票当"证据"会严重低估。
+        song_tot = {}
         # 批量 IN 查询（分块避开 SQLite 999 变量上限）
         for i in range(0, len(hashes), 500):
             chunk = hashes[i:i + 500]
@@ -434,9 +467,14 @@ class FingerprintDB:
             for (h, song_id, dboff) in self.conn.execute(
                     f"SELECT hash, song_id, offset FROM fingerprints "
                     f"WHERE hash IN ({ph})", chunk):
+                # 只认当前曲库里的歌（过期指纹会被历史扫描留在库里）
+                if self.allowed is not None and song_id not in self.allowed:
+                    continue
                 for qoff in qoff_map.get(h, ()):
                     key = (song_id, dboff - qoff)
                     votes[key] = votes.get(key, 0) + 1
+                    song_tot[song_id] = song_tot.get(song_id, 0) + 1
+        self.last_song_votes = song_tot
         picked = self._pick(votes, hint_delta, hint_w)
         if picked is None:
             return -1, 0, 0.0

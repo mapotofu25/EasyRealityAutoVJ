@@ -113,7 +113,12 @@ def main():
         print("!! 还没打包过（src/_build_ver.py 里没有版本号），先跑 tools/build_exe.py")
         return 1
     zip_name = build_version.zip_name(date_key, seq)
-    zip_path = os.path.join(ROOT, zip_name)
+    # ★ 2026-10-22：发布包默认落到「该软件自己的发行版目录」，
+    #   不再堆在源码工程根目录（用户要求：每个软件一个文件夹）。
+    _rel = os.environ.get("AUTOVJ_RELEASE_DIR") or os.path.join(ROOT, "发行版")
+    if not os.path.isdir(_rel):
+        _rel = ROOT
+    zip_path = os.path.join(_rel, zip_name)
 
     if len(sys.argv) > 1 and sys.argv[1] != ver:
         print(f"!! 包内版本 {ver} 与参数 {sys.argv[1]} 不一致，已按 exe 实际版本命名")

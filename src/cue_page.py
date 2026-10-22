@@ -37,14 +37,14 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QDialogButtonBox, QFileDialog, QHBoxLayout,
                                QHeaderView, QLabel, QMenu, QMessageBox,
-                               QPushButton, QScrollArea, QSizePolicy,
+                               QPushButton, QScrollArea, QSizePolicy, QSplitter,
                                QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
 import cue_fp_pack
 import cuesheet
 from i18n import T, Tf
-from panels import I18nDialog
+from panels import I18nDialog, I18nWidget
 
 #: abspath → ((mtime, size), 片段总数)；包变了（mtime/size 不同）才重读
 _FRAG_CACHE: dict[str, tuple] = {}
@@ -398,9 +398,10 @@ def pick_sheet(owner, parent=None, prompt=""):
 # ==========================================================================
 # 只读详情窗
 # ==========================================================================
-class CueSheetDetailDialog(I18nDialog):
-    """码表详情（**只读**）：表名 / 画布 / 曲目清单（含 BPM）/ 每层片段数 / 内嵌素材。
+class CueDetailPanel(I18nWidget):
+    """码表详情（**只读**，**内嵌在码表页右侧**）：表名 / 画布 / 曲目 / 素材清单。
 
+    ⚠ 2026-10-19 用户要求：不再弹独立窗口，直接放主页右侧（左列表 / 右详情）。
     ⚠ **不做编排编辑**（red line）：这里只"看"，改编排请用 EasyRealityCue 打开再导出。
     """
 
@@ -411,10 +412,9 @@ class CueSheetDetailDialog(I18nDialog):
         self.path = os.path.abspath(str(self.entry.get("path") or ""))
         self.sheet = None
         self.err = ""
-        self.setMinimumWidth(720)
-        self.setMinimumHeight(560)
+        self.setMinimumWidth(360)
         self._build()
-        self._load()
+        self.show_entry(entry)
 
     # ---------------- 构建 ----------------
     def _build(self):
@@ -463,11 +463,30 @@ class CueSheetDetailDialog(I18nDialog):
         self.tbl_media.horizontalHeader().setStretchLastSection(False)
         root.addWidget(self.tbl_media, 1)
 
-        bb = QDialogButtonBox(QDialogButtonBox.Close, self)
-        bb.button(QDialogButtonBox.Close).setText(T("关闭"))
-        bb.rejected.connect(self.reject)
-        bb.clicked.connect(lambda _b: self.close())
-        root.addWidget(bb)
+
+    def show_entry(self, entry):
+        """切换到这个码表（内嵌面板用；同一面板反复复用）。"""
+        self.entry = dict(entry or {})
+        _raw = str(self.entry.get("path") or "").strip()
+        self.path = os.path.abspath(_raw) if _raw else ""
+        self.sheet = None
+        self.err = ""
+        self.missing = []
+        if not self.path:
+            # 未选中：给一句引导，不做"文件不存在"的报错（内嵌面板常态）
+            try:
+                self.lbl_head.setText(T("在左侧选择一个码表查看详情"))
+                self.lbl_err.setText("")
+                self.tbl_tracks.setRowCount(0)
+                self.tbl_media.setRowCount(0)
+                self.thumb_strip.clear()
+            except Exception:                                    # noqa: BLE001
+                pass
+            return
+        try:
+            self._load()
+        except Exception as e:                                   # noqa: BLE001
+            self.err = str(e)
 
     # ---------------- 填充 ----------------
     def reload(self, path=None, entry=None):
@@ -701,11 +720,22 @@ class CueSheetPanel(QWidget):
         hh = self.tbl.horizontalHeader()
         # ⚠ 最小列宽 88：`ResizeToContents` 在表头文字（「覆盖曲目」「修改时间」）比数据宽时
         #   会把列压到只剩一个字 —— 显式给下限，表名那列再吃剩余宽度。
-        hh.setMinimumSectionSize(88)
+        hh.setMinimumSectionSize(72)
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
         for c in range(1, len(self.COLS)):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        root.addWidget(self.tbl, 1)
+        # ★ 2026-10-19 用户要求：**左列表 / 右详情**，不再弹独立窗口。
+        self.split = QSplitter(Qt.Horizontal, self)
+        self.split.setChildrenCollapsible(False)
+        self.split.addWidget(self.tbl)
+        self._detail = CueDetailPanel(self.owner, {}, self.split)
+        self._detail.setMinimumWidth(420)
+        self.split.addWidget(self._detail)
+        self.split.setStretchFactor(0, 2)
+        self.split.setStretchFactor(1, 5)
+        self.split.setSizes([460, 760])
+        root.addWidget(self.split, 1)
+        self.tbl.itemSelectionChanged.connect(self._on_sel_changed)
 
         self.lbl_stat = QLabel("")
         self.lbl_stat.setStyleSheet("color:" + _muted_color() + ";font-size:11px;")
@@ -876,6 +906,18 @@ class CueSheetPanel(QWidget):
                 self._fp_timer.stop()
             except Exception:                                    # noqa: BLE001
                 pass
+            # ★ 2026-10-17：作业结束 ⇒ 刷新 HUD 歌名映射。
+            #   刚导入的码表曲目只有 `cfg["cue"]["fp_songs"]` 里有标题，不刷新的话
+            #   要重启程序才显示（用户会以为是"认不出来"）。
+            try:
+                _m = getattr(self.owner, "_merge_cue_song_meta", None)
+                if _m is not None:
+                    _m()
+                    _sg = getattr(getattr(self.owner, "engine", None), "set_song_genres", None)
+                    if _sg is not None:
+                        _sg(getattr(self.owner, "_song_meta_by_id", {}) or {})
+            except Exception:                                    # noqa: BLE001
+                pass
 
     @staticmethod
     def _fp_text(job):
@@ -930,7 +972,7 @@ class CueSheetPanel(QWidget):
         self.refresh()
         if bad:
             QMessageBox.warning(
-                self, T("导入码表"),
+                self, T( T("导入码表")),
                 "\n".join([Tf("已导入 {} 张码表。", len(ok)),
                            Tf("以下 {} 个文件不是有效的码表包：", len(bad))] + bad))
         elif ok:
@@ -940,7 +982,7 @@ class CueSheetPanel(QWidget):
         """删除：**只从列表移除**（二次确认，明确告知不删磁盘文件）。"""
         paths = self._sel_paths()
         if not paths:
-            QMessageBox.information(self, T("删除码表"), T("请先选中要移除的码表。"))
+            QMessageBox.information(self, T( T("删除码表")), T("请先选中要移除的码表。"))
             return
         names = [sheet_label(self._entry_for(p) or {"path": p}) for p in paths]
         box = QMessageBox(self)
@@ -962,7 +1004,7 @@ class CueSheetPanel(QWidget):
         except Exception:                                        # noqa: BLE001
             idx = None
         if idx is None:
-            QMessageBox.warning(self, T("删除码表"), T("码表索引不可用，无法移除。"))
+            QMessageBox.warning(self, T( T("删除码表")), T("码表索引不可用，无法移除。"))
             return
         for p in paths:
             try:
@@ -996,7 +1038,7 @@ class CueSheetPanel(QWidget):
         """定位文件：在资源管理器里选中（文件不在了就打开其所在目录）。"""
         paths = self._sel_paths()
         if not paths:
-            QMessageBox.information(self, T("定位文件"), T("请先选中一行。"))
+            QMessageBox.information(self, T( T("定位文件")), T("请先选中一行。"))
             return
         p = paths[0]
         try:
@@ -1008,10 +1050,10 @@ class CueSheetPanel(QWidget):
                 if os.path.isdir(d):
                     os.startfile(d)      # noqa: S606  Windows 默认程序打开
                 else:
-                    QMessageBox.warning(self, T("定位文件"),
+                    QMessageBox.warning(self, T( T("定位文件")),
                                         Tf("文件和目录都不存在了：{}", p))
         except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, T("定位文件"), "%s: %s" % (type(e).__name__, e))
+            QMessageBox.warning(self, T( T("定位文件")), "%s: %s" % (type(e).__name__, e))
 
     def on_refresh(self):
         """刷新：按 mtime/size 重读变了的包（引擎的 rescan 只读改过的）。"""
@@ -1023,7 +1065,7 @@ class CueSheetPanel(QWidget):
                 idx = self.engine.cue_index(refresh=True)
                 idx.save_cfg(self.cfg)
         except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, T("刷新码表"), "%s: %s" % (type(e).__name__, e))
+            QMessageBox.warning(self, T( T("刷新码表")), "%s: %s" % (type(e).__name__, e))
         _FRAG_CACHE.clear()      # 包可能变了 ⇒ 片段数缓存整体失效（条目少，重建很便宜）
         self.refresh()
 
@@ -1033,7 +1075,21 @@ class CueSheetPanel(QWidget):
         if not paths:
             return
         e = self._entry_for(paths[0]) or {"path": paths[0]}
-        CueSheetDetailDialog(self.owner, e, self).exec()
+        self._show_detail(e)
+
+    def _on_sel_changed(self):
+        paths = self._sel_paths()
+        if not paths:
+            return
+        e = self._entry_for(paths[0]) or {"path": paths[0]}
+        self._show_detail(e)
+
+    def _show_detail(self, entry):
+        """把详情显示到右侧面板（不再开窗口）。"""
+        try:
+            self._detail.show_entry(entry)
+        except Exception as e:                                   # noqa: BLE001
+            self._flash("详情加载失败：%s" % e)
 
     def on_open_dialog(self):
         """「更多操作…」⇒ 打开**原有的轻量对话框**（手动起拍/最近/定位档位都在里面）。
@@ -1046,7 +1102,7 @@ class CueSheetPanel(QWidget):
             try:
                 fn()
             except Exception as e:                               # noqa: BLE001
-                QMessageBox.warning(self, T("码表"), "%s: %s" % (type(e).__name__, e))
+                QMessageBox.warning(self, T( T("码表")), "%s: %s" % (type(e).__name__, e))
             self.refresh()
 
     # ---------------- 右键菜单 ----------------
@@ -1076,13 +1132,13 @@ class CueSheetPanel(QWidget):
         """绑到图层…：选一个现有图层，把它变成码表图层并装上这张表。"""
         paths = self._sel_paths()
         if not paths:
-            QMessageBox.information(self, T("绑到图层"), T("请先选中一张码表。"))
+            QMessageBox.information(self, T( T("绑到图层")), T("请先选中一张码表。"))
             return
         path = paths[0]
         e = self._entry_for(path) or {"path": path}
         lays = list(getattr(self.engine, "layers", None) or [])
         if not lays:
-            QMessageBox.information(self, T("绑到图层"), T("当前没有图层。"))
+            QMessageBox.information(self, T( T("绑到图层")), T("当前没有图层。"))
             return
         dlg = QDialog(self)
         dlg.setWindowTitle(T("绑到图层"))
@@ -1117,14 +1173,14 @@ class CueSheetPanel(QWidget):
         try:
             import cue_ui
         except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, T("绑到图层"),
+            QMessageBox.warning(self, T( T("绑到图层")),
                                 Tf("加载码表模块失败：{}", str(e)))
             return False
         ok, msg = cue_ui.load_and_bind(self.owner, path, layer, parent=self)
         self._after_layers_changed()
         self.refresh()
         if msg:
-            QMessageBox.warning(self, T("绑到图层"), msg)
+            QMessageBox.warning(self, T( T("绑到图层")), msg)
         elif ok:
             self._flash(Tf("已把「{}」绑到图层「{}」。",
                            sheet_label(self._entry_for(path) or {"path": path}),

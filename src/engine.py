@@ -307,7 +307,7 @@ BLEND_LABELS = {
     "add": "添加",
     "subtract": "减少",
     "screen": "屏幕",
-    "multiply": "多层",
+    "multiply": "正片叠底",
     "lighten": "变亮",
     "darken": "变暗",
 }
@@ -465,7 +465,14 @@ class Layer:
         self.order_i = 0
 
     def close_all(self):
-        """关闭本图层所有解码器（图层删除/重建时调用）"""
+        """关闭本图层所有解码器（图层删除/重建时调用）。
+
+        ★★ 2026-10-19 审计修复：**码表专用解码器必须一起关**。
+          码表图层的播放器存在 `_cue_players`（不在 `self.cache` 里，见 `_cue_get_player`）。
+          旧实现只关 cache ⇒ 图层被移除后 `_cuesheet_tick` 不再遍历它，
+          这些播放器**保持 active 继续满速解码读盘**，直到进程退出才回收
+          —— 正是 2026-09-30「12 核跑满 / 磁盘 750MB/s」那起事故的形态。
+        """
         if self.player:
             self.player.close()
         if self.prev_player:
@@ -476,6 +483,21 @@ class Layer:
         self.cache.clear()
         self.player = None
         self.prev_player = None
+        # ---- 码表侧：先失活（不 decode 了）再 close，最后清引用 ----
+        for q in list((getattr(self, "_cue_players", None) or {}).values()):
+            try:
+                q.set_active(False)
+            except Exception:                                     # noqa: BLE001
+                pass
+            try:
+                q.close()
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._cue_players = {}
+        self._cue_items = {}
+        self._cue_last_frame = {}
+        self._cue_sub_tmps = {}
+        self.cs_states = []
 
     def to_dict(self):
         return {"name": self.name, "visible": self.visible, "opacity": self.opacity,
@@ -543,6 +565,24 @@ class _CueItemStub:
         return ()
 
 
+# ==========================================================================
+# 码表位置「自由运行」窗口（秒）—— 见 `__init__` 里的说明
+# ==========================================================================
+CUE_FREEWHEEL_SEC = 2.0       # 常规外推窗口（现在只用于判断"是否需要报告"，不再卸画面）
+# ★ 2026-10-18 真机实测：识别偶尔会卡 2~4 秒（低票段），一超 2 秒就卸画面 ⇒
+#   用户看到「码表闪出普通图层零点几秒」。而换歌/静音时本来就该卸。
+#   ⇒ 只要**还是同一首歌**且**没静音**，就一直滑行（上限 CUE_FREEWHEEL_MAX）；
+#     真正释放只由 `sid<0` / 静音>3s / 超上限 触发。
+CUE_FREEWHEEL_MAX = 30.0
+
+# 倍率死区（见 `_cue_auto_position` 里的说明）：±10% 内按原速处理（CUE_RATE_DEADBAND=0.10）
+CUE_RATE_DEADBAND = 0.10
+
+# 演出提前量（秒）：补偿指纹识别的固有滞后（用户 2026-10-18 指定 0.5s）
+CUE_LEAD_SEC = 0.50
+
+
+
 class _CueSubLayer:
     """码表内**单个子层**的轻量替身（**照搬备份 284-317 的完整 `__slots__`**）。
 
@@ -599,7 +639,17 @@ class AutoVJEngine(QObject):
     def __init__(self, config, audio_state, media_library, parent=None):
         super().__init__(parent)
         self.cfg = config
+        # ★★★ 2026-10-17 复盘（本项目代价最高的一次"接线错位"）：
+        #   `self.audio` **不是 AudioEngine，而是 AudioState 本身**（`ui_main.py:2267`
+        #   传的是 `self.audio.state`）。历史上本文件多处按 "self.audio 是引擎" 写成了
+        #   `getattr(self.audio, "state", None)` ⇒ 恒为 None ⇒ 码表自动跟拍**永远读到 -1**，
+        #   而所有单测都自己塞了带 `.state` 的假对象 ⇒ 测试全绿、现场全黑。
+        #   铁律：**凡"某字段恒为 -1/0/None"先验证取数对象本身存不存在**（`getattr` 默认值
+        #   会把"取错了对象"和"还没数据"伪装成同一件事）。
         self.audio = audio_state
+        # 真正的音频引擎（读 `_recognizer_engine` 等内部态用）。由 MainWindow 注入，
+        # 未注入时为 None ⇒ 调用方必须能退化成"只读 `self.audio` 的公开状态"。
+        self._audio_engine = None
         self.library = media_library
         self.layers = []
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
@@ -612,6 +662,14 @@ class AutoVJEngine(QObject):
         #     `match_track()` 五级链（含 md5/指纹）认出来的，不靠本机文件名猜。
         self._cue_rt = None         # cuesheet_runtime.CueRuntime
         self._cue_media = {}        # clip_id → 磁盘路径
+        # ★★★ 2026-10-17：码表素材的 **alpha 事实表**（磁盘路径 → 是否带 alpha）。
+        #   根因：码表包解压出来的素材**没有本地缩略图缓存**，而 `create_video_player()`
+        #   的免费判据就是"缩略图是 PNG 才算带 alpha"。没有缩略图 ⇒ 判 False ⇒ 用 OpenCV
+        #   解码 ⇒ **透明通道被丢掉，透明区变成不透明黑**。现场表现两个：
+        #     ① 上层（LOGO/PNG）把下层的 BGA 整片盖成黑 ⇒ 用户说"多层编排没实现"；
+        #     ② 淡出结束那一瞬整块黑 ⇒ 用户说"先黑屏才切出到其他层"。
+        #   而 `.ercue` 里 `media[].has_alpha` 是**编排端探测好的权威结论**，直接用，零成本。
+        self._cue_alpha = {}
         self._cue_pos_beats = None  # 本帧拍位（S3 只初始化，S4 才写）
         self._cue_pos_src = ""      # 位置来源（fingerprint / deck）
         self._cue_sid = -1          # 当前曲目 sid（换歌要重建 runtime）
@@ -620,8 +678,23 @@ class AutoVJEngine(QObject):
         self._cue_index = None      # 码表索引（曲目→码表；**只存摘要**，见 src/cue_index.py）
         # ---- 自动跟拍（Step3）：指纹位置 → 拍位 ----
         self._cue_pos_tracker = CuePositionTracker()
+        # ★★★ 2026-10-18（用户："码表图层偶尔突然消失零点几秒"）：
+        #   **自由运行（freewheel）** —— 广播 genlock 的标准做法：
+        #   位置源短时丢票时，**保持最后位置并继续按速率外推**，画面接着走；
+        #   超过 CUE_FREEWHEEL_SEC 才真正释放（卸画面）。
+        #   旧行为：`status="lost"` ⇒ `pb=None` ⇒ `_cuesheet_tick` 清空 `cs_states`
+        #   ⇒ 整块画面**直接消失**，恢复后再淡入 ⇒ 用户看到"闪一下/黑零点几秒"。
+        self._cue_fw_pos = None      # 最后一次可信拍位
+        self._cue_fw_t = 0.0         # 该拍位的时刻
+        self._cue_fw_rate = 1.0      # 当时的播放速率（外推用）
         self._cue_pos_next_t = 0.0     # 下次轮询时刻（0.2s 一次，**不进 compose**）
         self._cue_pos_song = -1        # 当前自动跟拍的歌（song_id）
+        self._cue_fw_on = False        # 本帧是否在自由运行（取证用）
+        self._cue_tick_why = ""        # 本帧没接管的原因（取证用）
+        # ★ 帧级暗场计时（用户："码表偶尔消失零点几秒"）—— 2s 一行的日志量不出来，靠这个
+        self._cue_dark_t0 = None       # 本轮"本该出画却没出"的起始时刻
+        self._cue_dark_max = 0.0       # 历史最长连续暗场（秒）
+        self._cue_dark_n = 0           # ≥50ms 的暗场次数
         self._cue_auto_sheet = ""      # 自动装上的表（路径）；"" = 没装
         self._cue_manual_clock = False # 手动起拍生效中 ⇒ 自动位置让位（兜底优先）
         _cue_cfg = (self.cfg.get("cue") if isinstance(self.cfg, dict) else None) or {}
@@ -867,6 +940,17 @@ class AutoVJEngine(QObject):
     def set_song_genres(self, lookup):
         """注入 song_id → {"genres":[...], ...} 映射（指纹识别到歌时取精确曲风）。ui_main 在曲库就绪后调用。"""
         self._song_genre_lookup = lookup or {}
+
+    def set_audio_engine(self, audio_engine):
+        """注入**音频引擎**本体（不是它的 state）。ui_main 在构造本对象后立刻调用。
+
+        为什么要单独一个入口（2026-10-17）：`__init__` 的第二个参数 `audio_state` 传进来的是
+        `AudioEngine.state`（AudioState），拿不到 `_recognizer_engine.current_song_id` ——
+        那是"电荷条确认后**稳定**的歌 id"，而 `state.recognized_song_id` 会被逐拍覆写。
+        码表自动跟拍必须两者都能读，所以引擎本体要单独拿到手。
+        未注入时一切逻辑退化成"只读 state"，不会抛异常。
+        """
+        self._audio_engine = audio_engine
 
     @_locked
     def set_song_grids(self, mapping):
@@ -1378,7 +1462,9 @@ class AutoVJEngine(QObject):
         # 深拷贝一帧再发射：GUI 只读这份独立数据，worker 不再碰它，彻底消除跨线程抢画布竞态
         w, h = self.canvas.width(), self.canvas.height()
         frame = QImage(w, h, QImage.Format_RGB32)
-        frame.fill(0)
+        # ★ 2026-10-19 性能：**删掉整幅清零**。下面紧接着就对整幅做 copy，
+        #   这次 fill(0) 是纯浪费 —— 实测 1080p 3.33ms/帧、4K 18.03ms/帧（同内容 memcpy 仅 0.64ms）。
+        #   这里故意不清零，别以为漏了又加回来。
         try:
             np.copyto(np.frombuffer(frame.bits(), np.uint8, frame.sizeInBytes()),
                       np.frombuffer(self.canvas.constBits(), np.uint8, self.canvas.sizeInBytes()))
@@ -2700,14 +2786,61 @@ class AutoVJEngine(QObject):
             lay._cue_players = cache
         q = cache.get(clip.path)
         if q is not None:
-            if hasattr(q, "set_max_size"):
+            # ★★ 2026-10-17（铁律 0）：**alpha 结论变了就必须重开解码器**。
+            #   为什么需要：`create_video_player()` 在没有缩略图、后台探测也没回填时
+            #   会"先按无 alpha 用起来"（OpenCV ⇒ 丢透明 ⇒ 透明区变不透明黑）。
+            #   后台 `_probe_alpha_async` 后来回填 `_has_alpha=True` 并置 `_alpha_recheck`，
+            #   但 `_cue_get_player` 原来**完全不看这个标记** ⇒ 一旦用错解码器就整场不再纠正
+            #   （普通图层的 `_get_player` 有这个逻辑，码表路径漏了）。
+            #   逐出顺序仍是三件套：set_active(False) → close() → 从 dict 删引用。
+            try:
+                _want = getattr(clip, "_has_alpha", None)
+                _had = getattr(q, "_cue_alpha_used", None)
+                if (getattr(clip, "_alpha_recheck", False) and _want is not None
+                        and (_had is None or bool(_want) != bool(_had))):
+                    clip._alpha_recheck = False
+                    cache.pop(clip.path, None)
+                    try:
+                        q.set_active(False)
+                    except Exception:                             # noqa: BLE001
+                        pass
+                    try:
+                        q.close()
+                    except Exception:                             # noqa: BLE001
+                        pass
+                    q = None
+                else:
+                    if _had is None and _want is not None:
+                        q._cue_alpha_used = bool(_want)
+                    if hasattr(q, "set_max_size"):
+                        q.set_max_size(mw, mh)
+                    return q
+            except Exception:                                     # noqa: BLE001
+                pass
+            if q is not None and hasattr(q, "set_max_size"):
                 q.set_max_size(mw, mh)
-            return q
+            if q is not None:
+                return q
         # ★ cue=True：码表场景的 DXV 不走 GPU（GPU 播放器没有 position/seek）
         q = make_player(clip, cue=True)
+        try:
+            q._cue_alpha_used = getattr(clip, "_has_alpha", None)
+        except Exception:                                         # noqa: BLE001
+            pass
         if hasattr(q, "set_max_size"):
             q.set_max_size(mw, mh)
         cache[clip.path] = q
+        # ★★★ 2026-10-17：**新开的解码器一律标"待落地"**。
+        #   为什么必须：播放器新建时从 **0 秒**开始，而此刻 `ps.play_sec` 往往已经在片段
+        #   中段（例如 LOGO 循环第 6.5 秒）⇒ 不 seek 就永远差 6.5 秒。
+        #   旧代码靠 `should_seek` 的"换片段"分支落地，但那个分支只在 `item_id` 变化时触发
+        #   —— 解码器被逐出/因 alpha 纠正而重建时 `item_id` 没变 ⇒ **永远不补 seek**
+        #   （实测：LOGO 层 `d` 稳定在 6.6 秒，画面与编排差 6 秒）。
+        #   ⇒ 由 `_cue_frame` 见到这个标记就立刻 `seek(ps.play_sec)` 并记账。
+        try:
+            q._cue_need_seek = True
+        except Exception:                                         # noqa: BLE001
+            pass
         cap = max(32, len(getattr(self, "_cue_media", None) or {}) + 16)
         while len(cache) > cap:
             act = {getattr(st, "clip_path", "") for st in
@@ -2743,6 +2876,17 @@ class AutoVJEngine(QObject):
         self.clear_cue_sheet(silent=True)
         self._cue_sheet = sheet
         self._cue_media = dict(media_paths or {})
+        # ★ 用包内 `media[].has_alpha` 建 alpha 事实表（见 `__init__` 的说明）。
+        #   键是**解压后的实际路径**，与 `_cue_item()` 拿到的 `ps.clip_path` 同源。
+        self._cue_alpha = {}
+        if sheet is not None:
+            try:
+                for _m in (getattr(sheet, "media", None) or []):
+                    _pth = self._cue_media.get(getattr(_m, "clip_id", "") or "")
+                    if _pth:
+                        self._cue_alpha[str(_pth)] = bool(getattr(_m, "has_alpha", False))
+            except Exception:                                     # noqa: BLE001
+                self._cue_alpha = {}
         if track is None and sheet is not None:
             try:
                 track = sheet.track_by_identity(track_title, track_artist,
@@ -2779,6 +2923,7 @@ class AutoVJEngine(QObject):
         self._cue_bad_song_n = 0
         self._cue_rt = None
         self._cue_media = {}
+        self._cue_alpha = {}
         self._cue_pos_beats = None
         self._cue_pos_src = ""
         self._cue_sid = -1
@@ -2821,6 +2966,14 @@ class AutoVJEngine(QObject):
         idn = getattr(track, "identity", None)
         lays = [l for l in (getattr(self, "layers", None) or [])
                 if getattr(l, "is_cuesheet", False)]
+        # ★ 2026-10-18：把"此刻有几层在画"暴露出去（HUD/日志都用它回答"多层到底有没有生效"）。
+        #   容器层一帧里可能同时画多个子层，用户光看画面难判断是"只有一层"还是"多层都在"。
+        n_states = n_act = 0
+        for l in lays:
+            for ps in (getattr(l, "cs_states", None) or []):
+                n_states += 1
+                if getattr(ps, "active", False) and not getattr(ps, "missing", False):
+                    n_act += 1
         return {
             "loaded": sheet is not None,
             "title": str(getattr(sheet, "title", "") or ""),
@@ -2833,6 +2986,8 @@ class AutoVJEngine(QObject):
             "rt_items": int(getattr(rt, "n_items", 0) or 0) if rt is not None else 0,
             "bound_layers": [l.name for l in lays],
             "active_layers": [l.name for l in lays if getattr(l, "cs_active", False)],
+            "sub_states": n_states,
+            "sub_active": n_act,
             "closed_last": int(getattr(self, "_cue_closed_last", 0) or 0),
         }
 
@@ -3158,7 +3313,8 @@ class AutoVJEngine(QObject):
             if now - t < 2.0:
                 return
             self._cue_diag_t = now
-            st = getattr(getattr(self, "audio", None), "state", None)
+            # ⚠ `self.audio` 就是 AudioState（见 `__init__` 的说明），不能取 `.state`
+            st = getattr(self, "audio", None)
             # ⚠ 不能用 `getattr(..., -1.0) or -1.0`：`silent_sec == 0.0`（**有声音**）会被
             #   `or` 变成 -1.0 ⇒ 日志显示"没见过声音"，与事实相反（本行第一版就踩了这个）。
             silent = -1.0
@@ -3172,15 +3328,59 @@ class AutoVJEngine(QObject):
             tr = getattr(self, "_cue_track", None)
             idn = getattr(tr, "identity", None) if tr is not None else None
             n_items = int(getattr(rt, "n_items", 0) or 0) if rt is not None else 0
+            # ★ 2026-10-18：**子层实况** —— 用户报"多层编排没看见"时，这一行是唯一判据：
+            #   `sub=3/2` 表示"这一帧有 3 个子层状态、其中 2 个真的在画"；
+            #   `dmax` = 各子层 |play_sec − 播放器实际位置| 的最大值（秒）；
+            #   `spd` = 实际下发的倍速范围（能看出实时变速对齐有没有在工作）。
+            n_states = n_act = 0
+            dmax = -1.0
+            spd_lo, spd_hi = 9.9, -9.9
+            for _l in (getattr(self, "layers", None) or []):
+                if not getattr(_l, "is_cuesheet", False):
+                    continue
+                _pls = getattr(_l, "_cue_players", None) or {}
+                for _ps in (getattr(_l, "cs_states", None) or []):
+                    n_states += 1
+                    if not (getattr(_ps, "active", False) and not getattr(_ps, "missing", False)):
+                        continue
+                    n_act += 1
+                    _p = _pls.get(getattr(_ps, "clip_path", "") or "")
+                    try:
+                        _pp = _p.position() if _p is not None else None
+                    except Exception:                            # noqa: BLE001
+                        _pp = None
+                    if _pp is not None:
+                        dmax = max(dmax, abs(float(_ps.play_sec) - float(_pp)))
+                    try:
+                        _sp = float(getattr(_p, "speed", 1.0) or 1.0)
+                        spd_lo = min(spd_lo, _sp)
+                        spd_hi = max(spd_hi, _sp)
+                    except (TypeError, ValueError):
+                        pass
+            # ★ 2026-10-18（变速真机验证）`r=` = 位置层实测的**音乐播放倍率**（前馈基准）。
+            #   有了它才能证明"音乐变速时码表按同一时间基走"，而不是靠 dmax 反推。
+            #   ⚠ 本函数里没有 `_f`（那是 `_cue_auto_position` 里的局部函数），这里就地兜住。
+            _trk = getattr(self, "_cue_pos_tracker", None)
+            try:
+                _rv = float(getattr(_trk, "rate", 1.0))
+            except (TypeError, ValueError):
+                _rv = 1.0
             line = ("[%s] silent=%.1fs sid=%s votes=%d off=%.2f status=%s pb=%s "
-                    "| sheet=%d track=%s rt=%d items=%d pos=%s"
+                    "| sheet=%d track=%s rt=%d items=%d pos=%s sub=%d/%d dmax=%.2f spd=%s fw=%d why=%s r=%.3f dark=%.2f/%d"
                     % (time.strftime("%H:%M:%S"), silent, sid, int(votes or 0),
                        float(off if off is not None else -1.0), status,
                        ("%.1f" % pb) if pb is not None else "None",
                        1 if getattr(self, "_cue_sheet", None) is not None else 0,
                        (str(getattr(idn, "title", "") or "?")[:14]) if idn else "None",
                        1 if rt is not None else 0, n_items,
-                       str(getattr(self, "_cue_pos_src", "") or "-")))
+                       str(getattr(self, "_cue_pos_src", "") or "-"),
+                       n_states, n_act, dmax,
+                       ("%.2f~%.2f" % (spd_lo, spd_hi)) if spd_hi > -9 else "-",
+                       1 if getattr(self, "_cue_fw_on", False) else 0,
+                       (getattr(self, "_cue_tick_why", "") or "-"),
+                       _rv,
+                       float(getattr(self, "_cue_dark_max", 0.0) or 0.0),
+                       int(getattr(self, "_cue_dark_n", 0) or 0)))
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
@@ -3380,6 +3580,61 @@ class AutoVJEngine(QObject):
                 bpm = 0.0
         return (60.0 / bpm) if bpm > 0 else 1.0
 
+    def _cue_match_track_local(self, query):
+        """在**当前已装的**码表里按 `query` 重新认曲目 ⇒ `(是否就是当前曲目, 认到的 TrackEntry)`。
+
+        为什么要它：同一张 `.ercue` 里有多首歌时，换歌必须重绑曲目（见 `_cue_auto_bind`）。
+        这里只查已加载的 `_cue_sheet`，**不读盘、不解压**。
+        """
+        tr_cur = getattr(self, "_cue_track", None)
+        sheet = getattr(self, "_cue_sheet", None)
+        if sheet is None:
+            return False, None
+        try:
+            q = query or {}
+            tr, _lvl = sheet.match_track(
+                title=str(q.get("title", "") or ""),
+                artist=str(q.get("artist", "") or ""),
+                duration_sec=float(q.get("duration_sec", 0.0) or 0.0),
+                fp_id=str(q.get("fp_id", "") or ""),
+                file_name=str(q.get("file_name", "") or ""),
+                file_md5=str(q.get("file_md5", "") or ""))
+        except Exception:                                        # noqa: BLE001
+            return False, None
+        if tr is None:
+            return False, None
+        return (tr is tr_cur), tr
+
+    def _cue_rebind_track(self, tr):
+        """**同一张码表内换曲目**：只重建运行时，一个解码器都不关。
+
+        为什么不直接 `set_cue_sheet()` 重装：那条路会 `clear_cue_sheet()` ⇒ 把该图层
+        所有码表解码器关掉（下次要重开，70~690ms 首帧黑）——换歌时完全没必要。
+        """
+        if tr is None:
+            return False
+        self._cue_track = tr
+        self._cue_bound_cache = None
+        self._cue_bad_song_n = 0
+        self._cue_bad_song_t = 0.0
+        self._cue_rt = None
+        try:
+            import cuesheet_runtime as _cr
+            self._cue_rt = _cr.CueRuntime(self._cue_sheet, tr,
+                                          media_paths=self._cue_media)
+        except Exception as e:                                    # noqa: BLE001
+            self._cue_health("换曲目失败（%s）：%s: %s"
+                             % (getattr(getattr(tr, "identity", None), "title", "?"),
+                                type(e).__name__, e))
+            self._cue_rt = None
+        # 片段全换了 ⇒ seek 状态（落地/降级/节流）必须清空，否则新片段继承旧状态
+        try:
+            if getattr(self, "_cue_policy", None) is not None:
+                self._cue_policy.reset()
+        except Exception:                                         # noqa: BLE001
+            pass
+        return self._cue_rt is not None
+
     def _cue_auto_bind(self, path, query):
         """自动选表 + 装表（换表）；没有候选 ⇒ **卸表**（明确策略，不静默保留错表）。"""
         hits = self.cue_sheets_for_track(**query)
@@ -3405,7 +3660,21 @@ class AutoVJEngine(QObject):
             return False
         want = str(pick.get("path") or "")
         if want and want == self._cue_auto_sheet:
-            return True                       # 已经是这张表，别重装（重装会重建解码器缓存）
+            # ★★★ 2026-10-17（用户："Nimbus 能识别但是 era 里没有码表编排的画面"）：
+            #   旧写法只要**包路径没变**就直接 `return True` —— 于是一张包里有多首曲目时，
+            #   换歌**永远不会重绑曲目**，一直用上一首的编排：
+            #     · 现场日志 `sid=216601071`（Nimbus）却 `track=揽月 rt=1 items=10`；
+            #     · 然后"认错歌护栏"发现 sid 不属于揽月 ⇒ `pb=None` ⇒ **一幅画面都不出**。
+            #   ⇒ 必须再比一次**曲目**：包相同但曲目不同 ⇒ 只重建运行时（不关解码器）。
+            if self._cue_sheet is not None and self._cue_track is not None:
+                _same, _tr = self._cue_match_track_local(query)
+                if _same:
+                    return True                 # 表与曲目都对 ⇒ 什么都不做
+                if _tr is not None:
+                    ok = self._cue_rebind_track(_tr)
+                    self._cue_auto_sheet = want if ok else ""
+                    return ok
+            # 表在但曲目认不出来 / 没有表对象 ⇒ 落到下面走完整重装（最稳妥）
         try:
             import cuesheet
             media_dir = ""
@@ -3454,7 +3723,14 @@ class AutoVJEngine(QObject):
         if now < float(getattr(self, "_cue_pos_next_t", 0.0) or 0.0):
             return ("skip", None)
         self._cue_pos_next_t = now + 0.2
-        st = getattr(getattr(self, "audio", None), "state", None)
+        # ⚠⚠ 2026-10-17 根因：这里原本是 `getattr(getattr(self, "audio", None), "state", None)`。
+        #   但 `self.audio` **就是** AudioState（MainWindow 传的是 `self.audio.state`），它没有
+        #   `.state` 属性 ⇒ 恒 None ⇒ 下面每个字段都取到默认值 ⇒ `sid=-1 votes=0 off=-1`
+        #   ⇒ 状态永远 `lost` ⇒ **码表图层从导入那一刻起就没演出过**。
+        #   取证的铁证：同一秒里 `[R] cur=346225955`（认歌线程确认了）而 `_cue_diag` 写
+        #   `sid=-1 votes=0 silent=-1.0s` —— `silent=-1.0` 是"对象不存在"的默认值，
+        #   不是"没声音"（真没声音时 `[R]` 会是 silent>0，这里是 0.0）。
+        st = getattr(self, "audio", None)
 
         # ⚠ 不能写 `int(x or -1)`：`song_id == 0` 是**合法**的（第一首），`0 or -1` 会变成 -1
         #   ⇒ 表现为"明明识别到了，却一直当没歌"。这类 bug 只在"歌的 id 恰好是 0"时出现。
@@ -3476,8 +3752,11 @@ class AutoVJEngine(QObject):
         #   （现场 `sheet=1 track=None rt=0`，本地已复现）。
         #   电荷条引擎里的 `current_song_id` 才是**确认后稳定**的那个值 ⇒ 作为兜底。
         if sid < 0:
-            _eng2 = getattr(getattr(self, "audio", None), "_recognizer_engine", None)
+            _eng2 = getattr(self, "_audio_engine", None)
             _cur2 = getattr(_eng2, "current_song_id", None)
+            if _cur2 is None:
+                _cur2 = getattr(getattr(_eng2, "_recognizer_engine", None),
+                                "current_song_id", None)
             if _cur2 is not None:
                 try:
                     sid = int(_cur2)
@@ -3486,9 +3765,28 @@ class AutoVJEngine(QObject):
         off = _f(getattr(st, "recognized_offset", -1.0), -1.0)
         votes = _i(getattr(st, "recognized_votes", 0), 0)
         rate = _f(getattr(st, "recognized_rate", 1.0), 1.0)
+        # ★★★ 2026-10-18（用户："码表视频还是会慢 跟不上音频"）——**用节拍钟 BPM 校正倍率**。
+        #   现场取证（用户自己的 cue_health.log，西行谣）：
+        #     · `pb` 74 秒只推进 172.1 拍 = 72.7 秒内容 ⇒ **0.983×，累积慢 1.3 秒**
+        #     · 同一段时间 `r=0.970`，而节拍钟全程稳定 `bpm=142.5`（码表 142）
+        #   根因：指纹 `off` 是**约 4 秒一格的阶梯**（低票时确认慢），拿它求斜率噪声大且偏低
+        #   ⇒ `r` 掉到 0.97 ⇒ 码表既按 0.97 外推、播放器也按 0.97 播 ⇒ **视频比音频慢 1.7%**。
+        #   ⚠⚠ 2026-10-18 更深的复盘：**用 BPM 校正这条路是错的**，已停用（原 `_cue_rate_with_bpm` 已删除）。
+        #   原因：节拍钟读的是**文件真实 tempo**（143.5），而码表里写的是 142 —— 两者本来就可能
+        #   不一致（码表 BPM 是用户填的/估算的）。拿 `bpm / 码表bpm` 当倍率会凭空多出 1%，
+        #   真机上实测把位置推快了 1%，累积 3.6 秒。⇒ 倍率只能来自**指纹 offset 自己的斜率**
+        #   （它是文件自身时间轴，与码表 BPM 无关）。
+        # rate 只用指纹估计（见上）
+        # ★★★ 2026-10-18（第四稿，真机反复量出来的结论）：**倍率死区**。
+        #   指纹 offset 是 2~4 秒一格的阶梯，1 分钟内估出来的倍率噪声约 **±3%**
+        #   —— 和"1% 级的速度偏差"同量级，再精调参数只会让它在 0.94~1.09 之间摆。
+        #   ⇒ |r−1| ≤ 5% 一律按**原速**处理（DJ 推子通常就在 0；真 ±10%/±20% 变速远超死区，
+        #     照常跟）。这样"稳定播放"时倍率恒为 1.000，不会被噪声带着慢慢漂。
         path = self._cue_song_path(sid)
         trk = self._cue_pos_tracker
-        trk.rate = rate if rate > 0 else 1.0
+        rate = rate if rate > 0 else 1.0
+        self._cue_rate_raw = rate               # 取证：未经死区的原始估计
+        trk.rate = 1.0 if abs(rate - 1.0) <= CUE_RATE_DEADBAND else rate
         # ★★★ 拍长必须与「真正消费 pos_beats 的那个 runtime」**同一来源**（2026-10-17 复盘）
         #
         # 为什么 BPM 本身不影响对拍：整条链上它是**纯单位换算**，两端用同一个常数就完全抵消。
@@ -3550,11 +3848,34 @@ class AutoVJEngine(QObject):
             if _q2:
                 self._cue_auto_bind(path, _q2)
         pb = self._cue_accept_pos(sid, pb)
+        # ★★ 自由运行（freewheel）：丢票不立刻卸画面，先按最后速率外推一小段
+        _fw = False
+        if pb is not None:
+            try:
+                self._cue_fw_pos = float(pb)
+                self._cue_fw_t = now
+                self._cue_fw_rate = float(rate) if rate and rate > 0 else 1.0
+            except (TypeError, ValueError):
+                self._cue_fw_pos = None
+        elif (getattr(self, "_cue_fw_pos", None) is not None and self._cue_rt is not None
+                and self._cue_track is not None):
+            _dt = now - float(self._cue_fw_t or 0.0)
+            # ★ 释放条件只有三个（等于"真丢了"）：没歌/换歌、静音太久、超过滑行上限。
+            #   只要还是同一首、还有声音 ⇒ **继续滑行**，绝不因为"识别卡了几秒"就卸画面。
+            _silent = _f(getattr(st, "silent_sec", None), 0.0)
+            _alive = (sid >= 0) and (_silent <= 3.0) and (_dt <= CUE_FREEWHEEL_MAX)
+            if _alive:
+                _bl = self._cue_pos_beat_len() or 1.0
+                pb = float(self._cue_fw_pos) + _dt * float(self._cue_fw_rate or 1.0) / _bl
+                _fw = True
+            else:
+                self._cue_fw_pos = None      # 真丢 ⇒ 允许卸画面
+        self._cue_fw_on = _fw
         self._cue_diag(sid, votes, off, status, pb, now)
         if pb is not None:
             self.set_cue_position(pb, "fp")
         else:
-            # 丢了（超容忍期）⇒ 不接管；**表与徽标保留**（用户回到这首歌能立刻继续）
+            # 真丢了（超过自由运行窗口）⇒ 不接管；**表与徽标保留**（回来能立刻继续）
             self.set_cue_position(None, "fp")
         return (status, pb)
 
@@ -3656,6 +3977,30 @@ class AutoVJEngine(QObject):
         vis = [l for l in lays if getattr(l, "visible", True)]
         rt = self._cue_rt
         pos = self._cue_pos_beats
+        # ★★★ 2026-10-18（用户："识别的延迟问题，给码表层演出加 0.5s 的提前"）
+        #   放在这里（`update()` 的唯一入口）而不是位置层：
+        #     · 这里的 `rt.beat_len` 一定可用（退化 0 的情况已排除），换算准确；
+        #     · 只影响"演出"（选片段 + play_sec + 播放器落点），不污染位置层的误差计算。
+        #   要调就改 `CUE_LEAD_SEC`（秒）。
+        if pos is not None:
+            try:
+                _bl1 = float(getattr(rt, "beat_len", 0.0) or 0.0)
+                if _bl1 > 1e-6:
+                    pos = float(pos) + float(CUE_LEAD_SEC) / _bl1
+            except (TypeError, ValueError):
+                pass
+        # ★ 2026-10-18（真机联调）：记住"本帧为什么没接管"，供 `_cue_diag` 输出。
+        #   码表图层**闪出普通图层**只有三条路径：没表 / 没位置 / 没可见层。
+        #   不把这条记下来，现场只能看到 `sub=0`，分不清是哪一种。
+        if rt is None:
+            self._cue_tick_why = "no_rt"
+        elif pos is None:
+            self._cue_tick_why = ("no_pos_fw" if getattr(self, "_cue_fw_on", False)
+                                  else "no_pos")
+        elif not vis:
+            self._cue_tick_why = "hidden"
+        else:
+            self._cue_tick_why = ""
         if rt is None or pos is None or not vis:
             for lay in lays:
                 if lay.cs_states:
@@ -3664,7 +4009,20 @@ class AutoVJEngine(QObject):
                 self._cue_set_active(lay, set())   # ★ 不接管 ⇒ 全部失活（别让解码器白烧 CPU）
             return
         try:
-            states = rt.update(pos)
+            # ★ 2026-10-18：把**输入音乐的播放速率**一并传进去 —— 码表把播放器倍速
+            #   写成 `it.speed × 它`，于是"位置源"和"播放器"共用同一个时间基，
+            #   音乐降速/变速时不会结构性越差越远（详见 `CueRuntime.update` 里的注释）。
+            #   取不到就是 1.0（与改动前逐值一致）。
+            _r = 1.0
+            try:
+                # ⚠ 必须 `getattr(self, "_cue_pos_tracker", None)` 两层取：
+                #   直接写 `getattr(self._cue_pos_tracker, ...)` 在桩对象上没有该属性时
+                #   仍然会抛 AttributeError（外层 getattr 的默认值救不了它）。
+                _trk = getattr(self, "_cue_pos_tracker", None)
+                _r = float(getattr(_trk, "rate", 1.0) or 1.0)
+            except (TypeError, ValueError, AttributeError):
+                _r = 1.0
+            states = rt.update(pos, rate=_r)
             self._cue_jumped = bool(getattr(rt, "jumped", False))
             self._cue_tick_fail = 0
         except Exception as e:                                    # noqa: BLE001
@@ -3682,6 +4040,31 @@ class AutoVJEngine(QObject):
         paths = {ps.clip_path for ps in states
                  if getattr(ps, "active", False) and getattr(ps, "clip_path", "")
                  and not getattr(ps, "missing", False)}
+        # ★★★ 2026-10-18（用户："码表偶尔会突然消失零点几秒"）——**帧级暗场计时**。
+        #   为什么必须单独做：`_cue_diag` 是 **2s 一行**，抓不到"不出画持续了多久"
+        #   （88 个采样里那 1 行 `sub=3/0` 到底是 16ms 还是 400ms，完全看不出来）。
+        #   这里逐帧累计：码表本该出画（有 rt、有位置、层可见）但**没有任何子层在画**
+        #   的连续时长，记最大值 + ≥50ms 的次数。热路径只做几个浮点运算，无锁、无 IO。
+        try:
+            _now = time.perf_counter()
+            # "该出画却没出画"：表已装上（rt 有）、层可见，但没有任何子层在画。
+            # ⚠ 必须包含 `pos is None` 的情形 —— 那正是 `_cuesheet_tick` 提前 return、
+            #   把 `cs_states` 清空、码表层整块消失（= 切出普通图层）的路径。
+            _dark = bool(rt is not None and vis) and not on_any
+            if _dark:
+                if getattr(self, "_cue_dark_t0", None) is None:
+                    self._cue_dark_t0 = _now
+            else:
+                _t0d = getattr(self, "_cue_dark_t0", None)
+                if _t0d is not None:
+                    self._cue_dark_t0 = None
+                    _dur = _now - float(_t0d)
+                    if _dur > float(getattr(self, "_cue_dark_max", 0.0) or 0.0):
+                        self._cue_dark_max = _dur
+                    if _dur >= 0.05:          # 50ms 以上才计数（1~2 帧属正常过渡）
+                        self._cue_dark_n = int(getattr(self, "_cue_dark_n", 0) or 0) + 1
+        except Exception:                                     # noqa: BLE001
+            pass
         for lay in lays:
             on = bool(getattr(lay, "visible", True)) and on_any
             lay.cs_states = states if on else []
@@ -3705,6 +4088,17 @@ class AutoVJEngine(QObject):
                 it = MediaItem(path)
             except Exception:                                     # noqa: BLE001
                 it = _CueItemStub(path)
+            # ★★★ 2026-10-17：把码表包里的 `has_alpha` **当天条**写进 MediaItem，
+            #   否则 `create_video_player()` 会因为"本地没有缩略图"而判 False ⇒ 用 OpenCV
+            #   解码 ⇒ 透明区变不透明黑（整层盖住下层 = 多层看起来没生效 + 淡出末尾黑屏）。
+            try:
+                _al = getattr(self, "_cue_alpha", None) or {}
+                if path in _al:
+                    it._has_alpha = bool(_al[path])
+                    # 明确告诉后面的重开判据：这个结论来自包内元数据，不是"猜的"
+                    it._cue_alpha_src = "pkg"
+            except Exception:                                     # noqa: BLE001
+                pass
             lay._cue_items[path] = it
         xf = xform or {}
         try:
@@ -3722,9 +4116,10 @@ class AutoVJEngine(QObject):
         ★★ 三段式（团队裁定，**别改**）：
           ① **取数据**：item / player / `position()`（实际显示帧的素材内秒）；
           ② **问 policy**：`settle()` 结算上次 seek、`should_seek()` 决定是否要 seek、
-             `on_seek()` 记账、`desired_speed()` 取该设的倍速 —— **判断一行都不在这里**；
+             `on_seek()` 记账、`desired_speed_for()` 取**实时变速对齐**的倍速 ——
+             **判断一行都不在这里**；
           ③ **执行**：`player.seek(play_sec)` / `player.set_speed(want)` / 取帧。
-        为什么必须这样：`tools/cue_should_seek_test.py` 用 26 个用例 + 5 个源码级变异
+        为什么必须这样：`tools/cue_should_seek_test.py` 用 32 个用例 + 5 个源码级变异
         验的就是 `cue_seek_policy` 那套判断。若在这里另写一遍，两套逻辑迟早分叉。
         """
         try:
@@ -3741,23 +4136,80 @@ class AutoVJEngine(QObject):
 
         pol = getattr(self, "_cue_policy", None)
         st = None
+        # ★★ 2026-10-17：**静态图/动图播放器没有 `position()`**（`ImagePlayer`），
+        #   而 policy 每一步都要读它 ⇒ 旧写法每帧抛 AttributeError ⇒ 被下面的 except 吞掉
+        #   ⇒ 那条 `码表 seek 策略异常` 日志刷屏，而且这个图层永远拿不到校正。
+        #   静态图本来就"定位无意义"，直接跳过整个 policy 段（不是降级，是不适用）。
+        # ★★★ 2026-10-18（真机联调）：**解码器回卷检测**。
+        #   素材实际长度常比元数据短一点（例：声明 20.0s，实际 19.85s）⇒ 播到 19.85 时
+        #   播放器 EOF 回卷到 0，而 `play_sec` 还在 19.9 ⇒ 误差 ~19.8s ⇒ 控制器猛冲/seek
+        #   ⇒ **画面抽一下**（真机 `dmax=19.85` 就是这么来的）。
+        #   判据：`pos` 比 `play_sec` 落后"接近整段长度"，且 `play_sec` 已接近素材末尾
+        #   ⇒ 认定回卷：冻结在末尾，不再去追。
+        _dur = 0.0
+        try:
+            _dur = float(getattr(ps, "dur", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _dur = 0.0
+        try:
+            _p_now = player.position() if callable(getattr(player, "position", None)) else None
+        except Exception:                                     # noqa: BLE001
+            _p_now = None
+        if (_dur > 0.5 and _p_now is not None
+                and ps.play_sec > _dur - 0.6
+                and _p_now < ps.play_sec - _dur * 0.4):
+            ps.play_sec = max(0.0, _dur - 0.2)
+            ps.src_ended = True
+        _pos_fn = getattr(player, "position", None)
+        if pol is not None and not callable(_pos_fn):
+            pol = None
         if pol is not None:
             try:
                 st = pol.state_for(ps)
+                # ★★ 新开/重建的解码器必须**先落地**到本片段当前时刻（见
+                #   `_cue_get_player` 里的 `_cue_need_seek`）。不做的话，被逐出或
+                #   因 alpha 纠正重建的播放器会从 0 秒开始播 —— 与编排差好几秒。
+                if getattr(player, "_cue_need_seek", False):
+                    player._cue_need_seek = False
+                    # ★ `off` 档（现场应急关闭定位）**连首次落地都不许** —— 档位判断
+                    #   只能问 policy，不许在这里另写一套（`cue_settings_test` 钉这条）。
+                    if pol.seek_enabled(item):
+                        ok0 = False
+                        try:
+                            # ★ 首次落地也落到"编排目标 + 前馈补偿"（见 sync_target）
+                            ok0 = bool(player.seek(
+                                pol.seek_target(ps) if hasattr(pol, "seek_target")
+                                else ps.play_sec))
+                        except Exception:                      # noqa: BLE001
+                            ok0 = False
+                        pol.on_seek(ps, st, ok0, None)
                 pol.settle(ps, player, st)                     # ②-a 结算上次 seek（落地/超时）
                 if pol.should_seek(ps, item, player, st):      # ②-b 判定（全部在 policy 里）
                     ok = False
                     try:
-                        ok = bool(player.seek(ps.play_sec))    # ③ 只投递，不等待（解码线程执行）
+                        # ★ 落到"编排目标 + 前馈补偿"（见 `cue_seek_policy.sync_target`），
+                        #   不能落到裸 play_sec —— 那样解码管线延迟会一直体现为"画面晚"。
+                        _tgt = (pol.seek_target(ps) if hasattr(pol, "seek_target")
+                                else ps.play_sec)
+                        ok = bool(player.seek(_tgt))           # ③ 只投递，不等待
                     except Exception:                          # noqa: BLE001
                         ok = False
                     pol.on_seek(ps, st, ok, player.position())  # ②-c 记账（带起点，供落地判方向）
                     if not ok:
                         self._cue_health("码表 seek 失败，本片段降级为自由播放：%s"
                                          % ps.clip_path)
-                want = pol.desired_speed(ps)                   # ②-d 计速取值（恒 ps.speed）
+                # ②-d 计速：**实时变速对齐**（小幅漂移用倍速追，不再 seek —— 见
+                #   `cue_seek_policy` 顶部"实时变速对齐"一节）。`pos` 取实际显示帧，
+                #   没有它就只能给名义倍速（旧行为）。
+                try:
+                    _pos_now = player.position()
+                except Exception:                              # noqa: BLE001
+                    _pos_now = None
+                want = pol.desired_speed_for(ps, item, _pos_now)
                 cur = float(getattr(player, "speed", 1.0) or 1.0)
-                if abs(cur - want) > 1e-6:
+                # 量化到 0.5% 才下发：漂移是连续量，逐帧微调会让 `set_speed` 每帧都响
+                # （虽然只是赋值，但没必要；也避免某些播放器在 set_speed 里重置计时器）。
+                if abs(cur - want) > max(0.005, abs(cur) * 0.005) and hasattr(player, "set_speed"):
                     player.set_speed(want)                     # ③ 执行
             except Exception as e:                             # noqa: BLE001
                 # policy 自身出问题也不许把渲染线程带走
@@ -3777,7 +4229,12 @@ class AutoVJEngine(QObject):
             lay._cue_last_frame = cache
 
         # ★ 到出点：**持最后一帧**（不 seek、不越过、不黑）—— 与 Cue 端 timeline A2 一致
-        if getattr(ps, "src_ended", False):
+        # ⚠⚠ 2026-10-22：**GIF 例外**。GIF 播放器（`GifPlayer`）是"自走时钟 + 内部循环"，
+        #   没有 `position()`；一旦这里因为 `src_ended` 返回缓存帧，就会永远停在
+        #   **第一帧**（用户实测："码表里的 GIF 一直卡在第一帧"）。
+        #   GIF 的正确行为是：整段循环播放（Cue 端已允许拉长/掐头去尾），不参与"到出点冻结"。
+        _is_gif_player = bool(getattr(player, "is_gif", False))
+        if getattr(ps, "src_ended", False) and not _is_gif_player:
             last = cache.get(ps.lyr_id)
             if last is not None and not last.isNull():
                 return last

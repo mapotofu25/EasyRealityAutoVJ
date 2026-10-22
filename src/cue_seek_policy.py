@@ -34,6 +34,51 @@ SEEK_TIMEOUT_SEC = 2.0        # 未落地超时 ⇒ 判失败并降级（不再 
 GOP_CONSERVATIVE = 60         # 平均 GOP > 60 帧（≈2s@30fps）⇒ 升保守档
 DEFAULT_FPS = 30.0            # 拿不到 fps 时的兜底（只用于换算"2 帧"容差）
 
+# ==========================================================================
+# ★★★ 音画对齐机制（四级，2026-10-18 定稿）
+# ==========================================================================
+# 用户诉求原文：「默认按编排正常播放；出现明显偏差时用**轻微调整播放速度**平滑对齐；
+#   只有偏差非常明显且微调纠正不了，才强制切换/跳转；要保证正常播放的连续性。」
+#
+# ── 对齐判据（唯一误差定义）────────────────────────────────────────────
+#     e = (play_sec + LEAD) − player.position()
+#   `play_sec`  = 编排在这一刻**应该显示**的素材内秒（由指纹位置推出）
+#   `LEAD`      = 前馈补偿（见下），抵消解码管线的固有延迟
+#   `position()`= 播放器**实际显示帧**的素材内秒（引擎侧读数，唯一可信来源）
+#   e > 0 ⇒ 视频落后于编排；e < 0 ⇒ 视频超前
+#   ⚠ **绝不能拿"上次请求的目标"当基准**（自己跟自己比，永远判不出偏差）。
+#
+# ── 为什么有 LEAD（前馈补偿）─────────────────────────────────────────
+#   `position()` 报的是"最后解出的那一帧"，解码管线天生落后 1~2 帧
+#   （30fps ⇒ 33~66ms）。这段延迟**不是漂移**，靠反馈越追越糟（会让素材永远快 6%）。
+#   前馈一个固定小量（视频略微**早**于音频）主观上最自然：
+#   人耳对"画面早 50ms"几乎无感，对"画面晚 150ms"很敏感（声音先到的心理声学效应）。
+LEAD_SEC = 0.06
+#
+# ── 四级调节策略 ─────────────────────────────────────────────────────
+#   ①   |e| ≤ DEADBAND(0.05)        → 名义倍速，**一个字节都不改**（正常播放零干扰）
+#   ②   DEADBAND < |e| ≤ SOFT(0.30) → **比例变速**：speed = 名义 × (1 + e/CATCHUP)，
+#                                      ±RATE_MAX 封顶。纯 set_speed，画面连续不跳帧。
+#   ③   SOFT < |e| 且 < SEEK_SOFT    → 倍速**拉满**去追；同时开始"滞留计时"
+#   ④   |e| ≥ SEEK_SOFT(0.60)        → 若**持续 SEEK_DWELL(2.0s)** 仍无改善 ⇒ 强制 seek；
+#       |e| ≥ SEEK_HARD(1.20)        → 立即 seek（大跳变：DJ 拖动 / 识别重新定位）
+#   跳完 SEEK_COOLDOWN(1.2s) 内不再跳（防抖，避免"跳—超调—再跳"的自激）
+#
+# ── 连续性保证 ───────────────────────────────────────────────────────
+#   · 只有 ④ 会改变画面位置；①②③ 全是**改速率**，画面永不跳。
+#   · ④ 的软阈值必须"持续 2 秒"才动手 ⇒ 识别抖动/短时卡顿（1~2s）根本触发不了。
+#   · `src_ended`（到出点冻结）期间一律不 seek、不调速（持帧是编排意图）。
+#   · `off` 档（现场应急）一字节都不改。
+RATE_DEADBAND_SEC = 0.05      # ① 死区
+RATE_SOFT_SEC = 0.30          # ② 比例段的右端（到这里倍速正好拉满）
+RATE_CATCHUP_SEC = 1.5        # 比例段增益：希望 1.5s 追平
+RATE_MAX = 0.25               # 倍速上限 ±25%（宁可短暂快慢，也不要 seek 跳帧）
+SEEK_SOFT_SEC = 0.60          # ④-软：开始滞留计时
+SEEK_DWELL_SEC = 2.0          # ④-软：持续这么久没改善才跳
+SEEK_HARD_SEC = 1.20          # ④-硬：立即跳
+SEEK_COOLDOWN_SEC = 1.2       # 跳后冷却（防抖）
+
+
 PROFILE_AUTO = "auto"
 PROFILE_CONSERVATIVE = "conservative"
 PROFILE_OFF = "off"
@@ -126,13 +171,67 @@ def player_speed(ps):
     return max(1e-6, _f(getattr(ps, "speed", 1.0), 1.0))
 
 
+def sync_target(ps):
+    """这一刻**应该显示**的素材内秒（含前馈补偿 `LEAD_SEC`）。
+
+    `src_ended`（到出点冻结）时不加 LEAD —— 冻结就该停在最后一帧，别去追。
+    """
+    t = _f(getattr(ps, "play_sec", 0.0))
+    if getattr(ps, "src_ended", False):
+        return t
+    return t + LEAD_SEC
+
+
+def rate_for(ps, pos, mode=MODE_NORMAL):
+    """**第 ①②③ 级：按偏差给本帧该设的倍速**（= 名义倍速 × (1 + 修正)）。
+
+    `pos` = 播放器**实际显示帧**的素材内秒（`player.position()`），取不到给 `None`。
+    `e = sync_target(ps) - pos`：>0 表示画面落后于编排 ⇒ 加速追。
+
+    返回 `ps.speed`（死区 / 不可信 / 冻结 / off 档）或 `ps.speed × (1 ± ≤RATE_MAX)`。
+
+    ⚠ 与 `player_speed()` 的关系：本函数**包含**它（基准就是它），不是另起一套计速。
+      两者都只返回"该设多少"，不记账、不读时钟 ⇒ 纯函数、可单测。
+    ⚠ `MODE_OFF`（现场应急关掉定位）⇒ 一字节都不改，返回名义倍速。
+    """
+    base = player_speed(ps)
+    if mode == MODE_OFF or pos is None or getattr(ps, "src_ended", False):
+        return base
+    if not getattr(ps, "active", True) or getattr(ps, "missing", False):
+        return base
+    e = sync_target(ps) - _f(pos)
+    if abs(e) <= RATE_DEADBAND_SEC:
+        return base                      # ① 正常播放：零干扰
+    # ② ③ 比例变速（到 RATE_SOFT_SEC 时正好拉满，之后保持满速追）
+    adj = max(-RATE_MAX, min(RATE_MAX, e / max(1e-6, RATE_CATCHUP_SEC)))
+    return max(1e-6, base * (1.0 + adj))
+
+
 # ==========================================================================
 # 状态
 # ==========================================================================
+def _trip_breaker(st, now, base=1.0, cap=8.0):
+    """把该子层的 seek 熔断一段冷却时间（**可恢复**，不是永久停，铁律 0）。
+
+    退避：1s → 2s → 4s → 8s（封顶）。每次失败翻倍，成功落地即清零（见 `settle`）。
+    """
+    n = int(st.get("fail_n", 0) or 0) + 1
+    st["fail_n"] = n
+    st["degraded"] = True
+    st["retry_at"] = _f(now) + min(cap, base * (2 ** min(3, n - 1)))
+    return st["retry_at"]
+
+
 def new_state():
     """单个子层的 seek 状态（键名与引擎 `lay._cue_seek_state[lyr_id]` 一致）。"""
     return {"item_id": "", "last_req": -1e9, "inflight": False, "target": 0.0,
-            "degraded": False, "from_pos": None}
+            "degraded": False, "from_pos": None,
+            # ★ 熔断不是永久：`fail_n` 连续失败次数，`retry_at` 下次允许尝试的时刻
+            "fail_n": 0, "retry_at": 0.0,
+            # ★ 音画对齐（第④级）用：进入软阈值的时刻 / 上次真 seek 的时刻
+            "soft_since": None, "last_seek": -1e9,
+            # ★ 硬阈值"连击"计数：单帧毛刺不许触发跳转（见 should_seek 9b）
+            "hard_n": 0}
 
 
 def settle(pos_now, now, st, tol):
@@ -145,6 +244,7 @@ def settle(pos_now, now, st, tol):
     target = _f(st.get("target"))
     if landed(pos_now, target, tol):
         st["inflight"] = False
+        st["fail_n"] = 0            # ★ 落地成功 ⇒ 熔断计数清零（必须成对）
         return "landed"
     # ★ 越过目标也算落地：播放器是**继续往前走**的，seek 到 target 之后 `position()` 会很快越过
     #   target（cv2 的 POS_MSEC 还会多报 1~2 帧）。只判 `|pos-target| <= 2 帧` 会永远判不出落地
@@ -153,13 +253,15 @@ def settle(pos_now, now, st, tol):
     if pos_now is not None and frm is not None:
         if _f(frm) <= target and _f(pos_now) >= target - _f(tol):
             st["inflight"] = False
+            st["fail_n"] = 0
             return "landed"
         if _f(frm) > target and _f(pos_now) <= target + _f(tol):
             st["inflight"] = False
+            st["fail_n"] = 0
             return "landed"
     if (now - _f(st.get("last_req"), 0.0)) > SEEK_TIMEOUT_SEC:
         st["inflight"] = False
-        st["degraded"] = True
+        _trip_breaker(st, now)
         return "timeout"
     return None
 
@@ -195,9 +297,15 @@ def should_seek(ps, pos, now, st, item, profile=PROFILE_AUTO):
         st["target"] = 0.0
         st["last_req"] = -1e9              # 入场不受节流限制
 
-    # 4) 已降级（seek 失败/超时）⇒ 本片段不再 seek
+    # 4) 熔断中（seek 失败/超时）⇒ 冷却期内不 seek；**到期必须放行一次**
+    #    ⚠ 旧写法是"置 degraded 就整段不再 seek" —— 那是标准的"一次失败永久停"
+    #      （铁律 0）。现场后果：某次 seek 因解码线程忙而超时 ⇒ 本片段**再也不校正**
+    #      ⇒ 位置一路漂到片尾 = 用户说的"越久越对不齐"。
     if st.get("degraded", False):
-        return False
+        if _f(now) < _f(st.get("retry_at"), 0.0):
+            return False
+        st["degraded"] = False
+        st["inflight"] = False
     # 5) 上一次还没落地 ⇒ 不重发。★ 防自激（长 GOP 落地要 664~848ms）
     if st.get("inflight", False):
         return False
@@ -215,15 +323,43 @@ def should_seek(ps, pos, now, st, item, profile=PROFILE_AUTO):
     # 9) 位置读数不可信（首帧未就绪 / 格式不报 pts）⇒ 跳过校正（不是错误）
     if pos is None:
         return False
+    # 9b) ④-硬：**大跳变不受节流限制** —— 它就是"必须马上落地"的场景。
+    #     放在节流之前判：否则刚跳完 1 秒内再来一次大跳变（DJ 连续拖动）会被节流吞掉，
+    #     画面就一直卡在错的位置直到下次机会。
+    if abs(sync_target(ps) - _f(pos)) >= SEEK_HARD_SEC:
+        # ★ 必须**连续 2 帧**都超硬阈值才算数（=33ms，肉眼无感）。
+        #   真机抓到过单帧 `dmax=1.31s` 的毛刺（某一层解码线程偶尔停一拍），
+        #   单帧就跳会让画面"时不时抽一下"——那正是用户说的"一直跳"。
+        st["hard_n"] = int(st.get("hard_n", 0) or 0) + 1
+        if st["hard_n"] >= 2:
+            st["hard_n"] = 0
+            return True
+        return False
+    st["hard_n"] = 0
     # 10) 节流：同一 player 两次 seek 至少隔 MIN_INTERVAL_SEC
     last_req = _f(st.get("last_req"), -1e9)
     if now - last_req < MIN_INTERVAL_SEC:
         return False
-    # 11) 漂移超阈值 ⇒ 校正（用实际位置 pos，不是请求目标 target）
+    # 11) 漂移超**硬阈值** ⇒ 校正（用实际位置 pos，不是请求目标 target）
+    #     ★ 2026-10-17：原来用 `drift_limit_for_mode()`（0.35s）⇒ 每 1s seek 一次 ⇒ 卡顿。
+    #       现在小幅漂移交给 `rate_for()` 用倍速追（画面连续），这里只处理
+    #       "追不回来"的大跳变（指纹重新锁定 / 用户拖了播放位置 / 解码器停了很久）。
     ref = pos
-    limit = drift_limit_for_mode(mode)
-    if abs(_f(getattr(ps, "play_sec", 0.0)) - _f(ref)) > limit:
-        return True
+    e = sync_target(ps) - _f(ref)
+    ae = abs(e)
+    # ④-软：明显但"可能追得回来" ⇒ 必须**持续 SEEK_DWELL_SEC 没改善**才动手
+    #   这条是"连续性"的核心：识别抖动/短时卡顿（1~2s）根本触发不了 seek。
+    if ae >= SEEK_SOFT_SEC:
+        if _f(now) - _f(st.get("last_seek"), -1e9) < SEEK_COOLDOWN_SEC:
+            return False                  # 刚跳过 ⇒ 冷却，防"跳—超调—再跳"自激
+        since = st.get("soft_since")
+        if since is None:
+            st["soft_since"] = _f(now)    # 开始计时
+            return False
+        return (_f(now) - _f(since)) >= SEEK_DWELL_SEC
+    # 回到死区/比例段 ⇒ 计时清零（下次要重新计满 2 秒）
+    st["soft_since"] = None
+    return False
     # 12) 否则不动
     return False
 
@@ -234,13 +370,15 @@ def on_seek(ps, now, st, accepted, pos=None):
     `pos`：投递时的实际位置（给 `settle` 判"是否已越过目标"用；缺省 None = 只按绝对误差判）。
     """
     st["item_id"] = str(getattr(ps, "item_id", "") or "")
-    st["target"] = _f(getattr(ps, "play_sec", 0.0))
+    st["target"] = _f(sync_target(ps))
+    st["last_seek"] = _f(now)
+    st["soft_since"] = None
     st["from_pos"] = None if pos is None else _f(pos)
     st["last_req"] = _f(now)
     if accepted:
         st["inflight"] = True
     else:
-        st["degraded"] = True          # 不受理 ⇒ 立刻降级，不重试
+        _trip_breaker(st, now)         # 不受理 ⇒ 熔断（带退避，到期自动重试）
     return bool(accepted)
 
 
@@ -281,11 +419,48 @@ class CueSeekPolicy:
     def drift_limit(self, mode):
         return drift_limit_for_mode(mode)
 
+    def seek_enabled(self, item=None):
+        """本片段是否允许 seek（**`off` 档一律不允许**）。
+
+        为什么要单独一个口子：引擎侧"新解码器首次落地"那条 seek 不走 `should_seek`，
+        如果它不看档位，`off`（现场应急关闭定位）就会**仍然 seek** ——
+        `tools/cue_settings_test.py` 的「off 完全不 seek」就是钉这个。
+        """
+        return mode_for(item, self.profile) != MODE_OFF
+
     def land_tol(self, player):
         return land_tol(getattr(player, "fps", 0.0))
 
-    def desired_speed(self, ps):
-        return player_speed(ps)
+    def desired_speed(self, ps, pos=None):
+        """本帧该设的倍速（实时变速对齐）。`pos` 不给 ⇒ 名义倍速（旧调用方兼容）。"""
+        try:
+            mode = mode_for(None, self.profile)
+        except Exception:                                         # noqa: BLE001
+            mode = MODE_NORMAL
+        return rate_for(ps, pos, mode)
+
+    def desired_speed_for(self, ps, item=None, pos=None):
+        """同 `desired_speed`，但按**本片段素材**判档位（DXV=free / HEVC=conservative）。
+
+        ★ 2026-10-18（真机联调）：**换片段/落地中一律走名义倍速**。
+          换片段那一瞬间 `play_sec` 会跳回新片段的 `src_in`（常常是 0），而播放器还在
+          旧位置 ⇒ 误差看起来有"快一个片段的长度"（真机抓到 19.7s）⇒ 若照常按 ②③ 倍速
+          去追，画面会在切换瞬间猛快/猛慢一下。这段窗口里真正要做的是**等落地**，
+          不是在旧画面上变速。
+        """
+        try:
+            st = self.state_for(ps)
+            if st.get("inflight") or st.get("switched_recently"):
+                return player_speed(ps)
+            if (self._now() - float(st.get("last_seek", -1e9))) < 0.35:
+                return player_speed(ps)
+        except Exception:                                         # noqa: BLE001
+            pass
+        return rate_for(ps, pos, mode_for(item, self.profile))
+
+    def seek_target(self, ps):
+        """真要 seek 时**落到哪一秒**（= 编排目标 + 前馈补偿）。"""
+        return sync_target(ps)
 
     # ---- 状态 ----
     def state_for(self, ps):
@@ -300,13 +475,27 @@ class CueSeekPolicy:
         """切歌/卸表时清状态（配合 `clear_cue_sheet`）。"""
         self.state.clear()
 
+    def _read_pos(self, player):
+        """读播放器实际显示位置。**没有 `position()` 的播放器（静态图）⇒ None**。
+
+        ⚠ 2026-10-17：`ImagePlayer` 没有 `position()`，旧写法直接 `player.position()`
+          会每帧抛 AttributeError（现场日志刷 `码表 seek 策略异常`）。这里统一兜住。
+        """
+        fn = getattr(player, "position", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:                                         # noqa: BLE001
+            return None
+
     # ---- 四步 ----
     def settle(self, ps, player, st):
-        pos = player.position() if player is not None else None
+        pos = self._read_pos(player)
         return settle(pos, self._now(), st, self.land_tol(player))
 
     def should_seek(self, ps, item, player, st):
-        pos = player.position() if player is not None else None
+        pos = self._read_pos(player)
         return should_seek(ps, pos, self._now(), st, item, self.profile)
 
     def on_seek(self, ps, st, accepted, pos=None):
@@ -360,12 +549,33 @@ def selftest():
     assert player_speed(_PS(speed=0.0)) > 0.0     # 防御：0 会给到 1e-6，不是 1.0
 
     # 4) 漂移用实际位置（不是请求目标）—— 本模块最重要的一条
+    #    ★ 2026-10-17：硬阈值抬到 SEEK_HARD_SEC(1.2)；0.35~1.2 改由倍速对齐处理。
+    #      本断言要钉的是"用 pos 不用 target"，与阈值无关 ⇒ 把漂移拉到硬阈值之上。
     ps, item = _PS(play_sec=10.0), _Item()
     st = new_state()
     st["item_id"] = "i1"
     st["target"] = 10.0                            # 上次请求值 == play_sec
-    assert should_seek(ps, 9.0, 100.0, st, item) is True, "必须用 pos 判漂移"
-    assert should_seek(ps, 9.9, 100.0, st, item) is False, "0.1 < 0.35 不该 seek"
+    # ★ 硬阈值现在要求连续 2 帧（抗单帧毛刺）
+    assert (should_seek(ps, 8.0, 100.0, st, item)
+            or should_seek(ps, 8.0, 100.0, st, item)) is True, "必须用 pos 判漂移"
+    assert should_seek(ps, 9.9, 100.0, st, item) is False, "0.1 远小于阈值，不该 seek"
+    # ★ 中段漂移（0.35~1.2）不 seek，交给倍速
+    assert should_seek(ps, 9.4, 100.0, st, item) is False, "0.6s 漂移应由倍速追，不 seek"
+
+    # 4b) 音画对齐（rate_for）：连续、有界、可退化
+    #   ★ 现在误差基准是 `sync_target(ps) = play_sec + LEAD_SEC`（前馈补偿解码管线延迟）。
+    _tgt = sync_target(_PS(play_sec=10.0))
+    assert abs(_tgt - (10.0 + LEAD_SEC)) < 1e-9, "目标 = 编排 + 前馈补偿"
+    assert rate_for(_PS(play_sec=10.0), _tgt) == 1.0, "无偏差 ⇒ 名义倍速（正常播放零干扰）"
+    assert rate_for(_PS(play_sec=10.0), _tgt - 0.01) == 1.0, "死区内不纠正"
+    _up = rate_for(_PS(play_sec=10.0), _tgt - 0.3)
+    assert _up > 1.0 and _up <= 1.0 + RATE_MAX + 1e-9, "落后 ⇒ 加速且钳位（%.4f）" % _up
+    _dn = rate_for(_PS(play_sec=10.0), _tgt + 0.3)
+    assert _dn < 1.0 and _dn >= 1.0 - RATE_MAX - 1e-9, "超前 ⇒ 减速且钳位（%.4f）" % _dn
+    assert rate_for(_PS(play_sec=10.0, speed=2.0), _tgt - 1.0) > 2.0, "倍速要对 ps.speed 乘"
+    assert rate_for(_PS(play_sec=10.0), None) == 1.0, "pos 不可信 ⇒ 名义倍速"
+    assert rate_for(_PS(play_sec=10.0, src_ended=True), 1.0) == 1.0, "持帧 ⇒ 名义倍速"
+    assert rate_for(_PS(play_sec=10.0), _tgt - 1.0, MODE_OFF) == 1.0, "off 档一字节都不改"
 
     # 5) 三条防自激
     assert should_seek(_PS(play_sec=10.0, src_ended=True), 0.0, 100.0,
@@ -380,8 +590,18 @@ def selftest():
     st3 = new_state()
     st3["item_id"] = "i1"
     st3["last_req"] = 100.0
-    assert should_seek(ps, 0.0, 100.5, st3, item) is False, "节流窗口内不 seek"
-    assert should_seek(ps, 0.0, 101.5, st3, item) is True, "超出窗口后恢复"
+    # ★ 偏差 0.10 落在"比例段" ⇒ 靠变速解决，**任何时刻都不 seek**
+    _p3 = sync_target(ps) - 0.10
+    assert should_seek(ps, _p3, 100.5, st3, item) is False, "比例段不 seek"
+    assert should_seek(ps, _p3, 101.5, st3, item) is False, "比例段不 seek（过窗后也一样）"
+    # ★ 软阈值 + 节流：0.70 偏差要先过冷却、再滞留满 SEEK_DWELL 才跳
+    st7 = new_state()
+    st7["item_id"] = "i1"
+    st7["last_req"] = 100.0
+    _p7 = sync_target(ps) - 0.70
+    assert should_seek(ps, _p7, 100.5, st7, item) is False, "节流窗口内不 seek"
+    assert should_seek(ps, _p7, 101.5, st7, item) is False, "刚进软阈值：开始计时，不当场跳"
+    assert should_seek(ps, _p7, 103.8, st7, item) is True, "滞留满 2 秒 ⇒ seek"
     st4 = new_state()
     st4["item_id"] = "OLD"
     st4["last_req"] = 100.0

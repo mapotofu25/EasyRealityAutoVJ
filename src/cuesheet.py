@@ -709,13 +709,35 @@ def capability_report(sheet, app_version="", missing_media=None):
 def check_media(sheet, media_dir):
     """检查素材是否就位。返回 `(missing_names, present_map)`。
 
-    `media_dir` 为 None / 不存在时，按"全部缺失"处理（用户只导入了 json 的情况）。
+    `media_dir` 可以是**一个目录，也可以是按优先级排好的目录列表**（2026-10-18 新增）。
+    为 None / 全都不存在时，按"全部缺失"处理（用户只导入了 json 的情况）。
+
+    ★★★ 为什么必须支持多目录（现场事故，用户："多层编排还是没在 era 里看见"）：
+      旧实现是 `media_dir` **替换**包内解出的 `<包路径>.media/`：
+          md = media_dir if media_dir is not None else embed_dir
+      而 `cfg["cue"]["media_dir"]` 默认被设成了**包所在目录**（`…/码表素材`）。
+      那一层里恰好放着两个**BGA 的散装副本**（c1/c2），但 LOGO(c5)/PNG(c4) 只存在于
+      `<包>.media/` 里 ⇒ `check_media` 只找到 2 个 ⇒ 另外两层的 `clip_path` 为空
+      ⇒ `missing=True` ⇒ **一帧都不画**。现场表现：`sub=3/1`，画面只有 BGA，
+      用户说"多层编排没看见"。
+      ⇒ 搜索顺序固定为：**包内 `<pkg>.media/` 优先** → 用户配置的 media_dir →
+        包所在目录。包内解出来的就是作者当初用的那份，必须最优先。
     """
+    dirs = []
+    if isinstance(media_dir, (list, tuple)):
+        dirs = [d for d in media_dir if d]
+    elif media_dir:
+        dirs = [media_dir]
     present, missing = {}, []
     for m in sheet.media:
-        p = os.path.join(media_dir, m.name) if media_dir else ""
-        if p and os.path.isfile(p):
-            present[m.clip_id] = p
+        hit = ""
+        for d in dirs:
+            cand = os.path.join(d, m.name)
+            if os.path.isfile(cand):
+                hit = cand
+                break
+        if hit:
+            present[m.clip_id] = hit
         else:
             missing.append(m.name)
     return missing, present
@@ -776,9 +798,17 @@ def load(path, media_dir=None, meta_only=False):
             sheet.thumbs = extract_thumbs(path, path + "." + THUMB_DIR) or {}
         except Exception:                                        # noqa: BLE001
             sheet.thumbs = {}
-    md = media_dir if media_dir is not None else (
-        embed_dir if embed_dir and os.path.isdir(embed_dir) else None)
-    missing, present = check_media(sheet, md)
+    # ★ 搜索目录（优先级从高到低）：包内解出的 `<pkg>.media/` → 用户配置的 media_dir
+    #   → 包所在目录。见 `check_media` 的说明（现场 `sub=3/1` 就是这条惹的）。
+    _dirs = []
+    if embed_dir and os.path.isdir(embed_dir):
+        _dirs.append(embed_dir)
+    if media_dir and media_dir not in _dirs:
+        _dirs.append(media_dir)
+    _pdir = os.path.dirname(os.path.abspath(path))
+    if _pdir and _pdir not in _dirs:
+        _dirs.append(_pdir)
+    missing, present = check_media(sheet, _dirs or None)
     warn, miss = capability_report(sheet, missing_media=missing)
     return sheet, {"warnings": warn, "missing_media": miss, "present_media": present,
                    "embedded": bool(embed_dir and os.path.isdir(embed_dir))}

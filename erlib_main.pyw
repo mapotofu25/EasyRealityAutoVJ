@@ -1,33 +1,24 @@
 # -*- coding: utf-8 -*-
-"""erlib —— 曲库分析器（**DJ 端独立小软件**）。
+"""ERLIB 曲库分析 —— 独立小 exe 的入口。
 
-## 用途
-在自己的曲库上跑一遍分析，导出成 `.eravjlib` 包（**不含任何音频文件**，
-只有曲风/封面/指纹/节拍网格），拿到演出机的 ERAVJ 里导入。
-之后 DJ 放歌时，演出机能在几秒内**认出正在放的是哪首歌**，
-自动套用曲风、封面和**离线节拍网格**（画面切在八拍乐句头上）。
+⚠ 这个文件曾经丢过一次（git 从未跟踪），导致 `tools/build_erlib_exe.py` 直接报
+  `script 'erlib_main.pyw' not found`、exe 无法重建。**新增入口脚本必须立刻 git add。**
 
-## 为什么不塞进 ERAVJ 主程序
-1. DJ 机器不必装整个 ERAVJ（主程序打包 460 MB，这个小很多）；
-2. 扫描很吃 CPU/磁盘（指纹约 2.4 秒/首），独立进程不干扰别的事；
-3. 崩溃隔离 —— 扫描端出问题不会影响演出机。
-
-## 用法
-双击运行 → 选曲库文件夹 → 开始扫描（可挂着跑）→ 勾选要导出的歌 → 导出。
-
-⚠ 2026-10-10：本文件曾丢失（未被 git 跟踪），从 `__pycache__/erlib_main.cpython-313.pyc`
-   的字节码逐指令还原重建，已 `git add` 防再丢。
+职责只有一个：把 `src` 放进 sys.path（源码运行时用；打包后由 spec 的 `pathex` 处理），
+然后调用 `erlib.app.main()`。真正的界面/业务全在 `src/erlib/app.py`。
 """
 
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.join(_HERE, "src"), _HERE):
-    if os.path.isdir(_p) and _p not in sys.path:
-        sys.path.insert(0, _p)
+# 源码运行：项目根/erlib_main.pyw → 项目根/src
+if not getattr(sys, "frozen", False):
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _src = os.path.join(_here, "src")
+    if os.path.isdir(_src) and _src not in sys.path:
+        sys.path.insert(0, _src)
 
-from erlib.app import main
+from erlib.app import main                                        # noqa: E402
 
 if __name__ == "__main__":
     sys.exit(main())

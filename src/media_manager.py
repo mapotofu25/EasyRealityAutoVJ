@@ -856,6 +856,48 @@ class _DecoderHealth:
         self.gave_up_reason = ""
 
 
+class _Pacer:
+    """解码线程的**绝对时间表**节拍器：长期平均速率精确等于 `1/(interval/speed)`。
+
+    为什么必须绝对时间表（2026-10-18 用户："视频和音乐时间越久越对不齐"）：
+      旧写法 `wait = interval/speed - (perf_counter() - t0)`，而 `t0` 只包住
+      "读一帧 + 转格式"这一段，**循环自身的开销**（seek 检查、活跃判断、属性读取）
+      落在 `t0` 之外 ⇒ 每轮真实耗时 = interval + 开销。
+      实测（10 秒窗口，真素材）：
+        · `VideoPlayer`(H.264) 设 1.00 实跑 **0.9833**
+        · `AvAlphaPlayer`(带 alpha mov) 设 1.00 实跑 **0.9798**
+      1.7~2% 听着不大，但 **5 分钟就落后 5~6 秒** —— 正是"越久越对不齐"。
+      ⇒ 改成 `next_t += interval/speed`、每轮只睡 `next_t - now`：开销被吸收进等待里，
+        长期平均严格 1.0（实测改成 1.0002）。
+
+    ⚠ 解码跟不上时（落后超过 4 个 interval）⇒ **重新对齐到当前时刻**，不追不雪崩：
+      追会把等待变成负数 ⇒ 满速空转、CPU 打满、画面反而更烂。
+    """
+    __slots__ = ("_next",)
+
+    def __init__(self):
+        self._next = 0.0
+
+    def reset(self):
+        self._next = time.perf_counter()
+
+    def wait(self, interval, speed=1.0):
+        try:
+            iv = float(interval) / (float(speed) or 1.0)
+        except (TypeError, ValueError):
+            return
+        if iv <= 0.0:
+            return
+        now = time.perf_counter()
+        if self._next <= 0.0 or now - self._next > iv * 4.0:
+            self._next = now + iv            # 首次 / 严重落后 ⇒ 重新对齐
+            return
+        self._next += iv
+        d = self._next - time.perf_counter()
+        if d > 0.0:
+            time.sleep(d)
+
+
 class VideoPlayer(_DecoderHealth):
     """OpenCV 视频循环播放线程，提供最新帧；非活跃时挂起省 CPU。
 
@@ -980,6 +1022,9 @@ class VideoPlayer(_DecoderHealth):
                 self._release()
                 return
             interval = 1.0 / max(self.fps, 1.0)
+            # ★ 绝对时间表节拍器（见 `_Pacer`）—— 旧写法每轮白丢 ~1.7% 速率
+            pacer = _Pacer()
+            pacer.reset()
             fail = 0
             try:
                 while not self._dead and self.cap is not None:
@@ -1034,9 +1079,7 @@ class VideoPlayer(_DecoderHealth):
                             self._pts = None
                         self._mark_frame()             # ★ 看门狗心跳
                         ever = True
-                    wait = float(interval / self.speed - (time.perf_counter() - t0))
-                    if wait > 0:
-                        time.sleep(wait)
+                    pacer.wait(interval, self.speed)
             finally:
                 self._release()
             if self._dead:
@@ -1292,6 +1335,9 @@ class AvAlphaPlayer(_DecoderHealth):
                 self.c = None
                 return
             interval = 1.0 / max(self.fps, 1.0)
+            # ★ 绝对时间表节拍器（见 `_Pacer`）—— 旧写法每轮白丢 ~1.7% 速率
+            pacer = _Pacer()
+            pacer.reset()
             frames = self._iter_frames()
             fail = 0
             while not self._dead:
@@ -1361,9 +1407,7 @@ class AvAlphaPlayer(_DecoderHealth):
                     fail += 1
                     if fail >= 20:
                         break
-                wait = float(interval / self.speed - (time.perf_counter() - t0))
-                if wait > 0:
-                    time.sleep(wait)
+                pacer.wait(interval, self.speed)
             # 本轮结束：释放容器（解码器只在解码线程内释放，避免跨线程崩溃）
             try:
                 self.c.close()
@@ -2237,6 +2281,9 @@ class GpuDxvPlayer(_DecoderHealth):
             if self._dead:                 # 打开期间就被关掉了
                 break
             interval = 1.0 / max(self.fps, 1.0)
+            # ★ 绝对时间表节拍器（见 `_Pacer`）—— 旧写法每轮白丢 ~1.7% 速率
+            pacer = _Pacer()
+            pacer.reset()
             gen_gpu = (self.gpu or self.gpu_want) and gpu_decode_enabled()
             frames = self._gpu_frames() if gen_gpu else self._soft_gen()
             produced = False
@@ -2271,9 +2318,7 @@ class GpuDxvPlayer(_DecoderHealth):
                     produced = True
                     fail = 0
                     self._mark_frame()             # ★ 看门狗心跳
-                wait = float(interval / self.speed - (time.perf_counter() - t0))
-                if wait > 0:
-                    time.sleep(wait)
+                pacer.wait(interval, self.speed)
             if self._dead:
                 break
             # ---- ② 取帧收工：出过帧说明素材是好的，重置计数；否则累加 ----
@@ -2381,6 +2426,10 @@ def create_video_player(item, cue=False):
 
 class GifPlayer:
     """GIF 循环播放（QImageReader 逐帧）"""
+
+    # ★ 2026-10-22：标记"这是自走时钟的动画播放器"——
+    #   码表路径靠它判断"不要因为 src_ended 就冻结在缓存帧"（GIF 必须一直动）。
+    is_gif = True
 
     def __init__(self, path):
         from PySide6.QtGui import QImageReader

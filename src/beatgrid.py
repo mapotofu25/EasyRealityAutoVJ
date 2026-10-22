@@ -194,7 +194,15 @@ def pick_bpm(peaks):
     if not peaks:
         return 0.0, 0.0
     best_s = peaks[0][1]
-    inrange = [(b, s) for b, s in peaks if BPM_PRIOR[0] <= b <= BPM_PRIOR[1]]
+    # ⚠ 边界必须带容差：实测有一首歌的首选峰真值是 110.0，但 `fine_bpms` 的浮点累加
+    #   给出 109.99999999999994 ⇒ `110 <= 109.9999…` 为假 ⇒ 被先验排除 ⇒ 掉到 164.9（双速）。
+    #   这类误差只在"峰恰好落在先验边界上"时出现，加 1e-6 容差就干净。
+    #   ⚠⚠ 编排端 `EasyRealityCue/src/ercue/model/bpm_core.py` 里有同一行，**必须同步改**，
+    #      否则两端对同一首歌会给出不同 BPM（码表按自己的 BPM 换算秒，会整体不对拍）。
+    #   不升 `GRID_VER`：改动只影响"恰好卡在边界 1e-6 内"的候选，结果差 ≤0.05 BPM（细扫步长），
+    #   已有网格不受影响，不值得让用户全库重算。
+    inrange = [(b, s) for b, s in peaks
+               if BPM_PRIOR[0] - 1e-6 <= b <= BPM_PRIOR[1] + 1e-6]
     if inrange:
         for b, s in inrange:
             if s >= 0.70 * best_s:
