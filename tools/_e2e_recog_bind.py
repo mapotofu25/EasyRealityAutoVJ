@@ -20,8 +20,8 @@ from charge_engine import ChargeBarEngine
 from cue_position import CuePositionTracker
 
 SR, CHUNK, PRE, WAIT = 48000, 1440, 12.0, 30.0
-REAL_CFG = r"C:/Users/Administrator/AppData/Local/AutoVJ/config.json"
-REAL_DB = r"C:/Users/Administrator/AppData/Local/AutoVJ/fingerprints.db"
+REAL_CFG = r"C:/Users/<用户名>/AppData/Local/AutoVJ/config.json"
+REAL_DB = r"C:/Users/<用户名>/AppData/Local/AutoVJ/fingerprints.db"
 
 
 class FakeCfg(dict):
@@ -167,7 +167,7 @@ def main():
         ("Nimbus（码表包）", r"Y:/EasyRealityAutoVJ/码表素材/Nimbus Spark 1999 - Supa7onyz.flac",
          C.fp_song_id("fp2-f6ebed7d34af40e3")),
         ("Cosmic String（曲库·无表）",
-         r"W:/临时结界相关/2of/tofu/Rolling Contact - Cosmic String.flac", "NO_SHEET"),
+         r"<素材库>/2of/tofu/Rolling Contact - Cosmic String.flac", "NO_SHEET"),
     ]
     ok = n = 0
     for name, path, want in CASES:

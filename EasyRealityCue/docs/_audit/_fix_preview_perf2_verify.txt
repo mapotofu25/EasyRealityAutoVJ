@@ -8,7 +8,7 @@ Task F 判据验证：4K 取帧缩放 + 有界多线程解码
   [PASS] ① 1080p 取帧更快（< 4K）
         1080p p50=6.9 p95=15.2 ms  vs  4K p50=12.1 ms
   [PASS] ③ 画质不明显下降（截图对比）
-        平均像素差：全幅=0.45（阈 3.0） / crop 放大2×=1.20（阈 6.0）；截图 P:\ERAVJ\EasyRealityCue\_shots\m7_scale_compare.png
+        平均像素差：全幅=0.45（阈 3.0） / crop 放大2×=1.20（阈 6.0）；截图 <项目根>\EasyRealityCue\_shots\m7_scale_compare.png
   [PASS] ② 端到端播放 2~3 层 ≥ 24fps
         2 层同入点：改前=29.5 → 改后=32.2 fps；3 层同入点：改前=18.7 → 改后=32.1 fps；3 层异入点（有界池已修复）：32.2 fps
   [PASS] ⑤ 未动 waveform.py / timeline_widget.py

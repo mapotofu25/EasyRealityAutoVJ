@@ -2,7 +2,7 @@
 """造一个 3 帧测试 GIF（给 T02 验证用）。
 
 ⚠ 本脚本需要 **PIL** —— 用 AutoVJ 的 venv 跑（ERCUE venv 无 PIL）：
-  P:/ERAVJ/AutoVJ/venv/Scripts/python.exe tools/_make_test_gif.py <输出路径>
+  <项目根>/AutoVJ/venv/Scripts/python.exe tools/_make_test_gif.py <输出路径>
 
 产物：3 帧（红/绿/蓝），每帧 100ms，loop=0（无限循环）⇒ 一轮 0.3s。
 """

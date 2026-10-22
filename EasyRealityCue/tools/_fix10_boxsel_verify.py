@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-CUE = r"P:\ERAVJ\EasyRealityCue"
+CUE = r"<项目根>\EasyRealityCue"
 sys.path.insert(0, os.path.join(CUE, "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["ERCUE_NO_AUTOSAVE"] = "1"

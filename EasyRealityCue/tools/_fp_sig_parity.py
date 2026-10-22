@@ -54,7 +54,7 @@ SIG_RE = re.compile(r"^fp2-[0-9a-f]{16}$")
 
 # 本机可用素材：期望采样率只用于挑选"至少一个 44.1k + 一个 48k"，实际率以解码结果为准。
 CANDIDATES = [
-    ("W:/临时结界相关/2of/tofu/Rolling Contact - Cosmic String.flac", 44100),
+    ("<素材库>/2of/tofu/Rolling Contact - Cosmic String.flac", 44100),
     ("W:/CloudMusic/Amateras Records/東方太嗨 -Touhou Toohigh Trance-/"
      "Amateras Records - Pretty World.mp3", 48000),
 ]
@@ -65,7 +65,7 @@ CANDIDATES = [
 #   解释器（优先本进程；其次演出端 AutoVJ 的 venv；再次 `ERCUE_SF_PYTHON` 环境变量）。
 #   全程**不修改任何 venv**。
 SF_PYTHON_CANDIDATES = [
-    "P:/ERAVJ/AutoVJ/venv/Scripts/python.exe",
+    "<项目根>/AutoVJ/venv/Scripts/python.exe",
 ]
 
 # 子进程里跑的 A 侧片段（与进程内实现**同一套算法**，逐行对应）。

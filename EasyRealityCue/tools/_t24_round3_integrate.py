@@ -31,7 +31,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = os.path.join(ROOT, "venv", "Scripts", "python.exe")
-AUDIT = r"P:\ERAVJ\brand\ui_audit"
+AUDIT = r"<项目根>\brand\ui_audit"
 WALK = os.path.join(AUDIT, "_walk_ui_audit.py")
 FPSTEMP = os.path.join(AUDIT, "_fps_probe.py")
 OUT_JSON = os.path.join(AUDIT, "_round3_verify_out.json")

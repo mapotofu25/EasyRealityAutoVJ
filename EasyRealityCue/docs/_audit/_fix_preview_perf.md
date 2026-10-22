@@ -1,7 +1,7 @@
 # 视频预览卡顿 · profile + 修复报告
 
 **范围**：只改 `src/ercue/ui/preview.py` + `src/ercue/media/frames.py`（**未动** `audio/waveform.py`，
-**未触碰** `P:\ERAVJ\AutoVJ\`）。
+**未触碰** `<项目根>\AutoVJ\`）。
 **自测脚本**：`tools/_profile_preview.py`（真实素材 + 真实 runtime + 真实事件循环）。
 **结论**：**卡顿主因是 `preview.FPS = 10` 硬封顶**（渲染管线实测能跑 70~82 fps）；**次因**是
 `frames._decode_until` **无界顺序解码**（一次前进近 1 秒 → P95 = 211 ms 卡主线程）。
@@ -11,7 +11,7 @@
 
 跑法：
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_profile_preview.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_profile_preview.py
 ```
 
 ---

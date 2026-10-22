@@ -2,7 +2,7 @@
 
 **范围**：只改 `src/ercue/media/frames.py` + `src/ercue/ui/preview.py`
 （+ 新增 `tools/_fix_decoder_pool_verify.py`、微调 `tools/_fix_preview_perf2_verify.py`）。
-**未动** `src/ercue/audio/waveform.py`、`src/ercue/ui/timeline_widget.py`（判据⑥已核）；**未触碰** `P:\ERAVJ\AutoVJ\`。
+**未动** `src/ercue/audio/waveform.py`、`src/ercue/ui/timeline_widget.py`（判据⑥已核）；**未触碰** `<项目根>\AutoVJ\`。
 
 **结论（一句话）**：本轮报告 §四 那条遗留限制——「同一素材切几段、分放多层（VJ 典型用法），各层入点不同
 却挤在一个解码器上互相 `seek`，三层场景只有 ~15 fps」——是用户"预览还是非常卡"的**另一半原因**。
@@ -14,7 +14,7 @@
 
 跑法：
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_decoder_pool_verify.py    # 判据 ①~⑥ 复跑
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_decoder_pool_verify.py    # 判据 ①~⑥ 复跑
 ```
 证据留存：`docs/_audit/_fix_decoder_pool_verify.txt`（本轮判据原始输出）。
 
@@ -210,4 +210,4 @@ POOL_HOT_SEC      = 0.5  # "热"判据：最近这么多秒被取过帧的解码
 | `tools/_fix_decoder_pool_verify.py` | **新增**：判据 ①~⑥ 复跑闸门（含 ctypes 内存/句柄测量、"改前"用实例级禁 lane 模拟） |
 | `tools/_fix_preview_perf2_verify.py` | t2 的"3 层异入点"由"已知老限制"改为**按出货配置断言 ≥24（有界池已修复）** |
 
-**未改**：`audio/waveform.py`、`ui/timeline_widget.py`、`render/compositor.py`、`model/*`、`P:\ERAVJ\AutoVJ\`。
+**未改**：`audio/waveform.py`、`ui/timeline_widget.py`、`render/compositor.py`、`model/*`、`<项目根>\AutoVJ\`。

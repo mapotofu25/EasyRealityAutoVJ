@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-CUE = r"P:\ERAVJ\EasyRealityCue"
+CUE = r"<项目根>\EasyRealityCue"
 PY = CUE + r"\venv\Scripts\python.exe"
 LOG = CUE + r"\_shots\recon2.log"
 

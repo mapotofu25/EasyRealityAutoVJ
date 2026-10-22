@@ -2,7 +2,7 @@
 
 > 阶段：修复。允许改代码。范围：`src/ercue/model/timeline.py`、`src/ercue/model/features.py`、`src/ercue/render/compositor.py`。
 > 验证脚本：`tools/_fix_a_verify.py`（`tempfile.mkdtemp()` 造夹具，无头运行）。
-> 解释器：`P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe`（Python 3.13.14 / PyAV 18.1.0 / PySide6 6.11.2）。
+> 解释器：`<项目根>\EasyRealityCue\venv\Scripts\python.exe`（Python 3.13.14 / PyAV 18.1.0 / PySide6 6.11.2）。
 
 ## 结论速览
 

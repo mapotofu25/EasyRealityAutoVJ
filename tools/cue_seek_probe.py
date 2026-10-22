@@ -410,7 +410,7 @@ def auto_pick(limit=6):
             picked.append(("长 H.264(>2min)", p, m))
             break
     # 3) 长 HEVC（用户素材库另一类长片）
-    for p in glob.glob(r"P:\临时结界活动记录\*\*.mp4"):
+    for p in glob.glob(r"<素材库>\*\*.mp4"):
         m = _probe_meta(p)
         if m and m["codec"] == "hevc" and m["dur"] > 120.0:
             picked.append(("长 HEVC(>2min)", p, m))
@@ -425,7 +425,7 @@ def auto_pick(limit=6):
 def _extract_dxv_from_packages():
     """在 `.ercue` 包里找 `media/*`（codec=dxv），解到临时目录。"""
     import tempfile
-    pats = [r"P:\ERAVJ\**\*.ercue", r"P:\ERAVJ\brand\ui_audit\*\*\*.ercue"]
+    pats = [r"<项目根>\**\*.ercue", r"<项目根>\brand\ui_audit\*\*\*.ercue"]
     seen = []
     for pat in pats:
         seen.extend(glob.glob(pat, recursive=True))

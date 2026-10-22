@@ -1,7 +1,7 @@
 # 真实彩色波形接入时间轴 · 接线报告
 
 **范围**：只改 `src/ercue/ui/timeline_widget.py`（主）+ `src/ercue/ui/window.py`（喂路径 / 停线程）
-（**未改** `src/ercue/audio/waveform.py` 数据层；**未触碰** `P:\ERAVJ\AutoVJ\`）。
+（**未改** `src/ercue/audio/waveform.py` 数据层；**未触碰** `<项目根>\AutoVJ\`）。
 **自测脚本**：`tools/_fix_wave_ui_verify.py`（离屏 Qt 实测：真造音频、真跑后台线程、真取像素）。
 **结论**：把 `ui/timeline_widget.py` 里那条**假波形**换成**真数据**；
 `_fix_wave_ui_verify.py` **6/6 通过（含 ②③ 两条反向验证）**；`compileall -q src/` 零错误；
@@ -10,9 +10,9 @@ test_timeline / test_compositor / test_audio 全通过）。
 
 跑法：
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_wave_ui_verify.py
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/selftest.py
-QT_QPA_PLATFORM=offscreen  P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tests\test_ui_smoke.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_wave_ui_verify.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/selftest.py
+QT_QPA_PLATFORM=offscreen  <项目根>\EasyRealityCue\venv\Scripts\python.exe  tests\test_ui_smoke.py
 ```
 
 ---

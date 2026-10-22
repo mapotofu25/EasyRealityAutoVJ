@@ -1,7 +1,7 @@
 # media/audio/render 审计报告
 
 > 范围：`src/ercue/media/{thumbs,frames,probe}.py`、`src/ercue/audio/player.py`、`src/ercue/render/compositor.py`
-> 参照物：`P:\ERAVJ\AutoVJ_码表备份_20260930\src\{cuesheet.py, cuesheet_runtime.py, engine.py}`（演出端旧实现）
+> 参照物：`<项目根>\AutoVJ_码表备份_20260930\src\{cuesheet.py, cuesheet_runtime.py, engine.py}`（演出端旧实现）
 > 方式：**只读**代码审计 + 与演出端逐条对照。未修改任何源码。
 
 ## 小结
@@ -15,7 +15,7 @@
 
 ### [P1] 预览用 contain 适配，演出端默认用 cover（铺满+裁切），两者几何不一致
 
-- **位置**：`src/ercue/render/compositor.py:166` 对照 `P:\ERAVJ\AutoVJ_码表备份_20260930\src\engine.py:2800-2802`
+- **位置**：`src/ercue/render/compositor.py:166` 对照 `<项目根>\AutoVJ_码表备份_20260930\src\engine.py:2800-2802`
 - **现象**：非 16:9 素材（或任何分辨率不匹配画布的素材）在**编辑器预览里被完整显示并留黑边**，而**现场演出端会把画面铺满整屏、裁掉溢出部分**。同一个 `xform={"scale":1,"x":0,"y":0}` 的片段，两处看到的构图不同；用户会认为"预览是对的、现场是错的"（或反之）。
 - **根因**：`compositor._target_src` **无条件**用 contain（`k = min(W/fw, H/fh)`）；而演出端 `paint_cover` 只在用户改过 scale/x/y（`custom`）时才用 contain，默认走 cover（`s = max(W/iw, H/ih)`）。
 - **证据**：

@@ -7,7 +7,7 @@
 
 跑法：
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_b_verify.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_b_verify.py
 ```
 
 ---

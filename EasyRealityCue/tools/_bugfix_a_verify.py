@@ -17,7 +17,7 @@ import sys
 import tempfile
 import traceback
 
-CUE = r"P:\ERAVJ\EasyRealityCue"
+CUE = r"<项目根>\EasyRealityCue"
 sys.path.insert(0, os.path.join(CUE, "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -31,7 +31,7 @@ from PySide6.QtTest import QTest                   # noqa: E402
 from PySide6.QtWidgets import QApplication         # noqa: E402
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(CUE, "tools", "_bugfix_a_verify.json")
-AUD = r"P:\ERAVJ\brand\ui_audit"
+AUD = r"<项目根>\brand\ui_audit"
 
 res = {}
 app = QApplication.instance() or QApplication([])

@@ -2,7 +2,7 @@
 
 **范围**：只改 `src/ercue/media/frames.py` + `src/ercue/ui/preview.py`（+ 扩测 `tools/_profile_preview.py`、
 新增 `tools/_fix_preview_perf2_verify.py`）。
-**未动** `src/ercue/audio/waveform.py`、`src/ercue/ui/timeline_widget.py`（判据⑤已核）；**未触碰** `P:\ERAVJ\AutoVJ\`。
+**未动** `src/ercue/audio/waveform.py`、`src/ercue/ui/timeline_widget.py`（判据⑤已核）；**未触碰** `<项目根>\AutoVJ\`。
 
 **结论**（一句话）：4K 素材慢的根因是**"按原始分辨率解码 → 转全尺寸 BGRA（33MB）→ 交给合成器再缩放"**，
 中间数据被放大 ~10 倍。**把缩放提前到解码后立刻做**（`out_size` + **缓存 `VideoReformatter`**），
@@ -11,7 +11,7 @@
 
 跑法：
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_profile_preview.py          # 完整 profile
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_profile_preview.py          # 完整 profile
 ERCUE_PROF_MAIN=0  P:...\python.exe tools/_profile_preview.py                        # 只看 Task F 专项
 P:...\python.exe tools/_fix_preview_perf2_verify.py                                  # 判据 ①~⑤ 复跑
 ```
@@ -211,4 +211,4 @@ seek 惩罚从 62 ms/次 压到 16.9 ms/次，**没有进一步恶化**。
 | `tools/_profile_preview.py` | 新增 Task F 专项：判据①取帧统计、四步拆解（改前/改后，含线程调参）、端到端 fps 矩阵、`grab()` **画质对比截图**；`_build_runtime` 支持 `crop`/`offsets`；`ERCUE_PROF_MAIN/TASKF` 开关 |
 | `tools/_fix_preview_perf2_verify.py` | 新增：判据 ①~⑤ 复跑闸门 |
 
-**未改**：`audio/waveform.py`、`ui/timeline_widget.py`、`render/compositor.py`、`model/*`、`P:\ERAVJ\AutoVJ\`。
+**未改**：`audio/waveform.py`、`ui/timeline_widget.py`、`render/compositor.py`、`model/*`、`<项目根>\AutoVJ\`。

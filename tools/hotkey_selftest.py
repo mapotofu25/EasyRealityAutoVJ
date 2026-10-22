@@ -112,7 +112,7 @@ def main():
     for f in FAIL:
         w("   ✗ " + f)
     # 报告落在**项目根**（脚本相对推导，随项目迁移自动跟随）。旧实现硬编码
-    # P:\AutoVJ\ —— 项目迁到 P:\ERAVJ\AutoVJ 后写盘即 FileNotFoundError。
+    # P:\AutoVJ\ —— 项目迁到 <项目根>\AutoVJ 后写盘即 FileNotFoundError。
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     open(os.path.join(_root, "_hotkey_selftest.txt"), "w", encoding="utf-8").write("\n".join(out))
 

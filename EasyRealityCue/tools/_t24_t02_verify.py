@@ -18,7 +18,7 @@ import os
 import sys
 import tempfile
 
-CUE = r"P:\ERAVJ\EasyRealityCue"
+CUE = r"<项目根>\EasyRealityCue"
 sys.path.insert(0, os.path.join(CUE, "src"))
 os.environ.pop("QT_QPA_PLATFORM", None)
 os.environ.setdefault("ERCUE_PROF_MAIN", "0")

@@ -155,7 +155,7 @@ def _mono_of(path):
 
 def _autovj_reference(mono, sr, maxsec=180.0):
     """演出端自己的函数在同一段 PCM 上算 BPM（移植保真度的黄金标准）。"""
-    sys.path.insert(0, "P:/ERAVJ/AutoVJ/src")
+    sys.path.insert(0, "<项目根>/AutoVJ/src")
     import beatgrid as bg                                      # noqa: E402
     x = np.ascontiguousarray(mono, dtype=np.float32)
     n = int(maxsec * sr)

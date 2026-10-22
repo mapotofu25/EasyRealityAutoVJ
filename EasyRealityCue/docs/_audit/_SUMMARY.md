@@ -1,7 +1,7 @@
 # EasyRealityCue 审计总账（2026-10-11）
 
 > 三路并行只读审计：`t1_model.md` / `t2_ui.md` / `t3_media_audio_render.md`
-> 范围：`src/ercue/` 27 文件 / **7,672 行**；另有对演出端旧实现的对照（`P:\ERAVJ\AutoVJ_码表备份_20260930\`）
+> 范围：`src/ercue/` 27 文件 / **7,672 行**；另有对演出端旧实现的对照（`<项目根>\AutoVJ_码表备份_20260930\`）
 
 ## 总账
 

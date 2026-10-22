@@ -118,7 +118,7 @@ amp  = sqrt(rms * peak)        # 几何平均
 跑法：
 
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_waveform_verify.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_waveform_verify.py
 ```
 
 夹具用 `stdlib wave` + numpy 合成，落 `tempfile.mkdtemp()`；缓存目录被改写到临时目录（不污染用户目录）。

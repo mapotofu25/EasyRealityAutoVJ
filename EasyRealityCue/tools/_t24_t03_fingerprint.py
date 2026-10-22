@@ -18,12 +18,12 @@ import os
 import re
 import sys
 
-SNP_DEFAULT = (r"C:\Users\Administrator\.workbuddy\projects"
+SNP_DEFAULT = (r"C:\Users\<用户名>\.workbuddy\projects"
                r"\c-Users-Administrator-WorkBuddy-\u81ea\u52a8VJ\u8f6f\u4ef6"
                r"\4ab6e778-417b-403e-94c6-b9013ea43859\subagents"
                r"\agent-4e8cdd1e-8b6e-47e3-b39f-0838ee520753\tool-results"
                r"\call_00_jTi1co2NY1GRvmm58Qnc5151.txt")
-CUR_DEFAULT = r"P:\ERAVJ\EasyRealityCue\src\ercue\ui\timeline_widget.py"
+CUR_DEFAULT = r"<项目根>\EasyRealityCue\src\ercue\ui\timeline_widget.py"
 
 PROTECTED = ("_paint_ruler", "_paint_waveform", "wave_sample")
 _PREFIX = re.compile(r"^\s*\d+\u2192")          # `  123→...`

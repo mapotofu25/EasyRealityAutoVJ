@@ -7,8 +7,8 @@ import os
 import sys
 import tempfile
 
-CUE_SRC = r"P:\ERAVJ\EasyRealityCue\src"
-BAK_SRC = r"P:\ERAVJ\AutoVJ_码表备份_20260930\src"
+CUE_SRC = r"<项目根>\EasyRealityCue\src"
+BAK_SRC = r"<项目根>\AutoVJ_码表备份_20260930\src"
 
 sys.path.insert(0, CUE_SRC)
 sys.path.insert(0, BAK_SRC)          # 后插 ⇒ 优先级更高，方便 import 顶层 cuesheet

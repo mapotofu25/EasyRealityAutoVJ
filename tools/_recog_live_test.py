@@ -122,7 +122,7 @@ def main():
     real = os.path.join(os.path.expanduser("~"), "AppData", "Local", "AutoVJ",
                         "fingerprints.db")
     if not os.path.isfile(real):
-        real = r"C:/Users/Administrator/AppData/Local/AutoVJ/fingerprints.db"
+        real = r"C:/Users/<用户名>/AppData/Local/AutoVJ/fingerprints.db"
     db.close()
     tmp = os.path.join(tempfile.mkdtemp(), "fp.db")
     shutil.copyfile(real, tmp)
@@ -134,9 +134,9 @@ def main():
         ("Nimbus（码表包·合成id）", r"Y:/EasyRealityAutoVJ/码表素材/Nimbus Spark 1999 - Supa7onyz.flac",
          C.fp_song_id("fp2-f6ebed7d34af40e3")),
         ("Cosmic String（曲库歌）",
-         r"W:/临时结界相关/2of/tofu/Rolling Contact - Cosmic String.flac", None),
+         r"<素材库>/2of/tofu/Rolling Contact - Cosmic String.flac", None),
         ("Black Warrior（曲库歌）",
-         r"W:/临时结界相关/2of/tofu/Rolling Contact - Black Warrior (2025 Remaster).flac", None),
+         r"<素材库>/2of/tofu/Rolling Contact - Black Warrior (2025 Remaster).flac", None),
     ]
     ok = 0
     n = 0

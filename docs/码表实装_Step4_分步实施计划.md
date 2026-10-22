@@ -71,7 +71,7 @@ python tools/cue_should_seek_test.py --impl real --mutations   # 5/5 被抓
 python -m compileall -q src/media_manager.py src/engine.py
 grep -n "\.seek(" src/engine.py        # 期望：0 命中（证明"零调用"）
 python tools/_bench_player.py          # 现有播放器基准（改动前后各跑一次）
-python "P:/ERAVJ/brand/ui_audit/_fps_ab.py"   # 与 baseline 对比
+python "<项目根>/brand/ui_audit/_fps_ab.py"   # 与 baseline 对比
 ```
 **通过判据**
 - `grep "\.seek(" src/engine.py` = 0；
@@ -108,7 +108,7 @@ python "P:/ERAVJ/brand/ui_audit/_fps_ab.py"   # 与 baseline 对比
 ```
 python tools/cue_pixel_diff_guard.py --scene norcrop --frames 30   # 新增（附录 C.3）
 python tools/cue_pixel_diff_guard.py --scene withcrop --frames 30
-python "P:/ERAVJ/brand/ui_audit/_fps_ab.py"
+python "<项目根>/brand/ui_audit/_fps_ab.py"
 python tools/twoside_parity_check.py --pkg <真实包>               # Step1 门禁不许退化
 ```
 **通过判据**
@@ -201,7 +201,7 @@ python tools/_after_strip_smoke.py        # 现有无头冒烟
 **回归命令**
 ```
 python tools/cue_pixel_diff_guard.py --scene norcrop --frames 30    # 普通图层仍 0 差异
-python "P:/ERAVJ/brand/ui_audit/_fps_ab.py"                          # 码表关 vs 开
+python "<项目根>/brand/ui_audit/_fps_ab.py"                          # 码表关 vs 开
 python tools/cue_should_seek_test.py
 ```
 **通过判据**
@@ -268,7 +268,7 @@ python tools/twoside_parity_check.py --pkg <真实包>
 | **G1 数据层** | `python tools/twoside_parity_check.py --pkg <真实包>` | S2/S3/S5/S6/S7 | `PARITY_OK` 是硬门禁 ⇒ 停手上报（说明有人动了 Step1 语义） |
 | **G2 政策单测** | `python tools/cue_should_seek_test.py --impl real --mutations` | S0/S4/S6 | 用例或变异漏检 ⇒ 修政策模块，**不许改测试期望** |
 | **G3 像素** | `python tools/cue_pixel_diff_guard.py --scene norcrop --frames 30` | S2/S5 | 有差异 ⇒ 回滚该段（这是"误伤普通图层"的唯一证据） |
-| **G4 帧率** | `python "P:/ERAVJ/brand/ui_audit/_fps_ab.py"` | S1/S2/S4/S5/S6 | 退化 ≥1% ⇒ 回滚该段 |
+| **G4 帧率** | `python "<项目根>/brand/ui_audit/_fps_ab.py"` | S1/S2/S4/S5/S6 | 退化 ≥1% ⇒ 回滚该段 |
 | **G5 资源** | `python tools/cue_resource_probe.py` | S6/S7 | 任一红线 ⇒ 回滚 S7，回 S6 查泄漏 |
 
 ---

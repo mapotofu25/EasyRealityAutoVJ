@@ -63,13 +63,13 @@ from ercue.model import ercue_io, fp_core, fp_pack                # noqa: E402
 from ercue.model.cuesheet import CompLayer, CueItem, MediaRef     # noqa: E402
 
 # 演出端解释器（只用来跑 `fp.fingerprint_audio`，**绝不改 AutoVJ 仓库里的任何文件**）
-AUTOVJ_ROOT = "P:/ERAVJ/AutoVJ"
+AUTOVJ_ROOT = "<项目根>/AutoVJ"
 AUTOVJ_PYTHON = os.path.join(AUTOVJ_ROOT, "venv", "Scripts", "python.exe")
 AUTOVJ_SRC = os.path.join(AUTOVJ_ROOT, "src")
 
 # 真实素材（按顺序找；都没有 ⇒ 生成 wav，并在报告里**明说**是生成的）
 CANDIDATES = [
-    "W:/临时结界相关/2of/tofu/Rolling Contact - Cosmic String.flac",     # 44.1k / 281.6 s
+    "<素材库>/2of/tofu/Rolling Contact - Cosmic String.flac",     # 44.1k / 281.6 s
     "W:/CloudMusic/Amateras Records/東方太嗨 -Touhou Toohigh Trance-/"
     "Amateras Records - Pretty World.mp3",                                # 48k
 ]

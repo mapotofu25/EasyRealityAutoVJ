@@ -1,6 +1,6 @@
 # 时间轴 5 条用户问题 · 修复报告
 
-**范围**：只改 `P:\ERAVJ\EasyRealityCue\src\ercue\**` 与 `tests/**`（未触碰 `P:\ERAVJ\AutoVJ\`）。
+**范围**：只改 `<项目根>\EasyRealityCue\src\ercue\**` 与 `tests/**`（未触碰 `<项目根>\AutoVJ\`）。
 **自测脚本**：`tools/_fix_timeline_verify.py`（离屏 Qt 实测：真造 180s 视频、真取帧、真跑鼠标拖放）。
 **结论**：5 条全部修复；`compileall -q src/` 零错误；`tools/selftest.py` **7/7**；
 `tests/` **全绿**（test_media 8/8、test_ui_smoke 全通过、test_timeline/test_compositor/test_audio 全通过）；
@@ -8,8 +8,8 @@
 
 跑法：
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_timeline_verify.py
-QT_QPA_PLATFORM=offscreen  P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tests\test_ui_smoke.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_fix_timeline_verify.py
+QT_QPA_PLATFORM=offscreen  <项目根>\EasyRealityCue\venv\Scripts\python.exe  tests\test_ui_smoke.py
 ```
 
 ---

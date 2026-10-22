@@ -88,7 +88,7 @@ af  = an**pw * loc**0.30
 ## 四、判据结果（可复跑：`tools/_waveform_verify.py`，7/7 全过）
 
 ```
-P:\ERAVJ\EasyRealityCue\venv\Scripts\python.exe  tools/_waveform_verify.py
+<项目根>\EasyRealityCue\venv\Scripts\python.exe  tools/_waveform_verify.py
 ```
 
 | # | 判据 | 结果 |

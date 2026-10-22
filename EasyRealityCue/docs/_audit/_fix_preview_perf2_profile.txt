@@ -47,7 +47,7 @@
 [3 层混合(4K+2×HD)    ] 交付 fps：改前=31.6  →  改后=32.0（目标 ≥24）  ✓
 
 --- 画质对比（截图 side-by-side）---
-已存：P:\ERAVJ\EasyRealityCue\_shots\m7_scale_compare.png
+已存：<项目根>\EasyRealityCue\_shots\m7_scale_compare.png
 平均像素差：全幅=0.45 / crop 放大 2×=1.20（0 = 与「原尺寸取帧」完全一致）
 
 完成。

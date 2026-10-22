@@ -9,9 +9,9 @@ import sys
 import time
 from ctypes import wintypes
 
-CUE = r"P:\ERAVJ\EasyRealityCue"
+CUE = r"<项目根>\EasyRealityCue"
 PY = CUE + r"\venv\Scripts\python.exe"
-PYSPY = r"P:\ERAVJ\AutoVJ\venv\Scripts\py-spy.exe"
+PYSPY = r"<项目根>\AutoVJ\venv\Scripts\py-spy.exe"
 u32 = ctypes.windll.user32
 
 

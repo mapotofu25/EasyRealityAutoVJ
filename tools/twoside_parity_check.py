@@ -35,7 +35,7 @@ TOL = 1e-6
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 AUTOVJ_SRC = os.path.abspath(os.path.join(_HERE, "..", "src"))
-DEFAULT_CUE_SRC = r"P:\ERAVJ\EasyRealityCue\src"
+DEFAULT_CUE_SRC = r"<项目根>\EasyRealityCue\src"
 
 #: 无包时的兜底样例（与 Cue 端 `ercue_io.SPEC_SAMPLE_JSON` 同一份结构）。
 SPEC_SAMPLE = {
