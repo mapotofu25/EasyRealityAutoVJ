@@ -1,0 +1,30 @@
+==========================================================================
+Task G 判据验证：有界解码器池（同素材多层异入点）
+素材库 = Y:\EasyRealityAutoVJ\素材库
+出货配置：thread_type='AUTO' thread_count=2；池上限 per-path=3 total=6 hot=0.50s
+==========================================================================
+  [PASS] ① 目标场景 3 层异入点(0/10/20s) ≥ 24fps
+        3 层 Balls visual@110 (19).mov 改前=18.1 → 改后=29.1 fps（dec=3 lane=3 evict=0）  [✓]
+  [PASS] ① 变体 3 层异入点(0/0.7/1.4s) ≥ 24fps
+        3 层 异入点(0/.7/1.4)      改前=15.3 → 改后=32.2 fps（dec=3 lane=3 evict=0）
+  [PASS] ② 无退化（1 层 / 3 层不同素材 / 3 层同入点）
+        1 层 4K                 改前=31.7 → 改后=31.6 fps（dec=1 lane=1 evict=0）；3 层不同素材                改前=32.2 → 改后=32.2 fps（dec=3 lane=3 evict=0）；3 层同素材同入点              改前=31.4 → 改后=32.2 fps（dec=3 lane=3 evict=0）
+  [PASS] ③ 内存有界：5 层异入点 decoder_count ≤ 池上限
+        5 层同素材异入点：12.4 fps；dec=3（上限 per-path=3 / total=6）lane=5 evict=0；进程内存 92 → 峰值 479 MB
+  [PASS] ④ 无泄漏：切轨 20 次后 decoder/handle 不增长
+        切轨 20 次：解码器 max=2（≤3）；句柄 base=433 → after=433 → closed=397；内存 277 → 277 MB；shutdown 后 dec=0
+  [PASS] ⑥ 未动 waveform.py / timeline_widget.py
+        越界命中=无；frames.py 含 Task G 符号=True；两文件 mtime 更早=True
+  [PASS] ⑤ 静态闸门 + 全量测试
+        compileall=True selftest7/7=True tests失败=无 timeline6/6=True wave6/6=True perf2=True
+
+==========================================================================
+  [PASS] ① 目标场景 3 层异入点(0/10/20s) ≥ 24fps
+  [PASS] ① 变体 3 层异入点(0/0.7/1.4s) ≥ 24fps
+  [PASS] ② 无退化（1 层 / 3 层不同素材 / 3 层同入点）
+  [PASS] ③ 内存有界：5 层异入点 decoder_count ≤ 池上限
+  [PASS] ④ 无泄漏：切轨 20 次后 decoder/handle 不增长
+  [PASS] ⑥ 未动 waveform.py / timeline_widget.py
+  [PASS] ⑤ 静态闸门 + 全量测试
+==========================================================================
+汇总：7/7 通过  ⇒  全绿 ✓

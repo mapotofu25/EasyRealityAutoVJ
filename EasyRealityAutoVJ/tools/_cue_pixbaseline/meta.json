@@ -1,0 +1,327 @@
+{
+ "created_at": "2026-10-17 12:33:36",
+ "fixed": {
+  "snap_bass": 0.62,
+  "silent": false,
+  "intensity": 1.0,
+  "opacity": 0.9
+ },
+ "pulse": 1.0496,
+ "python": "3.13.14",
+ "qt": "6.11.2",
+ "engine": {
+  "engine_md5": "74dbb2819bbb99832daa5807ad6eae17",
+  "engine_bytes": 185111,
+  "draw_layer_md5": "f3bf38bc1be2cec0e232df32dc0a6ca6",
+  "draw_layer_lines": 101
+ },
+ "scenes": [
+  {
+   "name": "cut_cover",
+   "note": "tr=cut, xform 默认 ⇒ cover(铺满裁切)；1440x1080 画布 + 1920x1080 源",
+   "W": 1440,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "cut_cover\\00.png",
+     "sha": "aef59a9bb7d9cf259ca50714e6ef4c32"
+    }
+   ]
+  },
+  {
+   "name": "cut_contain",
+   "note": "tr=cut, img_scale=0.8 ⇒ contain(完整显示)",
+   "W": 1440,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "cut_contain\\00.png",
+     "sha": "959cd943b4b920e6524f107c61a67a80"
+    }
+   ]
+  },
+  {
+   "name": "rot17",
+   "note": "tr=cut, img_rot=17° ⇒ 走旋转分支 drawImage(_tgt,image)",
+   "W": 1920,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "rot17\\00.png",
+     "sha": "719668bc1d88cd6d220f9b9046da7e72"
+    }
+   ]
+  },
+  {
+   "name": "fade",
+   "note": "tr=fade, prog=0.25/0.5/0.75/1.0；prev 与 cur 内容不同",
+   "W": 1440,
+   "H": 1080,
+   "tr": "fade",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 0.25,
+      "now": 1000.0
+     },
+     "png": "fade\\00.png",
+     "sha": "579ea7e04d240a08f643cd9a63185bc6"
+    },
+    {
+     "i": 1,
+     "cond": {
+      "prog": 0.5,
+      "now": 1000.1
+     },
+     "png": "fade\\01.png",
+     "sha": "bf02848bc02f015e0f1e8b3119253577"
+    },
+    {
+     "i": 2,
+     "cond": {
+      "prog": 0.75,
+      "now": 1000.2
+     },
+     "png": "fade\\02.png",
+     "sha": "75a963e5fd2ce9715c32e2e64419b447"
+    }
+   ]
+  },
+  {
+   "name": "slide",
+   "note": "tr=slide, prog=0.3/0.6",
+   "W": 1440,
+   "H": 1080,
+   "tr": "slide",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 0.3,
+      "now": 1000.0
+     },
+     "png": "slide\\00.png",
+     "sha": "be968200ab3462ead684010865d6124d"
+    },
+    {
+     "i": 1,
+     "cond": {
+      "prog": 0.6,
+      "now": 1000.1
+     },
+     "png": "slide\\01.png",
+     "sha": "6d69c6d7d64af37dab8f002f216f9e60"
+    }
+   ]
+  },
+  {
+   "name": "zoom",
+   "note": "tr=zoom, prog=0.4/0.7",
+   "W": 1440,
+   "H": 1080,
+   "tr": "zoom",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 0.4,
+      "now": 1000.0
+     },
+     "png": "zoom\\00.png",
+     "sha": "d1a11d21d10b642465e65a6e63326446"
+    },
+    {
+     "i": 1,
+     "cond": {
+      "prog": 0.7,
+      "now": 1000.1
+     },
+     "png": "zoom\\01.png",
+     "sha": "e9dbc15fdd8446be263d86ab7934f892"
+    }
+   ]
+  },
+  {
+   "name": "glitch",
+   "note": "tr=glitch：rng=Random(int(now*1000)) ⇒ **必须冻结时钟**",
+   "W": 1440,
+   "H": 1080,
+   "tr": "glitch",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 0.5,
+      "now": 1000.0
+     },
+     "png": "glitch\\00.png",
+     "sha": "77b70f8faf04b0513fcfdda8f00e634d"
+    },
+    {
+     "i": 1,
+     "cond": {
+      "prog": 0.5,
+      "now": 1000.017
+     },
+     "png": "glitch\\01.png",
+     "sha": "e60256f4a3cbad2c62ed0dd83b9716c1"
+    },
+    {
+     "i": 2,
+     "cond": {
+      "prog": 0.5,
+      "now": 1000.034
+     },
+     "png": "glitch\\02.png",
+     "sha": "c5a15d7c7c5c47c5a04c3bfe04f1acec"
+    }
+   ]
+  },
+  {
+   "name": "alpha_flat",
+   "note": "use_alpha=False + 带 alpha 的图 ⇒ 透明区填黑（_alpha_img 缓存）",
+   "W": 1440,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "alpha_flat\\00.png",
+     "sha": "6d88113b65910332b0c2d7eb6679605f"
+    }
+   ]
+  },
+  {
+   "name": "alpha_flat_cached",
+   "note": "use_alpha=False 第二次（先自预热 ⇒ 命中 _alpha_key 缓存复用分支，与执行顺序无关）",
+   "W": 1440,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "alpha_flat_cached\\00.png",
+     "sha": "6d88113b65910332b0c2d7eb6679605f"
+    }
+   ]
+  },
+  {
+   "name": "pulse",
+   "note": "pulse=1.050（bass=0.62, intensity=1.0）",
+   "W": 1440,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    0.0,
+    0.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "pulse\\00.png",
+     "sha": "aef59a9bb7d9cf259ca50714e6ef4c32"
+    }
+   ]
+  },
+  {
+   "name": "drift",
+   "note": "drift=(18,-12) ⇒ dx=drift_x*(0.5+(cur%3)*0.25)，dy 同理",
+   "W": 1440,
+   "H": 1080,
+   "tr": "cut",
+   "pulse": 1.0496,
+   "drift": [
+    18.0,
+    -12.0
+   ],
+   "frames": [
+    {
+     "i": 0,
+     "cond": {
+      "prog": 1.0,
+      "now": 1000.0
+     },
+     "png": "drift\\00.png",
+     "sha": "6a7b9a4fcf526fb968db2ca291187682"
+    }
+   ]
+  }
+ ]
+}

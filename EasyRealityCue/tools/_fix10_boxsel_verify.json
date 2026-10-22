@@ -1,0 +1,98 @@
+{
+ "⓪_box_drawn": {
+  "box_active": true,
+  "screenshot": "P:\\ERAVJ\\EasyRealityCue\\tools\\_fix10_boxselect.png",
+  "diff_px": 36874,
+  "bug": false
+ },
+ "①_box_select_immediate": {
+  "during_box_active": true,
+  "multi_count": 2,
+  "selected_ids": [
+   "i1",
+   "i2"
+  ],
+  "props_enabled": false,
+  "view0_unchanged": true,
+  "bug": false
+ },
+ "②_long_press_pan": {
+  "pan_active": true,
+  "box_active": false,
+  "view0_after": 4.678,
+  "multi_count": 0,
+  "bug": false
+ },
+ "③_blank_click_clears": {
+  "before": [
+   "L1",
+   "i1"
+  ],
+  "after": [
+   "",
+   ""
+  ],
+  "multi_count": 0,
+  "bug": false
+ },
+ "④_group_move": {
+  "multi_before": 2,
+  "at1_before": 2.0,
+  "at2_before": 15.0,
+  "at1_after": 6.678,
+  "at2_after": 19.678,
+  "delta1": 4.678,
+  "delta2": 4.678,
+  "undo_delta": 1,
+  "rel_before": 13.0,
+  "rel_after": 13.0,
+  "dur_kept": true,
+  "bug": false
+ },
+ "⑤_click_collapses_to_single": {
+  "multi_after_box": 2,
+  "props_enabled_in_multi": false,
+  "lbl_sel_multi": "已选中 2 个片段 —— 多选状态下不可编辑",
+  "multi_after_click": 0,
+  "sel_after_click": [
+   "L1",
+   "i1"
+  ],
+  "props_enabled_after_click": true,
+  "lbl_sel_single": "选中：层 1 / i1",
+  "hint_in_multi": true,
+  "bug": false
+ },
+ "⑥_group_duplicate": {
+  "multi": 2,
+  "items_before": 2,
+  "items_after_menu_copy": 4,
+  "undo_delta_menu_copy": 1,
+  "items_after_cdr": 6,
+  "undo_delta_cdr": 1,
+  "dup_mode_final": false,
+  "bug": false
+ },
+ "⑦_exit_paths": {
+  "a_multi_before": 2,
+  "a_ok": true,
+  "b_ok": true,
+  "c_ok": true,
+  "d_multi_before": 2,
+  "d_ok": true,
+  "e_multi_before": 2,
+  "e_ok": true,
+  "bug": false
+ },
+ "_summary_bugs": {
+  "⓪_box_drawn": false,
+  "①_box_select_immediate": false,
+  "②_long_press_pan": false,
+  "③_blank_click_clears": false,
+  "④_group_move": false,
+  "⑤_click_collapses_to_single": false,
+  "⑥_group_duplicate": false,
+  "⑦_exit_paths": false
+ },
+ "_verdict": "ALL_FIXED"
+}

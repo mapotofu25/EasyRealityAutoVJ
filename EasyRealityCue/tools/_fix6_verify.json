@@ -1,0 +1,59 @@
+{
+ "①_cdr_duplicate": {
+  "press_dup_mode": false,
+  "after_drag_dup_mode": false,
+  "dups_after_drag": 0,
+  "after_rightclick_dup_mode": true,
+  "after_rightclick_dups": 0,
+  "cursor_dragcopy": true,
+  "during_at_unchanged": true,
+  "after_rightrelease_dup_mode": true,
+  "orig_at": 4.0,
+  "orig_end": 14.0,
+  "moved_emits": 0,
+  "dup_emits": 1,
+  "items_before": 1,
+  "items_after": 2,
+  "new_item_at": 11.992,
+  "dup_mode_final": false,
+  "cursor_arrow_final": true,
+  "bug": false
+ },
+ "①b_legacy_duplicate_autocancel": {
+  "items_before": 1,
+  "items_after": 2,
+  "dup_mode_after": false,
+  "cursor_arrow": true,
+  "items_after2": 3,
+  "dup_mode_after2": false,
+  "bug": false
+ },
+ "③_trim_right_handle": {
+  "edit_mode": true,
+  "end_before": 14.0,
+  "end_after": 10.019,
+  "end_shrank": true,
+  "end_after_undo": 14.0,
+  "undo_restored": true,
+  "bug": false
+ },
+ "③b_trim_offscreen_edge": {
+  "x_of_end_off": 3152.0,
+  "W": 1100,
+  "edge_offscreen": true,
+  "edit_mode": true,
+  "moved_emits": 0,
+  "at_after": 4.0,
+  "end_after": 14.0,
+  "end_changed": true,
+  "at_unchanged": true,
+  "bug": false
+ },
+ "_summary_bugs": {
+  "①_cdr_duplicate": false,
+  "①b_legacy_duplicate_autocancel": false,
+  "③_trim_right_handle": false,
+  "③b_trim_offscreen_edge": false
+ },
+ "_verdict": "ALL_FIXED"
+}

@@ -1,0 +1,41 @@
+==========================================================================
+音源诊断          2026-09-25 12:12:45
+==========================================================================
+
+[1] 配置    C:\Users\Administrator\AppData\Local\AutoVJ\config.json
+    音源类型        : system（系统声音）
+    设备名 device_name : '扬声器 (2- Realtek High Definition Audio)'
+    按类型记忆 system : '扬声器 (2- Realtek High Definition Audio)'
+    按类型记忆 mic    : '麦克风 (2- Realtek High Definition Audio)'
+
+[2] soundcard 枚举到的设备（共 6 个）
+    #   归类        loopback  设备名
+    1   系统声音        是         扬声器 (EDIFIER Halo Soundbar)
+    2   系统声音        是         扬声器 (2- Realtek High Definition Audio)
+    3   系统声音        是         扬声器 (Steam Streaming Microphone)
+    4   系统声音        是         扬声器 (Steam Streaming Speakers)
+    5   麦克风         否         内部 AUX 插座 (Steam Streaming Speakers)
+    6   麦克风         否         麦克风 (Steam Streaming Microphone)
+
+[3] 按引擎逻辑模拟（用配置里的设备和类型）
+    音源类型「system」→ 候选设备 4 个
+        · 扬声器 (EDIFIER Halo Soundbar)
+        · 扬声器 (2- Realtek High Definition Audio)
+        · 扬声器 (Steam Streaming Microphone)
+        · 扬声器 (Steam Streaming Speakers)
+    用 device_name 匹配：**成功**
+    → 实际会被打开的设备：扬声器 (2- Realtek High Definition Audio)
+
+[4] 实际采集测试（打开上面那台设备，录 3 秒）
+    采样率 48000   电平峰值 0.0000
+    ★电平是 0 —— 这台设备上**没有声音进来**（或它不是你期望的那台）
+
+==========================================================================
+怎么读这个结果
+  · 如果你要的设备出现在「麦克风」那一列，却在第 3 步匹配失败 →
+    在软件里**重新选一次**并点「应用」（不是直接关掉对话框）。
+  · 如果你要的设备被算成了「系统声音」（loopback=是）→
+    把软件里的「音源类型」改成「系统声音（Loopback）」，再选它。
+  · 如果 device_name 是空的 → 说明上次没保存成功，重新选 + 点「应用」。
+  · 第 4 步电平为 0 且设备确实是你要的那台 → 是设备侧没声音（VBAN 那边）。
+==========================================================================

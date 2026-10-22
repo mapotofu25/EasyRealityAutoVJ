@@ -1,0 +1,7 @@
+PySide6>=6.8
+numpy
+soundcard
+opencv-python
+soundfile
+av                 # PyAV：alpha 视频（DXV/ProRes4444）必须用它，OpenCV 会丢 alpha
+glfw               # GPU 解码（实验）：建离屏 OpenGL 上下文；不带它则自动回退软解

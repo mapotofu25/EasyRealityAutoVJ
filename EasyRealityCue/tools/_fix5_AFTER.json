@@ -1,0 +1,43 @@
+{
+ "①_snap_switch": {
+  "switch_exists": true,
+  "switch_visible": true,
+  "on_enables_timeline": true,
+  "cfg_persisted_true": true,
+  "off_disables_timeline": true,
+  "cfg_persisted_false": true,
+  "bug": false
+ },
+ "②_duplicate_wired": {
+  "items_before": 1,
+  "items_after": 2,
+  "added": 1,
+  "dup_mode": true,
+  "undo_delta": 1,
+  "orig_at_unchanged": true,
+  "new_at": 8.97,
+  "bug": false
+ },
+ "③_duplicate_keeps_original": {
+  "orig_at_before": 4.0,
+  "orig_at_after": 4.0,
+  "orig_moved": false,
+  "items": 2,
+  "bug": false
+ },
+ "⑥_ruler_seek": {
+  "click_pos": 11.97,
+  "click_ok": true,
+  "drag_pos": 14.97,
+  "drag_ok": true,
+  "playhead": 14.97,
+  "bug": false
+ },
+ "_summary_bugs": {
+  "①_snap_switch": false,
+  "②_duplicate_wired": false,
+  "③_duplicate_keeps_original": false,
+  "⑥_ruler_seek": false
+ },
+ "_verdict": "ALL_FIXED"
+}
