@@ -73,7 +73,7 @@ def _app_version() -> str:
         return "0.0.0-dev"
 
 
-APP_VERSION = (_app_version()) + "-RC1"
+APP_VERSION = (_app_version()) + "-RC3"
 UNDO_CAP = 50
 # 滑杆 seek 防抖：拖动停止这么久之后才真正给音频重定位一次（P1，避免每帧重启音频）
 SEEK_DEBOUNCE_MS = 100
@@ -1512,7 +1512,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QFileDialog
         files, _ = QFileDialog.getOpenFileNames(
             self, "添加素材", self.session.dir if self.session else "",
-            "视频 / 图片 (*.mp4 *.mov *.webm *.avi *.mkv *.png *.jpg *.jpeg *.bmp);;所有文件 (*)")
+            "视频 / 图片 / GIF (*.mp4 *.mov *.webm *.avi *.mkv *.gif *.png *.jpg *.jpeg *.bmp);;所有文件 (*)")
         if files:
             self.add_media_paths(files)
 
@@ -1887,10 +1887,7 @@ class MainWindow(QMainWindow):
         it = CueItem(item_id=iid, clip_id=clip_id, at_sec=at, end_sec=end,
                      trans_in="fade", trans_in_sec=2.0,
                      trans_out="fade", trans_out_sec=2.0).normalized()
-        # ★ 需求 4：**GIF 片段绝不设 src_out_sec**（设了就会"到达出点冻结"、循环失效）。
-        #   新片段本就不设；这里再兜一道，防止将来有人给它写值。
-        if probe.is_gif(s.media_paths.get(clip_id) or ""):
-            it.src_out_sec = None                      # 循环由 frames 侧按一轮时长环绕实现
+        # ★ 2026-10-22：GIF 现在**允许掐尾**（src_out），运行时会按 [src_in, src_out] 循环。
         ly.items.append(it)
         ly.items.sort(key=lambda x: (x.at_sec, x.item_id))
         self._sync_timeline_data()
@@ -2069,9 +2066,6 @@ class MainWindow(QMainWindow):
         it.end_sec = None if end_sec is None else max(it.at_sec, float(end_sec))
         it.src_in_sec = max(0.0, float(src_in_sec))
         it.src_out_sec = None if src_out_sec is None else max(0.0, float(src_out_sec))
-        # ★ 需求 4：GIF 不设 src_out（设了就会"到出点冻结"、循环失效）
-        if self._is_gif_clip(it.clip_id):
-            it.src_out_sec = None
         it.normalized()
         ly.items.sort(key=lambda x: (x.at_sec, x.item_id))
         self._sync_props_selection()
@@ -2483,7 +2477,7 @@ class MainWindow(QMainWindow):
                     reconcile_item_timing(
                         it, prev,
                         src_dur=self._clip_source_dur(getattr(it, "clip_id", "")),
-                        keep_src_out_unset=probe.is_gif(path))
+                        keep_src_out_unset=False)
                     it.normalized()
                 except Exception:                      # noqa: BLE001
                     log.exception("变速一致性收敛失败（保持 commit 后的原值）")

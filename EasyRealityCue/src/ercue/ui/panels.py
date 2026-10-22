@@ -93,7 +93,7 @@ class ThumbWorker(QThread):
     放主线程生成几十个就"未响应"。这里全部丢本线程。
     """
 
-    done = Signal(str, bytes)
+    done = Signal(str, str, bytes)      # clip_id, path, png
 
     def __init__(self, cache_dir, parent=None):
         super().__init__(parent)
@@ -124,7 +124,7 @@ class ThumbWorker(QThread):
                 cached = resolve_thumb(path, self.cache_dir)
                 if cached:
                     with open(cached, "rb") as f:
-                        self.done.emit(cid, f.read())
+                        self.done.emit(cid, path, f.read())
                     continue
                 png = make_thumb(path)
                 if png:
@@ -134,7 +134,7 @@ class ThumbWorker(QThread):
                             f.write(png)
                     except OSError:
                         log.exception("写缩略图缓存失败: %s", path)
-                    self.done.emit(cid, png)
+                    self.done.emit(cid, path, png)
             except Exception:                               # noqa: BLE001
                 log.exception("生成缩略图失败: %s", path)
 
@@ -417,7 +417,11 @@ class MediaPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker = None
-        self._thumbs_ready = {}          # clip_id -> QIcon
+        # ★★ 2026-10-22 修「导入素材后缩略图错、重启才正确」：
+        #   clip_id 是**每张码表从 c1 重新编号**的，用它当键必然跨码表撞车
+        #   ⇒ 旧图盖新图（重启后内存缓存清空才恢复）。
+        #   现在键 = 素材**路径**（thumbs.cache_key，含 mtime），换文件/换码表都不会串。
+        self._thumbs_ready = {}          # 路径键 -> QIcon
         lv = QVBoxLayout(self)
         lv.setContentsMargins(6, 6, 6, 6)
         lv.setSpacing(5)
@@ -458,17 +462,33 @@ class MediaPanel(QWidget):
             self._worker.done.connect(self._on_thumb)
             self._worker.start()
 
-    def _on_thumb(self, clip_id, png):
+    @staticmethod
+    def _icon_key(path):
+        """缩略图内存键：按**素材路径**（含 mtime），不是 clip_id。"""
+        try:
+            from ercue.media.thumbs import cache_key
+            return cache_key(str(path))
+        except Exception:                                    # noqa: BLE001
+            return os.path.normcase(os.path.abspath(str(path)))
+
+    def _on_thumb(self, clip_id, path, png):
         img = QImage()
         if not img.loadFromData(png):
             return
         icon = QIcon(QPixmap.fromImage(img))
-        self._thumbs_ready[str(clip_id)] = icon
+        key = self._icon_key(path)
+        self._thumbs_ready[key] = icon
+        want_path = os.path.normcase(os.path.abspath(str(path))) if path else ""
         for i in range(self.lst.count()):
             it = self.lst.item(i)
-            if str(it.data(Qt.UserRole) or "") == str(clip_id):
-                it.setIcon(icon)
-                break
+            if str(it.data(Qt.UserRole) or "") != str(clip_id):
+                continue
+            # 同一 clip_id 可能对应不同路径（跨码表），必须再比路径
+            it_path = str(it.data(Qt.UserRole + 1) or "")
+            if want_path and os.path.normcase(os.path.abspath(it_path)) != want_path:
+                continue
+            it.setIcon(icon)
+            break
 
     def _on_double(self, item):
         cid = str(item.data(Qt.UserRole) or "") if item is not None else ""
@@ -513,7 +533,7 @@ class MediaPanel(QWidget):
                     it.setIcon(red_dot_icon())
                     it.setForeground(QColor(theme.c("fg_dim")))
                 else:
-                    icon = self._thumbs_ready.get(m.clip_id)
+                    icon = self._thumbs_ready.get(self._icon_key(path))
                     if icon is not None:
                         it.setIcon(icon)
                 self.lst.addItem(it)
@@ -526,7 +546,8 @@ class MediaPanel(QWidget):
             self._ensure_worker(cache_dir)
             for m in sheet.media:
                 path = media_paths.get(m.clip_id) or ""
-                if path and os.path.isfile(path) and m.clip_id not in self._thumbs_ready:
+                if (path and os.path.isfile(path)
+                        and self._icon_key(path) not in self._thumbs_ready):
                     self._worker.request(m.clip_id, path)
 
     def stop_worker(self):

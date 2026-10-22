@@ -405,9 +405,18 @@ class CueRuntime:
                 #   ⇒ 采用"到出点冻结"：视觉上等价于"素材物理放完后停住"，且尊重用户设定的出点。
                 st.src_out_sec = (None if it.src_out_sec is None
                                   else _units.to_float(it.src_out_sec))
+                # ★ 2026-10-22：**GIF 允许掐尾** —— 到达 src_out 后回到 src_in 循环，
+                #   而不是冻结（普通视频保持"到出点冻结"原语义）。
+                _is_gif = str(path or "").lower().endswith(".gif")
                 if st.src_out_sec is not None and raw_play >= st.src_out_sec:
-                    st.play_sec = st.src_out_sec
-                    st.src_ended = True
+                    if _is_gif:
+                        _lo = st.src_in_sec
+                        _span = max(0.03, st.src_out_sec - _lo)
+                        st.play_sec = _lo + ((raw_play - _lo) % _span)
+                        st.src_ended = False
+                    else:
+                        st.play_sec = st.src_out_sec
+                        st.src_ended = True
                 else:
                     st.play_sec = raw_play
                     st.src_ended = False

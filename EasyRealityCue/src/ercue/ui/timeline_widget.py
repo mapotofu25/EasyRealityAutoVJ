@@ -171,7 +171,7 @@ def snap_at(at, dur, targets, px_per_sec, tol_px=SNAP_TOL_PX):
     return (best_at, best_target)
 
 
-def compute_trim(edge, at, end, src_in, src_out, speed, target_sec, src_dur):
+def compute_trim(edge, at, end, src_in, src_out, speed, target_sec, src_dur, loopable=False):
     """★ trim 公式（**纯函数**，需求 3 / 设计文档 §需求3）。
 
     「trim **同时**改『源内起止 + 时间轴起止』（由 `speed` 锁定），**不 ripple**；素材边界**钳位**」。
@@ -184,6 +184,8 @@ def compute_trim(edge, at, end, src_in, src_out, speed, target_sec, src_dur):
     speed     : 变速（>0；非法回落 1.0）
     target_sec: 拖动落点（秒）—— 左把手 = 新 `at'`；右把手 = 新 `end'`
     src_dur   : 素材**源时长** S（秒）；`<=0` 表示**未知**
+    loopable  : `True` = 该素材可循环（GIF）⇒ **允许把片段拉长**（超过源时长也不钳，
+                源出点保持不变，多出来的长度由运行时循环填充）
 
     返回
     ----
@@ -243,6 +245,16 @@ def compute_trim(edge, at, end, src_in, src_out, speed, target_sec, src_dur):
     length = max(0.0, end_new - at)
     src_out_new = src_in + length * speed
     if src_dur > 0.0:
+        if loopable:
+            # ★ 2026-10-22：**GIF 允许拉长** —— 超出源时长时不钳终点；
+            #   源出点固定在 min(原 src_out, S)；多出来的时间轴长度由运行时循环填充。
+            base_out = src_dur if src_out is None else min(src_out, src_dur)
+            base_out = max(base_out, src_in)
+            if src_out_new <= base_out + 1e-9:
+                # 往回缩：正常按长度算 src_out
+                return (at, at + max(0.0, src_out_new - src_in) / speed, src_in, src_out_new)
+            # 拉长：终点跟手，源出点不动
+            return (at, end_new, src_in, base_out)
         if src_out_new > src_dur:
             # 素材不够长 ⇒ 钳到素材尾（不产生"冻结尾帧"）
             src_out_new = src_dur
@@ -872,6 +884,15 @@ class CueTimeline(QWidget):
             nxt = [x.at_sec for x in ly.items if _units.to_float(x.at_sec) > _units.to_float(it.at_sec)]
             end = min(nxt) if nxt else (self.view0 + self.view_span)
         return max(_units.to_float(end), _units.to_float(it.at_sec))
+
+    def _clip_is_gif(self, it):
+        """该片段的素材是否 GIF（GIF 允许拉长后循环）。"""
+        try:
+            m = self.sheet.media_by_id(it.clip_id) if self.sheet is not None else None
+            name = str(getattr(m, "name", "") or "")
+            return name.lower().endswith(".gif")
+        except Exception:                                  # noqa: BLE001
+            return False
 
     def _clip_src_dur(self, it):
         """★ 需求 3：素材**源时长** S（秒）。拿不到返回 `0.0`（= 未知 ⇒ trim 末尾不设 `src_out`）。"""
@@ -1644,6 +1665,7 @@ class CueTimeline(QWidget):
                           "src_in0": _units.to_float(it.src_in_sec),
                           "src_out0": it.src_out_sec,
                           "src_dur": self._clip_src_dur(it),
+                          "loopable": self._clip_is_gif(it),
                           # ★ A1 加固：初值给"当前几何（at0,end0,src_in0,src_out0）"而非 None
                           #   （与拖动期 `compute_trim` 产出的 4 元组**同格式**，双保险）
                           "preview": (at0, end0, _units.to_float(it.src_in_sec), it.src_out_sec),
@@ -1732,7 +1754,7 @@ class CueTimeline(QWidget):
             target = max(0.0, self._sec(e.position().x()))
             at, end, src_in, src_out = compute_trim(
                 ts["edge"], ts["at0"], ts["end0"], ts["src_in0"], ts["src_out0"],
-                it.speed, target, ts["src_dur"])
+                it.speed, target, ts["src_dur"], ts.get("loopable", False))
             ts["preview"] = (at, end, src_in, src_out)
             if ts["edge"] == "l":
                 ts["moved"] = abs(at - ts["at0"]) > 1e-3

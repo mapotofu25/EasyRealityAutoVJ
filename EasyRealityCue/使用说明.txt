@@ -1,5 +1,5 @@
 EasyRealityCue —— DJ 码表（Cue Sheet）编排编辑器
-版本 2026.10.19.01
+版本 2026.10.22.06
 （上面这行的版本号在每次打包时由 tools\build_version.py 自动改写，无需手改）
 
 一、这是什么

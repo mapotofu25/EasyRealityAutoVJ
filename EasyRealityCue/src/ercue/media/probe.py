@@ -86,12 +86,13 @@ def is_gif(path: str) -> bool:
 
 
 def gif_src_out_conflict(name: str, src_out_sec) -> bool:
-    """★ GIF 运行时约束的**检查器**（需求 4）：返回 True = **违反**约束。
+    """GIF 出点约束检查器（**2026-10-22 起恒为 False**）。
 
-    约束：**GIF 片段必须不设 `src_out_sec`**（否则"到达出点即冻结"会让 GIF 只播一轮，
-    循环失效）。供 UI（加片段时）与预检使用；零 Qt，可单测。
+    旧约束：GIF 不许设 `src_out_sec`（到出点会冻结，循环失效）。
+    现在：运行时会按 **[src_in, src_out] 区间循环**（见 `model/timeline.py`），
+    因此 GIF 可以像视频一样掐头去尾；保留本函数仅为兼容旧调用点。
     """
-    return bool(is_gif(name)) and (src_out_sec is not None)
+    return False
 
 
 @dataclass

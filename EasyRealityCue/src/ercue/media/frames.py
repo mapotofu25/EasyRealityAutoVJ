@@ -145,7 +145,8 @@ class _Source:
     __slots__ = ("path", "container", "stream", "time_base", "is_image", "static",
                  "static_px", "static_scaled", "static_failed", "scalers",
                  "cur_pts", "cur_frame", "cur_size", "_scale_warned",
-                 "loop_dur")                       # ★ 需求4：GIF 的"一轮时长"（秒；非 GIF / 拿不到 = None）
+                 "loop_dur",                       # ★ 需求4：GIF 的"一轮时长"（秒；非 GIF / 拿不到 = None）
+                 "gif_frames", "gif_tried")        # ★ 2026-10-22：GIF 全帧缓存（≤80 帧才缓存）
 
     def __init__(self, path, container, stream, is_image):
         self.path = path
@@ -159,6 +160,8 @@ class _Source:
         self.static = None                          # 图片/单帧缓存的**原始 VideoFrame**
         self.static_px = None                       # 图片/单帧缓存的**原尺寸** BGRA 数组
         self.static_scaled = {}                     # (w,h) -> 该尺寸的 BGRA 数组（图片按需缩放缓存）
+        self.gif_frames = None                       # [(pts, VideoFrame)]（GIF 全帧缓存）
+        self.gif_tried = False
         self.static_failed = False                  # 图片解帧失败标记（不反复重解）
         # ★ A6：按目标尺寸缓存的可复用 swscale 缩放器（(w,h) -> VideoReformatter | None）
         self.scalers = {}
@@ -549,6 +552,18 @@ class CueFrameSource:
                 return self._static_frame(src, out_size)
 
             target = float(sec)
+            # ★★ 2026-10-22：**GIF 必须走精确取帧**。
+            #   实测（W://qq 的真实 GIF）：`frame_play` 的顺序/复用机制对 GIF 会取错帧
+            #   （t=0.20 返回的其实是第 0 帧，40 个采样点里 24 个错帧）⇒ 预览"内容一闪一闪"。
+            #   原因：GIF 没有关键帧，seek 经常落回起点，而"复用上一帧"的分支会返回陈旧帧。
+            #   GIF 体积小、帧数少，精确解码代价可接受，因此这里直接走精确路径。
+            if src.loop_dur is not None:
+                try:
+                    target = float(target) % float(src.loop_dur)
+                except Exception:                            # noqa: BLE001
+                    pass
+                return self._gif_frame(src, target, out_size)
+
             # ① 同一位置（或往前一点）重复取帧 → 复用上一帧（绝不再解码，避免跳帧）。
             #    ★ 仅当**尺寸一致**才复用：换了 out_size（控件 resize）时旧帧分辨率不符，
             #      必须重新取一帧新的（否则尺寸会一直卡在旧值）。
@@ -568,6 +583,61 @@ class CueFrameSource:
             #   画面连续、主线程不卡（绝不因为一次掉帧就顺序解上百帧）。
             return self._decode_until(src, target, PLAY_MAX_STEP_FRAMES,
                                       PLAY_STEP_BUDGET_SEC, out_size)
+
+    def _gif_frame(self, src: "_Source", target: float, out_size=None):
+        """GIF 专用：整段解码一次进内存，之后按时间戳直接取（避免每帧重解）。"""
+        if not src.gif_tried:
+            src.gif_tried = True
+            frames = []
+            try:
+                import av as _av
+                with _av.open(src.path) as c:
+                    st = c.streams.video[0]
+                    tb = float(st.time_base)
+                    for fr in c.decode(video=0):
+                        frames.append((float(fr.pts or 0) * tb, fr))
+                        if len(frames) > 80:               # 超长 GIF 不缓存，退回精确路径
+                            break
+            except Exception:                              # noqa: BLE001
+                frames = []
+            if 0 < len(frames) <= 80:
+                src.gif_frames = frames
+        frames = src.gif_frames
+        if not frames:
+            return self._exact_locked(src, target, out_size)
+        for pts, fr in frames:
+            if pts + 1e-6 >= target:
+                return _frame_to_bgra(fr, out_size, src)
+        return _frame_to_bgra(frames[-1][1], out_size, src)
+
+    def _exact_locked(self, src: "_Source", target: float, out_size=None):
+        """已持锁的精确取帧（GIF 专用；等价 `frame_exact` 的核心）。"""
+        if not self._seek(src, target):
+            return self._decode_first(src, out_size)
+        try:
+            tb = src.time_base
+            eps = 1e-6
+            last = None
+            for fr in src.container.decode(video=0):
+                if fr is None:
+                    continue
+                if fr.pts is None:
+                    src.cur_pts, src.cur_frame, src.cur_size = None, None, None
+                    return _frame_to_bgra(fr, out_size, src)
+                p = float(fr.pts) * tb
+                if p + eps >= target:
+                    arr = _frame_to_bgra(fr, out_size, src)
+                    src.cur_pts, src.cur_frame, src.cur_size = p, arr, out_size
+                    return arr
+                last = fr
+            # 末帧区间（GIF 常见：末帧显示到一轮结束）
+            if last is not None:
+                arr = _frame_to_bgra(last, out_size, src)
+                src.cur_pts, src.cur_frame, src.cur_size = None, arr, out_size
+                return arr
+            return None
+        except Exception:                                    # noqa: BLE001
+            return None
 
     def _decode_first(self, src: "_Source", out_size=None):
         """退化的取首帧（仅在 seek 不可用时）。"""

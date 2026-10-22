@@ -316,8 +316,15 @@ class PropsPanel(QWidget):
         self._loading = True                                 # ★ 置位在动控件之前（B2）
         try:
             if not on:
-                # 没选中片段 ⇒ 混合/不透明度编辑**当前层**（标签用「本层…」）
-                self.lbl_blend.setText(LBL_BLEND_LAYER)
+                # ★ 2026-10-22 用户要求：**去掉「本层混合」**（保留「本素材混合」）。
+                #   未选中片段时，混合这一行整体隐藏（不显示、也不写 layer.blend）；
+                #   不透明度仍按「本层不透明度」编辑当前层。
+                self.lbl_blend.setVisible(False)
+                self.cb_blend.setVisible(False)
+                # ★ 2026-10-22 追加：**本层不透明度也去掉** —— 未选中片段时整组层属性都隐藏，
+                #   只保留"选中素材才出现"的属性；不写 layer.opacity。
+                self.lbl_op.setVisible(False)
+                self.sp_op.setVisible(False)
                 self.lbl_op.setText(LBL_OP_LAYER)
                 if ly is not None:
                     self._set_combo(self.cb_blend, ly.blend)
@@ -329,6 +336,10 @@ class PropsPanel(QWidget):
                     self.sp_op.setEnabled(False)
             else:
                 # 选中片段 ⇒ 混合/不透明度编辑**该片段**（标签用「本素材…」）
+                self.lbl_blend.setVisible(True)
+                self.cb_blend.setVisible(True)
+                self.lbl_op.setVisible(True)
+                self.sp_op.setVisible(True)
                 self.lbl_blend.setText(LBL_BLEND_ITEM)
                 self.lbl_op.setText(LBL_OP_ITEM)
                 self._set_combo(self.cb_clip, it.clip_id)
