@@ -142,7 +142,17 @@ class ColorRenderer:
         manual = str(c.get("manual_color", "") or "")
         hold = float(c.get("manual_hold", 10.0) or 0.0)
         t_manual = float(c.get("manual_t", 0.0) or 0.0)
-        manual_active = bool(manual) and auto and (now - t_manual) < hold
+        # ★ 2026-10-23 修（用户报「点了色卡没反应」+「颜色一直是同一个」）：
+        #   ① 旧条件写成 `... and auto`：关掉「自动模式」后点色卡**永远无效**，
+        #      而界面 tooltip 明明写着"关掉后只有点色卡才染色" —— 两条自相矛盾，属真 bug。
+        #   ② `manual_t` 存的是 **perf_counter**（进程内相对时钟）却被落盘，
+        #      重启后新进程的 perf_counter 可能**更小** ⇒ `now - t_manual` 是负数
+        #      ⇒ 永远 `< hold` ⇒ 一开机就被上一次的颜色锁死（症状："颜色一直不变"）。
+        #   现在用墙钟 `time.time()` 判，并要求 0 <= 已过时间 < hold：
+        #      旧配置里的 perf_counter 值代入后要么是巨大正数、要么负数，两种都判为"已过期"，
+        #      天然完成迁移（不需要改配置版本号）。
+        _elapsed = time.time() - t_manual
+        manual_active = bool(manual) and (0.0 <= _elapsed < hold)
 
         # ---- 目标强度 ----
         # 顺序很关键：**手动点色卡优先级最高**（除了总开关/旁路/Kv 三个硬关闭），
@@ -155,7 +165,7 @@ class ColorRenderer:
             # 手动锁定优先：全强度染色，不管频闪；10 秒后自动回到自动模式
             want = max(0.35, gain)
             self.last_state = Tf("手动锁定「{}」（{}s 后回自动）", T(manual),
-                                 f"{max(0.0, hold - (now - t_manual)):.0f}")
+                                 f"{max(0.0, hold - _elapsed):.0f}")
         elif flicker and auto and str(c.get("flicker_mode", "on")) != "off":
             # 频闪休眠只在自动模式下生效；手动锁定在上一条已经返回，不受影响。
             # flicker_mode=off（用户选了「不休眠」）时这里也不拦——双保险，
@@ -169,7 +179,11 @@ class ColorRenderer:
             want = 0.0
             self.last_state = T("能量过低，颜色渲染已休眠")
         elif E < TIER_HIGH:
-            want = (0.20 + 0.20 * (E - TIER_LOW) / (TIER_HIGH - TIER_LOW)) * gain
+            # 2026-10-23：中段从 0.20~0.40 抬到 0.35~0.60。
+            # 理由：绝大多数舞曲常态落在 0.45~0.60，旧公式乘上「染色强度 60%」后只剩
+            # 0.12~0.18，实测平均像素差仅 7/255（tools/_verify_color_postfx.py），
+            # 用户看到的就是"开了也没变"。下限 0.40 以下的休眠保持不变（用户 09-22 明确要求）。
+            want = (0.35 + 0.25 * (E - TIER_LOW) / (TIER_HIGH - TIER_LOW)) * gain
             self.last_state = T("辅助染色（中低能量）")
         else:
             want = (0.80 + 0.20 * min(1.0, (E - TIER_HIGH) / 0.35)) * gain
@@ -198,7 +212,9 @@ class ColorRenderer:
         if (not on) or bypass or kv_on > 0.01:
             self.s = 0.0
         else:
-            k = 0.14 if want > self.s else 0.07
+            # 升 0.24 / 降 0.07：升快降慢。0.24 在 60fps 下约 0.15 秒到位
+            # （旧值 0.14 要 0.4 秒，加上中段强度本来就低，用户会觉得"没反应"）。
+            k = 0.24 if want > self.s else 0.07
             self.s += (want - self.s) * k
             if self.s < 0.004:
                 self.s = 0.0

@@ -321,9 +321,24 @@ MODE_META = {
 }
 
 
-# 自动模式后处理强度 = 能量 × （全局强度 × AUTO_FX_RATIO）
-# 0.6 =「取全局强度的六成」，是全局面板的从属系数，不是固定的绝对强度值。
-AUTO_FX_RATIO = 0.6
+# 自动模式后处理强度 = 「全局强度（感知曲线）」×「能量唤醒系数」
+#
+# 2026-10-23 修（用户报「后处理好像没效果」）：
+#   旧公式 = E × 0.6 × 全局强度。三个乘数**连乘**，任何一个小都会把结果压进死区：
+#   全局强度滑到 8% 时，E=0.5 的结果只有 0.024 —— 也就是「2.4% 的特效」，
+#   在 255 级画面上平均只改 3 个色阶，肉眼等于没有（实测见
+#   tools/_verify_color_postfx.py --user）。
+#   现改为两级：
+#     · 全局强度走**感知曲线** `g ** 0.55`：滑块低端不再是死区（8% → 0.14、
+#       60% → 0.45、100% → 0.60），上限仍是「满滑块 = 全局的六成」，沿用原设计；
+#     · 能量只做**唤醒**（0.15 以下休眠、0.70 以上满额）：安静段照旧几乎没有效果，
+#       但中段（0.4~0.6，绝大多数舞曲的常态）能到 45%~80% 而不是 10%。
+#   ★ 判据：**乘法链条上每一环都不能单独把结果压到看不见**；低端要有可用的分辨率。
+AUTO_FX_MAX = 0.6      # 满滑块 + 满唤醒时的强度上限（= 全局强度的六成，旧 AUTO_FX_RATIO）
+AUTO_FX_GAMMA = 0.55   # 全局强度的感知曲线指数（<1 = 低端抬高，避免死区）
+AUTO_FX_WAKE_LO = 0.15  # 能量低于此值：完全休眠
+AUTO_FX_WAKE_HI = 0.70  # 能量高于此值：满额
+AUTO_FX_RATIO = AUTO_FX_MAX   # 兼容旧名字（外部脚本/测试引用）
 
 
 # 「无声音时隐藏本层」（hide_silent）的防抖秒数。
@@ -4651,30 +4666,36 @@ class AutoVJEngine(QObject):
         """
         # ★ 码表接管期间跳整条后处理链（同 Kv：成片不该被辉光/色差等污染）
         if self._cuesheet_on():
+            # 拖影缓冲必须一起清：不清的话码表切回来会闪一帧上一场的残影
+            self._postfx_reset_trails()
+            self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
+                                 "state": "码表接管中，已跳过"}
             return
         cfg = self.cfg["postfx"]
         # Kv 待机层显示中：画面以 Kv 为主，跳过整条后处理链
         # （Kv 图层要求完全独立，不受「后处理」等任何设置影响）
         kv = self.kv_layer()
         if kv is not None and kv.kv_on > 0.01:
-            try:
-                from postprocess import fx_trails
-                fx_trails(None, 0.0, reset=True)
-            except Exception:
-                pass
+            self._postfx_reset_trails()
+            self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
+                                 "state": "Kv 待机层接管，已跳过"}
             return
         if not cfg or not cfg.get("enabled", True):
-            try:
-                from postprocess import fx_trails
-                fx_trails(None, 0.0, reset=True)
-            except Exception:
-                pass
+            self._postfx_reset_trails()
+            self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
+                                 "state": "总开关已关闭"}
             return
         self._frame_i = getattr(self, "_frame_i", 0) + 1
         now = time.perf_counter()
         auto_link = bool(cfg.get("auto", True))
         mode = cfg.get("mode", "auto")
         g = max(0.0, min(1.0, float(cfg.get("global_level", 60)) / 100.0))
+        # ★ 尺度兜底：老版本/手改过的配置里 global_level 可能是 0~1 小数（写成 0.6），
+        #   直接 /100 会变成 0.006 ⇒ 自动模式"配置看着有值、画面完全没效果"。
+        #   0.001~1 之间一律按比例换算（0 仍然是 0，代表用户真的关掉了）。
+        _rg = float(cfg.get("global_level", 60) or 0.0)
+        if 0.0 < _rg < 1.0:
+            g = min(1.0, _rg)
         genres_now = [x.lower() for x in self._current_genres(snap)] if auto_link else []
         # 全局唤醒系数：能量映射 0~1（0.2 以下归零=缓拍段休眠，0.65 以上满额=高潮活跃）。
         E = snap.get("energy", 0.0)
@@ -4689,13 +4710,11 @@ class AutoVJEngine(QObject):
         effects_cfg = cfg.get("effects") or {}
 
         if mode != "manual":
-            # 自动模式：按曲风/能量挑选 2~3 个效果，最终强度 = **能量 × 全局强度的 60%**。
-            # 注意这里的 0.6 是「取全局强度的六成」，不是固定的绝对强度：
-            #   全局强度 100% + 能量 1.0 → 60%；全局强度 60% + 能量 1.0 → 36%；
-            #   全局强度 60% + 能量 0.5 → 18%。
-            # （原来是「固定 45 × 唤醒系数 × 全局」——死值 45 不跟能量走，观感偏死板；
-            #   现在强度完全由能量连续决定，安静段≈没有效果、高潮段≈全局的六成。）
-            # level 给 100：让最终强度就等于这条公式，不再被 45/100 二次压小。
+            # 自动模式：按曲风/能量挑选 2~3 个效果。
+            # 强度 = 全局强度（感知曲线 g^0.55，上限六成）× 能量唤醒（0.15 以下 0、0.70 以上满额）。
+            # 例：全局 60% + 能量 0.5 → 0.45×0.64 ≈ 29%；全局 8% + 能量 0.5 → 0.14×0.64 ≈ 9%
+            # （旧公式是 E×0.6×g，同样条件下只有 3% 和 2.4% —— 那就是"看不出效果"的原因）。
+            # level 给 100：让最终强度就等于这条公式，不再被二次压小。
             # 关键：自动挑的效果必须绕过 effects[].on 过滤（默认全 False，否则永远没效果）。
             E_auto = max(0.0, min(1.0, float(snap_energy(snap, 0.0))))
             # 「效果保持」：0 = 实时跟随能量（旧行为）；>0 = 选中一组效果后保持 N 拍，
@@ -4725,7 +4744,16 @@ class AutoVJEngine(QObject):
                     self._fx_hold_genres = gkey
                 chosen = self._fx_hold_pick
             effects_override = {n: {"on": True, "level": 100} for n in chosen}
-            mods = {n: E_auto * AUTO_FX_RATIO * g for n in chosen}
+            # ★ 2026-10-23：不再把三个乘数连乘（见 AUTO_FX_MAX 注释），
+            #   全局强度走感知曲线、能量只做唤醒 ⇒ 低滑块/中能量也有可见强度。
+            _g_eff = AUTO_FX_MAX * (g ** AUTO_FX_GAMMA)
+            _wake_auto = max(0.0, min(1.0, (E_auto - AUTO_FX_WAKE_LO)
+                                    / max(0.01, AUTO_FX_WAKE_HI - AUTO_FX_WAKE_LO)))
+            _m = _g_eff * _wake_auto
+            mods = {n: _m for n in chosen}
+            if self._frame_i % 6 == 0:       # 10Hz 足够（GUI 每 500ms 才读一次）
+                self._postfx_info = {"mode": "auto", "g": g, "E": E_auto,
+                                     "fx": {n: _m for n in chosen}, "state": ""}
         else:
             effects_override = None
             mods = {}
@@ -4759,14 +4787,40 @@ class AutoVJEngine(QObject):
                 # 所以「全局强度」只在自动模式生效，不会再暗地里缩放手动效果。
                 mods[name] = m
                 active.append((name, e))
+            if self._frame_i % 6 == 0:       # 同上：10Hz 回显就够
+                self._postfx_info = {"mode": "manual", "g": g, "E": float(E),
+                                     "fx": {n: float(v) * float(
+                                         (effects_cfg.get(n) or {}).get("level", 0)) / 100.0
+                                         for n, v in mods.items()},
+                                     "state": ""}
+        # 拖影：**只在「刚刚停止」那一帧清一次**。
+        # ⚠ 旧写法 `reset_trails=not self.running` 在**预览**（从未点开始）时每帧都清 ⇒
+        #   拖影在预览里永远为空，用户会认定「拖影这个效果没有用」。
+        _was_run = getattr(self, "_postfx_run_prev", None)
+        _reset = (_was_run is True) and (not self.running)
+        self._postfx_run_prev = bool(self.running)
         try:
             from postprocess import apply_postfx
             apply_postfx(self.canvas, cfg, seed=self._frame_i, mods=mods,
                          spectrum=snap.get("spectrum"),
-                         reset_trails=not self.running,
+                         reset_trails=_reset,
                          effects_override=effects_override)
         except Exception:
             pass  # 后处理失败不影响渲染
+
+    def _postfx_reset_trails(self):
+        """清空拖影缓冲（步进被跳过时用，避免下次开启闪现旧残影）。
+
+        ★ 只在缓冲**真的有内容**时才动：码表演出时这条每帧都会被调用，
+          无条件清一次等于每帧多一次函数调用 + 属性写（虽然是微秒级，
+          但热路径上的"每帧都做"要能省就省）。
+        """
+        try:
+            import postprocess as _pp
+            if _pp._TRAIL.get("buf") is not None:
+                _pp.fx_trails(None, 0.0, reset=True)
+        except Exception:
+            pass
 
     _AUTO_FX_BY_GENRE = [
         (("hardcore", "frenchcore", "gabber", "uptempo"), ["chromatic", "glitch"]),

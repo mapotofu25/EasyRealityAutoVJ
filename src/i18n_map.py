@@ -1065,6 +1065,36 @@ ZH2EN = {
         "Clears the cue sheet for this run only (picture hands back to the other layers); go to the Cue page to remove it permanently",
     "清掉本次装载的码表，并把这个图层变回普通图层（会保存）；下次启动不会再自动装回来":
         "Clears the loaded cue sheet and turns this layer back into a normal layer (saved; it will not be re-mounted on next launch)",
+    # ---- 颜色渲染 / 后处理状态回显（2026-10-23）----
+    "码表接管中，已跳过": "cue sheet is in control — skipped",
+    "Kv 待机层接管，已跳过": "Kv standby layer is in control — skipped",
+    "总开关已关闭": "master switch is off",
+    "后处理：本帧无生效效果": "Post-processing: no effect active this frame",
+    "强度为 0（能量过低或全局强度为 0）": "Strength is 0 (energy too low, or global strength is 0)",
+    "后处理：{}": "Post-processing: {}",
+    "后处理（{}）：{}": "Post-processing ({}): {}",
+    "自动": "Auto",
+    "手动": "Manual",
+    # ---- ASIO 输入（2026-10-22 新增，补译）----
+    "ASIO（低延迟 · 声卡）": "ASIO (low latency · audio interface)",
+    "ASIO：尚未启动（点「应用」后开始采集）": "ASIO: not started yet (click Apply to start capture)",
+    "（已回退到系统声音）": " (fell back to system audio)",
+    "⚠ ASIO 打开失败：": "⚠ ASIO failed to open: ",
+    "✅ ASIO 已启用：": "✅ ASIO enabled: ",
+    "未检测到 ASIO 驱动：请先安装声卡自带的 ASIO 驱动（或 ASIO4ALL），再回到本页点「刷新」。":
+        "No ASIO driver found. Install the ASIO driver that came with your audio interface "
+        "(or ASIO4ALL), then come back to this page and click Refresh.",
+    "低延迟声卡输入：选本项后，在「设备」里选 ASIO 驱动（如 %s），再用右侧「输入通道」选第几路输入。ASIO 抓不到…":
+        "Low-latency audio-interface input: after selecting this, pick the ASIO driver (e.g. %s) "
+        "under Device, then choose the input channel on the right. ASIO cannot capture…",
+    "低延迟声卡输入：选本项后，在「设备」里选 ASIO 驱动（如 %s），再用右侧「输入通道」选第几路输入。ASIO 抓不到别的程序播放的声音，只录声卡输入。":
+        "Low-latency audio-interface input: after selecting this, pick the ASIO driver (e.g. %s) "
+        "under Device, then choose the input channel on the right. ASIO cannot capture what other "
+        "apps are playing — it only records the interface's own inputs.",
+    "在左侧选择一个码表查看详情": "Select a cue sheet on the left to see its details",
+    "自动模式按当前曲风挑效果；强度 = 全局强度（上限六成）× 能量。\n能量 0.15 以下休眠、0.70 以上满额 —— 缓拍几乎无效果，高潮最明显。":
+        "Auto mode picks effects by genre; strength = global strength (capped at 60%) × energy.\n"
+        "Sleeps below 0.15 energy, full above 0.70 — almost nothing in calm parts, strongest at the drop.",
 }
 
 

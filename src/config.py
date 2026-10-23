@@ -138,7 +138,10 @@ DEFAULTS = {
             "chromatic":  {"on": False, "level": 40, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
             "bloom":      {"on": False, "level": 30, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
             "glitch":     {"on": False, "level": 50, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
-            "exposure":   {"on": False, "level": 0,  "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
+            # exposure 的 level 原来是 0：手动模式下 `level>0` 是硬性过滤条件
+            # ⇒ 勾上「曝光脉冲」永远没有效果（自动模式因为 override 成 100 才正常）。
+            # 2026-10-23 改成 30，与其它效果同量级。
+            "exposure":   {"on": False, "level": 30, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
             "saturation": {"on": False, "level": 30, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
             "softfocus":  {"on": False, "level": 30, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
             "trails":     {"on": False, "level": 30, "trigger": "constant", "genres": "", "decay": 1.5, "drive": "off"},
@@ -160,7 +163,7 @@ DEFAULTS = {
         "skip_flicker": True,         # 旧字段（仅用于兼容老配置，新代码读 flicker_mode）
         "bypass": False,              # 一键旁路：原片 / 调色 闪切
         "manual_color": "",           # 手动锁定的色卡名（空=未锁定）
-        "manual_t": 0.0,              # 锁定时刻（perf_counter，跨次启动自动失效）
+        "manual_t": 0.0,              # 锁定时刻（**墙钟 time.time()**；老的 perf_counter 值会被判为已过期）
         "manual_hold": 10.0,          # 手动锁定保持秒数，之后回到自动
     },
     "ui": {

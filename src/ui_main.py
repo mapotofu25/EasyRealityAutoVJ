@@ -55,6 +55,35 @@ MEDIA_FILTER = "媒体素材 (*.mp4 *.mov *.webm *.avi *.mkv *.gif *.png *.jpg *
 MUSIC_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".aiff", ".aif", ".aac", ".ogg", ".opus", ".wma"}
 MUSIC_FILTER = "音频文件 (*.flac *.mp3 *.m4a *.wav *.aiff *.aif *.aac *.ogg *.opus *.wma);;All Files (*)"
 
+# 后处理效果的配置键 → 界面中文名（配置里存的是英文 key，状态行要显示中文）
+POSTFX_CN = {
+    "chromatic": "色差", "bloom": "辉光", "glitch": "故障位移", "exposure": "曝光脉冲",
+    "saturation": "饱和度脉冲", "softfocus": "柔焦", "trails": "拖影", "grain": "颗粒",
+    "pixelate": "像素化", "spectrum": "径向频谱", "deform": "音频反应变形",
+}
+
+
+def postfx_status_text(pi):
+    """把引擎的 `_postfx_info` 变成状态行文案（纯函数，便于自测）。
+
+    设计目的：用户报"后处理看不出效果"时，界面必须能直接回答
+    ——是关着？被码表/Kv 接管？还是强度只有 3%？
+    """
+    pi = pi or {}
+    st_txt = pi.get("state") or ""
+    fx = pi.get("fx") or {}
+    if st_txt:
+        return Tf("后处理：{}", T(st_txt))
+    if not fx:
+        return T("后处理：本帧无生效效果")
+    names = sorted(fx.items(), key=lambda kv: -kv[1])
+    body = " · ".join("%s %d%%" % (T(POSTFX_CN.get(k, k)), round(v * 100))
+                      for k, v in names if v > 0.004)
+    if not body:
+        body = T("强度为 0（能量过低或全局强度为 0）")
+    mode_txt = T("自动") if pi.get("mode") == "auto" else T("手动")
+    return Tf("后处理（{}）：{}", mode_txt, body)
+
 
 def scan_music_folder(folder):
     """递归扫描文件夹，返回音频文件路径列表（音乐曲库用）"""
@@ -397,9 +426,8 @@ class SettingsPanel(QWidget):
             "「实时」= 跟着能量即时变化（能量在门槛附近抖动时，效果会忽有忽无）；\n"
             "设成 8~64 拍则每组效果稳定停留一段时间，变化更有节奏感。")
         pa.addWidget(self.postfx_hold, 2, 1)
-        hint = QLabel("自动模式按当前曲风挑效果，强度跟着音乐能量连续变化。\n"
-                      "效果强度 = 能量 × 全局强度的 60%"
-                      "（全局强度只决定「多强」，不影响多久换一次效果）。")
+        hint = QLabel("自动模式按当前曲风挑效果；强度 = 全局强度（上限六成）× 能量。\n"
+                      "能量 0.15 以下休眠、0.70 以上满额 —— 缓拍几乎无效果，高潮最明显。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#999;")
         pa.addWidget(hint, 3, 0, 1, 2)
@@ -447,7 +475,12 @@ class SettingsPanel(QWidget):
         hint_m.setStyleSheet("color:#999;font-size:11px;")
         pm.addWidget(hint_m, len(POSTFX), 0, 1, 3)
         pf.addWidget(self.postfx_manual_page, 2, 0, 1, 3)
-        pf.setRowStretch(3, 1)
+        # 实时强度回显：直接回答"到底有没有生效、现在是多强"
+        self.lbl_postfx_state = QLabel("")
+        self.lbl_postfx_state.setWordWrap(True)
+        self.lbl_postfx_state.setStyleSheet("color:#7ab;font-size:11px;")
+        pf.addWidget(self.lbl_postfx_state, 3, 0, 1, 3)
+        pf.setRowStretch(4, 1)
         # 同上
 
         # ---- 逐拍交替参数 ----
@@ -3381,10 +3414,15 @@ class MainWindow(QMainWindow):
         self.engine_cfg("color", key, val)
 
     def set_color_palette(self, name):
-        """点色卡 = 手动锁定该颜色 10 秒（10 秒后自动回到自动变色）"""
+        """点色卡 = 手动锁定该颜色 10 秒（10 秒后自动回到自动变色）
+
+        ⚠ `manual_t` 必须存**墙钟** `time.time()`：以前存的是 `perf_counter()`
+          （进程内相对时钟）却落盘，重启后新进程的 perf_counter 更小 ⇒ 差值为负
+          ⇒ 永远"还没到期" ⇒ 一开机就被上次的颜色锁死（用户报"颜色一直不变"）。
+        """
         import time
         self.cfg["color"]["manual_color"] = name
-        self.cfg["color"]["manual_t"] = time.perf_counter()
+        self.cfg["color"]["manual_t"] = time.time()
         self.cfg.save()
         self.settings.sync_color_palette(name)
 
@@ -3931,9 +3969,12 @@ class MainWindow(QMainWindow):
             self.settings.color_flicker.setCurrentIndex(0)
         self.settings.btn_color_bypass.setChecked(bool(col.get("bypass", False)))
         # 手动锁定若已过期就不再高亮（避免看起来像锁着其实已回自动）
+        # ⚠ 与 colorfx.tick 同口径：墙钟 + 「0 <= 已过时间 < hold」。
+        #   旧配置里存的是 perf_counter，算出来是负数或天文数字 ⇒ 判为已过期（自动迁移）。
         import time as _t
         lock = str(col.get("manual_color", "") or "")
-        if lock and (_t.perf_counter() - float(col.get("manual_t", 0.0) or 0.0)) >= float(col.get("manual_hold", 10.0)):
+        _el = _t.time() - float(col.get("manual_t", 0.0) or 0.0)
+        if lock and not (0.0 <= _el < float(col.get("manual_hold", 10.0) or 10.0)):
             lock = ""
         self.settings.sync_color_palette(lock)
         # 后处理特效回填
@@ -6224,6 +6265,14 @@ class MainWindow(QMainWindow):
             else:
                 txt = T(txt)
             self.settings.lbl_color_state.setText(Tf("当前能量：{}　{}", tier, txt))
+
+        # 后处理状态提示：显示"当前模式下实际生效的效果与强度"
+        # 只读引擎每帧写好的普通 dict（未加锁，GIL 下原子），不抢渲染锁。
+        try:
+            self.settings.lbl_postfx_state.setText(
+                postfx_status_text(getattr(self.engine, "_postfx_info", None)))
+        except Exception:                                        # noqa: BLE001
+            pass
 
         # ★★ 本函数所有"引擎取值"**一律走无锁只读快照**，绝不调 `@_locked` 方法：
         #   `_update_status` 挂在 500ms 的 QTimer 上，而 `@_locked` 会 `acquire(timeout=2.0)`

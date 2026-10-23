@@ -18,10 +18,15 @@ import cv2
 # ---- 特效函数：输入 BGR (H,W,3) uint8，强度 0~1，返回新数组 ----
 
 def fx_chromatic(bgr, strength):
-    """色差：R 通道右移、B 通道左移（G 不动），强度越大偏移越大"""
-    shift = int(strength * 14)
-    if shift <= 0:
+    """色差：R 通道右移、B 通道左移（G 不动），强度越大偏移越大
+
+    ⚠ 旧写法 `shift = int(strength * 14)`：`strength < 0.0714`（滑条 1~7）时 shift=0
+      ⇒ **整段区间完全无效果**，用户拖到 5、10 会以为"色差坏了"。
+      现在只要 strength>0 就至少错 1px（1px 已是可见的紫边）。
+    """
+    if strength <= 0:
         return bgr
+    shift = max(1, int(round(strength * 14)))
     h, w = bgr.shape[:2]
     if shift >= w:
         shift = w - 1
@@ -144,7 +149,9 @@ def fx_pixelate(bgr, strength):
 
 def fx_spectrum(bgr, strength, spectrum):
     """径向频谱：24 段频谱以圆环放射线形式叠加在画面中心（音乐可视化）"""
-    if strength <= 0 or not spectrum:
+    if strength <= 0 or not spectrum or max(spectrum) <= 0.001:
+        # 频谱全 0 = 没在采集（audio_engine 切源时会置 [0.0]*24）：
+        # 画出来只剩一个 1px 圆环，等于"开了没效果"，直接跳过更诚实也更省。
         return bgr
     h, w = bgr.shape[:2]
     cx, cy = w // 2, h // 2
@@ -168,7 +175,7 @@ def fx_spectrum(bgr, strength, spectrum):
 
 def fx_deform(bgr, strength, spectrum, seed):
     """音频反应变形：画面按频谱分段水平错位（低频段大位移，正弦相位随帧流动）"""
-    if strength <= 0 or not spectrum:
+    if strength <= 0 or not spectrum or max(spectrum) <= 0.001:
         return bgr
     h, w = bgr.shape[:2]
     n = len(spectrum)
@@ -233,6 +240,22 @@ def write_back_bgr(img, bgr):
     v4[:, :, 3] = alpha
 
 
+def _level01(e):
+    """读单个效果的 level 并归一化到 0~1。
+
+    ⚠ 尺度兜底：UI 滑条写的是 0~100，但老配置/手改可能是 0~1 小数。
+      `float(e.get("level", 0)) / 100` 遇上 0.4 会得到 0.004 ⇒ 该特效静默失效
+      （"配置里明明开着、画面就是没有"）。0.0001~1 之间按比例解释。
+    """
+    try:
+        v = float(e.get("level", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if 0.0 < v < 1.0:
+        return max(0.0, min(1.0, v))
+    return max(0.0, min(1.0, v / 100.0))
+
+
 def apply_postfx(canvas, postfx_cfg, seed=0, mods=None, spectrum=None, reset_trails=False,
                  effects_override=None):
     """对合成画布应用启用的后处理特效（原地写回 canvas）。
@@ -253,12 +276,12 @@ def apply_postfx(canvas, postfx_cfg, seed=0, mods=None, spectrum=None, reset_tra
     effects = effects_override if effects_override is not None else (postfx_cfg.get("effects") or {})
     mods = mods or {}
     active = [(n, e) for n, e in effects.items()
-              if e.get("on") and float(e.get("level", 0)) > 0 and n in _FX]
+              if e.get("on") and _level01(e) > 0 and n in _FX]
     if not active:
         return
     bgr = _np_view_bgr(canvas)
     for name, e in active:
-        strength = max(0.0, min(1.0, float(e.get("level", 0)) / 100.0)) * max(0.0, min(1.0, mods.get(name, 1.0)))
+        strength = _level01(e) * max(0.0, min(1.0, mods.get(name, 1.0)))
         if strength <= 0:
             continue
         fn = _FX[name]
