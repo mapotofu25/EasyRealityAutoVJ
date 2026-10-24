@@ -5561,10 +5561,11 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.setToolTipsVisible(True)      # ★ 长条目拆短后，括号里的说明挪进悬停提示
         a_ren = m.addAction("重命名…")
-        # ★ 2026-10-25（用户要求）：与素材右键菜单统一口径 ——
-        #   「停止切换本层素材」= 这一层停在当前这张图上；已经在停时显示「恢复切换」。
+        # ★ 2026-10-25：文案**固定**为「停止切换本层素材」，不再随状态改名。
+        #   用户明确要求：前面已经打了勾，勾本身就表示"已停住"，文案跟着变反而让人以为
+        #   是另一个功能（截图里"✓ 恢复切换本层素材"就是这么来的）。勾 = 已停止切换。
         _stopped = lay.fixed >= 0
-        a_fix = m.addAction("恢复切换本层素材" if _stopped else "停止切换本层素材")
+        a_fix = m.addAction("停止切换本层素材")
         a_fix.setCheckable(True)
         a_fix.setChecked(_stopped)
         a_fix.setToolTip(T("本层停在这一张素材上，不再自动换；也挡不住你手动切"))
@@ -5830,10 +5831,11 @@ class MainWindow(QMainWindow):
         a_size.setEnabled(media is not None)
         # ★ 2026-10-25（用户要求）：菜单文案改成「停止切换本层素材」——
         #   它做的事就是"这一层停在这张图上"，不是"设为默认素材"，旧文案容易被理解反。
-        #   已经停在当前这张时，文案反过来写成「恢复切换」，点一下即可解开。
+        #   文案**固定不变**：已停住时前面就是个勾（勾 = 已停止切换），
+        #   别再改成"恢复切换"——那会让人以为点了是另一个功能。
         _fixed_here = (media is not None and lay.fixed >= 0
                        and 0 <= lay.fixed < len(lay.clips) and lay.clips[lay.fixed] is media)
-        a_fix = m.addAction("恢复切换本层素材" if _fixed_here else "停止切换本层素材")
+        a_fix = m.addAction("停止切换本层素材")
         a_fix.setCheckable(True)
         a_fix.setEnabled(not is_auto)
         a_fix.setChecked(_fixed_here)
