@@ -5568,7 +5568,10 @@ class MainWindow(QMainWindow):
         a_fix.setCheckable(True)
         a_fix.setChecked(_stopped)
         a_fix.setToolTip(T("本层停在这一张素材上，不再自动换；也挡不住你手动切"))
-        # 手动切下一个（只动本层，不重排全局切换倒计时）
+        # ★ 2026-10-25：「手动切换素材」**只放在这里**。
+        #   素材右键菜单里曾也放了一份，和「播放此素材」重复（都是把本层切到某一格，
+        #   一个指定、一个顺移），用户直接指出"是不是重复了" ⇒ 素材菜单里删掉。
+        #   图层菜单没有"选哪一格"的能力，这一项才是唯一能单层前进一格的操作。
         a_step = m.addAction("手动切换素材")
         a_step.setToolTip(T("立刻切到本层的下一个素材（不影响其它图层与节奏）"))
         a_step.setEnabled(len(getattr(lay, "clips", []) or []) >= 2
@@ -5818,14 +5821,11 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         a_play = m.addAction("播放此素材")
         a_play.setEnabled(media is not None and not is_auto)   # 自动图层素材由曲风管理
-        # ★ 2026-10-25（用户要求）：手动切换素材 —— 顺序切到本层的下一个素材。
-        #   与「播放此素材」的区别：不用先点中目标，按一下就往下走一格（现场更顺手）。
-        #   安全边界：Kv 待机层（静音驱动）、单素材图层不给；「停止切换」的图层**允许**
-        #   （切完仍然停住，见 engine.manual_switch_layer 里的 fixed 跟随）。
-        _is_kv = bool(getattr(lay, "is_kv", False))
-        a_step = m.addAction("手动切换素材")
-        a_step.setEnabled(media is not None and not is_auto and not _is_kv
-                          and len(lay.clips) >= 2)
+        # ★ 2026-10-25（用户指出重复后删掉）：这里**不再放「手动切换素材」**。
+        #   素材菜单的每一项都是"对**这一格**做事"，而「播放此素材」已经能把这层切到
+        #   任意一格 —— 再挂一个"顺移下一个"就是同义重复，菜单里并排两项反而让人犹豫。
+        #   「手动切换素材」只留在**图层右键菜单**：那里没有"选哪一格"的能力，
+        #   它才是唯一能单层前进一格的操作（不重复，也不缺能力）。
         a_size = m.addAction("素材大小与位置…")
         a_size.setEnabled(media is not None)
         # ★ 2026-10-25（用户要求）：菜单文案改成「停止切换本层素材」——
@@ -5864,13 +5864,6 @@ class MainWindow(QMainWindow):
                 self.engine._switch_layer_to(lay, lay.clips.index(media))
                 self.layers_panel.refresh_playing()
             except ValueError:
-                pass
-        elif act == a_step and media is not None:
-            # 顺序切下一个（只动这一层，不重排全局切换倒计时）
-            try:
-                self.engine.manual_switch_layer(layer_idx)
-                self.layers_panel.refresh_playing()
-            except Exception:                                    # noqa: BLE001
                 pass
         elif act == a_fix and media is not None:
             try:
