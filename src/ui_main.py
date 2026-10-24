@@ -44,7 +44,8 @@ from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
                       BRIGHTNESS_DARK_THRESHOLD, BRIGHTNESS_BRIGHT_THRESHOLD)
 from audio_engine import AudioEngine
 from media_manager import MediaItem, ThumbWorker, ThumbBackfillWorker, scan_folder
-from engine import AutoVJEngine, Layer, MODE_LABELS, BLEND_MODES, BLEND_LABELS
+from engine import (AutoVJEngine, Layer, MODE_LABELS, BLEND_MODES, BLEND_LABELS,
+                    SWITCH_MANUAL)
 from output_window import OutputWindow
 from hotkeys import HotkeyManager
 from panels import (LayerStackPanel, PreviewPanel, AudioSourceDialog, MiniLevel,
@@ -230,7 +231,16 @@ class SettingsPanel(QWidget):
         gm = QGridLayout(p1)
         gm.addWidget(QLabel("素材切换节奏"), 0, 0)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["自动（推荐）", "常规切", "快切", "逐拍交替"])
+        # ★ 2026-10-25：加回「手动」——选它之后**完全不做自动切换**，
+        #   只有你按「手动切换素材 / 下一素材 / 播放此素材」才换画面。
+        #   Kv 待机层、码表、自愈看门狗都不受影响（它们本来就不走"自动换素材"）。
+        self.mode_combo.addItems(["自动（推荐）", "常规切", "快切", "逐拍交替",
+                                  "手动（不自动切换）"])
+        self.mode_combo.setToolTip(
+            "自动：按能量/瞬态自己挑「常规切 / 快切」\n"
+            "常规切 / 快切 / 逐拍交替：固定用这一种节奏\n"
+            "手动（不自动切换）：永远不自动换素材，只在素材右键「手动切换素材」、"
+            "「播放此素材」或按「下一素材」快捷键时换。Kv 待机层与码表不受影响。")
         gm.addWidget(self.mode_combo, 0, 1)
         self.lbl_cur_mode = QLabel("当前节奏: -")
         self.lbl_cur_mode.setStyleSheet("color:#7ab;")
@@ -3595,6 +3605,12 @@ class MainWindow(QMainWindow):
         if i == 0:
             self.engine_cfg("mode", "auto", True)
             self.engine_cfg("mode", "manual", "auto")
+        elif i == 4:
+            # 手动切换：不走自动打分，三个节奏档也不生效。
+            # `mode.auto=False` 与三档一致（都表示"不自动挑节奏"）；
+            # `manual` 存 SWITCH_MANUAL，引擎侧由 manual_switch_mode() 统一判定。
+            self.engine_cfg("mode", "auto", False)
+            self.engine_cfg("mode", "manual", SWITCH_MANUAL)
         else:
             self.engine_cfg("mode", "auto", False)
             self.engine_cfg("mode", "manual", ["normal", "fast", "beat"][i - 1])
@@ -3912,7 +3928,9 @@ class MainWindow(QMainWindow):
         # 能量校正滑条已无 UI（2026-10-18）；配置值在 __init__ 里直接写进 audio.energy_scale。
         m = self.cfg["mode"]
         manual = m.get("manual", "auto")
-        if m.get("auto", True) or manual in (None, "auto"):
+        if str(manual) == SWITCH_MANUAL:
+            self.settings.mode_combo.setCurrentIndex(4)
+        elif m.get("auto", True) or manual in (None, "auto"):
             self.settings.mode_combo.setCurrentIndex(0)
         else:
             try:
@@ -5526,7 +5544,8 @@ class MainWindow(QMainWindow):
             self._cur_layer = idx
             self.layer_del()
 
-    def layer_menu(self, idx, gpos):
+    def layer_menu(self, idx, gpos, _no_exec=False):
+        """图层右键菜单。`_no_exec=True` 只构建不弹出（离线取证用）。"""
         """图层右键菜单（**码表图层走另一套**，见 `_cue_layer_menu`）。"""
         if not (0 <= idx < len(self.engine.layers)):
             return
@@ -5542,9 +5561,19 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.setToolTipsVisible(True)      # ★ 长条目拆短后，括号里的说明挪进悬停提示
         a_ren = m.addAction("重命名…")
-        a_fix = m.addAction("固定播放本层当前素材")
+        # ★ 2026-10-25（用户要求）：与素材右键菜单统一口径 ——
+        #   「停止切换本层素材」= 这一层停在当前这张图上；已经在停时显示「恢复切换」。
+        _stopped = lay.fixed >= 0
+        a_fix = m.addAction("恢复切换本层素材" if _stopped else "停止切换本层素材")
         a_fix.setCheckable(True)
-        a_fix.setChecked(lay.fixed >= 0)
+        a_fix.setChecked(_stopped)
+        a_fix.setToolTip(T("本层停在这一张素材上，不再自动换；也挡不住你手动切"))
+        # 手动切下一个（只动本层，不重排全局切换倒计时）
+        a_step = m.addAction("手动切换素材")
+        a_step.setToolTip(T("立刻切到本层的下一个素材（不影响其它图层与节奏）"))
+        a_step.setEnabled(len(getattr(lay, "clips", []) or []) >= 2
+                          and not bool(getattr(lay, "auto_mode", False))
+                          and not bool(getattr(lay, "is_kv", False)))
         a_sil = m.addAction("无声音时隐藏本层")
         a_sil.setCheckable(True)
         a_sil.setChecked(bool(lay.hide_silent))
@@ -5600,6 +5629,8 @@ class MainWindow(QMainWindow):
             a_copy.setEnabled(False)
 
         i18n.retranslate(m)     # 临时菜单：弹出前刷语言
+        if _no_exec:
+            return m
         act = m.exec(gpos)
         if act is None:
             return
@@ -5620,6 +5651,12 @@ class MainWindow(QMainWindow):
             elif lay.cur >= 0:
                 lay.fixed = lay.cur
             self.save_layers()
+        elif act == a_step:
+            try:
+                self.engine.manual_switch_layer(idx)
+                self.layers_panel.refresh_playing()
+            except Exception:                                    # noqa: BLE001
+                pass
         elif act == a_sil:
             lay.hide_silent = not lay.hide_silent
             self.save_layers()
@@ -5768,8 +5805,12 @@ class MainWindow(QMainWindow):
         self._enforce_kv_top()
         self._sync_layers()
 
-    def clip_menu(self, layer_idx, media, gpos):
-        """素材格右键菜单"""
+    def clip_menu(self, layer_idx, media, gpos, _no_exec=False):
+        """素材格右键菜单。
+
+        `_no_exec=True`：只**构建**菜单并返回，不弹出（供离线 UI 取证脚本截图，
+        避免在无窗口环境里 `QMenu.exec()` 永久阻塞）。日常路径永远是 False。
+        """
         if not (0 <= layer_idx < len(self.engine.layers)):
             return
         lay = self.engine.layers[layer_idx]
@@ -5777,13 +5818,25 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         a_play = m.addAction("播放此素材")
         a_play.setEnabled(media is not None and not is_auto)   # 自动图层素材由曲风管理
+        # ★ 2026-10-25（用户要求）：手动切换素材 —— 顺序切到本层的下一个素材。
+        #   与「播放此素材」的区别：不用先点中目标，按一下就往下走一格（现场更顺手）。
+        #   安全边界：Kv 待机层（静音驱动）、单素材图层不给；「停止切换」的图层**允许**
+        #   （切完仍然停住，见 engine.manual_switch_layer 里的 fixed 跟随）。
+        _is_kv = bool(getattr(lay, "is_kv", False))
+        a_step = m.addAction("手动切换素材")
+        a_step.setEnabled(media is not None and not is_auto and not _is_kv
+                          and len(lay.clips) >= 2)
         a_size = m.addAction("素材大小与位置…")
         a_size.setEnabled(media is not None)
-        a_fix = m.addAction("固定为本层素材")
+        # ★ 2026-10-25（用户要求）：菜单文案改成「停止切换本层素材」——
+        #   它做的事就是"这一层停在这张图上"，不是"设为默认素材"，旧文案容易被理解反。
+        #   已经停在当前这张时，文案反过来写成「恢复切换」，点一下即可解开。
+        _fixed_here = (media is not None and lay.fixed >= 0
+                       and 0 <= lay.fixed < len(lay.clips) and lay.clips[lay.fixed] is media)
+        a_fix = m.addAction("恢复切换本层素材" if _fixed_here else "停止切换本层素材")
         a_fix.setCheckable(True)
         a_fix.setEnabled(not is_auto)
-        a_fix.setChecked(media is not None and lay.fixed >= 0
-                        and 0 <= lay.fixed < len(lay.clips) and lay.clips[lay.fixed] is media)
+        a_fix.setChecked(_fixed_here)
         m.addSeparator()
         a_rm = m.addAction(theme.danger_icon(), "从本层移除")
         a_rm.setEnabled(media is not None and not is_auto)
@@ -5798,6 +5851,8 @@ class MainWindow(QMainWindow):
         a_lay = m.addAction("图层设置…")
         # 菜单是临时构造的短命对象，弹出前刷一次语言（词表机制）
         i18n.retranslate(m)
+        if _no_exec:
+            return m
         act = m.exec(gpos)
         if act is None:
             return
@@ -5809,6 +5864,13 @@ class MainWindow(QMainWindow):
                 self.engine._switch_layer_to(lay, lay.clips.index(media))
                 self.layers_panel.refresh_playing()
             except ValueError:
+                pass
+        elif act == a_step and media is not None:
+            # 顺序切下一个（只动这一层，不重排全局切换倒计时）
+            try:
+                self.engine.manual_switch_layer(layer_idx)
+                self.layers_panel.refresh_playing()
+            except Exception:                                    # noqa: BLE001
                 pass
         elif act == a_fix and media is not None:
             try:
@@ -6246,7 +6308,9 @@ class MainWindow(QMainWindow):
             is_manual = bool(snap_mode.get("manual"))
         except Exception:                                        # noqa: BLE001
             is_manual = False
-        tag = T("手动") if is_manual else T("自动")
+        # 手动切换策略下 m == "manual"：别再拼成「手动切换（手动）」那种同义反复
+        tag = (T("不自动切换") if m == SWITCH_MANUAL
+               else (T("手动") if is_manual else T("自动")))
         self.settings.lbl_cur_mode.setText(
             Tf("当前节奏: {}（{}）", T(MODE_LABELS.get(m, m)), tag))
 

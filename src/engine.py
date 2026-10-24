@@ -265,7 +265,15 @@ MODE_LABELS = {
     "normal": "常规切",
     "fast": "快切",
     "beat": "逐拍交替",
+    # ★ 2026-10-25：**不是一种节奏**，而是「完全不自动切换」的策略值（`cfg["mode"]["manual"]`）。
+    #   它**绝不能进 `MODES`**：`MODES` 同时被 `manual_mode()` / `modes_snapshot()` 当合法值校验，
+    #   而且 `MODES` 里的值会落到 `self.mode`，随后被 `MODE_META[self.mode]` 取过渡时长 ——
+    #   `MODE_META` 只有三个节奏键，放进去就是 KeyError。
+    #   这里只是给状态栏/HUD 一个显示名（`MODE_LABELS.get(m, m)` 兜底也不会崩）。
+    "manual": "手动切换",
 }
+# 「手动切换素材」策略值（存在 `cfg["mode"]["manual"]`，与自动/三档节奏互斥）
+SWITCH_MANUAL = "manual"
 # 图层混合模式（键为配置文件值；Qt 无原生"减少"，用逐像素实现）
 BLEND_MODES = ("normal", "add", "subtract", "screen", "multiply", "lighten", "darken")
 
@@ -1394,9 +1402,17 @@ class AutoVJEngine(QObject):
         # 自动匹配：曲风变化时重算自动图层素材池
         self._refresh_auto_layers(snap)
 
+        # ★ 2026-10-25「手动切换素材」：**一次性关掉本帧所有自动切换入口**。
+        #   为什么用同一个布尔而不是各分支各写一遍：切换入口一共 3 个
+        #   （能量跨档 / 按拍位 / 逐拍交替），漏掉任何一个都会变成
+        #   "选了手动却还在偷偷换素材"。`pause_auto`（热键 P）语义相同，天然合并。
+        #   ⚠ 这里**不能**顺带 gating 下面这些：Kv 待机层（_kv_tick，静音进出）、
+        #     码表（_cuesheet_tick，跟拍驱动）、自愈看门狗 —— 它们与"自动换素材"无关。
+        _no_auto_switch = self.pause_auto or self.manual_switch_mode()
+
         # 能量跨档即时切换：能量从高/低跨过阈值（带防抖）时立即换素材动态档，
         # 不等到下一个拍位切换点（否则能量变了十几秒素材动态还换不过来）。
-        if self.running and not self.pause_auto and self.mode != "beat":
+        if self.running and not _no_auto_switch and self.mode != "beat":
             self._energy_tier_switch(snap)
 
         # BPM 速度同步
@@ -1406,11 +1422,11 @@ class AutoVJEngine(QObject):
             speed = 1.0
 
         # 非逐拍模式的按拍位切换
-        if self.running and not self.pause_auto and self.mode != "beat":
+        if self.running and not _no_auto_switch and self.mode != "beat":
             self._auto_switch_tick(snap)
 
         # 逐拍交替（仅当模式为 beat；相位驱动，每帧节流在内部完成）
-        if self.running and not self.pause_auto and self.mode == "beat":
+        if self.running and not _no_auto_switch and self.mode == "beat":
             self._beat_tick(snap)
 
         # 预热：把「下一个要切的素材」提前打开容器+解首帧（切到时零延迟，见 warm_up）
@@ -1696,6 +1712,10 @@ class AutoVJEngine(QObject):
             m = self.cfg["mode"].get("manual", "auto")
             if m not in (None, "auto") and m in MODES:
                 manual = m
+            elif str(m) == SWITCH_MANUAL:
+                # 手动切换策略：状态栏/HUD 要显示「手动切换」而不是上一次的节奏
+                return {"mode": SWITCH_MANUAL, "manual": SWITCH_MANUAL,
+                        "scores": dict(self.mode_scores or {})}
         except Exception:                                        # noqa: BLE001
             manual = None
         return {
@@ -1709,12 +1729,72 @@ class AutoVJEngine(QObject):
         m = self.cfg["mode"].get("manual", "auto")
         # 已删除「慢切」「静止/氛围」模式：旧配置若存了 slow/ambient，回退到自动，
         # 避免 MODE_META KeyError（旧配置迁移）。
+        # ⚠ 「手动切换」(SWITCH_MANUAL) 也走这条 return None：它不是节奏，
+        #   self.mode 必须保持 normal/fast/beat 之一（否则 MODE_META 取不到）。
         if m in (None, "auto") or m not in MODES:
             return None
         return m
 
+    def manual_switch_mode(self):
+        """是否处于「手动切换素材」策略（完全不自动切换）。
+
+        ⚠ 故意**不加 `@_locked`**：渲染线程每帧都要读它，而它只读 `cfg`（普通 dict，
+          `.get()` 在 GIL 下原子）。加锁等于每帧多抢一次渲染锁，本函数是纯读、无副作用。
+          也不被 GUI 直接调用 ⇒ `tools/_scan_locks.py` 的白名单不用动。
+        """
+        try:
+            return str(self.cfg["mode"].get("manual", "auto")) == SWITCH_MANUAL
+        except Exception:                                        # noqa: BLE001
+            return False
+
+    @_locked
+    def manual_switch_layer(self, layer_idx):
+        """手动切换**某一个图层**的素材（右键菜单「手动切换素材」）：顺序切到下一个。
+
+        与「下一素材」(`next_scene`) 的区别：只动这一层，**不重排全局切换倒计时**，
+        所以现场「悄悄换一张图」不会把别层的节奏打乱。
+
+        安全边界（用户 2026-10-25 明确要求"不要影响码表 / Kv / 停止切换"）：
+          · 码表图层：`clips` 为空（素材由 `.ercue` 运行时给），天然不动；
+            即便将来有 clips，也在下面显式跳过 `is_cuesheet`；
+          · Kv 待机层：由静音进出驱动，手动切没有意义 ⇒ 直接拒绝；
+          · 全局锁定(`self.locked`)：拒绝（锁定就是要画面不动）；
+          · 「停止切换本层素材」的图层：**允许**切（这是用户对这个图层的显式操作），
+            但停在哪一格的那个标记 `lay.fixed` 要跟着挪过去 ⇒ 切完仍然是"停住"状态，
+            不会被下一次自动切换顶掉，也不会因为 fixed 指向旧索引导致画面与标记不一致。
+        """
+        try:
+            _i = int(layer_idx)
+        except (TypeError, ValueError):
+            return False
+        # ⚠ 必须显式判上下界：`self.layers[-1]` 在 Python 里是合法的**最后一层**，
+        #   只写 try/except IndexError 会把 -1 当成有效索引，悄悄切错图层。
+        if not (0 <= _i < len(self.layers)):
+            return False
+        lay = self.layers[_i]
+        if not lay.clips or len(lay.clips) < 2 or self.locked:
+            return False
+        if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
+            return False
+        cur = int(getattr(lay, "cur", 0) or 0)
+        if not (0 <= cur < len(lay.clips)):
+            cur = 0
+        nxt = (cur + 1) % len(lay.clips)
+        if nxt == cur:
+            return False
+        self._switch_layer_to(lay, nxt)
+        if getattr(lay, "fixed", -1) >= 0:
+            lay.fixed = nxt
+        lay.pre_idx = -1
+        lay.warm_pend = False
+        return True
+
     def _update_mode(self, snap):
         now = time.perf_counter()
+        if self.manual_switch_mode():
+            # 手动切换：节奏档位不再自动打分（否则 `self.mode` 会在后台乱跳，
+            # 一旦切回自动，过渡时长/状态栏会先闪一下别的档）。
+            return
         manual = self.manual_mode()
         if manual:
             self.mode = manual
@@ -1960,7 +2040,13 @@ class AutoVJEngine(QObject):
 
     def beats_to_next_switch(self, snap):
         """距离下一次自动切换还有多少拍（供预览 HUD）。
-        基于对齐到小节线的固定目标点，倒计时单调递减不跳动。"""
+        基于对齐到小节线的固定目标点，倒计时单调递减不跳动。
+
+        手动切换策略下**永远返回 None**（没有"下一次自动切换"这回事）——
+        HUD 会自然省掉「还有 N 拍切换」这一段，而不是卡在某个数字上不动。
+        """
+        if self.manual_switch_mode():
+            return None
         if self.mode == "beat":
             return 1.0
         due = self._next_switch_due(snap)

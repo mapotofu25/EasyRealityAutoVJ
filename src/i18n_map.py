@@ -802,6 +802,7 @@ ZH2EN = {
     "强度+": "Intensity +",
     "强度-": "Intensity −",
     "手动切换": "Manual Switch",
+    "不自动切换": "no auto switching",
     "锁定素材": "Lock Clip",
     "输出全屏": "Output Fullscreen",
     "显示/隐藏界面": "Show / Hide UI",
@@ -1073,6 +1074,25 @@ ZH2EN = {
     "强度为 0（能量过低或全局强度为 0）": "Strength is 0 (energy too low, or global strength is 0)",
     "后处理：{}": "Post-processing: {}",
     "后处理（{}）：{}": "Post-processing ({}): {}",
+    # ---- 素材切换：手动模式 / 停止切换本层（2026-10-25）----
+    "手动切换素材": "Switch Clip Manually",
+    "停止切换本层素材": "Stop Switching This Layer",
+    "恢复切换本层素材": "Resume Switching This Layer",
+    "手动（不自动切换）": "Manual (no auto switching)",
+    "手动切换": "Manual Switch",
+    "不自动切换": "no auto switching",
+    "本层停在这一张素材上，不再自动换；也挡不住你手动切":
+        "Pins this layer to the current clip — no more auto switching, "
+        "but manual switching still works",
+    "立刻切到本层的下一个素材（不影响其它图层与节奏）":
+        "Switch this layer to its next clip right away — other layers and the "
+        "global switch countdown are left alone",
+    "自动：按能量/瞬态自己挑「常规切 / 快切」\n常规切 / 快切 / 逐拍交替：固定用这一种节奏\n手动（不自动切换）：永远不自动换素材，只在素材右键「手动切换素材」、「播放此素材」或按「下一素材」快捷键时换。Kv 待机层与码表不受影响。":
+        "Auto: picks Normal / Fast by energy and transients\n"
+        "Normal / Fast / Beat: always use that one tempo\n"
+        "Manual (no auto switching): never switches on its own — only via the clip "
+        "menu (Switch Clip Manually / Play This Clip) or the Next Clip hotkey. "
+        "The Kv standby layer and cue sheets are unaffected.",
     "自动": "Auto",
     "手动": "Manual",
     # ---- ASIO 输入（2026-10-22 新增，补译）----
