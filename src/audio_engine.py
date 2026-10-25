@@ -140,7 +140,48 @@ def _band_mean(spec, rg):
 FP_USE_HINT = False   # 见 `_recognize_loop` 里的对照实验说明
 
 
-FP_USE_HINT = False   # 见 `_recognize_loop` 里的对照实验说明
+def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
+    """初次锁定「这首歌能不能认」的证据门槛（纯函数，便于离线回归）。
+
+    `votes`  = 最佳**单一对齐位置**的票数（`fp.match` 的返回值）
+    `tot`    = 该曲**跨所有对齐位置**的总票（重复段落会把票摊开）
+    `second_best` = 其它歌里**最佳单对齐票**的最高值
+    `second_tot`  = 其它歌里**总票**的最高值
+    `hit_rate` = 查询哈希里有多大比例在库里出现过（0~1）
+
+    两条判据（**或**关系）：
+
+    ① 常规直通：`tot ≥ 80 且 votes ≥ 80`
+       原速播放时单点票很高（实测真歌 110~227），跨歌误认只有 30~61 —— 这条最干净。
+
+    ② 变速兜底（2026-10-25 加，用户实测「DJ 录的视频」认不出）：
+       DJ 混音视频常被 beatmatch 调速：**保留音高、只改速度** ⇒ 谱峰频率不变、
+       哈希照样命中（实测 94~97%），但位置整体漂移 ⇒ 票被摊到十几个 delta，
+       单点只剩 15~90，被"单点 ≥80"整条拦死。
+       此时四条同时成立才放行：
+         · 命中率 ≥60%     —— 库里确实有这段录音（别的歌到不了这个数）
+         · 总票 ≥120       —— 证据总量够（4.5s 窗口实测 240~750）
+         · 总票 ≥2× 第二名 —— 混音里另一首可能同时可闻，只要求总票明显领先
+         · 单点 ≥15 票     —— 不是纯噪声凑出来的
+       ※ 四条**同时**成立才放行，缺一不可；放行时会记 `gate=warp`。
+    """
+    if sid is None or int(sid) < 0:
+        return False
+    try:
+        votes, tot = int(votes or 0), int(tot or 0)
+        second_best, second_tot = int(second_best or 0), int(second_tot or 0)
+        hit_rate = float(hit_rate or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if tot >= 80 and votes >= 80:
+        return True
+    # 变速兜底（DJ 混音/调速）：
+    #   · 命中率 ≥60%     库里确实有这段录音
+    #   · 总票 ≥120       证据总量够
+    #   · 总票 ≥2× 第二名 混音里另一首可能同时可闻，只要求总票明显领先
+    #   · 单点 ≥15 票     不是纯噪声凑出来的（DJ 混音下单点被摊薄，不能要求 80）
+    return (hit_rate >= 0.60 and tot >= 120 and votes >= 15
+            and tot >= 2 * max(1, second_tot))
 
 
 class RateEstimator:
@@ -1654,11 +1695,15 @@ class AudioEngine:
                 line += " allow=%s" % ("-" if _al is None else len(_al))
             except Exception:
                 pass
-            # ★ 白名单规模（None=未限制；0=空集=谁都不认，属异常）
+            # ★ 本次锁定用的是哪条判据：strict（单点≥80）/ warp（变速兜底）/ none
+            line += " gate=%s" % (getattr(self, "_last_gate", "-") or "-")
+            # ★ 门槛前的原始数字：(pick, votes, tot, second_tot, hit_rate)
+            #   排查"为什么不认"时，这五个数就能直接判断是哪一条没过。
             try:
-                _al = getattr(fp_db, "allowed", None)
-                line += " allow=%s" % ("-" if _al is None else len(_al))
-            except Exception:
+                _gi = getattr(self, "_gate_info", None)
+                if _gi:
+                    line += " pick=%d pv=%d ptot=%d p2=%d phr=%.2f" % _gi
+            except Exception:                                    # noqa: BLE001
                 pass
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
@@ -1815,8 +1860,27 @@ class AudioEngine:
                     # ★★ 2026-10-22：**初次锁定还要求"单拍峰值 ≥80 票"**。
                     #   实测真歌峰值 124~227，跨歌误认（同专辑相似曲）峰值 30~61；
                     #   只看总票会放过后者（总票被多位置摊高）。这条把误认压到 0。
-                    if _tot < 80 or int(votes or 0) < 80:
+                    # 2026-10-25：判定抽成纯函数 `fp_lock_gate`（见模块级定义），
+                    #   因为"DJ 录的视频"要加一条新的放行条件，得能离线回归。
+                    _second, _second_tot = 0, 0
+                    try:
+                        _sv = getattr(fp_db, "last_song_best", {}) or {}
+                        _second = max((int(v) for k, v in _sv.items() if k != sid), default=0)
+                        _tv = getattr(fp_db, "last_song_votes", {}) or {}
+                        _second_tot = max((int(v) for k, v in _tv.items() if k != sid), default=0)
+                    except Exception:                        # noqa: BLE001
+                        _second, _second_tot = 0, 0
+                    _hr = float(getattr(fp_db, "last_hit_rate", 0.0) or 0.0)
+                    # 取证：把"门槛前"的原始数字留下来（`[R]` 行末尾 pick/pv/ptot/p2）
+                    self._gate_info = (int(sid), int(votes or 0), int(_tot),
+                                       int(_second_tot), round(_hr, 2))
+                    if not fp_lock_gate(sid, int(votes or 0), _tot, _second, _second_tot, _hr):
+                        self._last_gate = "none"
                         sid, votes, off = -1, 0, 0.0
+                    else:
+                        # 取证：区分"走常规门槛"还是"走变速兜底"——兜底放行的日志要能回看
+                        self._last_gate = ("strict" if (int(votes or 0) >= 80 and _tot >= 80)
+                                           else "warp")
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
                 _prev_off = float(_lm0[2]) if _lm0 else None

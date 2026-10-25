@@ -275,6 +275,14 @@ class FingerprintDB:
         self.conn.execute("PRAGMA journal_mode=WAL")   # WAL：扫描写/识别读可并发
         self._pending = 0          # 批量模式下"已写未 commit"的歌曲数（见 commit_batch）
         self.last_song_votes = {}  # ★ 上一次 match 的「每曲总票」：{song_id: votes}
+        # ★ 上一次 match 的「命中哈希率」：查询哈希里有多大比例在库里出现过（0~1）。
+        #   beatmatch 变速不改变音高 ⇒ 哈希仍命中（→ 高命中率），但位置漂移
+        #   ⇒ 单对齐票被摊平。这个指标用来把"同一首歌被变速"和"另一首相似的歌"分开。
+        self.last_hit_rate = 0.0
+        # ★ 上一次 match 的「每曲最佳单对齐票」：{song_id: votes}
+        #   与 last_song_votes（总票）配合：总票会被重复段落抬高，
+        #   单对齐最佳票才是"某个位置真的对上了"的证据。
+        self.last_song_best = {}
         # ★★ 2026-10-19：**只允许当前曲库里真实存在的 song_id 参与匹配**。
         #   背景：指纹库会残留「已从曲库移除」的历史条目；若不设白名单，放一首
         #   不在曲库的歌，也会被匹配到这些过期 id ⇒ 界面报出一首不存在的歌（假阳性）。
@@ -449,6 +457,8 @@ class FingerprintDB:
           调用点见 engine._beat_pos_grid → audio_engine._recognize_loop。"""
         hs = fingerprint_audio(sig, sr)
         if not hs:
+            self.last_hit_rate = 0.0
+            self.last_song_best = {}
             return -1, 0, 0.0
         qoff_map = {}
         hashes = []
@@ -460,6 +470,12 @@ class FingerprintDB:
         #   为什么要它：重复/相似段落会把票摊到多个 delta，单对齐票常只有个位数，
         #   而整首歌的总票仍有几百 —— 只用单对齐票当"证据"会严重低估。
         song_tot = {}
+        # ★ 2026-10-25：**命中哈希率**（有多少查询哈希在库里出现过，不看白名单）。
+        #   为什么要它：DJ 混音视频里的歌常被 beatmatch 调速（保留音高、只改速度），
+        #   谱峰频率不变 ⇒ 哈希照样命中，但**位置整体漂移** ⇒ 单对齐票被打散、
+        #   过不了「单点 ≥80」的门槛。命中率高（实测 85~91%）说明"库里就是这段录音"，
+        #   这比单点票更可靠地区分「同一首歌被变速」与「另一首相似的歌」。
+        seen = set()
         # 批量 IN 查询（分块避开 SQLite 999 变量上限）
         for i in range(0, len(hashes), 500):
             chunk = hashes[i:i + 500]
@@ -467,6 +483,7 @@ class FingerprintDB:
             for (h, song_id, dboff) in self.conn.execute(
                     f"SELECT hash, song_id, offset FROM fingerprints "
                     f"WHERE hash IN ({ph})", chunk):
+                seen.add(h)
                 # 只认当前曲库里的歌（过期指纹会被历史扫描留在库里）
                 if self.allowed is not None and song_id not in self.allowed:
                     continue
@@ -475,6 +492,13 @@ class FingerprintDB:
                     votes[key] = votes.get(key, 0) + 1
                     song_tot[song_id] = song_tot.get(song_id, 0) + 1
         self.last_song_votes = song_tot
+        self.last_hit_rate = (len(seen) / float(len(qoff_map))) if qoff_map else 0.0
+        # 每曲最佳单对齐票（用于"这首歌在某个位置明显领先"的判定）
+        _best = {}
+        for (s_, _d), v_ in votes.items():
+            if v_ > _best.get(s_, 0):
+                _best[s_] = v_
+        self.last_song_best = _best
         picked = self._pick(votes, hint_delta, hint_w)
         if picked is None:
             return -1, 0, 0.0
