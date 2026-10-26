@@ -772,7 +772,7 @@ class _Analyzer:
                 h = h - np.mean(h)
                 ac = np.correlate(h, h, "full")[len(h) - 1:]
                 acn = ac / (ac[0] + 1e-9)
-                lo = max(2, int(60 / 200 * fps))
+                lo = max(2, int(60 / 220 * fps))
                 hi = min(int(60 / 60 * fps), len(acn) - 10)
                 if hi <= lo + 2:
                     return 0.0, -1, acn
@@ -798,23 +798,18 @@ class _Analyzer:
             else:
                 lag, acn, _hist = flag, fac, fh
             # 半速（亚谐波）分辨率：**对 kick 与全频两分支都生效**。
-            # 4/4 电子乐 kick 每拍一响，自相关在「真实拍长」与「2×拍长」处都有峰，
-            # 梳状打分两者几乎同分；offbeat bass 让相邻拍相关性低于隔拍相关性时，
-            # 2×拍长反而更高分 ⇒ BPM 被减半（实测 160→80、180→90）。旧代码只在全频分支
-            # 且只查 ×2/×1.5，kick 分支与 2.5× 亚谐波都漏掉。
-            # 修法：候选 BPM<120（多半是亚谐波）时，在 [lo, lag) 里找第一个「绝对强度够、
-            # 且是局部峰」的更短周期（=真实拍长），相对当前峰 ≥0.6 才算。半拍/噪声峰
-            # （绝对强度 <0.30）与真实慢歌（无更强半拍能量）都不会被误升。
+            # 4/4 电子乐 kick 每拍一响，自相关在「真实拍长」与「2×拍长」处都有峰，梳状打分两者
+            # 几乎同分；offbeat 让相邻拍相关性低于隔拍相关性时，2×拍长反而更高分 ⇒ BPM 被减半。
+            # 修法：候选 BPM<120 时，在 [lo, lag) 里找第一个「绝对强度够、且是局部峰」的更短周期
+            # （=真实拍长），相对当前峰 ≥阈值才算。半拍/噪声峰（<0.30）与真实慢歌都不被误升。
             if lag > 0:
                 b0 = 60.0 / (lag / fps)
                 if b0 < 120.0:
-                    # ★ 半速修正搜索下界：按最高 240 BPM 反推最短拍长。原来 200 ⇒
-                    #   真实 BPM >200 的曲目（如 Uptempo 209）其真实拍长落在搜索范围外，
-                    #   减半值（209→104.5）无法被修正。提到 240 后 209 的拍长进入范围。
+                    # 半速修正搜索下界：按最高 240 BPM 反推最短拍长（209/210 真实拍长可进范围）。
                     lo_lag = max(2, int(60.0 / 240.0 * fps))
-                    # 8× 上采样直方图后再自相关：kick 周期（如 160BPM=17.578 块）非整数，
-                    # 整数 lag 会把主拍/半拍峰都「抹平」到相近值，无法分辨「80+offbeat（160 处是弱
-                    # offbeat）」与「160 减半成 80（160 处是强 kick）」。上采样直方图才能测准亚采样峰。
+                    # 8× 上采样直方图后再自相关：kick 周期（160BPM=17.578 块）非整数，整数 lag 会把
+                    # 主拍/半拍峰都抹平到相近值，无法分辨「80+offbeat（160 处弱 offbeat）」与
+                    # 「160 减半成 80（160 处强 kick）」。上采样直方图才能测准亚采样峰。
                     _hist_c = np.asarray(_hist, dtype=np.float64)
                     _hist_c = _hist_c - np.mean(_hist_c)
                     _hu = np.interp(np.linspace(0, len(_hist_c) - 1, len(_hist_c) * 8),
@@ -837,7 +832,7 @@ class _Analyzer:
                         if acn[cand] < left or acn[cand] < right:
                             continue
                         # 相对强度：上采样峰比 ≥阈值 才算「下半拍够强」→ 修正；
-                        # 弱 offbeat（真实 80+offbeat 的峰比 ≈0.77）不修正。
+                        # 弱 offbeat（真实 80+offbeat 峰比 ≈0.77）不修正。
                         if _peak_up(cand * 8) < _HALFSPEED_RATIO_MIN * _peak_up(lag * 8):
                             continue
                         lag = cand
