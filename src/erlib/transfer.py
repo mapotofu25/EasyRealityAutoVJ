@@ -58,7 +58,8 @@ def export_subset(work, out_path, sids, on_progress=None, app_ver="erlib"):
                 if sid not in sids:
                     continue
                 w.add_song(sid, s, src.fingerprints_of(sid),
-                           src.cover(sid), commit=False)
+                           src.cover(sid), commit=False,
+                           waveform=src.waveform(sid))
                 n += 1
                 if n % 5 == 0:
                     w.commit()
@@ -243,7 +244,8 @@ def import_into(pkg_path, base_dir, on_progress=None, clear_first=False):
                         n_cover += 1
                 except Exception:                                # noqa: BLE001
                     cp = ""
-                IL.add_song(conn, sid, s, cp, pack=pack)
+                IL.add_song(conn, sid, s, cp, pack=pack,
+                            waveform=src.waveform(sid))
                 n_song += 1
                 if n_song % 50 == 0:
                     conn.commit()

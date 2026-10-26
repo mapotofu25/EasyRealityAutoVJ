@@ -140,6 +140,21 @@ def _band_mean(spec, rg):
 FP_USE_HINT = False   # 见 `_recognize_loop` 里的对照实验说明
 
 
+# ==========================================================================
+# 识别锁定门槛（fp_lock_gate）—— 阈值抽成模块级常量，便于离线回归与 QA 复验
+# ==========================================================================
+LOCK_VOTES_STRICT = 80     # ① 常规直通：单点票
+LOCK_TOT_STRICT   = 80     # ① 常规直通：总票
+LOCK_TOT_WARP     = 120    # ② 变速兜底：总票
+LOCK_VOTES_WARP   = 15     # ② 变速兜底：单点票
+LOCK_HIT_WARP     = 0.60   # ② 变速兜底：命中率
+LOCK_LEAD_WARP    = 2.0    # ② 变速兜底：领先倍数
+LOCK_HIT_RECODE   = 0.85   # ③ 重编码兜底：命中率（比 ② 更严）
+LOCK_TOT_RECODE   = 40     # ③ 重编码兜底：总票下限（只挡"总共几十票"的弱匹配）
+LOCK_VOTES_RECODE = 5      # ③ 重编码兜底：单点票下限（白噪峰值≤4，5 是安全下界）
+LOCK_LEAD_RECODE  = 3.0    # ③ 重编码兜底：总票领先倍数（真歌必胜，硬误无领先）
+
+
 def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
     """初次锁定「这首歌能不能认」的证据门槛（纯函数，便于离线回归）。
 
@@ -149,7 +164,7 @@ def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
     `second_tot`  = 其它歌里**总票**的最高值
     `hit_rate` = 查询哈希里有多大比例在库里出现过（0~1）
 
-    两条判据（**或**关系）：
+    三条判据（**或**关系）：
 
     ① 常规直通：`tot ≥ 80 且 votes ≥ 80`
        原速播放时单点票很高（实测真歌 110~227），跨歌误认只有 30~61 —— 这条最干净。
@@ -157,13 +172,19 @@ def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
     ② 变速兜底（2026-10-25 加，用户实测「DJ 录的视频」认不出）：
        DJ 混音视频常被 beatmatch 调速：**保留音高、只改速度** ⇒ 谱峰频率不变、
        哈希照样命中（实测 94~97%），但位置整体漂移 ⇒ 票被摊到十几个 delta，
-       单点只剩 15~90，被"单点 ≥80"整条拦死。
-       此时四条同时成立才放行：
+       单点只剩 15~90，被"单点 ≥80"整条拦死。此时四条同时成立才放行：
          · 命中率 ≥60%     —— 库里确实有这段录音（别的歌到不了这个数）
          · 总票 ≥120       —— 证据总量够（4.5s 窗口实测 240~750）
          · 总票 ≥2× 第二名 —— 混音里另一首可能同时可闻，只要求总票明显领先
          · 单点 ≥15 票     —— 不是纯噪声凑出来的
        ※ 四条**同时**成立才放行，缺一不可；放行时会记 `gate=warp`。
+
+    ③ 重编码/低单点兜底（2026-10-27 加，QA 实测 B 站重编码正确 top1 被门栏几乎全拦）：
+       B 站/重编码音频「正确 top1 + 高命中率 + 低单点票」（揽月 votes 6~9），
+       够不到 ① 的 `单点≥80`、② 的 `单点≥15`。把「单点票」降级为弱噪声下限（≥5，
+       白噪峰值≤4），改由「命中率 ≥85% + 总票 ≥40 + 总票 ≥3× 第二名」守底线：
+       硬误发生时**真歌也在库里**，真歌总票 ≥ 误匹配歌总票 ⇒ 领先 ≥3× 对硬误恒不成立、
+       对正确（byte-identical / 真重编码）恒成立。放行时记 `gate=recode`。
     """
     if sid is None or int(sid) < 0:
         return False
@@ -173,15 +194,20 @@ def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
         hit_rate = float(hit_rate or 0.0)
     except (TypeError, ValueError):
         return False
-    if tot >= 80 and votes >= 80:
+    # ① 常规直通（原速高票，最干净，逐值不变）
+    if tot >= LOCK_TOT_STRICT and votes >= LOCK_VOTES_STRICT:
         return True
-    # 变速兜底（DJ 混音/调速）：
-    #   · 命中率 ≥60%     库里确实有这段录音
-    #   · 总票 ≥120       证据总量够
-    #   · 总票 ≥2× 第二名 混音里另一首可能同时可闻，只要求总票明显领先
-    #   · 单点 ≥15 票     不是纯噪声凑出来的（DJ 混音下单点被摊薄，不能要求 80）
-    return (hit_rate >= 0.60 and tot >= 120 and votes >= 15
-            and tot >= 2 * max(1, second_tot))
+    # ② 变速兜底（DJ 混音/调速，逐值不变）
+    if (hit_rate >= LOCK_HIT_WARP and tot >= LOCK_TOT_WARP
+            and votes >= LOCK_VOTES_WARP
+            and tot >= LOCK_LEAD_WARP * max(1, second_tot)):
+        return True
+    # ③ 重编码/低单点兜底（★ 新增）
+    if (hit_rate >= LOCK_HIT_RECODE and tot >= LOCK_TOT_RECODE
+            and votes >= LOCK_VOTES_RECODE
+            and tot >= LOCK_LEAD_RECODE * max(1, second_tot)):
+        return True
+    return False
 
 
 class RateEstimator:
@@ -1717,7 +1743,7 @@ class AudioEngine:
                 line += " allow=%s" % ("-" if _al is None else len(_al))
             except Exception:
                 pass
-            # ★ 本次锁定用的是哪条判据：strict（单点≥80）/ warp（变速兜底）/ none
+            # ★ 本次锁定用的是哪条判据：strict（单点≥80）/ warp（变速兜底）/ recode（重编码兜底）/ none
             line += " gate=%s" % (getattr(self, "_last_gate", "-") or "-")
             # ★ 门槛前的原始数字：(pick, votes, tot, second_tot, hit_rate)
             #   排查"为什么不认"时，这五个数就能直接判断是哪一条没过。
@@ -1900,9 +1926,15 @@ class AudioEngine:
                         self._last_gate = "none"
                         sid, votes, off = -1, 0, 0.0
                     else:
-                        # 取证：区分"走常规门槛"还是"走变速兜底"——兜底放行的日志要能回看
-                        self._last_gate = ("strict" if (int(votes or 0) >= 80 and _tot >= 80)
-                                           else "warp")
+                        # 取证：区分"走常规门槛 / 变速兜底 / 重编码兜底"——兜底放行的日志要能回看
+                        self._last_gate = (
+                            "strict" if (int(votes or 0) >= LOCK_VOTES_STRICT
+                                         and _tot >= LOCK_TOT_STRICT)
+                            else "warp" if (_hr >= LOCK_HIT_WARP and _tot >= LOCK_TOT_WARP
+                                            and int(votes or 0) >= LOCK_VOTES_WARP
+                                            and _tot >= LOCK_LEAD_WARP * max(1, _second_tot))
+                            else "recode"
+                        )
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
                 _prev_off = float(_lm0[2]) if _lm0 else None
