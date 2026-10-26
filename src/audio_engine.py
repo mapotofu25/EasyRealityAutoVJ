@@ -602,7 +602,7 @@ class _Analyzer:
         self.cx_smooth = 0.0
         self.energy_hist = deque(maxlen=192)
         self.voc_smooth = 0.0
-        self.lv_smooth = -60.0                 # 绝对响度（RMS dBFS）的平滑值，见 EN_ABS_* 
+        self.lv_smooth = 0.0                   # 绝对响度的**线性 RMS**平滑值（先平滑功率再转 dB，见 feed）
         self.seg_state = {"quiet_since": None, "build_since": None, "last_drop": 0.0,
                           "was_high": False, "high_since": None, "label": "none",
                           "seg_until": 0.0, "prev_e": 0.0}
@@ -754,16 +754,29 @@ class _Analyzer:
                 lag, acn = klag, kac
             else:
                 lag, acn = flag, fac
-                # 半速修正：全频通量偏向「真实 BPM 的 1/2 或 2/3」（intro 半速 73↔146、
-                # 主段 2/3 半速 96↔145、88↔132）。候选偏慢时依次检查 ×2、×1.5 处自相关，
-                # 若也强则升上去。舞曲场景慢歌(<120)极少，误升风险低。
+            # 半速（亚谐波）分辨率：**对 kick 与全频两分支都生效**。
+            # 4/4 电子乐 kick 每拍一响，自相关在「真实拍长」与「2×拍长」处都有峰，
+            # 梳状打分两者几乎同分；offbeat bass 让相邻拍相关性低于隔拍相关性时，
+            # 2×拍长反而更高分 ⇒ BPM 被减半（实测 160→80、180→90）。旧代码只在全频分支
+            # 且只查 ×2/×1.5，kick 分支与 2.5× 亚谐波都漏掉。
+            # 修法：候选 BPM<120（多半是亚谐波）时，在 [lo, lag) 里找第一个「绝对强度够、
+            # 且是局部峰」的更短周期（=真实拍长），相对当前峰 ≥0.6 才算。半拍/噪声峰
+            # （绝对强度 <0.30）与真实慢歌（无更强半拍能量）都不会被误升。
+            if lag > 0:
                 b0 = 60.0 / (lag / fps)
-                if b0 < 120:
-                    for mult in (2.0, 1.5):
-                        lagm = int(round(60.0 / (b0 * mult) * fps))
-                        if 2 <= lagm < len(acn) and acn[lagm] > 0.6 * acn[lag]:
-                            lag = lagm
-                            break
+                if b0 < 120.0:
+                    lo_lag = max(2, int(60.0 / 200.0 * fps))
+                    for cand in range(lo_lag, int(lag)):
+                        if acn[cand] < 0.30:
+                            continue
+                        left = acn[cand - 1] if cand > 0 else -1.0
+                        right = acn[cand + 1] if cand + 1 < len(acn) else -1.0
+                        if acn[cand] < left or acn[cand] < right:
+                            continue
+                        if acn[cand] < 0.6 * acn[lag]:
+                            continue
+                        lag = cand
+                        break
             if lag > 0 and (kscore > 0.9 or fscore > 0):
                 # 抛物线插值细化亚采样精度
                 delta = 0.0
@@ -985,10 +998,18 @@ class _Analyzer:
         #   Black Warrior 钢琴 breakdown −11.9 / Cosmic String 常规段 −12.4 /
         #   BW 3:00 段 −15.7。
         #   ⇒ 窗口取 [−14, −6]：drop 得 0.65~0.83；钢琴段只有 0.14、intro 与 BW3:00 为 0。
-        lv_db_now = 20.0 * float(np.log10(max(rms, 1e-5)))
-        self.lv_smooth += (lv_db_now - self.lv_smooth) * (
+        # ★ 绝对响度兜底项：**先平滑功率（rms²）再转 dB**。
+        #   旧实现先 `20*log10(rms)` 再 EMA（=对 dB 取平均）。硬舞曲 Drop 的 kick 是
+        #   「高 RMS 脉冲 + 拍间低 RMS」的双峰分布，对 dB 取平均会系统性偏向安静间隙
+        #   （Jensen 不等式：log 的均值 < 均值的 log），把整体响度低估 3~4 dB ⇒ abs_ev
+        #   偏低、Hardstyle/Hardcore Drop 能量上不去。而且即便对「块 RMS」取平均，仍会因
+        #   sqrt 的凹性再低估一次（mean(sqrt) < sqrt(mean)）。只有对**功率**（rms²）取平均、
+        #   再 `10*log10` 转回 dB，才与窗口 [-14,-6] 标定时用的「段平均 RMS」口径严格一致。
+        lv_pow_now = max(float(rms) * float(rms), 1e-10)
+        self.lv_smooth += (lv_pow_now - self.lv_smooth) * (
             1.0 - float(np.exp(-self.block_sec / EN_LV_TAU)))
-        abs_ev = max(0.0, min(1.0, (self.lv_smooth - EN_ABS_LO_DB)
+        lv_db_sm = 10.0 * float(np.log10(max(self.lv_smooth, 1e-10)))
+        abs_ev = max(0.0, min(1.0, (lv_db_sm - EN_ABS_LO_DB)
                               / (EN_ABS_HI_DB - EN_ABS_LO_DB))) * EN_ABS_W
         loud_term = e_loud                                  # 响度项（0~1，融合前）
         # 低频证据项（0~1）：kick 冲击 / 低频能量 / 低频起伏 / **绝对响度** 取 max
@@ -1149,6 +1170,7 @@ class _Analyzer:
                 self._peak_confirmed = False   # 新歌 peak 重新观察（锚定保护重启）
                 self._peak_age = 0.0
                 self._kick_e_smooth = 0.0      # 持续打击平滑重置
+                self.lv_smooth = 0.0           # 绝对响度线性 RMS 平滑重置（换歌后重新积累）
                 self.fluct_peak = 0.0          # 起伏变化量慢峰重置
                 self.prev_bass_e = None
                 self.e_loud_smooth = 0.0

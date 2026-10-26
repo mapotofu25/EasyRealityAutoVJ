@@ -37,8 +37,13 @@ _SCHEMA = (
     #   `pack=''` = 加这一列之前导入的旧数据 ⇒ 界面显示「早期导入」。
     #   ⚠ 新增列一律放**最后**（与 ALTER TABLE ADD COLUMN 追加到末尾一致），
     #     保证 `add_song` 的显式列名顺序与建表顺序对齐（防"列插反"静默写错）。
-    " pack TEXT DEFAULT '')",
+    " pack TEXT DEFAULT '',"
+    # ★ 2026-10-27 曲库识别增强：手工标注（bpm_manual/anchors/segments），JSON。
+    " manual TEXT DEFAULT '')",
     "CREATE INDEX IF NOT EXISTS idx_imp_name ON songs(file_name)",
+    # ★ 2026-10-27 曲库识别增强：导入歌的波形（zlib 压缩 JSON BLOB）。
+    "CREATE TABLE IF NOT EXISTS waveforms ("
+    " song_id INTEGER PRIMARY KEY, data BLOB)",
 )
 
 
@@ -78,6 +83,15 @@ def _migrate(conn):
             #   下次 open_meta 会重试并自愈。打一行日志便于排查"导入歌偶发消失"。
             try:
                 print("[imported_lib] 迁移补列 pack 失败（下次打开会重试）：%s" % e)
+            except Exception:                                    # noqa: BLE001
+                pass
+    if "manual" not in cols:
+        try:
+            conn.execute("ALTER TABLE songs ADD COLUMN manual TEXT DEFAULT ''")
+            conn.commit()
+        except Exception as e:                                   # noqa: BLE001
+            try:
+                print("[imported_lib] 迁移补列 manual 失败（下次打开会重试）：%s" % e)
             except Exception:                                    # noqa: BLE001
                 pass
 
@@ -133,29 +147,43 @@ def _p(v):
     return v
 
 
-def add_song(conn, sid, meta, cover_path="", pack=""):
+def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None):
     """写/覆盖一首导入歌（用于导入过程；调用方自行 commit）。
 
     `pack` = 这首歌来自哪个导入包（包名，不含 `.eravjlib` 扩展名）；
     留空表示"未知来源"（界面按「早期导入」显示）。
+    `manual`/`waveform` 可显式传（优先于 `meta` 内的同名键）：
+      · `manual`  = grid_manual dict（bpm_manual/anchors/segments），落 songs.manual；
+      · `waveform` = waveform dict（{v,cps,dur,amp}），落 waveforms 表 BLOB。
 
     ⚠⚠ **必须显式写列名**（不要用 `INSERT ... VALUES(?,?,...)` 的裸写法）——
       2026-10-08 踩过大坑：SQLite 动态类型**不会**因"参数个数/顺序对不上列"
       而报错，列错位会**静默写错数据**（表现为"读出来全是空/串位"）。
-      加列（pack）后尤其危险 —— 显式列名 + 与 `_SCHEMA` 逐列对齐是唯一保险。
+      加列（pack/manual）后尤其危险 —— 显式列名 + 与 `_SCHEMA` 逐列对齐是唯一保险。
     """
     m = dict(meta or {})
+    manual_val = manual if manual is not None else m.get("manual")
     conn.execute(
         "INSERT OR REPLACE INTO songs ("
         " song_id, file_name, file_size, duration, artist, title, rel_path,"
         " genres, styles, source, level, ai_zh, grid, cover_path, imported_at,"
-        " pack) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " pack, manual) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (int(sid), m.get("file_name", ""), int(m.get("file_size") or 0),
          float(m.get("duration") or 0.0), m.get("artist", ""),
          m.get("title", ""), m.get("rel_path", ""),
          _j(m.get("genres")), _j(m.get("styles")), m.get("source", ""),
          m.get("level", ""), _j(m.get("ai_zh")), _j(m.get("grid")),
-         cover_path or "", time.time(), str(pack or "")))
+         cover_path or "", time.time(), str(pack or ""),
+         _j(manual_val)))
+    if waveform is not None:
+        try:
+            import waveform as _wf
+            blob = _wf.waveform_encode(waveform)
+            if blob:
+                conn.execute("INSERT OR REPLACE INTO waveforms VALUES (?,?)",
+                             (int(sid), sqlite3.Binary(blob)))
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 def lookup_grids(base_dir):
@@ -172,8 +200,8 @@ def lookup_grids(base_dir):
             return out
         c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
         try:
-            for sid, g, flip in c.execute(
-                    "SELECT song_id, grid, '' FROM songs"):
+            for sid, g, manual in c.execute(
+                    "SELECT song_id, grid, manual FROM songs"):
                 g = _p(g)
                 if not isinstance(g, dict):
                     continue
@@ -187,10 +215,13 @@ def lookup_grids(base_dir):
                     continue
                 if conf < 0.6 or not (0.2 < bl < 1.5):
                     continue
+                manual = _p(manual)
+                if not isinstance(manual, dict):
+                    manual = None
                 out[int(sid)] = {"bpm": g.get("bpm"), "beat_len": bl,
                                  "anchor": anchor, "conf": conf,
                                  "src": g.get("src"), "dur": g.get("dur"),
-                                 "flip": 0.0}
+                                 "flip": 0.0, "manual": manual}
         finally:
             c.close()
     except Exception:                                            # noqa: BLE001
@@ -249,9 +280,9 @@ def display_rows(base_dir):
         # ⚠ 必须走 open_meta（内含 _migrate）——直连会在未迁移的旧库上因 pack 列缺失而抛
         c = open_meta(base_dir)
         try:
-            for (sid, name, dur, artist, title, gen, grid, pack) in c.execute(
+            for (sid, name, dur, artist, title, gen, grid, pack, manual) in c.execute(
                     "SELECT song_id, file_name, duration, artist, title, "
-                    "genres, grid, pack FROM songs ORDER BY song_id"):
+                    "genres, grid, pack, manual FROM songs ORDER BY song_id"):
                 g = _p(grid)
                 if not isinstance(g, dict):
                     g = {}
@@ -264,6 +295,9 @@ def display_rows(base_dir):
                     du = float(g.get("dur") or dur or 0.0) or None
                 except (TypeError, ValueError):
                     du = None
+                manual = _p(manual)
+                if not isinstance(manual, dict):
+                    manual = None
                 cp = os.path.join(cover_dir(base_dir), "%d.jpg" % int(sid))
                 out.append({
                     "sid": int(sid),
@@ -275,6 +309,7 @@ def display_rows(base_dir):
                     "dur": du,
                     "cover": cp if os.path.isfile(cp) else "",
                     "pack": pack or "",
+                    "manual": manual,
                 })
         finally:
             c.close()
@@ -287,6 +322,44 @@ def cover_path_of(base_dir, sid):
     """这首导入歌的封面文件路径（没有则点封面时找不到文件，界面自行兜底）。"""
     p = os.path.join(cover_dir(base_dir), "%d.jpg" % int(sid))
     return p if os.path.isfile(p) else ""
+
+
+def manual_of(base_dir, sid):
+    """这首导入歌的手工标注 `grid_manual` dict（没有/损坏返回 None）。"""
+    try:
+        if not os.path.isfile(meta_db_path(base_dir)):
+            return None
+        c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
+        try:
+            r = c.execute("SELECT manual FROM songs WHERE song_id=?",
+                          (int(sid),)).fetchone()
+            if not r:
+                return None
+            v = _p(r[0])
+            return v if isinstance(v, dict) else None
+        finally:
+            c.close()
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def waveform_of(base_dir, sid):
+    """这首导入歌的波形 `waveform` dict（{v,cps,dur,amp}；没有/损坏返回 None）。"""
+    try:
+        if not os.path.isfile(meta_db_path(base_dir)):
+            return None
+        c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
+        try:
+            r = c.execute("SELECT data FROM waveforms WHERE song_id=?",
+                          (int(sid),)).fetchone()
+            if not r:
+                return None
+            import waveform as _wf
+            return _wf.waveform_decode(bytes(r[0]))
+        finally:
+            c.close()
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def remove_songs(base_dir, sids):
@@ -310,6 +383,7 @@ def remove_songs(base_dir, sids):
             for sid in sids:
                 cur = c.execute("DELETE FROM songs WHERE song_id=?", (sid,))
                 n += max(0, int(cur.rowcount))
+                c.execute("DELETE FROM waveforms WHERE song_id=?", (sid,))
             c.commit()
         finally:
             c.close()
@@ -344,6 +418,7 @@ def clear(base_dir):
         c = open_meta(base_dir)
         try:
             c.execute("DELETE FROM songs")
+            c.execute("DELETE FROM waveforms")
             c.commit()
         finally:
             c.close()

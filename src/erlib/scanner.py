@@ -112,7 +112,8 @@ class Scanner:
         self._vdj = None
         self._stop = False
         self.stats = {"ok": 0, "fail": 0, "skip": 0, "t_decode": 0.0,
-                      "t_fp": 0.0, "t_meta": 0.0, "t_grid": 0.0, "t_cover": 0.0}
+                      "t_fp": 0.0, "t_meta": 0.0, "t_grid": 0.0,
+                      "t_wave": 0.0, "t_cover": 0.0}
 
     # ---------------- 资源准备（进程级只做一次） ----------------
     def _ensure(self):
@@ -140,7 +141,7 @@ class Scanner:
 
     # ---------------- 单首 ----------------
     def scan_one(self, path):
-        """返回 `(sid, meta_dict, fps, cover_bytes)`；失败抛异常（调用方吞）。"""
+        """返回 `(sid, meta_dict, fps, cover_bytes, waveform)`；失败抛异常（调用方吞）。"""
         self._ensure()
         from erlib.format import song_id_of
         t0 = time.perf_counter()
@@ -180,6 +181,16 @@ class Scanner:
             pass
         t4 = time.perf_counter()
 
+        # ★ 波形峰值包络：复用同一次已解码的 `sig`（每首只解码一次），现算现存。
+        #   失败不阻断扫描（详情页没波形就显示「无波形」）。
+        wf = None
+        try:
+            import waveform as _wf
+            wf = _wf.waveform_from_signal(sig, sr)
+        except Exception:                                        # noqa: BLE001
+            wf = None
+        t5 = time.perf_counter()
+
         cover_bytes = None
         try:
             # ★ 用 erlib 自带的轻量封面提取（mutagen + PIL）而**不是**主程序的
@@ -189,11 +200,11 @@ class Scanner:
             cover_bytes = _cb(path)
         except Exception:                                        # noqa: BLE001
             cover_bytes = None
-        t5 = time.perf_counter()
+        t6 = time.perf_counter()
 
         for k, dt in (("t_decode", t1 - t0), ("t_fp", t2 - t1),
                       ("t_meta", t3 - t2), ("t_grid", t4 - t3),
-                      ("t_cover", t5 - t4)):
+                      ("t_wave", t5 - t4), ("t_cover", t6 - t5)):
             self.stats[k] += dt
 
         try:
@@ -220,7 +231,7 @@ class Scanner:
             "ai_zh": r.get("ai_zh") or [],
             "grid": r.get("grid") or {},
         }
-        return song_id_of(path), meta, fps, cover_bytes
+        return song_id_of(path), meta, fps, cover_bytes, wf
 
     # ---------------- 整目录（串行版；并行见 scan_tree_parallel） ----------------
     def scan_tree(self, root, writer, progress_every=1):
@@ -240,8 +251,8 @@ class Scanner:
             if self._stop:
                 break
             try:
-                sid, meta, fps, cov = self.scan_one(p)
-                writer.add_song(sid, meta, fps, cov, commit=False)
+                sid, meta, fps, cov, wf = self.scan_one(p)
+                writer.add_song(sid, meta, fps, cov, commit=False, waveform=wf)
                 if i % 6 == 0:
                     writer.commit()
                 self.stats["ok"] += 1

@@ -69,14 +69,42 @@ _SCHEMA = (
     " artist TEXT, title TEXT, genre_raw TEXT,"
     " genres TEXT, styles TEXT, source TEXT, level TEXT, ai_zh TEXT,"
     " grid TEXT, fp_count INTEGER DEFAULT 0, cover_size INTEGER DEFAULT 0,"
-    " scanned_at REAL)",
+    " scanned_at REAL,"
+    # ★ 2026-10-27 曲库识别增强：新增 `manual`（用户手工标注：bpm_manual/anchors/segments）。
+    #   放**最后**（与 ALTER TABLE ADD COLUMN 追加到末尾一致，见 _migrate）。
+    " manual TEXT)",
     "CREATE TABLE IF NOT EXISTS fingerprints ("
     " song_id INTEGER NOT NULL, hash TEXT NOT NULL, offset INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS idx_fp_hash ON fingerprints(hash)",
     "CREATE INDEX IF NOT EXISTS idx_fp_song ON fingerprints(song_id)",
     "CREATE TABLE IF NOT EXISTS covers ("
     " song_id INTEGER PRIMARY KEY, data BLOB)",
+    # ★ 2026-10-27 曲库识别增强：新增 `waveforms` 表（zlib 压缩 JSON BLOB，与 covers 同构）。
+    "CREATE TABLE IF NOT EXISTS waveforms ("
+    " song_id INTEGER PRIMARY KEY, data BLOB)",
 )
+
+
+def _migrate(conn):
+    """幂等迁移：给老库补 `songs.manual` 列（`waveforms` 表由 _SCHEMA 的 CREATE IF NOT EXISTS 兜底）。
+
+    ★ `_SCHEMA` 是 `CREATE TABLE IF NOT EXISTS` —— 对已存在的旧表**不会**加新列，
+      老用户升级后必须靠 ALTER 补列。每次打开 LibWriter 都跑一遍（幂等，见 _migrate 调用）。
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(songs)")}
+    except Exception:                                            # noqa: BLE001
+        return
+    if "manual" not in cols:
+        try:
+            conn.execute("ALTER TABLE songs ADD COLUMN manual TEXT")
+            conn.commit()
+        except Exception as e:                                   # noqa: BLE001
+            # 罕见：他处持写锁导致 ALTER 失败，本次吞掉、下次打开重试自愈。
+            try:
+                print("[erlib.format] 迁移补列 manual 失败（下次打开会重试）：%s" % e)
+            except Exception:                                    # noqa: BLE001
+                pass
 
 
 # ==========================================================================
@@ -118,6 +146,7 @@ class LibWriter:
             pass
         for stmt in _SCHEMA:
             self.conn.execute(stmt)
+        _migrate(self.conn)           # 幂等补列（老库加 songs.manual）
         self.conn.commit()
         # ★★ 2026-10-10（T7 审计修复 1）：`resume=False` = "要一个干净的包"。
         #   导出时目标文件名可能已存在（用户覆盖同名导出），此时**必须清空三张数据表**，
@@ -130,6 +159,7 @@ class LibWriter:
             try:
                 self.conn.execute("DELETE FROM fingerprints")
                 self.conn.execute("DELETE FROM covers")
+                self.conn.execute("DELETE FROM waveforms")
                 self.conn.execute("DELETE FROM songs")
                 self.conn.commit()
             except Exception:                                    # noqa: BLE001
@@ -161,12 +191,16 @@ class LibWriter:
         except Exception:                                        # noqa: BLE001
             return set()
 
-    def add_song(self, sid, meta_dict, fps=(), cover_bytes=None, commit=True):
+    def add_song(self, sid, meta_dict, fps=(), cover_bytes=None, commit=True,
+                 manual=None, waveform=None):
         """写一首歌（幂等：同一 song_id 重复写会整体替换）。
 
         `meta_dict` 允许包含 rel_path/file_name/file_size/duration/artist/title/
-        genre_raw/genres/styles/source/level/ai_zh/grid 这些键（缺失按空处理）。
-        `genres/styles/ai_zh/grid` 允许直接给 list/dict，这里统一转 JSON 存。
+        genre_raw/genres/styles/source/level/ai_zh/grid/manual 这些键（缺失按空处理）。
+        `genres/styles/ai_zh/grid/manual` 允许直接给 list/dict，这里统一转 JSON 存。
+        `manual`/`waveform` 也可显式传（优先于 `meta_dict` 内的同名键）：
+          · `manual`  = grid_manual dict（bpm_manual/anchors/segments）；
+          · `waveform` = waveform dict（{v,cps,dur,amp}），落 `waveforms` 表 BLOB。
         """
         m = dict(meta_dict or {})
 
@@ -177,18 +211,24 @@ class LibWriter:
                 return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
             return str(v)
 
+        manual_val = manual if manual is not None else m.get("manual")
         self.conn.execute("DELETE FROM fingerprints WHERE song_id=?", (sid,))
         self.conn.execute("DELETE FROM covers WHERE song_id=?", (sid,))
+        self.conn.execute("DELETE FROM waveforms WHERE song_id=?", (sid,))
+        # ★ 显式列名（**绝不裸 INSERT VALUES**）：加 manual 列后列数变了，
+        #   裸写法会静默串列（2026-10-08 踩过同款坑）。
         self.conn.execute(
-            "INSERT OR REPLACE INTO songs VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO songs ("
+            " song_id, rel_path, file_name, file_size, duration, artist, title,"
+            " genre_raw, genres, styles, source, level, ai_zh, grid, fp_count,"
+            " cover_size, scanned_at, manual) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, m.get("rel_path", ""), m.get("file_name", ""),
              int(m.get("file_size") or 0), float(m.get("duration") or 0.0),
              m.get("artist", ""), m.get("title", ""), m.get("genre_raw", ""),
              _j(m.get("genres")), _j(m.get("styles")), m.get("source", ""),
              m.get("level", ""), _j(m.get("ai_zh")), _j(m.get("grid")),
              len(list(fps or ())), len(cover_bytes or b""),
-             time.time()))
+             time.time(), _j(manual_val)))
         rows = [(sid, h, int(o)) for h, o in (fps or ())]
         if rows:
             self.conn.executemany(
@@ -196,6 +236,15 @@ class LibWriter:
         if cover_bytes:
             self.conn.execute("INSERT OR REPLACE INTO covers VALUES (?,?)",
                               (sid, sqlite3.Binary(cover_bytes)))
+        if waveform is not None:
+            try:
+                import waveform as _wf
+                blob = _wf.waveform_encode(waveform)
+                if blob:
+                    self.conn.execute("INSERT OR REPLACE INTO waveforms VALUES (?,?)",
+                                      (sid, sqlite3.Binary(blob)))
+            except Exception:                                    # noqa: BLE001
+                pass
         if commit:
             self.conn.commit()
 
@@ -231,6 +280,28 @@ class LibWriter:
         except Exception:                                        # noqa: BLE001
             return 0
 
+    def update_manual(self, sid, manual):
+        """只更新一首歌的**手工标注列**（详情页保存用）。返回是否命中一行。
+
+        ⚠ 与 `update_genres` 同理，**绝不能走 `add_song`**（会删指纹/封面/波形）；
+          这里只改 `songs.manual`，其余列原样保留。
+        """
+        def _j(v):
+            if v is None:
+                return ""
+            if isinstance(v, (list, dict)):
+                return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            return str(v)
+
+        try:
+            cur = self.conn.execute(
+                "UPDATE songs SET manual=? WHERE song_id=?",
+                (_j(manual), int(sid)))
+            self.conn.commit()
+            return max(0, int(cur.rowcount))
+        except Exception:                                        # noqa: BLE001
+            return 0
+
     def commit(self):
         try:
             self.conn.commit()
@@ -257,6 +328,7 @@ class LibWriter:
             self.conn.execute(
                 "DELETE FROM fingerprints WHERE song_id=?", (sid,))
             self.conn.execute("DELETE FROM covers WHERE song_id=?", (sid,))
+            self.conn.execute("DELETE FROM waveforms WHERE song_id=?", (sid,))
         self.conn.commit()
         return n
 
@@ -358,7 +430,7 @@ class LibReader:
         cols = [d[0] for d in cur.description]
         for row in cur:
             d = dict(zip(cols, row))
-            for k in ("genres", "styles", "ai_zh", "grid"):
+            for k in ("genres", "styles", "ai_zh", "grid", "manual"):
                 v = d.get(k)
                 if isinstance(v, str) and v:
                     try:
@@ -392,6 +464,35 @@ class LibReader:
             r = self.conn.execute("SELECT data FROM covers WHERE song_id=?",
                                   (int(sid),)).fetchone()
             return bytes(r[0]) if r else None
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    def manual_of(self, sid):
+        """某一首的手工标注 `grid_manual` dict（没有/损坏返回 None）。"""
+        try:
+            r = self.conn.execute("SELECT manual FROM songs WHERE song_id=?",
+                                  (int(sid),)).fetchone()
+            if not r:
+                return None
+            v = r[0]
+            if isinstance(v, str) and v:
+                try:
+                    v = json.loads(v)
+                except Exception:                                # noqa: BLE001
+                    return None
+            return v if isinstance(v, dict) else None
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    def waveform(self, sid):
+        """某一首的波形 `waveform` dict（{v,cps,dur,amp}；没有/损坏返回 None）。"""
+        try:
+            r = self.conn.execute("SELECT data FROM waveforms WHERE song_id=?",
+                                  (int(sid),)).fetchone()
+            if not r:
+                return None
+            import waveform as _wf
+            return _wf.waveform_decode(bytes(r[0]))
         except Exception:                                        # noqa: BLE001
             return None
 

@@ -24,7 +24,7 @@ import time
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow,
-                               QMessageBox, QProgressBar, QPushButton,
+                               QMenu, QMessageBox, QProgressBar, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
@@ -121,7 +121,7 @@ class ExportThread(QThread):
 # ==========================================================================
 # 主窗口
 # ==========================================================================
-COLS = ["", "文件名", "艺人", "曲名", "曲风", "时长", "状态"]
+COLS = ["", "文件名", "艺人", "曲名", "曲风", "时长", "BPM（来源）", "状态"]
 
 
 class OnlineThread(QThread):
@@ -290,9 +290,13 @@ class ErlibWindow(QMainWindow):
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.tbl.setColumnWidth(0, 34)
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for i in (2, 3, 4, 5, 6):
+        for i in (2, 3, 4, 5, 6, 7):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self.tbl.itemChanged.connect(self._on_item_changed)
+        # ★ 2026-10-27 曲库识别增强：右键/双击打开「歌曲详情」。
+        self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tbl.customContextMenuRequested.connect(self._on_table_menu)
+        self.tbl.cellDoubleClicked.connect(self._on_cell_double)
         v.addWidget(self.tbl, 1)
 
         bot = QHBoxLayout()
@@ -318,11 +322,67 @@ class ErlibWindow(QMainWindow):
             g = [g]
         vals = [s.get("file_name", ""), s.get("artist", ""), s.get("title", ""),
                 " / ".join(str(x) for x in g[:3]), fmt_dur(s.get("duration")),
-                "已分析"]
+                self._bpm_text(s), "已分析"]
         for i, t in enumerate(vals, start=1):
             self.tbl.setItem(r, i, QTableWidgetItem(str(t)))
         if checked:
             self._n_checked += 1
+
+    @staticmethod
+    def _bpm_text(s):
+        """BPM（来源）列文案：有效 BPM（bpm_manual 覆盖自动值）；无 BPM 显示「—」。"""
+        g = s.get("grid") or {}
+        if not isinstance(g, dict):
+            g = {}
+        try:
+            import beatgrid as _bg
+            eg = _bg.effective_grid(g, s.get("manual"))
+        except Exception:                                        # noqa: BLE001
+            eg = g
+        bpm = eg.get("bpm") if isinstance(eg, dict) else None
+        src = (eg.get("src") or "") if isinstance(eg, dict) else ""
+        if bpm:
+            try:
+                return "%.1f（%s）" % (float(bpm), src or "?")
+            except (TypeError, ValueError):
+                pass
+        return "—"
+
+    def _sid_of_row(self, r):
+        it = self.tbl.item(r, 0)
+        if it is None:
+            return 0
+        try:
+            return int(it.data(Qt.ItemDataRole.UserRole) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _open_detail(self, sid):
+        if not sid:
+            return
+        if self._work_busy_guard():
+            return
+        try:
+            from erlib.detail import ErlibDetailDialog
+            dlg = ErlibDetailDialog(self.work, sid, self.root, parent=self)
+            dlg.exec()
+            self._reload_table()       # 保存后 BPM 列/详情刷新
+        except Exception as e:                                   # noqa: BLE001
+            QMessageBox.warning(self, APP_TITLE, "打开详情失败：%s" % e)
+
+    def _on_table_menu(self, pos):
+        r = self.tbl.rowAt(pos.y())
+        if r < 0:
+            return
+        self.tbl.selectRow(r)
+        sid = self._sid_of_row(r)
+        menu = QMenu(self)
+        act = menu.addAction("歌曲详情…")
+        act.triggered.connect(lambda _=False: self._open_detail(sid))
+        menu.exec(self.tbl.viewport().mapToGlobal(pos))
+
+    def _on_cell_double(self, r, _c):
+        self._open_detail(self._sid_of_row(r))
 
     def _load_existing(self):
         """启动时把工作库里已有的歌列出来（这样续扫/再次导出都能看到）。"""

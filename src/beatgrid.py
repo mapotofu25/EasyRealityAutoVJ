@@ -772,6 +772,143 @@ def grid_beat_index(grid, offset_sec, phrase_len=8):
 
 
 # ==========================================================================
+# 6.5 手工标注（grid_manual）与「有效网格」合并
+# ==========================================================================
+def effective_grid(grid, manual):
+    """合并算法 `grid` + 手工 `manual` → 引擎/详情页统一消费的「有效网格」。
+
+    规则（与架构设计 §3.2/§8-Q2 一致）：
+      · `manual.segments` 非空 → **分段模式**，`bpm_manual`/`anchors` 忽略；
+        顶层 `bpm/beat_len/anchor` 取第 0 段（兼容只读单值的旧消费方）；
+      · 无分段且 `manual.bpm_manual>0` → 覆盖整曲 `bpm/beat_len/src="manual"`；
+      · 无分段且 `manual.anchors` 非空 → `anchors` 生效，`anchor=anchors[0]`；
+      · 二者可共存（单段模式：手动 BPM + 多个八拍头）。
+
+    返回**新 dict**（绝不原地改 `grid`——grid 是算法产物，重扫要能重建）。
+    """
+    if not isinstance(grid, dict):
+        grid = {}
+    g = dict(grid)
+    m = manual if isinstance(manual, dict) else {}
+
+    def _f(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    segs = m.get("segments") or []
+    if segs:
+        g["segments"] = [dict(s) for s in segs if isinstance(s, dict)]
+        if g["segments"]:
+            s0 = g["segments"][0]
+            bpm0 = _f(s0.get("bpm")) or _f(g.get("bpm"))
+            bl0 = _f(s0.get("beat_len")) or (60.0 / bpm0 if bpm0 > 0 else 0.0)
+            g["bpm"] = bpm0
+            g["beat_len"] = round(bl0, 6)
+            g["anchor"] = _f(s0.get("anchor"))
+            g["src"] = "manual"
+        return g
+
+    bpm_m = _f(m.get("bpm_manual"))
+    if bpm_m > 0:
+        g["bpm"] = bpm_m
+        g["beat_len"] = round(60.0 / bpm_m, 6)
+        g["src"] = "manual"
+
+    anchors = m.get("anchors") or []
+    if anchors:
+        g["anchors"] = sorted({_f(a) for a in anchors if _f(a) >= 0.0})
+        if g["anchors"]:
+            g["anchor"] = g["anchors"][0]
+    return g
+
+
+def segment_at(segments, offset, grid=None):
+    """返回 `offset` 所在段（`t0` 升序、首尾相接）。
+
+    · `segments` 非空 → 取 `t0 <= offset` 的最后一段；
+    · `segments` 为空 → 单段（由 `grid` 的 bpm/beat_len/anchor 构造；
+      没给 `grid` 时返回全零单段）。
+    """
+    if segments:
+        seg = None
+        for s in segments:
+            if not isinstance(s, dict):
+                continue
+            try:
+                t0 = float(s.get("t0") or 0.0)
+            except (TypeError, ValueError):
+                t0 = 0.0
+            if t0 <= offset:
+                seg = s
+            else:
+                break
+        if seg is not None:
+            return dict(seg)
+    if isinstance(grid, dict):
+        bl = grid.get("beat_len") or 0.0
+        bpm = grid.get("bpm") or 0.0
+        if not bpm and bl > 0:
+            bpm = 60.0 / bl
+        if not bl and bpm > 0:
+            bl = 60.0 / bpm
+        return {"t0": 0.0, "bpm": float(bpm), "beat_len": float(bl),
+                "anchor": float(grid.get("anchor") or 0.0)}
+    return {"t0": 0.0, "bpm": 0.0, "beat_len": 0.0, "anchor": 0.0}
+
+
+def anchor_for(grid, offset):
+    """当前 offset 应采用哪个八拍头锚点。
+
+    · 单锚（无 `anchors`）→ `grid.anchor`；
+    · 多锚（`anchors` 升序）→ offset 前最近一个 `anchor_i`。
+    """
+    if not isinstance(grid, dict):
+        return 0.0
+    anchors = grid.get("anchors") or []
+    if anchors:
+        best = None
+        for a in anchors:
+            try:
+                av = float(a)
+            except (TypeError, ValueError):
+                continue
+            if av <= offset:
+                best = av
+            else:
+                break
+        if best is not None:
+            return best
+        return float(anchors[0])
+    return float(grid.get("anchor") or 0.0)
+
+
+def grid_anchor_after_v2(grid, offset_sec, phrase_len=8):
+    """返回**下一个八拍头**的绝对秒数（分段/多锚感知；无分段无多锚时逐值等同旧 `grid_anchor_after`）。
+
+    与 `grid_anchor_after` 的区别：分段时用「offset 所在段」的 beat_len/anchor，
+    多锚时用 `anchor_for`（offset 前最近一个八拍头）而不是整曲单 anchor。
+    """
+    if not isinstance(grid, dict):
+        return None
+    if grid.get("segments"):
+        seg = segment_at(grid["segments"], offset_sec, grid)
+        bl = seg.get("beat_len") or 0.0
+        if bl <= 0:
+            return None
+        a = seg.get("anchor") or 0.0
+        step = phrase_len * bl
+        return a + (math.floor((offset_sec - a) / step) + 1) * step
+    bl = grid.get("beat_len") or 0.0
+    if bl <= 0:
+        return None
+    a = anchor_for(grid, offset_sec)
+    step = phrase_len * bl
+    return a + (math.floor((offset_sec - a) / step) + 1) * step
+
+
+# ==========================================================================
 # 7. 演出用的「网格时钟」——把离线网格变成一条连续、单调、防抖的拍位
 # ==========================================================================
 class GridClock:
@@ -973,6 +1110,27 @@ class GridClock:
                 return          # 还没锁定坐标系：速率无意义，不动
             self.bl = float(beat_len)
             self.r = r
+
+    def reanchor(self, beat_len, anchor, off, r, ref_t):
+        """跨段/换锚时**硬重锚**：坐标整体换系，不经「有限增益校正 / 跳变判据」。
+
+        与 `update` 的差别：段边界是**离线已知**的（manual.segments / anchors），
+        跨段时 BPM/锚点突变是预期行为、不是识别抖动 ⇒ 无需防抖，直接一步到位。
+        `sid` 不变（同一首歌只是换了坐标系）。
+        """
+        if beat_len is None or beat_len <= 0:
+            return
+        r = 1.0 if (r is None or not (0.5 <= r <= 2.0)) else float(r)
+        with self._lock:
+            ref_pos = (off - anchor) / beat_len
+            self.bl = float(beat_len)
+            self.r = r
+            self.t0 = ref_t
+            self.pos0 = ref_pos
+            self.ref_t = ref_t
+            self.last_pos = None
+            self._err_run = 0
+            self._err_sign = 0
 
     def _pos_locked(self, now):
         """持锁状态下取拍位（单调不减）。"""
