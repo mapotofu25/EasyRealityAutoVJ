@@ -1,0 +1,111 @@
+classDiagram
+    class Grid {
+        +float bpm
+        +float beat_len
+        +float anchor
+        +int phrase
+        +float contrast
+        +str src
+        +float conf
+        +float dur
+        +int grid_ver
+    }
+    class GridManual {
+        +float bpm_manual
+        +list anchors
+        +list segments
+    }
+    class Segment {
+        +float t0
+        +float bpm
+        +float beat_len
+        +float anchor
+    }
+    class Waveform {
+        +int v
+        +float cps
+        +float dur
+        +list amp
+    }
+    class beatgrid {
+        +effective_grid(grid, manual) dict
+        +segment_at(segments, offset) Segment
+        +anchor_for(grid, offset) float
+        +grid_anchor_after_v2(grid, offset) float
+        +store_grid(cfg, path, grid) bool
+        +get_grid(cfg, path) dict
+    }
+    class GridClock {
+        +update(sid, beat_len, anchor, off, r, ref_t, strong)
+        +reanchor(beat_len, anchor, off, r, ref_t)
+        +update_rate(beat_len, r)
+        +pos(now) float
+        +beats_to_phrase(now) float
+    }
+    class waveform {
+        +waveform_from_signal(sig, sr, cps) Waveform
+        +waveform_cache_path(path) str
+        +waveform_save(path, wf) bool
+        +waveform_load(path) Waveform
+    }
+    class WaveformMarkWidget {
+        +set_waveform(wf)
+        +set_grid(grid)
+        +set_manual(manual)
+        +set_snap(on)
+        +anchorsChanged()
+        +segmentsChanged()
+        +bpmPicked(sec)
+    }
+    class MusicDetailPanel {
+        +load(path)
+        +save()
+        +set_bpm_manual(bpm)
+        +add_anchor(sec)
+        +add_segment(t0, t1, bpm)
+    }
+    class ErlibDetailDialog {
+        +load(sid)
+        +save()
+    }
+    class LibWriter {
+        +add_song(sid, meta, fps, cover_bytes, manual, waveform)
+        +delete_songs(sids)
+        +stats()
+    }
+    class LibReader {
+        +songs() iter
+        +waveform(sid) dict
+        +manual_of(sid) dict
+        +check_versions() tuple
+    }
+    class imported_lib {
+        +add_song(conn, sid, meta, cover_path, pack)
+        +lookup_grids(base_dir) dict
+        +display_rows(base_dir) list
+    }
+    class AudioEngine {
+        +_Analyzer.feed(data, st)
+        +_recognize_loop()
+    }
+    class Engine {
+        +set_song_grids(mapping)
+        +_grid_observe(snap)
+        +_beat_pos_grid(snap, gs)
+        +_auto_switch_tick()
+    }
+
+    GridManual "0..1" --> Grid : 覆盖合并
+    GridManual "1" *-- "0..*" Segment
+    GridManual "0..1" --> Waveform : 指针
+    beatgrid ..> GridManual : effective_grid
+    beatgrid ..> Segment : segment_at
+    GridClock ..> Segment : 按 offset 取段
+    Engine --> GridClock : 驱动
+    Engine --> beatgrid : 消费
+    WaveformMarkWidget --> Waveform : 渲染
+    MusicDetailPanel --> WaveformMarkWidget
+    ErlibDetailDialog --> WaveformMarkWidget
+    LibWriter --> Waveform : 落库
+    LibReader --> Waveform : 读取
+    imported_lib ..> GridManual : manual 列

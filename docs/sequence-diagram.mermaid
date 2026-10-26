@@ -1,0 +1,54 @@
+sequenceDiagram
+    autonumber
+    participant DJ as DJ/VJ
+    participant EUI as ERLIB 详情页/主窗
+    participant SCAN as Scanner(erlib)
+    participant BG as beatgrid
+    participant WF as waveform
+    participant WR as LibWriter
+    participant DB as .eravjlib
+    participant AUI as ERAVJ 详情页
+    participant MM as music_meta/config
+    participant AE as AudioEngine
+    participant EN as Engine(GridClock)
+    participant SW as 自动切换
+
+    Note over DJ, DB: ① 扫描建库（ERALIB / ERAVJ 内嵌 erlib 同款）
+    DJ->>EUI: 选曲库 → 开始扫描
+    EUI->>SCAN: scan_tree(root, writer)
+    loop 每首音频
+        SCAN->>SCAN: decode() → 单声道 sig(native sr)
+        SCAN->>BG: grid_from_signal(sig, sr, vdj, path, dur)
+        BG-->>SCAN: grid dict
+        SCAN->>WF: waveform_from_signal(sig, sr, cps=100)
+        WF-->>SCAN: waveform dict
+        SCAN->>WR: add_song(sid, meta, fps, cover, manual=None, waveform)
+        WR->>DB: 写 songs/grid/fingerprints/waveforms
+    end
+    WR->>DB: commit()
+
+    Note over DJ, MM: ② 详情页手动标记（ERLIB 与 ERAVJ 交互一致）
+    DJ->>EUI: 右键/双击歌曲 → 打开详情
+    EUI->>DB: LibReader: songs(grid) + waveform(sid) + manual
+    EUI->>EUI: WaveformMarkWidget 画波形 + 标记
+    DJ->>EUI: 标 BPM / 点八拍锚 / 拖选分段
+    EUI->>EUI: 归一化 segments(首尾相接) / anchors(升序)
+    DJ->>EUI: 保存
+    EUI->>WR: add_song(..., manual=grid_manual, ...)
+    WR->>DB: 落 songs.manual 列（覆盖）
+    Note over AUI, MM: ERAVJ 详情页同款：写 music_meta[path]["grid_manual"]
+
+    Note over AE, SW: ③ 演出实时识别 + 对齐（ERAVJ）
+    AE->>AE: 每 0.5s 采集窗 → fp.match(sig) → (song_id, votes, offset_sec)
+    AE-->>EN: recognized_song_id / offset / rate / votes
+    EN->>EN: _grid_observe: effective_grid(sid) → 分段/多锚/bpm_manual
+    EN->>BG: segment_at(segments, offset) + anchor_for(grid, offset)
+    BG-->>EN: 当前段 (beat_len, anchor)
+    alt 段/锚未变
+        EN->>EN: GridClock.update(sid, beat_len, anchor, off, r)
+    else 跨段/换锚
+        EN->>EN: GridClock.reanchor(beat_len, anchor, off, r)
+    end
+    EN->>EN: _beat_pos_grid → pos = (off - anchor)/beat_len
+    EN->>SW: 自动切换起点 = 当前段最近八拍头 anchor_i + 8n*beat_len
+    SW->>SW: 踩八拍头切换素材
