@@ -53,6 +53,11 @@ EN_ABS_W = 1.0                     # 兜底项权重（0 = 关闭该项，用于
 # 钢琴@-14.9 ≈ 0.7。取 2.0 分隔「真鼓点 drop」与「钢琴/人声 breakdown 的偶发低频敲击」。
 # 用于 `_peak_confirmed` 锚定保护：当前块 kick_density 达标即视为可信，不再乘 1.54 压峰。
 _KICK_PEAK_ABS_FLOOR = 2.0
+# 半速修正「下半拍是否够强」的相对阈值（8× 上采样直方图自相关的峰比）。
+# 80+offbeat（160 处是弱 offbeat，kick 强在 80）→ 峰比 ≈0.772；真实 160（160 处是强 kick）→ ≈0.80~0.81。
+# 取 0.785 分隔：只在下半拍周期**足够接近**主拍强度时才修正，防止真实 80+offbeat 被误升到 160，
+# 同时保住「160 被减半成 80 仍能回正」。
+_HALFSPEED_RATIO_MIN = 0.785
 
 
 def _sc():
@@ -755,6 +760,13 @@ class _Analyzer:
             fps = self.sr / self.block
             bh = self.bass_flux_hist.copy()
             fh = self.flux_hist.copy()
+            # ★ 环形缓冲按写指针解卷成**时序顺序**（2026-10-27）：`flux_hist[i]=flux[i%L]`
+            #   是环形顺序，直接 `np.correlate` 会让「lag」不再对应真实时间差，把自相关峰抹平
+            #   （160BPM 非整数拍长下尤其明显）。解卷后自相关才准，半速修正确/全频梳状都受益。
+            _w = self.flux_i % len(bh)
+            if _w:
+                bh = np.concatenate([bh[_w:], bh[:_w]])
+                fh = np.concatenate([fh[_w:], fh[:_w]])
 
             def _comb_score(h):
                 h = h - np.mean(h)
@@ -782,9 +794,9 @@ class _Analyzer:
             kscore, klag, kac = _comb_score(bh)
             fscore, flag, fac = _comb_score(fh)
             if kscore > 0.9:      # kick 节奏清晰 → 用 kick
-                lag, acn = klag, kac
+                lag, acn, _hist = klag, kac, bh
             else:
-                lag, acn = flag, fac
+                lag, acn, _hist = flag, fac, fh
             # 半速（亚谐波）分辨率：**对 kick 与全频两分支都生效**。
             # 4/4 电子乐 kick 每拍一响，自相关在「真实拍长」与「2×拍长」处都有峰，
             # 梳状打分两者几乎同分；offbeat bass 让相邻拍相关性低于隔拍相关性时，
@@ -800,6 +812,23 @@ class _Analyzer:
                     #   真实 BPM >200 的曲目（如 Uptempo 209）其真实拍长落在搜索范围外，
                     #   减半值（209→104.5）无法被修正。提到 240 后 209 的拍长进入范围。
                     lo_lag = max(2, int(60.0 / 240.0 * fps))
+                    # 8× 上采样直方图后再自相关：kick 周期（如 160BPM=17.578 块）非整数，
+                    # 整数 lag 会把主拍/半拍峰都「抹平」到相近值，无法分辨「80+offbeat（160 处是弱
+                    # offbeat）」与「160 减半成 80（160 处是强 kick）」。上采样直方图才能测准亚采样峰。
+                    _hist_c = np.asarray(_hist, dtype=np.float64)
+                    _hist_c = _hist_c - np.mean(_hist_c)
+                    _hu = np.interp(np.linspace(0, len(_hist_c) - 1, len(_hist_c) * 8),
+                                    np.arange(len(_hist_c)), _hist_c)
+                    _hu = _hu - np.mean(_hu)
+                    _ac_up = np.correlate(_hu, _hu, "full")[len(_hu) - 1:]
+                    _acn_up = _ac_up / (_ac_up[0] + 1e-9)
+
+                    def _peak_up(i):
+                        # 在上采样自相关里取 i 附近 ±4（=±0.5 块）的峰——容忍 kick 周期的非整数 lag。
+                        lo = max(0, int(i) - 4)
+                        hi = min(len(_acn_up), int(i) + 5)
+                        return float(np.max(_acn_up[lo:hi]))
+
                     for cand in range(lo_lag, int(lag)):
                         if acn[cand] < 0.30:
                             continue
@@ -807,7 +836,9 @@ class _Analyzer:
                         right = acn[cand + 1] if cand + 1 < len(acn) else -1.0
                         if acn[cand] < left or acn[cand] < right:
                             continue
-                        if acn[cand] < 0.6 * acn[lag]:
+                        # 相对强度：上采样峰比 ≥阈值 才算「下半拍够强」→ 修正；
+                        # 弱 offbeat（真实 80+offbeat 的峰比 ≈0.77）不修正。
+                        if _peak_up(cand * 8) < _HALFSPEED_RATIO_MIN * _peak_up(lag * 8):
                             continue
                         lag = cand
                         break
@@ -832,10 +863,12 @@ class _Analyzer:
                     mode = float(edges[peak] + 0.5)
                     conf = float(hist[peak]) / len(vals)
                     if not self._bpm_lock:
-                        # 锁定建立：舞曲常见区间 [115,220] + 众数集中 + 票数足。
-                        # intro 的半速值(64/73)一致但错，落在区间外 → 不锁定，等主段正确值。
-                        # 上界 220：Frenchcore/Uptempo 190~220 BPM（2026-10-27 高 BPM 支持）。
-                        if 115 <= mode <= 220 and conf >= 0.45 and len(vals) >= 20:
+                        # 锁定建立：舞曲常见区间 [70,220] + 众数集中 + 票数足。
+                        # 下界 70：覆盖慢歌（用户会放 80 BPM 的场）。上界 220：Frenchcore/Uptempo
+                        #   190~220 BPM（2026-10-27 高 BPM 支持）。
+                        # intro 的半速值（64=128/2、73=146/2）：64 被下界 70 排除；73 这类
+                        #   稀疏 intro 因半速修正找不到 146 的峰而保持 73——此为窄边界已知限制。
+                        if 70 <= mode <= 220 and conf >= 0.45 and len(vals) >= 20:
                             self.bpm_smooth = mode
                             self._bpm_lock = True
                         elif conf >= 0.4 and self.bpm_smooth > 0:
