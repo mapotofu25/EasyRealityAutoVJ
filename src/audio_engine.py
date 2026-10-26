@@ -48,6 +48,11 @@ EN_VOC_MAX, EN_VOC_KNEE, EN_VOC_SPAN = 0.45, 0.30, 0.35
 EN_ABS_LO_DB, EN_ABS_HI_DB = -14.0, -6.0
 EN_LV_TAU = 1.0                    # 绝对响度（RMS dBFS）的平滑时间常数（秒）
 EN_ABS_W = 1.0                     # 兜底项权重（0 = 关闭该项，用于 A/B 对照）
+# kick_density 的「真 kick」绝对强度下限（1s 低频通量累计，与 RMS 线性相关）。
+# 实测：drop@-7.7dBFS ≈ 4.6~5.7、drop@-10 ≈ 4.0、钢琴 breakdown（即使拉到 -7.7）≈ 1.6、
+# 钢琴@-14.9 ≈ 0.7。取 2.0 分隔「真鼓点 drop」与「钢琴/人声 breakdown 的偶发低频敲击」。
+# 用于 `_peak_confirmed` 锚定保护：当前块 kick_density 达标即视为可信，不再乘 1.54 压峰。
+_KICK_PEAK_ABS_FLOOR = 2.0
 
 
 def _sc():
@@ -791,7 +796,10 @@ class _Analyzer:
             if lag > 0:
                 b0 = 60.0 / (lag / fps)
                 if b0 < 120.0:
-                    lo_lag = max(2, int(60.0 / 200.0 * fps))
+                    # ★ 半速修正搜索下界：按最高 240 BPM 反推最短拍长。原来 200 ⇒
+                    #   真实 BPM >200 的曲目（如 Uptempo 209）其真实拍长落在搜索范围外，
+                    #   减半值（209→104.5）无法被修正。提到 240 后 209 的拍长进入范围。
+                    lo_lag = max(2, int(60.0 / 240.0 * fps))
                     for cand in range(lo_lag, int(lag)):
                         if acn[cand] < 0.30:
                             continue
@@ -810,7 +818,7 @@ class _Analyzer:
                     denom = acn[lag - 1] - 2 * acn[lag] + acn[lag + 1]
                     if abs(denom) > 1e-9:
                         delta = max(-0.5, min(0.5, 0.5 * (acn[lag - 1] - acn[lag + 1]) / denom))
-                bpm = float(max(60.0, min(200.0, 60.0 / ((lag + delta) / fps))))
+                bpm = float(max(60.0, min(220.0, 60.0 / ((lag + delta) / fps))))
                 # 60s 投票众数 + 两阶段锁定：一首歌 BPM 恒定。
                 # 未锁定阶段：主段众数集中(conf≥0.45)且票数足(≥20)才建立锁定；
                 # 已锁定阶段：只接受与锁定值 ±8 内的微调，breakdown/outro 的飞值（无 kick
@@ -818,15 +826,16 @@ class _Analyzer:
                 self._bpm_votes.append(bpm)
                 vals = np.array(self._bpm_votes, dtype=np.float32)
                 if len(vals) >= 6:
-                    bins = np.arange(60.0, 201.0, 1.0)
+                    bins = np.arange(60.0, 221.0, 1.0)
                     hist, edges = np.histogram(vals, bins=bins)
                     peak = int(np.argmax(hist))
                     mode = float(edges[peak] + 0.5)
                     conf = float(hist[peak]) / len(vals)
                     if not self._bpm_lock:
-                        # 锁定建立：舞曲常见区间 [115,185] + 众数集中 + 票数足。
+                        # 锁定建立：舞曲常见区间 [115,220] + 众数集中 + 票数足。
                         # intro 的半速值(64/73)一致但错，落在区间外 → 不锁定，等主段正确值。
-                        if 115 <= mode <= 185 and conf >= 0.45 and len(vals) >= 20:
+                        # 上界 220：Frenchcore/Uptempo 190~220 BPM（2026-10-27 高 BPM 支持）。
+                        if 115 <= mode <= 220 and conf >= 0.45 and len(vals) >= 20:
                             self.bpm_smooth = mode
                             self._bpm_lock = True
                         elif conf >= 0.4 and self.bpm_smooth > 0:
@@ -979,7 +988,15 @@ class _Analyzer:
         self._peak_age += self.block_sec
         if not self._peak_confirmed and (kick_density > self.kick_peak * 1.18 or self._peak_age > 90.0):
             self._peak_confirmed = True
-        peak_eff = max(self.kick_peak, 1e-6) * (1.0 if self._peak_confirmed else 1.54)
+        # ★ 2026-10-27 修「连续 drop 能量 0.4~0.5」：原「确认标志」一刀切——开场即连续 drop 的
+        #   歌 kick_density 平稳、从不超 kick_peak×1.18 ⇒ 卡在 1.54 因子 90 秒，kick_rel 被压到
+        #   ~0.59、kick_e 掉进死区。改成**按块判据**：当前 kick_density 已达「真 kick」绝对强度
+        #   （≥_KICK_PEAK_ABS_FLOOR）就视为可信、分母不再放大；仍在 breakdown/低冲击段（<floor）
+        #   才保持 1.54 锚定保护。这样连续 drop 首块即免罚，breakdown 开头的钢琴段（kick_density
+        #   长期 <floor）不会被误抬；1.54 因子原本防的「BW 钢琴 breakdown 锚定」场景不回归。
+        is_strong_kick = kick_density >= _KICK_PEAK_ABS_FLOOR
+        peak_eff = max(self.kick_peak, 1e-6) * (
+            1.0 if (self._peak_confirmed or is_strong_kick) else 1.54)
         kick_rel = kick_density / peak_eff
         # 映射带 0.50 死区：实测鼓点段 kick_rel 0.71~0.84、钢琴/人声段 0.08~0.50（BW 钢琴
         # 和弦的低频瞬态会贡献 0.3~0.5，但远低于真 kick）；Bunsen 类全程均匀 kick 的歌

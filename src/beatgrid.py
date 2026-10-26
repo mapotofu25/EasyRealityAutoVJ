@@ -45,7 +45,7 @@ F_LOW = (30.0, 200.0)      # kick / 低音
 F_MID = (200.0, 2000.0)    # 人声 / 主奏
 F_HIGH = (2000.0, 9000.0)  # hihat
 
-BPM_MIN, BPM_MAX = 60.0, 200.0
+BPM_MIN, BPM_MAX = 60.0, 220.0   # 上限 220：Frenchcore/Uptempo 200~220 BPM（2026-10-27 高 BPM 支持）
 BPM_PRIOR = (110.0, 190.0)  # DJ 音乐的先验区间：半速歧义时优先取落在这里的候选
 PHRASE_MIN, PHRASE_MAX = 0.62, 1.30   # 八拍相位对比度阈值（低于此判定"证据不足"）
 
