@@ -1822,6 +1822,15 @@ class MusicScanThread(QThread):
                     old_fp[_p] = _fp_v
                 if _md5_v:
                     old_md5[_p] = _md5_v
+        # ★ 手工标注（grid_manual）与八拍相位翻转（grid_flip）是**用户产物**：重扫只重建
+        #   grid、不动它们（架构 §3.5）。**force 重扫也要保留**（和 fp_id/md5 不同——那是
+        #   算法判据，force 时该重算；手工标注是用户显式点的，绝不能丢）。主线程快照。
+        old_user = {}
+        for _p in items:
+            _m = meta.get(_p)
+            if isinstance(_m, dict) and (_m.get("grid_manual") or _m.get("grid_flip")):
+                old_user[_p] = {"grid_manual": _m.get("grid_manual"),
+                                "grid_flip": _m.get("grid_flip")}
 
         def _grid_one(p):
             """只算网格（已有元数据、缺网格）：解码一次 → grid_from_signal → 返回 grid。
@@ -1932,6 +1941,13 @@ class MusicScanThread(QThread):
                         r["cover"] = _cv
                 except Exception:
                     pass
+                # ★ 保留用户手工产物（重扫只重建 grid，不动 grid_manual / grid_flip）。
+                _ou = old_user.get(p)
+                if _ou:
+                    if _ou.get("grid_manual"):
+                        r["grid_manual"] = _ou["grid_manual"]
+                    if _ou.get("grid_flip"):
+                        r["grid_flip"] = _ou["grid_flip"]
                 return p, r, (t1 - t0), (t2 - t1), (t3 - t2)
             except Exception:
                 return p, None, 0.0, 0.0, 0.0
@@ -4113,6 +4129,10 @@ class MainWindow(QMainWindow):
         out = {}
         # song_id → 曲目路径：手动「八拍相位翻转」要按路径持久化到 cfg["music_meta"][path]
         self._grid_path_by_sid = {}
+        try:
+            import beatgrid as _bg
+        except Exception:                                        # noqa: BLE001
+            _bg = None
         for p, m in meta.items():
             if not isinstance(m, dict):
                 continue
@@ -4120,28 +4140,43 @@ class MainWindow(QMainWindow):
             g = m.get("grid")
             if not sid or not isinstance(g, dict):
                 continue
-            # 只认 vdj / bt 两个可信来源（local 小节头不可信，见上方说明）
-            if g.get("src") not in ("vdj", "bt"):
-                continue
+            manual = m.get("grid_manual") if isinstance(m.get("grid_manual"), dict) else None
+            # ★ 合并用户手工标注（架构 §6.1：grid 算法产物 + grid_manual 用户产物 → effective_grid）
+            g_eff = _bg.effective_grid(g, manual) if _bg is not None else dict(g)
+            # 用户显式标注过（BPM/八拍/分段）⇒ 用户产物可信，跳过 src/conf 门槛（仍校验 beat_len）；
+            # 无手工标注 ⇒ 沿用原 src/conf 门槛（零回归）。
+            user_marked = bool(manual and (
+                manual.get("segments") or manual.get("anchors")
+                or (float(manual.get("bpm_manual") or 0.0) > 0)))
             try:
-                bl = float(g.get("beat_len") or 0.0)
-                anchor = float(g.get("anchor"))
+                bl = float(g_eff.get("beat_len") or 0.0)
+                anchor = float(g_eff.get("anchor"))
                 conf = float(g.get("conf") or 0.0)
             except Exception:
                 continue
             # 阈值理由：
             #   - conf ≥ 0.6：VDJ 正常路径 conf≥0.80（可信）；本地自算需有八拍相位对比度证据
             #     （0.55 为无对比度地基线）；VDJ 分析失败回退项 conf=0.5 予以剔除。
-            #     （相位是否可信已由上面的 src=="vdj" 保证，conf 只做二次保险。）
             #   - beat_len ∈ (0.2, 1.5)：对应 BPM 40~300，排除异常值。
-            if conf < 0.6 or not (0.2 < bl < 1.5):
+            if not (0.2 < bl < 1.5):
                 continue
-            out[sid] = {"bpm": g.get("bpm"), "beat_len": bl, "anchor": anchor,
-                        "conf": conf, "src": g.get("src"), "dur": g.get("dur"),
-                        # 手动八拍相位翻转（见 engine.flip_phrase_now）：存的是开关标记，
-                        # 注入时换算成 4 拍偏移。落盘键故意放在 grid **外面**（同级的
-                        # `grid_flip`），否则重扫重建 grid 时会被覆盖掉。
-                        "flip": 4.0 if m.get("grid_flip") else 0.0}
+            if not user_marked:
+                if g.get("src") not in ("vdj", "bt"):
+                    continue
+                if conf < 0.6:
+                    continue
+            item = {"bpm": g_eff.get("bpm"), "beat_len": bl, "anchor": anchor,
+                    "conf": conf, "src": g_eff.get("src") or g.get("src"),
+                    "dur": g.get("dur"),
+                    # 手动八拍相位翻转（见 engine.flip_phrase_now）：存的是开关标记，
+                    # 注入时换算成 4 拍偏移。落盘键故意放在 grid **外面**（同级的
+                    # `grid_flip`），否则重扫重建 grid 时会被覆盖掉。
+                    "flip": 4.0 if m.get("grid_flip") else 0.0}
+            if g_eff.get("segments"):
+                item["segments"] = g_eff["segments"]
+            if g_eff.get("anchors"):
+                item["anchors"] = g_eff["anchors"]
+            out[sid] = item
             self._grid_path_by_sid[sid] = p
         # ★★ 2026-10-08（erlib 第二步）：合并「导入的曲库分析包」里的离线网格。
         #   导入的歌在本机**没有文件**，所以不可能出现在 `cfg["music_meta"]` 里；
@@ -4153,8 +4188,19 @@ class MainWindow(QMainWindow):
             import imported_lib as _IL
             _imp = _IL.lookup_grids(app_base_dir())
             for _sid, _g in _imp.items():
-                if _sid not in out:
-                    out[_sid] = _g
+                if _sid in out:
+                    continue
+                _manual = _g.get("manual") if isinstance(_g.get("manual"), dict) else None
+                _gel = _bg.effective_grid(_g, _manual) if _bg is not None else dict(_g)
+                _item = {"bpm": _gel.get("bpm"), "beat_len": _gel.get("beat_len"),
+                         "anchor": _gel.get("anchor"), "conf": _g.get("conf"),
+                         "src": _gel.get("src") or _g.get("src"),
+                         "dur": _g.get("dur"), "flip": _g.get("flip") or 0.0}
+                if _gel.get("segments"):
+                    _item["segments"] = _gel["segments"]
+                if _gel.get("anchors"):
+                    _item["anchors"] = _gel["anchors"]
+                out[_sid] = _item
             if _imp:
                 print("[曲库] 合并导入包：+%d 条离线网格" % len(_imp))
         except Exception:                                        # noqa: BLE001

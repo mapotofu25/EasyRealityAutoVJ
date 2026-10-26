@@ -1871,11 +1871,13 @@ class MusicLibraryPanel(QWidget):
             self.list.setCurrentItem(it)
         solo_loc = (not checked_mode) and (len(loc) == 1 and not imp)  # 单首本机歌=旧版完整菜单
         menu = QMenu(self)
-        edit = rescan = info = None
+        edit = rescan = info = detail = None
         if solo_loc:
             edit = menu.addAction(T("纠正曲风…"))
             rescan = menu.addAction(T("重新分析扫描此曲目"))
             info = menu.addAction(T("此曲目信息"))
+            # ★ 2026-10-27 曲库识别增强：打开「歌曲详情」（波形上标 BPM/八拍/分段）。
+            detail = menu.addAction(T("歌曲详情…"))
             menu.addSeparator()
             # ★ 封面大小（用户要求）：放子菜单里，当前档位打勾。
             #   为什么不做成"拖拽缩放"：曲库是**演出前整理**用的，这里要的是
@@ -1930,6 +1932,8 @@ class MusicLibraryPanel(QWidget):
             self.main.edit_music_genre(path)
         elif act == rescan:
             self.main.rescan_music(path)
+        elif act == detail:
+            self._open_music_detail(path)
         elif act == info:
             if solo_loc:
                 self.main.show_music_info(path)
@@ -1944,6 +1948,28 @@ class MusicLibraryPanel(QWidget):
             self._remove_local(loc)
         elif act == rm_imp:
             self._remove_imported(imp)
+
+    def _open_music_detail(self, path):
+        """打开演出端「歌曲详情」对话框（波形上标 BPM / 八拍起点 / BPM 分段）。
+
+        写入 `cfg["music_meta"][path]["grid_manual"]`；关闭后立即重新注入引擎，演出中
+        改标注当场生效（引擎下一帧 `_grid_observe` 就走新的 `effective_grid`）。
+        """
+        try:
+            from music_detail import MusicDetailDialog
+        except Exception as e:                                   # noqa: BLE001
+            QMessageBox.warning(self, T("歌曲详情…"), Tf("打开歌曲详情失败：{}", e))
+            return
+        try:
+            dlg = MusicDetailDialog(self.main.cfg, path, parent=self)
+            dlg.exec()
+            try:
+                self.main._inject_song_grids()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self.refresh()
+        except Exception as e:                                   # noqa: BLE001
+            QMessageBox.warning(self, T("歌曲详情…"), Tf("打开歌曲详情失败：{}", e))
 
     def _remove_local(self, paths):
         """从本机曲库移除（**二次确认**；批量 = 一次 save + 一次 refresh）。"""

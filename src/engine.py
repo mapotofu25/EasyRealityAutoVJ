@@ -999,8 +999,39 @@ class AutoVJEngine(QObject):
         self._grid_last_out = None
         self._grid_pending = None
         self._grid_seen = None
+        self._grid_segkey = None       # 当前段/锚标识（分段/多锚变化时硬重锚，见 _grid_observe）
         self._grid_flip = 0.0          # 手动八拍相位翻转量（0/4 拍），换库/重扫时清掉
         _publish_grid_hint(self, -1.0)
+
+    @staticmethod
+    def _grid_segment_of(grid, off):
+        """按 offset 取「当前段/锚」的 `(beat_len, anchor, segkey)`。
+
+        · 有 `segments`（分段 BPM）→ `segment_at(segments, off)` 取当前段的 beat_len/anchor；
+        · 有 `anchors`（多八拍头，无分段）→ `anchor_for(grid, off)` 取 offset 前最近八拍头；
+        · 都没有（老曲目）→ 直接用 `grid.beat_len / grid.anchor`，**segkey=None**（不触发重锚）。
+        """
+        try:
+            import beatgrid as _bg
+        except Exception:                                        # noqa: BLE001
+            _bg = None
+        segments = grid.get("segments") or []
+        anchors = grid.get("anchors") or []
+        if segments and _bg is not None:
+            seg = _bg.segment_at(segments, off)
+            bl = float(seg.get("beat_len") or 0.0)
+            anchor = float(seg.get("anchor") or 0.0)
+            return bl, anchor, ("seg", round(bl, 4), round(anchor, 4))
+        if anchors and _bg is not None:
+            bl = float(grid.get("beat_len") or 0.0)
+            anchor = float(_bg.anchor_for(grid, off))
+            return bl, anchor, ("anchor", round(bl, 4), round(anchor, 4))
+        bl = float(grid.get("beat_len") or 0.0)
+        try:
+            anchor = float(grid.get("anchor"))
+        except (TypeError, ValueError):
+            anchor = None
+        return bl, anchor, None
 
     # 指纹对齐票数门槛：低于此值视为「歧义 / 弱匹配」，offset 不可信 → 不做相位校正。
     # 依据（tools/_qa_votes_dist.py 实测：10 首真 FLAC、159 个 4.5s 查询窗；QA 第二轮 21 首
@@ -1065,14 +1096,14 @@ class AutoVJEngine(QObject):
         grid = self._song_grid_lookup.get(sid)
         if not grid:
             return None
-        bl = grid.get("beat_len") or 0.0
-        if bl <= 0:
-            return None
-        anchor = grid.get("anchor")
-        if anchor is None:
-            return None
         off = snap.get("recognized_offset", -1.0)
         if off is None or off < 0:
+            return None
+        off = float(off)
+        # ★ 当前段/锚：支持 grid_manual.segments（分段 BPM）/ anchors（多八拍头）。
+        #   老曲目（无 manual）⇒ 单段 = grid.beat_len/anchor、segkey=None（不触发重锚，零回归）。
+        bl, anchor, segkey = self._grid_segment_of(grid, off)
+        if bl <= 0 or anchor is None:
             return None
         r = snap.get("recognized_rate", 1.0)
         try:
@@ -1081,9 +1112,6 @@ class AutoVJEngine(QObject):
             r = 1.0
         if not (0.5 <= r <= 2.0):
             r = 1.0
-        bl = float(bl)
-        anchor = float(anchor)
-        off = float(off)
         # 手动八拍相位翻转（0/4 拍）：每帧从注入表读，所以 `flip_phrase_now()` 说改就改，
         # **不用重建网格、不丢锁定**。未设置时恒为 0（零回归）。
         try:
@@ -1125,7 +1153,13 @@ class AutoVJEngine(QObject):
             self._grid_seen = (sid, ref_t)
         if clock.sid == sid:
             if is_new_win:
-                if trusted:
+                # ★ 段/锚切换（跨分段、或多八拍头走到另一个）⇒ **硬重锚**：段边界/锚点是
+                #   离线已知的用户产物，不是识别抖动的坐标跳变 ⇒ 不走有限增益/跳变判据。
+                #   off 略有抖动也会被下一个可信窗的 update() 校正回来。
+                if segkey is not None and segkey != self._grid_segkey:
+                    clock.reanchor(bl, anchor, off, r, ref_t)
+                    self._grid_segkey = segkey
+                elif trusted:
                     clock.update(sid, bl, anchor, off, r, ref_t, strong=strong)
                 else:
                     # 低票数窗：只刷新速率、不做相位校正（阻塞项 A）
@@ -1148,6 +1182,7 @@ class AutoVJEngine(QObject):
                                   <= getattr(self, "GRID_CONSIST_HI", 1.45))
             if have and consistent:
                 clock.update(sid, bl, anchor, off, r, ref_t, strong=strong)  # 正式锁定
+                self._grid_segkey = segkey
             elif (not have) or dt > max_dt:
                 # 首个可信窗 / 距上个可信窗很久（识别超时、seek）→ 重新定位暂存锚
                 self._grid_pending = (sid, off, ref_t)
