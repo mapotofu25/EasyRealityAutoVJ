@@ -73,6 +73,16 @@ class ErlibDetailDialog(QDialog):
         form.addRow("手动 BPM", row)
         v.addLayout(form)
 
+        # ★ 波形标记控件必须**先创建**：下面的工具栏（lambda 引用 self.wave.set_mode）与
+        #   吸附复选框（connect self.wave.set_snap）都会在 build 期访问 self.wave；
+        #   若等 body 段才建，会 AttributeError: 'ErlibDetailDialog' object has no attribute 'wave'。
+        from waveform_mark import WaveformMarkWidget
+        self.wave = WaveformMarkWidget()
+        self.wave.anchorsChanged.connect(self._on_anchors_changed)
+        self.wave.segmentsChanged.connect(self._on_segments_changed)
+        self.wave.segmentSelected.connect(self._on_segment_selected)
+        self.wave.bpmPicked.connect(self._on_bpm_picked)
+
         # 模式工具栏
         bar = QHBoxLayout()
         self._mode_group = QButtonGroup(self)
@@ -95,12 +105,6 @@ class ErlibDetailDialog(QDialog):
 
         # 主体：左波形 / 右列表
         body = QHBoxLayout()
-        from waveform_mark import WaveformMarkWidget
-        self.wave = WaveformMarkWidget()
-        self.wave.anchorsChanged.connect(self._on_anchors_changed)
-        self.wave.segmentsChanged.connect(self._on_segments_changed)
-        self.wave.segmentSelected.connect(self._on_segment_selected)
-        self.wave.bpmPicked.connect(self._on_bpm_picked)
         body.addWidget(self.wave, 1)
 
         right = QVBoxLayout()

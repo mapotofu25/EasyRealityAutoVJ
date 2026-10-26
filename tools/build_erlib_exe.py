@@ -37,8 +37,16 @@ _MODELS = ("discogs", "beat_this")
 _HIDDEN = [
     "erlib", "erlib.format", "erlib.scanner", "erlib.app", "erlib.transfer",
     "erlib.cover",
+    # ★ 2026-10-27：详情页对话框 —— app.py 里 `_open_detail` 是**函数内延迟 import**
+    #   (`from erlib.detail import ErlibDetailDialog`)，静态分析看不到 ⇒ 不显式声明打包后
+    #   一点右键「歌曲详情」就 ImportError。
+    "erlib.detail",
     "appicon",                                     # ★ 应用图标定位（惰性 import）
     "fp", "beatgrid", "phrase_bt", "music_meta",
+    # ★ 2026-10-27：波形数据层 + 标记控件（ERALIB 经 pathex=[AutoVJ/src] 复用共享模块）。
+    #   detail.py 里 `from waveform_mark import WaveformMarkWidget` 是延迟 import；
+    #   scanner/format/imported_lib 里 `import waveform` 也是延迟 import ⇒ 必须显式声明。
+    "waveform", "waveform_mark",
     "audio_genre", "genre_lookup", "genre_keywords", "genre_visual_default",
     "config", "soundfile", "mutagen", "onnxruntime",
     # ★★ 这些是**函数内延迟 import** 的（`erlib.cover` / `music_meta` 里），
