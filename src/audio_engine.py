@@ -588,8 +588,6 @@ class AudioState:
         #   界面只剩 0。但拍钟若跟着未锁定值走，一旦它是半速值，切换节奏会错一整倍 ——
         #   所以「显示」与「驱动拍钟」必须解耦：这个字段只给界面看，不参与任何节奏计算。
         self.bpm_display = 0.0
-        # ★ 2026-10-27：**不钳位**的 BPM（只给 BPM 一致性校验用；显示/拍钟仍用 bpm_display）
-        self.bpm_raw = 0.0
         self.bpm_locked = False     # bpm_display 是否已是锁定值（界面据此加「≈」前缀）
         self.beat_phase = 0.0       # 0..1 拍内相位
         self.beat_count = 0         # 总拍数
@@ -789,11 +787,6 @@ class _Analyzer:
         self.bpm_smooth = 0.0
         self.bpm_display = 0.0               # 显示用（未锁定也可有值），不参与拍钟
         self._bpm_votes = deque(maxlen=60)   # 60s 投票窗口，众数取 BPM（换歌静音清空）
-        # ★ 2026-10-27：**不钳位**的原始 BPM 投票（只给"库内 BPM 一致性校验"用）。
-        #   钳位版（≤220）仍负责锁定/显示/拍钟；原始版保留 2×/3× 谐波关系，
-        #   否则 128BPM 被压成 219.5 会让校验把正确匹配判成误识别。
-        self._bpm_raw_votes = deque(maxlen=60)
-        self.bpm_raw = 0.0
 
         self._bpm_lock = False               # 锁定建立标志（主段稳定后锁定，breakdown 不扰动）
         self._bpm_song = -1                  # 上次识别到的 song_id：变了就清投票+解锁（见 feed）
@@ -904,8 +897,6 @@ class _Analyzer:
         if sid is not None and sid >= 0 and sid != self._bpm_song:
             self._bpm_song = sid
             self._bpm_votes.clear()
-            self._bpm_raw_votes.clear()
-            self.bpm_raw = 0.0
             self._bpm_lock = False
             self._bpm_far_sec = 0.0
         sig = np.mean(data, axis=1) if data.shape[1] > 1 else data[:, 0]
@@ -1078,14 +1069,6 @@ class _Analyzer:
                 # 已锁定阶段：只接受与锁定值 ±8 内的微调，breakdown/outro 的飞值（无 kick
                 # 时全频被旋律带飞）一律忽略，避免「2:20 飞到 180」。静音换歌重置解锁。
                 self._bpm_votes.append(bpm)
-                # 不钳位的原始值（只给 BPM 一致性校验用，见上方说明）。
-                # ⚠ 直方图上界必须 ≥ _bpm_raw 的上界 400，否则 256 这类值会被
-                #   np.histogram **静默丢掉**（落不进任何 bin）。
-                self._bpm_raw_votes.append(_bpm_raw)
-                _rvals = np.array(self._bpm_raw_votes, dtype=np.float32)
-                if len(_rvals) >= 6:
-                    _rhist, _redges = np.histogram(_rvals, bins=np.arange(60.0, 401.0, 1.0))
-                    self.bpm_raw = float(_redges[int(np.argmax(_rhist))] + 0.5)
                 vals = np.array(self._bpm_votes, dtype=np.float32)
                 if len(vals) >= 6:
                     bins = np.arange(60.0, 221.0, 1.0)
@@ -1117,8 +1100,6 @@ class _Analyzer:
                                 self._bpm_far_sec += 1.0
                                 if self._bpm_far_sec >= 20.0:
                                     self._bpm_votes.clear()
-                                    self._bpm_raw_votes.clear()
-                                    self.bpm_raw = 0.0
                                     self._bpm_lock = False
                                     self._bpm_far_sec = 0.0
                             else:
@@ -1448,7 +1429,6 @@ class _Analyzer:
             st.energy = E
             st.bpm = self.bpm_smooth
             st.bpm_display = self.bpm_display
-            st.bpm_raw = self.bpm_raw
             st.bpm_locked = self._bpm_lock
             st.beat_phase = min(1.0, max(0.0, phase))
             st.beat_count = self.beat_count
@@ -1494,8 +1474,6 @@ class _Analyzer:
             # 长静音（>10s）后重新有声 = 明确换歌：连 BPM 投票与锁定也清空（保守阈值防搓碟误清）
             if st.silent_sec > 10.0 and rms >= 1e-4:
                 self._bpm_votes.clear()
-                self._bpm_raw_votes.clear()
-                self.bpm_raw = 0.0
                 self._bpm_lock = False
                 self.bpm_smooth = 0.0
                 self.bpm_display = 0.0
@@ -2380,11 +2358,6 @@ class AudioEngine:
                         _rbpm = float(getattr(self.state, "bpm_display", 0.0) or 0.0)
                     except Exception:                        # noqa: BLE001
                         _rbpm = 0.0
-                    try:
-                        # 未钳位的实时 BPM（撞顶时靠它保住 2×/3× 谐波关系）
-                        _rbpm_raw = float(getattr(self.state, "bpm_raw", 0.0) or 0.0)
-                    except Exception:                        # noqa: BLE001
-                        _rbpm_raw = 0.0
                     # ★ 2026-10-27：先记住 fp_lock_gate 给出的结论（strict/warp/recode），
                     #   BPM 校验**通过**时要恢复它 —— 否则 `_last_gate="bpm"` 会从上一帧残留下来，
                     #   日志里出现 `brel=0.083 gate=bpm` 这种自相矛盾的组合（0.083 本该通过）。
