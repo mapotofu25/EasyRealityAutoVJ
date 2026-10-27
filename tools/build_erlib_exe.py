@@ -47,6 +47,8 @@ _HIDDEN = [
     #   detail.py 里 `from waveform_mark import WaveformMarkWidget` 是延迟 import；
     #   scanner/format/imported_lib 里 `import waveform` 也是延迟 import ⇒ 必须显式声明。
     "waveform", "waveform_mark",
+    # ★ 2026-10-27 详情页试听（sounddevice 播放，ERALIB 仍然**不引 PyAV**）
+    "audio_playback", "sounddevice",
     "audio_genre", "genre_lookup", "genre_keywords", "genre_visual_default",
     "config", "soundfile", "mutagen", "onnxruntime",
     # ★★ 这些是**函数内延迟 import** 的（`erlib.cover` / `music_meta` 里），

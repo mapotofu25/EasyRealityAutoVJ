@@ -85,6 +85,10 @@ cmd = [
     "--hidden-import", "music_detail",
     "--hidden-import", "waveform",
     "--hidden-import", "waveform_mark",
+    # ★ 2026-10-27 详情页试听：`music_detail._ensure_player` 里惰性 import，
+    #   漏了之后 exe 里点 ▶ 只显示「音频模块不可用」。
+    "--hidden-import", "audio_playback",
+    "--hidden-import", "sounddevice",
     "--hidden-import", "beatgrid",
     "--hidden-import", "lan_audio_send",
     "--hidden-import", "glctx",

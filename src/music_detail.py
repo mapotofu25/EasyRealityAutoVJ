@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox,
                                QFormLayout, QHBoxLayout, QInputDialog, QLabel,
                                QListWidget, QMessageBox, QPushButton,
@@ -70,6 +71,11 @@ class MusicDetailDialog(QDialog):
         self._manual = None
         self._wf = None
         self._auto_bpm = 0.0
+        # ---- 试听播放（懒创建：只有点了 ▶ 才去探测声卡 / 解码）----
+        self._player = None
+        self._tick = None
+        self._playing = False
+        self._pending_play = False
         self._build()
         self._load()
 
@@ -109,6 +115,7 @@ class MusicDetailDialog(QDialog):
         self.wave.segmentsChanged.connect(self._on_segments_changed)
         self.wave.segmentSelected.connect(self._on_segment_selected)
         self.wave.bpmPicked.connect(self._on_bpm_picked)
+        self.wave.playheadMoved.connect(self._on_playhead_moved)
 
         bar = QHBoxLayout()
         self._mode_group = QButtonGroup(self)
@@ -123,6 +130,20 @@ class MusicDetailDialog(QDialog):
                 b.setChecked(True)
             b.clicked.connect(lambda _=False, k=key: self.wave.set_mode(k))
         bar.addStretch(1)
+        # ★ 试听控制（用户要求）：播放起点 = 波形上的播放头竖线位置。
+        self.btn_play = QPushButton("▶ 播放")
+        self.btn_play.setToolTip("从播放头竖线所在位置开始播放")
+        self.btn_play.clicked.connect(self._on_play)
+        bar.addWidget(self.btn_play)
+        self.btn_pause = QPushButton("⏸ 暂停")
+        self.btn_pause.clicked.connect(self._on_pause)
+        bar.addWidget(self.btn_pause)
+        self.btn_stop = QPushButton("⏹ 停止")
+        self.btn_stop.clicked.connect(self._on_stop)
+        bar.addWidget(self.btn_stop)
+        self.lbl_pos = QLabel("位置 0.00s")
+        self.lbl_pos.setMinimumWidth(150)
+        bar.addWidget(self.lbl_pos)
         self.chk_snap = QCheckBox("吸附到拍")
         self.chk_snap.setChecked(True)
         self.chk_snap.toggled.connect(self.wave.set_snap)
@@ -170,6 +191,7 @@ class MusicDetailDialog(QDialog):
 
     # ---------------- 数据 ----------------
     def _load(self):
+        self._shutdown_audio()             # 重新读数据（含「回退自动」）先停掉试听
         try:
             self._meta = (self.cfg["music_meta"] or {}).get(self.path) or {}
         except Exception as e:                                   # noqa: BLE001
@@ -236,6 +258,7 @@ class MusicDetailDialog(QDialog):
         self.wave.set_waveform(self._wf)
         self.wave.set_grid(self._grid)
         self.wave.set_manual(mm)
+        self.wave.set_playhead(0.0)
         self._dirty = False
         self._refresh_lists()
         self._update_title()
@@ -320,6 +343,138 @@ class MusicDetailDialog(QDialog):
             self.spin_bpm.setValue(bpm)
             self._mark_dirty()
 
+    # ---------------- 试听播放（起点 = 播放头竖线） ----------------
+    def _ensure_player(self):
+        """懒创建播放器 + 50ms 轮询定时器（没声卡也绝不抛异常）。"""
+        if self._player is not None:
+            return self._player
+        try:
+            from audio_playback import AudioPlayer
+        except Exception as e:                                   # noqa: BLE001
+            self.lbl_pos.setText("无法播放：音频模块不可用（%s）" % e)
+            return None
+        try:
+            self._player = AudioPlayer()
+        except Exception as e:                                   # noqa: BLE001
+            self.lbl_pos.setText("无法播放：%s" % e)
+            return None
+        self._tick = QTimer(self)
+        self._tick.setInterval(50)                               # 20fps：够跟手，开销可忽略
+        self._tick.timeout.connect(self._on_tick)
+        self._tick.start()
+        return self._player
+
+    def _on_playhead_moved(self, sec):
+        """拖动播放头 → 记位置；正在播放就立即 seek 过去。"""
+        try:
+            self.lbl_pos.setText("位置 %.2fs" % float(sec))
+        except (TypeError, ValueError):
+            pass
+        if self._player is not None and self._player.loaded:
+            self._player.seek(sec)
+
+    def _on_play(self):
+        """▶：从播放头竖线所在秒起播（先 seek 再播）。"""
+        p = self._ensure_player()
+        if p is None:
+            return
+        if p.is_playing():
+            return
+        if not p.available:
+            self.lbl_pos.setText("无法播放：%s" % (p.error or "没有可用的音频输出设备"))
+            return
+        pos = float(self.wave.playhead_sec())
+        # 未装载 / 装的是别的歌 → 后台解码，`_on_tick` 里就绪后自动起播
+        if not (p.loaded and p.loaded_path == self.path):
+            self._pending_play = True
+            self.lbl_pos.setText("准备音频…（从 %.2fs 起播）" % pos)
+            if not p.load(self.path):
+                self._pending_play = False
+                self.lbl_pos.setText("无法播放：%s" % (p.error or "音频文件不可用"))
+            return
+        self._pending_play = False
+        if p.play(pos):
+            self._playing = True
+            self.btn_play.setText("▶ 播放中")
+            self.lbl_pos.setText("播放中（从 %.2fs）" % pos)
+        else:
+            self.lbl_pos.setText("无法播放：%s" % (p.error or "未知原因"))
+
+    def _on_pause(self):
+        p = self._player
+        if p is None:
+            return
+        if p.is_playing():
+            p.pause()
+        self._playing = False
+        self._pending_play = False
+        self.btn_play.setText("▶ 播放")
+        pos = p.position_sec()
+        self.wave.set_playhead(pos)          # 暂停后竖线留在原位
+        self.lbl_pos.setText("已暂停 %.2fs" % pos)
+
+    def _on_stop(self):
+        p = self._player
+        if p is not None:
+            p.stop()
+        self._playing = False
+        self._pending_play = False
+        self.btn_play.setText("▶ 播放")
+        self.wave.set_playhead(0.0)
+        self.lbl_pos.setText("位置 0.00s")
+
+    def _on_tick(self):
+        """播放中：竖线跟着音频走；就绪后自动补起播；播完复位按钮。"""
+        p = self._player
+        if p is None:
+            return
+        if self._pending_play and p.loaded and p.loaded_path == self.path:
+            self._pending_play = False
+            pos = float(self.wave.playhead_sec())
+            if p.play(pos):
+                self._playing = True
+                self.btn_play.setText("▶ 播放中")
+                self.lbl_pos.setText("播放中（从 %.2fs）" % pos)
+            else:
+                self.lbl_pos.setText("无法播放：%s" % (p.error or "未知原因"))
+                return
+        if self._playing and p.is_playing():
+            pos = p.position_sec()
+            self.wave.set_playhead(pos)
+            self.lbl_pos.setText("位置 %.2fs / %.2fs" % (pos, p.duration_sec))
+        elif self._playing and not p.is_playing():
+            # 自然播完（或声卡中途出错）
+            self._playing = False
+            self.btn_play.setText("▶ 播放")
+            pos = p.position_sec()
+            self.wave.set_playhead(pos)
+            self.lbl_pos.setText("播放结束 %.2fs%s"
+                                 % (pos, ("（%s）" % p.error) if p.error else ""))
+
+    def _shutdown_audio(self):
+        """关详情页必调：停播 + 停定时器 + 释放声卡流（绝不留后台线程）。"""
+        self._playing = False
+        self._pending_play = False
+        t = self._tick
+        self._tick = None
+        if t is not None:
+            try:
+                t.stop()
+                t.deleteLater()
+            except Exception:                                    # noqa: BLE001
+                pass
+        p = self._player
+        self._player = None
+        if p is not None:
+            try:
+                p.stop()
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                p.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+
     # ---------------- 保存 / 回退 ----------------
     def _write_manual(self, manual):
         """把 grid_manual 写回 music_meta[path] 并落盘。成功返回 True。"""
@@ -357,6 +512,7 @@ class MusicDetailDialog(QDialog):
             return
         self._load()
 
+
     def closeEvent(self, ev):
         if self._dirty:
             ret = QMessageBox.question(
@@ -366,4 +522,10 @@ class MusicDetailDialog(QDialog):
             if ret != QMessageBox.StandardButton.Yes:
                 ev.ignore()
                 return
+        self._shutdown_audio()
         super().closeEvent(ev)
+
+    def done(self, r):                     # noqa: D401 - Qt 钩子
+        """任何关闭路径（X / 关闭按钮 / ESC）都要停播 + 释放声卡流。"""
+        self._shutdown_audio()
+        super().done(r)
