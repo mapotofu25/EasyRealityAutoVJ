@@ -3214,7 +3214,31 @@ class MainWindow(QMainWindow):
         try:
             g = (getattr(self.engine, "_song_grid_lookup", None) or {}).get(int(sid)) or {}
             b = float(g.get("bpm") or 0.0)
-            return b if b > 0.0 else 0.0
+            if b > 0.0:
+                return b
+        except Exception:                                        # noqa: BLE001
+            pass
+        # ★ 2026-10-27：**码表包内嵌曲**（本机没有音频文件 ⇒ 没有 grid）走 `fp_songs.bpm`。
+        #   没有这一条，C 组那种「包内曲目被误匹配」的场景 BPM 校验永远拿不到库内 BPM
+        #   （实测 `brel=none`，判据等于关着）。
+        #   缓存策略：按 `fp_songs` 条数失效（导新包条数必变）⇒ 不用每窗都重建字典。
+        try:
+            fs = (self.cfg["cue"] or {}).get("fp_songs") or {}
+            n = len(fs)
+            cache = getattr(self, "_fp_song_bpm_cache", None)
+            if cache is None or cache[0] != n:
+                m = {}
+                for _k, _v in fs.items():
+                    try:
+                        _sid = int(_v.get("song_id") or 0)
+                        _b = float(_v.get("bpm") or 0.0)
+                        if _sid and _b > 0.0:
+                            m[_sid] = _b
+                    except (TypeError, ValueError):
+                        continue
+                cache = (n, m)
+                self._fp_song_bpm_cache = cache
+            return float(cache[1].get(int(sid), 0.0) or 0.0)
         except Exception:                                        # noqa: BLE001
             return 0.0
 
@@ -4406,6 +4430,17 @@ class MainWindow(QMainWindow):
             #   取值口径与注入给引擎的网格**同一份**（`_song_grid_lookup` 装的就是
             #   `effective_grid` 的产物，已含 `grid_manual.bpm_manual` 的手工覆盖）⇒
             #   用户改过 BPM 的曲子，校验用的也是改后的值，不会自相矛盾。
+            # ★ 2026-10-27：老数据迁移 —— `fp_songs` 以前漏存包内曲目的 `bpm`，
+            #   这里按 `sheet` 分组解一次 `.ercue` 的 `cuesheet.json` 补齐（幂等、只补缺的），
+            #   补到就落盘。放在注入 provider **之前**，保证第一次识别就能用上。
+            try:
+                import cue_fp_pack as _cfp
+                _nfix = _cfp.migrate_fp_song_bpm(self.cfg)
+                if _nfix:
+                    self.cfg.save()
+                    print("[识别] 包内曲目 BPM 补齐 %d 条（供 BPM 一致性校验）" % _nfix)
+            except Exception as _e:                              # noqa: BLE001
+                print("[识别] 包内曲目 BPM 迁移失败（不影响识别）：%s" % _e)
             try:
                 self.audio.set_song_bpm_provider(self._lib_bpm_of)
             except Exception:                                    # noqa: BLE001

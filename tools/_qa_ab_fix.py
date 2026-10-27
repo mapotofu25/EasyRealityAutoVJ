@@ -176,6 +176,20 @@ def main():
                 sid_bpm[sid] = b
         except Exception:                                         # noqa: BLE001
             continue
+    # ★ 2026-10-27：**码表包内嵌曲**的 BPM 来自 `cue.fp_songs[*].bpm`（迁移/导入已补上）。
+    #   生产 `ui_main._lib_bpm_of` 就是「先查 grid，再查 fp_songs」，这里照做。
+    _nfs = 0
+    for _k, _v in ((cfg.get("cue") or {}).get("fp_songs") or {}).items():
+        try:
+            _sid2 = int(_v.get("song_id") or 0)
+            _b2 = float(_v.get("bpm") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if _sid2 and _b2 > 0:
+            sid_bpm.setdefault(_sid2, _b2)
+            _nfs += 1
+    print("其中包内曲目（fp_songs）%d 条；西行谣=%s 揽月=%s"
+          % (_nfs, sid_bpm.get(3112469840), sid_bpm.get(346225955)))
     print("库内 BPM 表 %d 首；白名单 %d 个 sid；FP_PREV_HINT_SEC=%.1f BPM_MATCH_TOL=%.2f"
           % (len(sid_bpm), len(whitelist), AE.FP_PREV_HINT_SEC, AE.BPM_MATCH_TOL))
 

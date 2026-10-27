@@ -362,11 +362,19 @@ def _read_tracks(pkg_path):
             dur = float(idn.get("duration_sec") or 0.0)
         except (TypeError, ValueError):
             dur = 0.0
+        try:
+            bpm = float(idn.get("bpm") or 0.0)
+        except (TypeError, ValueError):
+            bpm = 0.0
         out.append({
             "fp_id": fp_id,
             "title": str(idn.get("title") or ""),
             "artist": str(idn.get("artist") or ""),
             "duration": dur,
+            # ★ 2026-10-27：包内曲目的 BPM（`cuesheet.json` 的 `tracks[].identity.bpm`）。
+            #   识别端要拿它做「库内 BPM ↔ 实时 BPM」一致性校验（防误识别）；以前导入时漏存，
+            #   导致 B 站 200BPM 快歌被误锁到 142BPM 的包内曲目且无从校验。
+            "bpm": bpm,
         })
     return out
 
@@ -504,6 +512,68 @@ def resolve_db(host, create=True):
 
 
 # ==========================================================================
+# 旧数据迁移：给 fp_songs 补 bpm（2026-10-27）
+# ==========================================================================
+def migrate_fp_song_bpm(cfg) -> int:
+    """把**包里已有、但导入时漏存 bpm** 的 fp_songs 条目补齐。返回补了几条。
+
+    背景：`fp_songs` 原先只存 `song_id/title/artist/duration/sheet`，独缺 `bpm`
+    ⇒ 识别端「库内 BPM ↔ 实时 BPM」校验对本机无文件的包内曲目**永远无从生效**
+    （实测：B 站 200BPM 快歌被误锁到 142BPM 的包内曲目，`brel` 那栏是 none）。
+
+    做法：按 `sheet`（同一张 `.ercue`）**分组只解一次 zip**，读 `cuesheet.json` 的
+    `tracks[].identity.bpm`，按 `fp_id` 对回去。**幂等**：已有 `bpm>0` 的条目不动；
+    没有 zip / 没有该曲 / 读失败一律跳过（绝不抛）。
+
+    ⚠ 只读 + 只改内存里的 `cfg`，落盘由调用方 `cfg.save()` 决定（启动路径要能零副作用地
+      先跑一遍再决定要不要写）。
+    """
+    try:
+        fp_songs = cfg["cue"]["fp_songs"]
+    except Exception:                                            # noqa: BLE001
+        return 0
+    if not isinstance(fp_songs, dict) or not fp_songs:
+        return 0
+    todo = {}
+    for fp_id, rec in fp_songs.items():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            if float(rec.get("bpm") or 0.0) > 0.0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        sheet = str(rec.get("sheet") or "")
+        if not sheet:
+            continue
+        todo.setdefault(sheet, []).append(fp_id)
+    if not todo:
+        return 0
+    fixed = 0
+    for sheet, ids in todo.items():
+        if not os.path.isfile(sheet):
+            continue
+        try:
+            tracks = _read_tracks(sheet) or []
+        except Exception:                                        # noqa: BLE001
+            continue
+        bpm_of = {}
+        for tr in tracks:
+            try:
+                b = float(tr.get("bpm") or 0.0)
+            except (TypeError, ValueError):
+                b = 0.0
+            if b > 0.0:
+                bpm_of[str(tr.get("fp_id") or "")] = b
+        for fp_id in ids:
+            b = bpm_of.get(fp_id)
+            if b:
+                fp_songs[fp_id]["bpm"] = float(b)
+                fixed += 1
+    return fixed
+
+
+# ==========================================================================
 # 灌库 / 清库（同步实现；GUI 请用 start_ingest/start_drop）
 # ==========================================================================
 def ingest_sheet(cfg, db, pkg_path) -> dict:
@@ -580,6 +650,8 @@ def ingest_sheet(cfg, db, pkg_path) -> dict:
                 "title": tr["title"],
                 "artist": tr["artist"],
                 "duration": float(tr["duration"]),
+                # ★ 2026-10-27：带上包内 BPM（识别端的 BPM 一致性校验要用它）
+                "bpm": float(tr.get("bpm") or 0.0),
                 "sheet": pkg,
             }
             res["tracks"] += 1
