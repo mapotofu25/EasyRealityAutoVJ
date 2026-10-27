@@ -175,7 +175,12 @@ BPM_OCTAVE_SET = (0.5, 1.0, 2.0)
 #     ② 谐波集补上 1/3、3 —— 检测器估成三倍/三分之一同样常见（与 0.5/2 同一个道理）。
 #   ⚠ 受影响的是 110~183 BPM 的**主力曲速段**（双倍后必然撞顶），不是边缘情况。
 BPM_RAIL = 218.0
-BPM_HARM_SET = (1.0 / 3.0, 0.5, 1.0, 2.0, 3.0)
+# ★★★ 2026-10-27 实机定案：谐波集**只能是 (0.5, 1, 2)**。
+#   曾扩到 (1/3, 3) 并加"用未钳位原始值判谐波"的兜底，实机立刻在 C 组误锁：
+#   日志证据 `lbpm=180.0 rbpm=219.5 brel=0.220` 本该拒绝，但原始值 360/180=2.0
+#   正好构成谐波 ⇒ 放行。**只要允许"任何倍率关系"，BPM 否决就失去意义**（检测器几乎总能
+#   找到某个 k 使 lbpm×k ≈ rbpm）。⇒ 恢复固定两倍关系，且只用钳位后的值。
+BPM_HARM_SET = (0.5, 1.0, 2.0)
 # ★★ 2026-10-27 第二轮实机（A 组 off 中位偏差 12.49/14.42s）：hint ±2s 兜不住重复段落
 #   —— 相邻两窗可能**连续**跳到另一处等票候选。改成 off 状态机：
 #   已锁定且同 sid 时，新 off 必须落在「上一**已接受**值 + 墙钟推进」的 ±TOL 内，
@@ -202,21 +207,37 @@ LOCK_LEAD_RECODE  = 3.0    # ③ 重编码兜底：总票领先倍数（真歌�
 #   而第二名 982、646 对 801 ⇒ ②③ 的「领先倍数」恒不成立 ⇒ 正确匹配永远锁不上。
 #   但正确曲能**连续多窗胜出且 offset 随墙钟线性推进**（错歌几乎做不到这两件事同时成立）。
 #   四条同时满足才放行（比 ② 更严的票数下限、更长的连续窗）：
-LOCK_STREAK_N     = 3      # 连续 N 窗同一首胜出（≈3 个识别周期）
-LOCK_STREAK_ADV   = 0.60   # 相邻窗 offset 必须按墙钟推进的容差（秒）
-LOCK_STREAK_HIT   = 0.80   # 命中率下限（比 ② 的 0.60 严）
-LOCK_STREAK_TOT   = 150    # 总票下限（比 ② 的 120 严，补偿"不要求领先"）
-LOCK_STREAK_VOTES = 20     # 单点票下限（比 ② 的 15 严）
+# ★★ 2026-10-27（对照 KVJ/KDJ 源码后重写）：**必须是"互不重叠"的两次观测**。
+#   原实现是"连续 3 窗同名 + offset 按墙钟推进"，看起来 3 份证据，其实**不是**：
+#   识别窗 4.5s、每 0.8~1.2s 一拍 ⇒ 相邻窗重叠 75~90%，三次"一致"≈同一次证据的三种说法，
+#   一次偶然对齐会顺着重叠自己延续下去（KVJ 源码原话：only windows that do not overlap
+#   are independent evidence）。实机代价：C 组「同作者同曲风」的歌被误锁。
+#   ⇒ 改成：两次观测**相距 ≥ 窗口长度**（真正不重叠）、同一首、隐含倍率 ∈[0.85,1.18]、
+#     且两次各自都要过"证据下限"。两次独立窗口同时命中，才是可采信的证据。
+LOCK_AGREE_MIN_SEC = 4.5   # 两次观测的最小间隔（= FP_WIN_SEC，保证不重叠；见下）
+LOCK_AGREE_RATE    = (0.85, 1.18)   # 隐含倍率允许区间（off 前进 / 墙钟前进）
+LOCK_AGREE_HIT     = 0.80   # 命中率下限（比 ② 的 0.60 严）
+LOCK_AGREE_TOT     = 150    # 总票下限（比 ② 的 120 严，补偿"不要求领先"）
+LOCK_AGREE_VOTES   = 20     # 单点票下限（比 ② 的 15 严）
 # ★★ 2026-10-27 实测（Round6 首次上机就翻车）：**必须加"票集中度"**。
 #   拿一首「不在曲库」的 B 站曲（Rolling Contact - Million Miles，同作者同曲风）离线实测：
 #     hit_rate = **0.96~0.99**、tot = 98~208，但单点票只有 **3~6** ⇒ pv/tot ≈ 0.03。
 #   ⇒ `hit_rate` 在本机这个规模的库上**对任何音乐都接近 1.0**，它不能证明"库里有这段录音"；
 #     去掉「2× 领先」以后，光靠 hits+总票就足以让一首无关的歌锁上（实测误锁到「西行谣」）。
 #   而真歌（Raccoon Memes）pv/tot = 0.18~0.27。⇒ 用 pv/tot ≥ 0.12 把两者分开。
-LOCK_STREAK_CONC  = 0.12   # 单点票 / 总票 的集中度下限（真歌 ≥0.18，无关曲 ≤0.05）
+LOCK_AGREE_CONC   = 0.12   # 单点票 / 总票 的集中度下限（真歌 ≥0.18，无关曲 ≤0.05）
+# ★★★ 2026-10-27 实机三轮定案：**这条通道默认关闭**。
+#   两版实现（连续 3 窗 / 互不重叠 2 窗）都试过，两次上机都在 C 组「无关曲」上误锁：
+#     · v1 连续 3 窗 + 集中度  ⇒ C3 误锁「西行谣」（71s）
+#     · v2 互不重叠 2 窗 + 集中度 ⇒ C1 误锁（41s）、C3 误锁（67s）
+#   根因：两个版本都**没有"对第二名的领先"**这一条，而 `hit_rate`/总票在这台机的库规模上
+#   对任何音乐都够（实测无关曲 hit 0.96~0.99）。要恢复弱素材的召回，必须上**打分校验**
+#   （白化谱相关 + runner-up 领先，见 KVJ/KDJ 的做法），不是继续放宽票数判据。
+#   ⇒ 保持关闭；`fp_obs_ok` / `fp_agree_ok` 两个纯函数与单测**保留**，供将来接打分通道时复用。
+LOCK_AGREE_ENABLE = False
 
 
-def bpm_gate_ok(lbpm, rbpm, rbpm_raw=0.0):
+def bpm_gate_ok(lbpm, rbpm):
     """「库内 BPM ↔ 实时 BPM」一致性校验（纯函数，便于离线回归）。
 
     返回 `(ok, brel, flag)`：
@@ -224,17 +245,6 @@ def bpm_gate_ok(lbpm, rbpm, rbpm_raw=0.0):
       · `brel` —— 相对偏差（用于取证；任一为 0 时 None）
       · `flag` —— 1 通过 / 0 拒绝 / -2 拒绝且当窗撞顶 / None 无法校验（有一边为 0）
 
-    `rbpm_raw`（2026-10-27 加）：**未钳位**的实时 BPM（`AudioState.bpm_raw`）。
-      钳位版被 `min(220)` 压平后谐波关系会丢（128 的真双倍 256 → 219.5，比值 1.72
-      既不是真值也不是整数倍）；原始版保留 256 ⇒ 比值 2.0 直接命中谐波集。
-      ⇒ 先按钳位值判，不过再拿原始值判一次；两者都不成立才拒绝。
-
-    判据：
-      ① 相对偏差 ≤ BPM_MATCH_TOL（20%）⇒ 过；
-      ② 否则看是否**谐波关系** `rbpm/lbpm ∈ BPM_HARM_SET(1/3, 0.5, 1, 2, 3)`（绝对容差）⇒ 过；
-      ③ `rbpm ≥ BPM_RAIL`（撞 `min(220)` 上限）⇒ 估计器已饱和，这个数不携带信息 ⇒ **跳过**。
-         ⚠ 这条是 2026-10-27 Round5 的核心修复：128BPM 的歌被估成双倍 256、钳成 219.5，
-           比值 1.72 既不是真值也不是整数倍 ⇒ 旧逻辑把 `phr=0.97` 的正确匹配判成误识别。
     """
     try:
         lb = float(lbpm or 0.0)
@@ -250,28 +260,66 @@ def bpm_gate_ok(lbpm, rbpm, rbpm_raw=0.0):
     #   撞顶值的根问题在**估计器的 min(220) 钳位**（真实 2× 被压平，谐波关系随之丢失），
     #   不能靠"忽略它"绕过。⇒ 恢复"只要两边都有值就校验"；
     #   `BPM_RAIL` 仅用于取证（`[R]` 里看得出这一窗是不是撞顶时段）。
-    def _cmp(lb_v, rb_v):
-        _b = abs(lb_v - rb_v) / lb_v
-        if _b <= BPM_MATCH_TOL:
-            return True, _b
-        _ratio = rb_v / lb_v
-        for _k in BPM_HARM_SET:
-            if abs(_ratio - _k) <= BPM_MATCH_TOL:
-                return True, _b
-        return False, _b
-
-    ok, brel = _cmp(lb, rb)
-    if ok:
+    brel = abs(lb - rb) / lb
+    if brel <= BPM_MATCH_TOL:
         return True, brel, 1
-    try:
-        rr = float(rbpm_raw or 0.0)
-    except (TypeError, ValueError):
-        rr = 0.0
-    if rr > 0.0 and abs(rr - rb) > 0.5:
-        ok2, brel2 = _cmp(lb, rr)
-        if ok2:
-            return True, brel2, 1
+    ratio = rb / lb
+    for _k in BPM_HARM_SET:
+        if abs(ratio - _k) <= BPM_MATCH_TOL:
+            return True, brel, 1
     return False, brel, (-2 if rb >= BPM_RAIL else 0)
+
+
+def fp_obs_ok(votes, tot, hit_rate):
+    """「本窗观测是否可入库」判据（纯函数）。
+
+    四条同时成立：命中率 ≥0.80、总票 ≥150、单点票 ≥20、**单点票/总票 ≥0.12**。
+    最后一条是关键：`hit_rate` 在本机库规模上对**任何音乐**都接近 1.0
+    （实测无关曲 0.96~0.99），只有「票集中在同一个对齐位置」才说明真的对上了。
+    真歌 pv/tot = 0.18~0.27，无关曲 0.03~0.05。
+    ⚠ 这条判据曾被改写时漏掉一次，实机立刻误锁（2026-10-27 Round10），故抽成纯函数 + 单测。
+    """
+    try:
+        v, t = int(votes or 0), int(tot or 0)
+        hr = float(hit_rate or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return (v >= LOCK_AGREE_VOTES
+            and t >= LOCK_AGREE_TOT
+            and hr >= LOCK_AGREE_HIT
+            and v >= LOCK_AGREE_CONC * max(1, t))
+
+
+def fp_agree_ok(now, sid, off, obs, min_sec=None, rate_lo=None, rate_hi=None):
+    """「互不重叠印证」判据（纯函数，便于离线回归）。
+
+    `obs` = 历史观测序列 `[(t, sid, off), ...]`（只含"自身证据达标"的窗口）。
+    当前观测 `(now, sid, off)` 与其中一条**相距 ≥ 窗口长度**（真正不重叠）、
+    **同一首**、且**隐含倍率 = Δoff/Δt 落在允许区间**的观测相互印证时返回 True。
+
+    ⚠ 为什么不能用"连续 N 窗"：识别窗 4.5s、每 0.8~1.2s 一拍 ⇒ 相邻窗重叠 75~90%，
+      三次"一致"其实是同一次证据的三种说法，偶然对齐会顺着重叠自己延续
+      （KVJ 源码原话：only windows that do not overlap are independent evidence）。
+    """
+    try:
+        _min = LOCK_AGREE_MIN_SEC if min_sec is None else float(min_sec)
+        _lo = LOCK_AGREE_RATE[0] if rate_lo is None else float(rate_lo)
+        _hi = LOCK_AGREE_RATE[1] if rate_hi is None else float(rate_hi)
+        n, s, o = float(now), int(sid), float(off)
+    except (TypeError, ValueError):
+        return False
+    for _ot, _osid, _ooff in obs or ():
+        try:
+            if int(_osid) != s:
+                continue
+            dt = n - float(_ot)
+            if dt < _min:
+                continue
+            if _lo <= (o - float(_ooff)) / dt <= _hi:
+                return True
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+    return False
 
 
 def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
@@ -1624,7 +1672,9 @@ class AudioEngine:
         #   天然不成立，correct 匹配被一直拒绝。但**同一首歌连续多窗胜出、且 offset
         #   按墙钟线性推进**是比"单窗票数比"强得多的证据（错歌极少连续重复且位置连续）。
         #   结构：{"sid", "n", "off", "t"}；sid 变了或 offset 不连续就重置。
-        self._pick_streak = {"sid": -1, "n": 0, "off": 0.0, "t": 0.0}
+        # 观测环形队列：(t, sid, off)。只存"自身证据达标"的观测，供「不重叠印证」比对。
+        # ⚠ 绝不能存"已接受（已锁定）"的结果：一个错锁不许给自己担保（KVJ 同款教训）。
+        self._pick_obs = deque(maxlen=16)
         self._eng_state = (0, -1, 0, 0)   # 取证：电荷条 (cur, cand, bar, hits)
         self._rec_err_t = 0.0
         self._genre_lock = threading.Lock()
@@ -2122,23 +2172,19 @@ class AudioEngine:
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w,
                                               hint_sid=(_prev_sid if _hint is not None else None))
-                # ★★ 2026-10-27 Round5：**连续一致计数**（gate=streak 的证据）。
-                #   判据：同一首连续胜出，且 offset 按**墙钟**线性推进（容差 LOCK_STREAK_ADV）。
-                #   ⚠ 必须用 `_now`（perf_counter）算 Δt，不能用固定 0.5 —— 识别周期实测 0.8~1.2s。
-                #   ⚠ 换歌后（sid 变）自然重置；同一首歌被判 -1 也重置（不跨"失锁"累积）。
+                # ★★ 2026-10-27（对照 KVJ 源码重写）：把"本窗观测"记进环形队列，
+                #   供**互不重叠印证**使用。只有"自身证据达标"的窗口才入库 ——
+                #   弱窗口存进去只会制造假证据。
+                #   ⚠ 门槛判定与 gate 无关（gate 在下面才算），入库不等于接受。
                 try:
-                    _ps = self._pick_streak
-                    if (int(sid) >= 0 and int(sid) == int(_ps.get("sid", -1))
-                            and abs((float(off) - float(_ps.get("off", 0.0)))
-                                    - (_now - float(_ps.get("t", 0.0)))) <= LOCK_STREAK_ADV):
-                        _ps["n"] = int(_ps.get("n", 0)) + 1
-                        _ps["off"] = float(off)
-                        _ps["t"] = _now
-                    else:
-                        _ps["sid"] = int(sid)
-                        _ps["n"] = 1 if int(sid) >= 0 else 0
-                        _ps["off"] = float(off)
-                        _ps["t"] = _now
+                    if LOCK_AGREE_ENABLE and int(sid) >= 0 and fp_obs_ok(
+                            votes,
+                            (getattr(fp_db, "last_song_votes", {}) or {}).get(sid, 0),
+                            getattr(fp_db, "last_hit_rate", 0.0)):
+                        self._pick_obs.append((float(_now), int(sid), float(off)))
+                        while (self._pick_obs
+                               and _now - float(self._pick_obs[0][0]) > LOCK_AGREE_MIN_SEC * 4.0):
+                            self._pick_obs.popleft()
                 except Exception:                            # noqa: BLE001
                     pass
                 # ★★ 2026-10-19：**证据门槛（防误识别）**。
@@ -2175,25 +2221,22 @@ class AudioEngine:
                                        int(_second_tot), round(_hr, 2))
                     _gate_ok = fp_lock_gate(sid, int(votes or 0), _tot,
                                             _second, _second_tot, _hr)
-                    # ★ 第四条放行通道：连续一致（见 LOCK_STREAK_* 常量说明）。
-                    _streak_ok = False
-                    if not _gate_ok:
+                    # ★ 第四条放行通道：互不重叠印证（见 LOCK_AGREE_* 常量说明）。
+                    _agree_ok = False
+                    if not _gate_ok and LOCK_AGREE_ENABLE:
+                        # 第四条通道：**互不重叠印证**（默认关闭，见 LOCK_AGREE_ENABLE 说明）。
+                        #   在环形观测队列里找一条「相距 ≥ 窗口长度、同一首、
+                        #   隐含倍率落在允许区间」的旧观测 ⇒ 两次独立窗口互相印证。
+                        #   ⚠ 队列里存的是"自身证据达标但未必被接受"的观测，不含已锁定结果。
                         try:
-                            _ps = self._pick_streak
-                            if (int(_ps.get("n", 0)) >= LOCK_STREAK_N
-                                    and int(_ps.get("sid", -1)) == int(sid)
-                                    and _hr >= LOCK_STREAK_HIT
-                                    and _tot >= LOCK_STREAK_TOT
-                                    and int(votes or 0) >= LOCK_STREAK_VOTES
-                                    and int(votes or 0) >= LOCK_STREAK_CONC * max(1, _tot)):
-                                _streak_ok = True
+                            _agree_ok = fp_agree_ok(_now, sid, off, self._pick_obs)
                         except Exception:                    # noqa: BLE001
-                            _streak_ok = False
-                    if not _gate_ok and not _streak_ok:
+                            _agree_ok = False
+                    if not _gate_ok and not _agree_ok:
                         self._last_gate = "none"
                         sid, votes, off = -1, 0, 0.0
-                    elif _streak_ok:
-                        self._last_gate = "streak"
+                    elif _agree_ok:
+                        self._last_gate = "agree2"
                     else:
                         # 取证：区分"走常规门槛 / 变速兜底 / 重编码兜底"——兜底放行的日志要能回看
                         self._last_gate = (
@@ -2232,7 +2275,7 @@ class AudioEngine:
                     #   日志里出现 `brel=0.083 gate=bpm` 这种自相矛盾的组合（0.083 本该通过）。
                     _gate_before = getattr(self, "_last_gate", "-")
                     self._bpm_ok_flag = None
-                    _bpm_ok, _brel, _bflag = bpm_gate_ok(_lbpm, _rbpm, _rbpm_raw)
+                    _bpm_ok, _brel, _bflag = bpm_gate_ok(_lbpm, _rbpm)
                     if _bflag is None:
                         # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
                         self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
