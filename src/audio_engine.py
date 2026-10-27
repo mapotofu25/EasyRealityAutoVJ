@@ -171,7 +171,7 @@ BPM_OCTAVE_SET = (0.5, 1.0, 2.0)
 #   已锁定且同 sid 时，新 off 必须落在「上一**已接受**值 + 墙钟推进」的 ±TOL 内，
 #   否则丢弃本次跳变（保持期望值）并累计异常；连续异常超过 MAX 才认定为真 seek。
 OFF_STATE_TOL_SEC = 2.0
-OFF_STATE_ABNORMAL_MAX = 3
+OFF_STATE_ABNORMAL_MAX = 6
 
 
 # ==========================================================================
@@ -1955,8 +1955,20 @@ class AudioEngine:
                 #   为什么不用 _last_match_t 推算"该走到哪"：历史上就是这么干过，实测 off 会
                 #   被锁死在预测附近（连续 8~10s 不动、落后 8~14s）。而用"上一帧实际匹配到的
                 #   off"当锚，只解决**同一位置附近**的重复段落歧义，不引入任何预测误差。
+                # ★★ 2026-10-27 第三轮（Leviathan off 没修好）：hint 锚点必须用
+                #   **状态机已接受**的 off，不能用 `_last_match[2]`（原始匹配值）。
+                #   用原始值时：这一窗跳到错位置 → 下一窗的 hint 被带到错位置 → 状态机
+                #   虽然把发布值拉住了，但识别一直是"对着错位置找" ⇒ 正反馈锁死。
+                #   改用 accepted 值后，hint 与状态机互相印证，形成闭环。
                 _prev_off = None
-                if _lm is not None:
+                _st = getattr(self, "_off_state", None)
+                if _st is not None:
+                    try:
+                        if int(_st.get("sid", -2)) >= 0 and float(_st.get("off", -1.0)) >= 0.0:
+                            _prev_off = float(_st["off"])
+                    except (TypeError, ValueError, KeyError):
+                        _prev_off = None
+                if _prev_off is None and _lm is not None:
                     try:
                         if (int(_lm[0]) >= 0 and int(_lm[1] or 0) >= 4
                                 and float(_lm[2] or 0.0) >= 0.0):
