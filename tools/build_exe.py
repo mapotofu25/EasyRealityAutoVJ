@@ -108,6 +108,13 @@ cmd = [
     "--exclude-module", "PySide6.QtNetwork",
     "--exclude-module", "PySide6.QtOpenGL",
     "--exclude-module", "PySide6.QtOpenGLWidgets",
+    # ★ 2026-10-27：librosa / numba / llvmlite 是**离线验收脚本**用的（time-stretch 造变速样本），
+    #   产品运行期零引用。不排除的话 numba 会把 llvmlite 整套（115MB）拖进包
+    #   （实测包从 827M 涨到 947M）。--exclude-module 拦得住，因为没人 import 它们。
+    "--exclude-module", "librosa",
+    "--exclude-module", "numba",
+    "--exclude-module", "llvmlite",
+    "--exclude-module", "sklearn",
     "--collect-all", "cyndilib",
     # GPU 解码（实验）：glfw 用来建离屏 GL 上下文（自带 glfw3.dll）；
     # _dxvlz.dll 是自研的 DXV3 LZ 解包（zig 编译，187KB），必须随包。
