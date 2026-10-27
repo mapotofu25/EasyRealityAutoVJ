@@ -74,6 +74,18 @@ cmd = [
     "--hidden-import", "erlib.scanner",
     "--hidden-import", "erlib.transfer",
     "--hidden-import", "imported_lib",
+    # ★★ 2026-10-27 曲库识别增强（T01/T02/T03）：以下模块全部是**函数内惰性 import**，
+    #   PyInstaller 的静态分析跟不进去 ⇒ 漏了之后 exe 里表现为
+    #     · 右键「歌曲详情…」→「打开歌曲详情失败：No module named 'music_detail'」
+    #     · 详情页无波形（`waveform` 缺失，`_lazy_waveform` 静默返回 None）
+    #     · `waveform_mark` 缺失 ⇒ 详情页对话框构造中途抛 ImportError（T02 踩过同样的坑）
+    #   与 ERLIB 那边 `tools/build_erlib_exe.py` 的 `_HIDDEN` 是同一份清单，两端必须一起加。
+    #   出处：panels._open_music_detail（music_detail）/ music_detail._lazy_waveform（waveform）
+    #        / music_detail._build（waveform_mark）/ engine._grid_segment_of（beatgrid）
+    "--hidden-import", "music_detail",
+    "--hidden-import", "waveform",
+    "--hidden-import", "waveform_mark",
+    "--hidden-import", "beatgrid",
     "--hidden-import", "lan_audio_send",
     "--hidden-import", "glctx",
     "--hidden-import", "SpoutGL",
