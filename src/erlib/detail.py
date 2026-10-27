@@ -89,6 +89,9 @@ class ErlibDetailDialog(QDialog):
         self.wave.segmentSelected.connect(self._on_segment_selected)
         self.wave.bpmPicked.connect(self._on_bpm_picked)
         self.wave.playheadMoved.connect(self._on_playhead_moved)
+        # 操作提示（用户点名要 ERCUE 的键位：Ctrl+滚轮缩放）
+        self.wave.setToolTip("Ctrl+滚轮 缩放 · Shift+滚轮 / 普通滚轮 平移 · "
+                             "在波形上拖动可移动播放头（播放从这里开始）")
 
         # 模式工具栏
         bar = QHBoxLayout()

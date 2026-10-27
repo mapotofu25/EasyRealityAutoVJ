@@ -44,9 +44,11 @@ MODE_BPM = "bpm"
 
 _HIT_PX = 6.0            # 命中标记线 / 播放头的像素阈值
 # ---- v2 布局常量（详见模块 docstring）----
-LABEL_H = 20.0           # 顶部标签带高度（分段 BPM / 八拍秒数只画在这里）
+LABEL_H = 20             # 顶部标签带高度（分段 BPM / 八拍秒数只画在这里）
+_BAND_H = LABEL_H        # 兼容别名（历史 API 名）
 AXIS_H = 14.0            # 底部时间轴高度
 MIN_SPAN_SEC = 0.5       # 最小可视跨度（秒）—— 再放大会看不清也不用
+_VIEW_MIN_SPAN = MIN_SPAN_SEC   # 兼容别名（历史 API 名）
 ZOOM_FACTOR = 0.82       # 每档滚轮缩放比例（与 ERCUE 一致）
 PAN_FRACTION = 0.1       # Shift+滚轮每次平移的可视跨度比例
 
@@ -54,8 +56,8 @@ PAN_FRACTION = 0.1       # Shift+滚轮每次平移的可视跨度比例
 _BAND_COLORS = (QColor(40, 58, 92), QColor(56, 46, 88), QColor(30, 70, 70))
 # 标签带底色 / 分段标注文字色 / 八拍标注文字色
 _LABEL_BG = QColor(30, 34, 42)
-_LABEL_SEG_COLOR = QColor(255, 220, 90)
-_LABEL_ANCHOR_COLOR = QColor(255, 150, 150)
+_LABEL_SEG_COLOR = QColor(235, 240, 250)   # 近白：与波形渐变(青/黄/红)不撞色，便于取像素断言
+_LABEL_ANCHOR_COLOR = QColor(205, 175, 255)  # 浅紫：同上
 # 播放头（醒目实线）
 _PLAYHEAD_COLOR = QColor(80, 255, 190)
 # 波形描边（叠在渐变填充上）
@@ -178,6 +180,10 @@ class WaveformMarkWidget(QWidget):
         """当前播放头位置（秒）。"""
         return float(self._playhead_sec)
 
+    def playhead(self) -> float:
+        """`playhead_sec()` 的别名（历史 API 名）。"""
+        return float(self._playhead_sec)
+
     def set_playhead(self, sec):
         """设置播放头（**不发信号**，供播放中随音频推进刷新）。"""
         try:
@@ -209,6 +215,26 @@ class WaveformMarkWidget(QWidget):
     def view_range(self):
         """当前可视窗口 `(view0, span)`（已按全曲长度钳制）。"""
         return self._view()
+
+    # ---- 兼容别名（历史 API 名，行为完全等价；新代码用上面的名字）----
+    def view(self):
+        """`(view0, span)`（`view_range` 的别名）。"""
+        return self._view()
+
+    def set_view(self, view0, span):
+        """直接设定视窗（`span <= 0` 或 >= 全曲 ⇒ 全曲）。"""
+        d = self._duration()
+        try:
+            view0 = float(view0)
+            span = float(span)
+        except (TypeError, ValueError):
+            return
+        if span <= 0.0 or span >= d:
+            self.reset_view()
+            return
+        self.view_span = max(MIN_SPAN_SEC, span)
+        self.view0 = max(0.0, min(d - self.view_span, view0))
+        self.update()
 
     def zoom_to(self, anchor_sec, span_sec):
         """把视窗设成「以 `anchor_sec` 居中、跨度 `span_sec`」（测试 / 快捷键用）。"""
@@ -502,7 +528,7 @@ class WaveformMarkWidget(QWidget):
             seg = amp[i0:i1]
             # ★ 只取 max 会让"母带很响"的曲子整块顶满（实测 colmax 均值 0.86 ⇒ 画面变成
             #   一整面渐变墙）。取 0.75*均值 + 0.25*峰值，既保留瞬态尖峰又看得见包络形状。
-            a = (0.75 * (sum(seg) / float(len(seg))) + 0.25 * max(seg)) * 0.92
+            a = 0.75 * (sum(seg) / float(len(seg))) + 0.25 * max(seg)
             cols.append((float(px), float(a)))
         if not cols:
             return
@@ -510,11 +536,11 @@ class WaveformMarkWidget(QWidget):
         # 按振幅渐变：中线（低）青蓝 → 中间黄 → 顶端（高）红，上下对称
         grad = QLinearGradient(QPointF(0.0, plot_top), QPointF(0.0, plot_bot))
         grad.setColorAt(0.00, QColor(235, 70, 70))     # 最高振幅 → 红
-        grad.setColorAt(0.18, QColor(240, 180, 60))    # 高 → 黄
-        grad.setColorAt(0.42, QColor(90, 210, 235))    # 中低 → 青蓝
-        grad.setColorAt(0.50, QColor(60, 170, 220))    # 中线 → 蓝
-        grad.setColorAt(0.58, QColor(90, 210, 235))
-        grad.setColorAt(0.82, QColor(240, 180, 60))
+        grad.setColorAt(0.18, QColor(245, 140, 60))    # 高 → 橙
+        grad.setColorAt(0.34, QColor(240, 190, 60))    # 中高 → 黄
+        grad.setColorAt(0.50, QColor(80, 205, 235))    # 中线（最低）→ 青蓝
+        grad.setColorAt(0.66, QColor(240, 190, 60))
+        grad.setColorAt(0.82, QColor(245, 140, 60))
         grad.setColorAt(1.00, QColor(235, 70, 70))
 
         path = QPainterPath()
@@ -575,12 +601,12 @@ class WaveformMarkWidget(QWidget):
         return abs(self._x_of_sec(self._playhead_sec) - float(x)) <= _HIT_PX
 
     def wheelEvent(self, e):
-        """滚轮缩放 / 平移（与 ERCUE `timeline_widget.wheelEvent` 同一套语义）。
+        """滚轮语义**逐条对齐 ERCUE** `timeline_widget.wheelEvent`（用户点名要 ERCUE 那一个按键）。
 
-        · **Ctrl + 滚轮**：以**鼠标所在秒位为锚**缩放（手不用重新找位置）；
+        · **Ctrl + 滚轮**：以**鼠标所在秒位为锚**缩放（手不用重新找位置，锚点不漂）；
         · **Shift + 滚轮**：左右平移；
-        · **普通滚轮**：本控件没有纵向内容可滚，等价于 Ctrl（= 缩放），
-          这样用户「只想滚一下」也能放大缩小（用户原话：滚轮放大缩小）。
+        · **普通滚轮**：ERCUE 里是「上下滚动」（纵向内容），本控件没有纵向内容 ⇒
+          退化为**左右平移**（与 Shift 同效），**不改变跨度**，避免误缩放。
         """
         dy = e.angleDelta().y()
         if not dy:
@@ -589,7 +615,7 @@ class WaveformMarkWidget(QWidget):
         mods = e.modifiers()
         d = self._duration()
         v0, span = self._view()
-        if mods & Qt.KeyboardModifier.ShiftModifier:
+        if not (mods & Qt.KeyboardModifier.ControlModifier):
             self._pan_sec(-n * span * PAN_FRACTION)
             e.accept()
             return
