@@ -1033,6 +1033,50 @@ class AutoVJEngine(QObject):
             anchor = None
         return bl, anchor, None
 
+    def _reanchor_across_segment(self, clock, bl, anchor, off, r, ref_t):
+        """跨分段 / 跨八拍锚点时的**连续**硬重锚（T05① 跨段 continuity）。
+
+        为什么不能只调 `GridClock.reanchor`：段边界换了坐标系（BPM 与锚点都变），
+        `pos0 = (off - anchor) / beat_len` 在边界处**整体跳变**（实测跨段一次 −256 拍）。
+        而 `_beat_pos` 返回的拍位 = 网格坐标 + `_grid_coord_delta`，delta 只在
+        「网格↔音频」边沿重算 ⇒ 段内跳变会**原样穿到消费方**：
+          · `_auto_switch_tick` 的 `pos < self.switch_pos` 把它当成「拍钟被重置」
+            ⇒ `switch_pos = pos`、`_next_due = None` ⇒ **倒计时从头数、多切一次素材**；
+          · 若新坐标反而比旧的大，同一帧 `pos >= due` ⇒ 边界那一拍立刻白切一次。
+
+        修法（复用「网格↔音频」边沿已有的**坐标续接**思路，不新造机制）：
+          ① 重锚前后各取一次 `clock.pos(ref_t)`，把差值（新旧坐标系原点差）叠进
+             `_grid_coord_delta` ⇒ 返回拍位在边界处**连续**，于是 `switch_pos` /
+             `_next_due` 全部继续有效：**不重置、不多切**。
+          ② 对齐相位 `off = (delta + flip) % 8` 随 delta 改变。若不管它，
+             `_next_switch_due` 会在同一帧把已排好的目标「重新贴线」，最多可**回退 4 拍**
+             ⇒ 又会提前触发一次切换。这里把 `_due_off` 同步成新相位（= 承认相位变了，
+             但保留原定目标），令那一次重贴线不执行；下一个间隔照常按新相位排。
+             注：`_bar_off_user`（用户按「下一素材」重定义过相位）优先于 delta，此时相位
+             与 delta 无关 ⇒ **不**同步 `_due_off`（否则会凭空触发一次重贴线）。
+          老曲目（无 segments/anchors）`segkey is None`，本方法**根本不会被调用**
+          ⇒ `_grid_coord_delta` / `_due_off` 逐值不变（零回归）。
+        """
+        try:
+            old_raw = clock.pos(ref_t)
+        except Exception:                                        # noqa: BLE001
+            old_raw = None
+        clock.reanchor(bl, anchor, off, r, ref_t)
+        try:
+            new_raw = clock.pos(ref_t)
+        except Exception:                                        # noqa: BLE001
+            new_raw = None
+        if old_raw is None or new_raw is None:
+            return                       # 取不到就不做续接（退化为旧行为，不会更糟）
+        shift = float(old_raw) - float(new_raw)
+        if abs(shift) <= 1e-9:
+            return                       # 坐标系没变（如 anchors 里重复项）：什么都不用做
+        self._grid_coord_delta = float(getattr(self, "_grid_coord_delta", 0.0)) + shift
+        self._grid_last_pos = new_raw
+        if getattr(self, "_bar_off_user", None) is None:
+            self._due_off = (self._grid_coord_delta
+                             + float(getattr(self, "_grid_flip", 0.0))) % 8.0
+
     # 指纹对齐票数门槛：低于此值视为「歧义 / 弱匹配」，offset 不可信 → 不做相位校正。
     # 依据（tools/_qa_votes_dist.py 实测：10 首真 FLAC、159 个 4.5s 查询窗；QA 第二轮 21 首
     #   × 前 200s、hop=1s、4116 个 4.5s 窗复测）：
@@ -1157,7 +1201,7 @@ class AutoVJEngine(QObject):
                 #   离线已知的用户产物，不是识别抖动的坐标跳变 ⇒ 不走有限增益/跳变判据。
                 #   off 略有抖动也会被下一个可信窗的 update() 校正回来。
                 if segkey is not None and segkey != self._grid_segkey:
-                    clock.reanchor(bl, anchor, off, r, ref_t)
+                    self._reanchor_across_segment(clock, bl, anchor, off, r, ref_t)
                     self._grid_segkey = segkey
                 elif trusted:
                     clock.update(sid, bl, anchor, off, r, ref_t, strong=strong)
@@ -1550,7 +1594,9 @@ class AutoVJEngine(QObject):
         try:
             _ui = {"switch_cd": self.switch_countdown(snap),
                    "phrase_cd": self.phrase_countdown(snap),
-                   "grid_view": self.beat_grid_view(snap)}
+                   "grid_view": self.beat_grid_view(snap),
+                   # ★ T05②：当前段/多锚（有分段/多锚才有值，否则 None ⇒ HUD 一字不变）
+                   "grid_seg": self.grid_segment_info(snap)}
             _now_ui = time.perf_counter()
             if (_now_ui - getattr(self, "_ui_next_t", 0.0)) >= _UI_NEXT_CLIP_INTERVAL:
                 self._ui_next_t = _now_ui
@@ -1588,7 +1634,7 @@ class AutoVJEngine(QObject):
     def ui_snapshot(self):
         """GUI 无锁只读状态快照（每 tick 由引擎线程算好，见 `_tick_locked` 尾部）。
 
-        返回 dict：`{"switch_cd", "phrase_cd", "grid_view", "next_clips"}`。GUI 用它替代原先
+        返回 dict：`{"switch_cd", "phrase_cd", "grid_view", "grid_seg", "next_clips"}`。GUI 用它替代原先
         直接调用 `switch_countdown` / `phrase_countdown` / `beat_grid_view` / `next_clip_for`
         这四个 `@_locked` 方法（那会每 500ms 抢一次渲染锁，慢帧时卡界面）。⚠ 勿"顺手修"成加锁版本。"""
         return self._ui_snap
@@ -1996,6 +2042,44 @@ class AutoVJEngine(QObject):
             beats = nxt if nxt > 1e-6 else 8.0
         sec = beats * bl / max(1e-6, r)
         return beats, sec
+
+    def grid_segment_info(self, snap):
+        """HUD 用「当前段 / 当前八角锚」信息（T05②）；**无分段且无多锚时返回 None**。
+
+        返回 `{"kind": "seg"|"anchor", "n": 段号(1基), "bpm": 实际生效BPM, "anchor": 锚点秒}`。
+        文案拼装放在 GUI（`ui_main._hud_grid_seg`）里做，引擎不依赖 i18n。
+
+        门控与「距八拍头」**完全一致**（都走 `_grid_state`）：只有网格已锁定、且全局开关
+        「节拍网格」打开时才返回值 ⇒ 现场看到的段号就是**此刻真正在用**的那一段，
+        不是按播放进度猜的；老曲目（无 manual）恒为 None，HUD 一字不变。
+
+        ⚠ 本方法**不加 `@_locked`**：只被 `_tick_locked`（已持 `_tick_lock`，RLock 可重入）
+          调用，结果随 `ui_snapshot` 一起发布给 GUI；GUI 侧绝不直接调它（那会抢渲染锁）。
+        """
+        try:
+            gs = self._grid_state(snap)
+        except Exception:                                        # noqa: BLE001
+            return None
+        if gs is None:
+            return None
+        grid, bl, anchor, off, _r, _sid = gs
+        if bl is None or bl <= 0 or anchor is None:
+            return None
+        bpm = 60.0 / float(bl)
+        segs = grid.get("segments") or []
+        if segs:
+            idx = 0
+            for i, s in enumerate(segs):
+                try:
+                    t0 = float(s.get("t0") or 0.0)
+                except (TypeError, ValueError, AttributeError):
+                    t0 = 0.0
+                if t0 <= float(off) + 1e-9:
+                    idx = i
+            return {"kind": "seg", "n": idx + 1, "bpm": bpm, "anchor": float(anchor)}
+        if grid.get("anchors"):
+            return {"kind": "anchor", "n": 1, "bpm": bpm, "anchor": float(anchor)}
+        return None
 
     @_locked
     def flip_phrase_now(self, snap):

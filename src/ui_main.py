@@ -2250,6 +2250,31 @@ def _probe_spout_once():
         return False, str(e)[:200]
 
 
+def _hud_grid_seg(us):
+    """HUD 里「当前段 / 当前八角锚」那一段文本（T05②）。
+
+    入参是引擎无锁快照 `ui_snapshot()`（字段 `grid_seg`，见 `engine.grid_segment_info`）。
+    · 有分段 → `  |  段2 155BPM · 锚120.03`
+    · 只有多锚 → `  |  多锚 140BPM · 锚28.80`
+    · 无分段/多锚（老曲目）、未锁定、或字段缺失 → 返回**空串**
+      ⇒ `_update_status` 拼上去等于没拼，现有 HUD 逐字不变（不影响现场既有读数）。
+
+    为什么由 GUI 拼而不在引擎里拼：引擎不依赖 i18n（`engine.py` 不 import i18n），
+    文案模板放这边才能跟着中英文切换走。
+    """
+    sg = (us or {}).get("grid_seg") if isinstance(us, dict) else None
+    if not sg:
+        return ""
+    try:
+        bpm = "%.0f" % float(sg.get("bpm") or 0.0)
+        anc = "%.2f" % float(sg.get("anchor") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if sg.get("kind") == "seg":
+        return "  |  " + Tf("段{} {}BPM · 锚{}", str(int(sg.get("n") or 1)), bpm, anc)
+    return "  |  " + Tf("多锚 {}BPM · 锚{}", bpm, anc)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -6413,6 +6438,10 @@ class MainWindow(QMainWindow):
         if pc is not None:
             pb, ps = pc
             hud += Tf("  |  距八拍头 {} 拍（{} 秒）", "%.1f" % pb, "%.1f" % ps)
+        # T05②：有分段 / 多锚时追加「当前段」——现场一眼看出此刻用的是哪一段
+        # （BPM 与锚点都是引擎**当前实际生效**的那一组，不是按进度猜的）。
+        # 无分段/多锚（老曲目）时 `_hud_grid_seg` 返回空串 ⇒ HUD 逐字不变。
+        hud += _hud_grid_seg(_us)
         hud += "  |  " + self._bpm_text(snap) + f"  {T('能量')} {snap['energy']:.2f}"
         sid_now = snap.get("recognized_song_id", -1)
         song_meta = self._song_meta_by_id.get(sid_now)
