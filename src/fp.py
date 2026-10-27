@@ -459,7 +459,8 @@ class FingerprintDB:
             self.allowed = None
         return 0 if self.allowed is None else len(self.allowed)
 
-    def match(self, sig, sr, hint_delta=None, hint_w=None, hint_sid=None):
+    def match(self, sig, sr, hint_delta=None, hint_w=None, hint_sid=None,
+              rate=1.0, hs=None):
         """返回 (song_id, aligned_votes, offset_sec) 或 (-1, 0, 0.0)
 
         hint_delta: 可选。预测的「对齐帧偏移」（单位 = HOP 帧，与内部 delta 同轴）。
@@ -471,8 +472,15 @@ class FingerprintDB:
           **按拍数**定义、跨 BPM 一致（固定帧窗在 90~200BPM 间对应的拍数差 2 倍以上）。
         hint_sid: 可选。hint 所属的 song_id（= 上一窗锁定的歌）。给了它 ⇒ hint 只在
           「窗内胜者就是这首歌」时生效，换歌后自动退回全局众数（见 `_pick` 说明）。
-          调用点见 engine._beat_pos_grid → audio_engine._recognize_loop。"""
-        hs = fingerprint_audio(sig, sr)
+          调用点见 engine._beat_pos_grid → audio_engine._recognize_loop。
+        rate: 可选。**播放倍率假设**（0.80~1.25）。DJ 机台变速**保留音高、只改速度**时，
+          谱峰频率不变 ⇒ 哈希照样命中，但「查询帧 → 参考帧」的映射要乘 rate 才不会
+          把票摊到一串相邻 delta 上。默认 1.0 ⇒ 与改动前逐值一致。
+          实战里由引擎在「锁不上」时按档位重试（见 audio_engine.FP_RATE_CANDS）。
+        hs: 可选。已算好的 `fingerprint_audio(sig, sr)` 结果，供同一段音频按多个 rate
+          重试时复用（否则每次都重算谱峰，7 个档位就慢 7 倍）。"""
+        if hs is None:
+            hs = fingerprint_audio(sig, sr)
         if not hs:
             self.last_hit_rate = 0.0
             self.last_song_best = {}
@@ -505,7 +513,9 @@ class FingerprintDB:
                 if self.allowed is not None and song_id not in self.allowed:
                     continue
                 for qoff in qoff_map.get(h, ()):
-                    key = (song_id, dboff - qoff)
+                    # 变速假设：把查询帧换算到参考帧再算对齐差（rate=1 时不变）
+                    _q = qoff if rate == 1.0 else int(round(qoff * rate))
+                    key = (song_id, dboff - _q)
                     votes[key] = votes.get(key, 0) + 1
                     song_tot[song_id] = song_tot.get(song_id, 0) + 1
         self.last_song_votes = song_tot
