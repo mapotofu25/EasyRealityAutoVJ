@@ -382,7 +382,7 @@ class FingerprintDB:
             pass
 
     @staticmethod
-    def _pick(votes, hint_delta=None, hint_w=None):
+    def _pick(votes, hint_delta=None, hint_w=None, hint_sid=None):
         """从 (song_id, delta)->votes 的投票表里挑出结果，返回 ((sid, delta), votes) 或 None。
 
         · hint_delta 为 None：与旧实现**逐值一致** —— `max(items, key=votes)`（同分取先出现的）。
@@ -393,7 +393,13 @@ class FingerprintDB:
           会把它带到错位置。这是**有意的**：没有可靠的"hint 对不对"判据（QA 实测"投票比"
           区分不了"hint 正确但弱"与"hint 错误"，两者全局票都更高）。因此**调用方必须**
           只在坐标系可信时给 hint（见 engine._beat_pos_grid：未锁定不发布；重锚后有界暂停）。
-          hint_w 缺省用 `HINT_W`（帧）—— 引擎按该歌 beat_len 换算后传入，跨 BPM 一致。
+        · hint_sid（2026-10-27 加）：hint 所属的 song_id。**换歌保护**——上一窗锁在 A、
+          这一窗放的已经是 B 时，hint 指向的是 A 的时间轴，对 B 毫无意义；而密集音乐里
+          "hint 窗口内无候选"这个前提根本不成立（任何位置都有票）⇒ hint 会把结果按在
+          A（或 B 的某个错误位置）上，电荷条永远看不到"新歌证据"。
+          给了 hint_sid 时，窗内胜者**必须是这首歌**才允许 hint 生效，否则退回全局众数。
+          None ⇒ 保持旧行为（逐值一致）。
+        hint_w 缺省用 `HINT_W`（帧）—— 引擎按该歌 beat_len 换算后传入，跨 BPM 一致。
         delta 单位 = hop 帧；窗内同分同样取先出现者（dict 插入序确定）。
         """
         if not votes:
@@ -433,7 +439,16 @@ class FingerprintDB:
                 #     不是同一个问题。阈值取 10% 而不是 50%，正是为了不误伤前者。
                 _top = max(votes.values())
                 if best[1] >= max(6, int(_top * HINT_WIN_MIN_RATIO)):
-                    return best
+                    # ★ 2026-10-27：换歌保护 —— hint 只在「窗内胜者就是 hint 所属那首歌」时生效。
+                    #   否则（已经换歌了）退回全局众数，让新歌的正确位置能赢。
+                    if hint_sid is None:
+                        return best
+                    try:
+                        _same = int(best[0][0]) == int(hint_sid)
+                    except (TypeError, ValueError):
+                        _same = (best[0][0] == hint_sid)
+                    if _same:
+                        return best
         return max(votes.items(), key=lambda kv: kv[1])
 
     def set_allowed(self, ids):
@@ -444,7 +459,7 @@ class FingerprintDB:
             self.allowed = None
         return 0 if self.allowed is None else len(self.allowed)
 
-    def match(self, sig, sr, hint_delta=None, hint_w=None):
+    def match(self, sig, sr, hint_delta=None, hint_w=None, hint_sid=None):
         """返回 (song_id, aligned_votes, offset_sec) 或 (-1, 0, 0.0)
 
         hint_delta: 可选。预测的「对齐帧偏移」（单位 = HOP 帧，与内部 delta 同轴）。
@@ -454,6 +469,8 @@ class FingerprintDB:
         hint_w: 可选。hint 窗口半宽（帧）。None ⇒ 用缺省 `HINT_W`（保持旧调用方逐值一致）。
           引擎按该歌 grid 的 beat_len 用 `hint_window_frames()` 换算后传入，使窗口
           **按拍数**定义、跨 BPM 一致（固定帧窗在 90~200BPM 间对应的拍数差 2 倍以上）。
+        hint_sid: 可选。hint 所属的 song_id（= 上一窗锁定的歌）。给了它 ⇒ hint 只在
+          「窗内胜者就是这首歌」时生效，换歌后自动退回全局众数（见 `_pick` 说明）。
           调用点见 engine._beat_pos_grid → audio_engine._recognize_loop。"""
         hs = fingerprint_audio(sig, sr)
         if not hs:
@@ -499,7 +516,7 @@ class FingerprintDB:
             if v_ > _best.get(s_, 0):
                 _best[s_] = v_
         self.last_song_best = _best
-        picked = self._pick(votes, hint_delta, hint_w)
+        picked = self._pick(votes, hint_delta, hint_w, hint_sid)
         if picked is None:
             return -1, 0, 0.0
         (song_id, delta), cnt = picked

@@ -166,6 +166,16 @@ FP_PREV_HINT_SEC = 2.0   # 上一帧 off 的连续性窗半宽（秒）；0 = �
 #   而 C 组误识别是 41%，20% 仍挡得住。倍频放行**也用这个常量**（不写死 0.15）。
 BPM_MATCH_TOL = 0.20
 BPM_OCTAVE_SET = (0.5, 1.0, 2.0)
+# ★★ 2026-10-27 第三轮实机（Round5：128BPM 的 Raccoon Memes 全程认不出，41 次掉锁）：
+#   实时 BPM 估计器在**双倍**时会 `min(220)` 钳顶 ⇒ 128 的真实双倍 256 被钳成 219.5，
+#   这是个「既不是真值、也不是整数倍」的**非法值**：219.5/128 = 1.72 不在倍频集里 ⇒
+#   BPM 校验把一条 `phr=0.97`（97% 哈希命中）的**正确匹配**判成误识别。
+#   两条修法：
+#     ① 撞顶（≥ BPM_RAIL，即落在 min(220) 上限 2 BPM 内）⇒ 这个数**不携带信息**，跳过校验；
+#     ② 谐波集补上 1/3、3 —— 检测器估成三倍/三分之一同样常见（与 0.5/2 同一个道理）。
+#   ⚠ 受影响的是 110~183 BPM 的**主力曲速段**（双倍后必然撞顶），不是边缘情况。
+BPM_RAIL = 218.0
+BPM_HARM_SET = (1.0 / 3.0, 0.5, 1.0, 2.0, 3.0)
 # ★★ 2026-10-27 第二轮实机（A 组 off 中位偏差 12.49/14.42s）：hint ±2s 兜不住重复段落
 #   —— 相邻两窗可能**连续**跳到另一处等票候选。改成 off 状态机：
 #   已锁定且同 sid 时，新 off 必须落在「上一**已接受**值 + 墙钟推进」的 ±TOL 内，
@@ -187,6 +197,81 @@ LOCK_HIT_RECODE   = 0.85   # ③ 重编码兜底：命中率（比 ② 更严）
 LOCK_TOT_RECODE   = 40     # ③ 重编码兜底：总票下限（只挡"总共几十票"的弱匹配）
 LOCK_VOTES_RECODE = 5      # ③ 重编码兜底：单点票下限（白噪峰值≤4，5 是安全下界）
 LOCK_LEAD_RECODE  = 3.0    # ③ 重编码兜底：总票领先倍数（真歌必胜，硬误无领先）
+# ★★ 2026-10-27 Round5：「连续一致」第四条放行通道（同专辑近似曲目专用）。
+#   背景：库里同一张专辑的曲目共用采样/loop，`总票` 会被分走 —— 实测正确曲 tot=708
+#   而第二名 982、646 对 801 ⇒ ②③ 的「领先倍数」恒不成立 ⇒ 正确匹配永远锁不上。
+#   但正确曲能**连续多窗胜出且 offset 随墙钟线性推进**（错歌几乎做不到这两件事同时成立）。
+#   四条同时满足才放行（比 ② 更严的票数下限、更长的连续窗）：
+LOCK_STREAK_N     = 3      # 连续 N 窗同一首胜出（≈3 个识别周期）
+LOCK_STREAK_ADV   = 0.60   # 相邻窗 offset 必须按墙钟推进的容差（秒）
+LOCK_STREAK_HIT   = 0.80   # 命中率下限（比 ② 的 0.60 严）
+LOCK_STREAK_TOT   = 150    # 总票下限（比 ② 的 120 严，补偿"不要求领先"）
+LOCK_STREAK_VOTES = 20     # 单点票下限（比 ② 的 15 严）
+# ★★ 2026-10-27 实测（Round6 首次上机就翻车）：**必须加"票集中度"**。
+#   拿一首「不在曲库」的 B 站曲（Rolling Contact - Million Miles，同作者同曲风）离线实测：
+#     hit_rate = **0.96~0.99**、tot = 98~208，但单点票只有 **3~6** ⇒ pv/tot ≈ 0.03。
+#   ⇒ `hit_rate` 在本机这个规模的库上**对任何音乐都接近 1.0**，它不能证明"库里有这段录音"；
+#     去掉「2× 领先」以后，光靠 hits+总票就足以让一首无关的歌锁上（实测误锁到「西行谣」）。
+#   而真歌（Raccoon Memes）pv/tot = 0.18~0.27。⇒ 用 pv/tot ≥ 0.12 把两者分开。
+LOCK_STREAK_CONC  = 0.12   # 单点票 / 总票 的集中度下限（真歌 ≥0.18，无关曲 ≤0.05）
+
+
+def bpm_gate_ok(lbpm, rbpm, rbpm_raw=0.0):
+    """「库内 BPM ↔ 实时 BPM」一致性校验（纯函数，便于离线回归）。
+
+    返回 `(ok, brel, flag)`：
+      · `ok`   —— 是否允许这条匹配成立
+      · `brel` —— 相对偏差（用于取证；任一为 0 时 None）
+      · `flag` —— 1 通过 / 0 拒绝 / -2 拒绝且当窗撞顶 / None 无法校验（有一边为 0）
+
+    `rbpm_raw`（2026-10-27 加）：**未钳位**的实时 BPM（`AudioState.bpm_raw`）。
+      钳位版被 `min(220)` 压平后谐波关系会丢（128 的真双倍 256 → 219.5，比值 1.72
+      既不是真值也不是整数倍）；原始版保留 256 ⇒ 比值 2.0 直接命中谐波集。
+      ⇒ 先按钳位值判，不过再拿原始值判一次；两者都不成立才拒绝。
+
+    判据：
+      ① 相对偏差 ≤ BPM_MATCH_TOL（20%）⇒ 过；
+      ② 否则看是否**谐波关系** `rbpm/lbpm ∈ BPM_HARM_SET(1/3, 0.5, 1, 2, 3)`（绝对容差）⇒ 过；
+      ③ `rbpm ≥ BPM_RAIL`（撞 `min(220)` 上限）⇒ 估计器已饱和，这个数不携带信息 ⇒ **跳过**。
+         ⚠ 这条是 2026-10-27 Round5 的核心修复：128BPM 的歌被估成双倍 256、钳成 219.5，
+           比值 1.72 既不是真值也不是整数倍 ⇒ 旧逻辑把 `phr=0.97` 的正确匹配判成误识别。
+    """
+    try:
+        lb = float(lbpm or 0.0)
+        rb = float(rbpm or 0.0)
+    except (TypeError, ValueError):
+        return False, None, None
+    if lb <= 0.0 or rb <= 0.0:
+        return True, None, None
+    # ★★ 2026-10-27 Round7（C 组再次误锁「西行谣」后回退）：
+    #   **撞顶不能跳过校验**。曾经试过「rbpm ≥ BPM_RAIL ⇒ 值不可信 ⇒ 跳过」，结果
+    #   C 组「同作者同曲风、不在曲库」的 B 站曲立刻被误锁 —— 日志里 `gate=bpm` 出现
+    #   26 次，说明**这条 BPM 否决本来就在当假阳性护栏用**，跳过它等于把护栏拆了。
+    #   撞顶值的根问题在**估计器的 min(220) 钳位**（真实 2× 被压平，谐波关系随之丢失），
+    #   不能靠"忽略它"绕过。⇒ 恢复"只要两边都有值就校验"；
+    #   `BPM_RAIL` 仅用于取证（`[R]` 里看得出这一窗是不是撞顶时段）。
+    def _cmp(lb_v, rb_v):
+        _b = abs(lb_v - rb_v) / lb_v
+        if _b <= BPM_MATCH_TOL:
+            return True, _b
+        _ratio = rb_v / lb_v
+        for _k in BPM_HARM_SET:
+            if abs(_ratio - _k) <= BPM_MATCH_TOL:
+                return True, _b
+        return False, _b
+
+    ok, brel = _cmp(lb, rb)
+    if ok:
+        return True, brel, 1
+    try:
+        rr = float(rbpm_raw or 0.0)
+    except (TypeError, ValueError):
+        rr = 0.0
+    if rr > 0.0 and abs(rr - rb) > 0.5:
+        ok2, brel2 = _cmp(lb, rr)
+        if ok2:
+            return True, brel2, 1
+    return False, brel, (-2 if rb >= BPM_RAIL else 0)
 
 
 def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
@@ -402,6 +487,8 @@ class AudioState:
         #   界面只剩 0。但拍钟若跟着未锁定值走，一旦它是半速值，切换节奏会错一整倍 ——
         #   所以「显示」与「驱动拍钟」必须解耦：这个字段只给界面看，不参与任何节奏计算。
         self.bpm_display = 0.0
+        # ★ 2026-10-27：**不钳位**的 BPM（只给 BPM 一致性校验用；显示/拍钟仍用 bpm_display）
+        self.bpm_raw = 0.0
         self.bpm_locked = False     # bpm_display 是否已是锁定值（界面据此加「≈」前缀）
         self.beat_phase = 0.0       # 0..1 拍内相位
         self.beat_count = 0         # 总拍数
@@ -601,6 +688,12 @@ class _Analyzer:
         self.bpm_smooth = 0.0
         self.bpm_display = 0.0               # 显示用（未锁定也可有值），不参与拍钟
         self._bpm_votes = deque(maxlen=60)   # 60s 投票窗口，众数取 BPM（换歌静音清空）
+        # ★ 2026-10-27：**不钳位**的原始 BPM 投票（只给"库内 BPM 一致性校验"用）。
+        #   钳位版（≤220）仍负责锁定/显示/拍钟；原始版保留 2×/3× 谐波关系，
+        #   否则 128BPM 被压成 219.5 会让校验把正确匹配判成误识别。
+        self._bpm_raw_votes = deque(maxlen=60)
+        self.bpm_raw = 0.0
+
         self._bpm_lock = False               # 锁定建立标志（主段稳定后锁定，breakdown 不扰动）
         self._bpm_song = -1                  # 上次识别到的 song_id：变了就清投票+解锁（见 feed）
         self._bpm_far_sec = 0.0              # 众数持续偏离锁定值的累计秒（未识别到歌时的换歌兜底）
@@ -710,6 +803,8 @@ class _Analyzer:
         if sid is not None and sid >= 0 and sid != self._bpm_song:
             self._bpm_song = sid
             self._bpm_votes.clear()
+            self._bpm_raw_votes.clear()
+            self.bpm_raw = 0.0
             self._bpm_lock = False
             self._bpm_far_sec = 0.0
         sig = np.mean(data, axis=1) if data.shape[1] > 1 else data[:, 0]
@@ -868,12 +963,28 @@ class _Analyzer:
                     denom = acn[lag - 1] - 2 * acn[lag] + acn[lag + 1]
                     if abs(denom) > 1e-9:
                         delta = max(-0.5, min(0.5, 0.5 * (acn[lag - 1] - acn[lag + 1]) / denom))
-                bpm = float(max(60.0, min(220.0, 60.0 / ((lag + delta) / fps))))
+                # ★★ 2026-10-27（Round7 定案）：**钳位只用于"锁定/显示"，不用于"一致性校验"**。
+                #   现场问题：128BPM 的歌被估成双倍 256，再被 min(220) 压成 219.5
+                #   ⇒ 比值 1.72 既不是真值也不是整数倍 ⇒ BPM 校验把 97% 命中的正确匹配判成误识别。
+                #   但钳位不能直接去掉：`_bpm_votes` 的直方图/锁定判据都按 ≤220 设计，
+                #   放进来 256 会让 `bpm_smooth` 建立不了 ⇒ 拍钟/踩拍全停（功能倒退）。
+                #   ⇒ 另开一条**不钳位的原始值** `bpm_raw`，只供 BPM 一致性校验用（保谐波关系）。
+                _bpm_raw = 60.0 / ((lag + delta) / fps)
+                _bpm_raw = float(max(60.0, min(400.0, _bpm_raw)))
+                bpm = float(max(60.0, min(220.0, _bpm_raw)))
                 # 60s 投票众数 + 两阶段锁定：一首歌 BPM 恒定。
                 # 未锁定阶段：主段众数集中(conf≥0.45)且票数足(≥20)才建立锁定；
                 # 已锁定阶段：只接受与锁定值 ±8 内的微调，breakdown/outro 的飞值（无 kick
                 # 时全频被旋律带飞）一律忽略，避免「2:20 飞到 180」。静音换歌重置解锁。
                 self._bpm_votes.append(bpm)
+                # 不钳位的原始值（只给 BPM 一致性校验用，见上方说明）。
+                # ⚠ 直方图上界必须 ≥ _bpm_raw 的上界 400，否则 256 这类值会被
+                #   np.histogram **静默丢掉**（落不进任何 bin）。
+                self._bpm_raw_votes.append(_bpm_raw)
+                _rvals = np.array(self._bpm_raw_votes, dtype=np.float32)
+                if len(_rvals) >= 6:
+                    _rhist, _redges = np.histogram(_rvals, bins=np.arange(60.0, 401.0, 1.0))
+                    self.bpm_raw = float(_redges[int(np.argmax(_rhist))] + 0.5)
                 vals = np.array(self._bpm_votes, dtype=np.float32)
                 if len(vals) >= 6:
                     bins = np.arange(60.0, 221.0, 1.0)
@@ -905,6 +1016,8 @@ class _Analyzer:
                                 self._bpm_far_sec += 1.0
                                 if self._bpm_far_sec >= 20.0:
                                     self._bpm_votes.clear()
+                                    self._bpm_raw_votes.clear()
+                                    self.bpm_raw = 0.0
                                     self._bpm_lock = False
                                     self._bpm_far_sec = 0.0
                             else:
@@ -1234,6 +1347,7 @@ class _Analyzer:
             st.energy = E
             st.bpm = self.bpm_smooth
             st.bpm_display = self.bpm_display
+            st.bpm_raw = self.bpm_raw
             st.bpm_locked = self._bpm_lock
             st.beat_phase = min(1.0, max(0.0, phase))
             st.beat_count = self.beat_count
@@ -1279,6 +1393,8 @@ class _Analyzer:
             # 长静音（>10s）后重新有声 = 明确换歌：连 BPM 投票与锁定也清空（保守阈值防搓碟误清）
             if st.silent_sec > 10.0 and rms >= 1e-4:
                 self._bpm_votes.clear()
+                self._bpm_raw_votes.clear()
+                self.bpm_raw = 0.0
                 self._bpm_lock = False
                 self.bpm_smooth = 0.0
                 self.bpm_display = 0.0
@@ -1502,6 +1618,13 @@ class AudioEngine:
         self._last_match_t = 0.0     # 上一拍的时刻（算 dt 用）
         self._last_sig = (-1, -1.0)  # 取证：真正喂给 match 的信号 (len, rms)
         self._last_adv = 0           # 取证：本拍 offset 是否推进 0.5s±0.4
+        # ★★ 2026-10-27 Round5：**连续一致锁定**（gate=streak）。
+        #   现场问题：「同专辑近似曲目」把总票分走，正确曲的总票甚至不如另一首
+        #   （实测 ExtraPain tot=708 而第二名 982、646 对 801）⇒ `2× 领先`这条判据
+        #   天然不成立，correct 匹配被一直拒绝。但**同一首歌连续多窗胜出、且 offset
+        #   按墙钟线性推进**是比"单窗票数比"强得多的证据（错歌极少连续重复且位置连续）。
+        #   结构：{"sid", "n", "off", "t"}；sid 变了或 offset 不连续就重置。
+        self._pick_streak = {"sid": -1, "n": 0, "off": 0.0, "t": 0.0}
         self._eng_state = (0, -1, 0, 0)   # 取证：电荷条 (cur, cand, bar, hits)
         self._rec_err_t = 0.0
         self._genre_lock = threading.Lock()
@@ -1961,20 +2084,28 @@ class AudioEngine:
                 #   虽然把发布值拉住了，但识别一直是"对着错位置找" ⇒ 正反馈锁死。
                 #   改用 accepted 值后，hint 与状态机互相印证，形成闭环。
                 _prev_off = None
+                # ★★ 2026-10-27 Round5（换歌永远切不过去）：hint 是**某一首歌时间轴上的
+                #   位置**，换了歌就对不上。这里把 hint 的"归属曲目"一起带给 fp，
+                #   让 `_pick` 只在「窗内胜者仍是这首」时才用 hint（否则退回全局众数）。
+                _prev_sid = -1
                 _st = getattr(self, "_off_state", None)
                 if _st is not None:
                     try:
                         if int(_st.get("sid", -2)) >= 0 and float(_st.get("off", -1.0)) >= 0.0:
                             _prev_off = float(_st["off"])
+                            _prev_sid = int(_st["sid"])
                     except (TypeError, ValueError, KeyError):
                         _prev_off = None
+                        _prev_sid = -1
                 if _prev_off is None and _lm is not None:
                     try:
                         if (int(_lm[0]) >= 0 and int(_lm[1] or 0) >= 4
                                 and float(_lm[2] or 0.0) >= 0.0):
                             _prev_off = float(_lm[2])
+                            _prev_sid = int(_lm[0])
                     except Exception:                        # noqa: BLE001
                         _prev_off = None
+                        _prev_sid = -1
                 _hint = None
                 _hint_w = None
                 if FP_USE_HINT and (_locked is not None and int(_locked) >= 0
@@ -1989,7 +2120,27 @@ class AudioEngine:
                     _hint = _prev_off * _FP_SR / _FP_HOP
                     _hint_w = FP_PREV_HINT_SEC * _FP_SR / _FP_HOP
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
-                                              hint_delta=_hint, hint_w=_hint_w)
+                                              hint_delta=_hint, hint_w=_hint_w,
+                                              hint_sid=(_prev_sid if _hint is not None else None))
+                # ★★ 2026-10-27 Round5：**连续一致计数**（gate=streak 的证据）。
+                #   判据：同一首连续胜出，且 offset 按**墙钟**线性推进（容差 LOCK_STREAK_ADV）。
+                #   ⚠ 必须用 `_now`（perf_counter）算 Δt，不能用固定 0.5 —— 识别周期实测 0.8~1.2s。
+                #   ⚠ 换歌后（sid 变）自然重置；同一首歌被判 -1 也重置（不跨"失锁"累积）。
+                try:
+                    _ps = self._pick_streak
+                    if (int(sid) >= 0 and int(sid) == int(_ps.get("sid", -1))
+                            and abs((float(off) - float(_ps.get("off", 0.0)))
+                                    - (_now - float(_ps.get("t", 0.0)))) <= LOCK_STREAK_ADV):
+                        _ps["n"] = int(_ps.get("n", 0)) + 1
+                        _ps["off"] = float(off)
+                        _ps["t"] = _now
+                    else:
+                        _ps["sid"] = int(sid)
+                        _ps["n"] = 1 if int(sid) >= 0 else 0
+                        _ps["off"] = float(off)
+                        _ps["t"] = _now
+                except Exception:                            # noqa: BLE001
+                    pass
                 # ★★ 2026-10-19：**证据门槛（防误识别）**。
                 #   `votes` 只是"某一个对齐位置"的票；重复/相似段落会把票摊到多个位置，
                 #   单点票低不代表不是这首歌。这里再用「该曲总票」把关：
@@ -2022,9 +2173,27 @@ class AudioEngine:
                     # 取证：把"门槛前"的原始数字留下来（`[R]` 行末尾 pick/pv/ptot/p2）
                     self._gate_info = (int(sid), int(votes or 0), int(_tot),
                                        int(_second_tot), round(_hr, 2))
-                    if not fp_lock_gate(sid, int(votes or 0), _tot, _second, _second_tot, _hr):
+                    _gate_ok = fp_lock_gate(sid, int(votes or 0), _tot,
+                                            _second, _second_tot, _hr)
+                    # ★ 第四条放行通道：连续一致（见 LOCK_STREAK_* 常量说明）。
+                    _streak_ok = False
+                    if not _gate_ok:
+                        try:
+                            _ps = self._pick_streak
+                            if (int(_ps.get("n", 0)) >= LOCK_STREAK_N
+                                    and int(_ps.get("sid", -1)) == int(sid)
+                                    and _hr >= LOCK_STREAK_HIT
+                                    and _tot >= LOCK_STREAK_TOT
+                                    and int(votes or 0) >= LOCK_STREAK_VOTES
+                                    and int(votes or 0) >= LOCK_STREAK_CONC * max(1, _tot)):
+                                _streak_ok = True
+                        except Exception:                    # noqa: BLE001
+                            _streak_ok = False
+                    if not _gate_ok and not _streak_ok:
                         self._last_gate = "none"
                         sid, votes, off = -1, 0, 0.0
+                    elif _streak_ok:
+                        self._last_gate = "streak"
                     else:
                         # 取证：区分"走常规门槛 / 变速兜底 / 重编码兜底"——兜底放行的日志要能回看
                         self._last_gate = (
@@ -2053,34 +2222,29 @@ class AudioEngine:
                         _rbpm = float(getattr(self.state, "bpm_display", 0.0) or 0.0)
                     except Exception:                        # noqa: BLE001
                         _rbpm = 0.0
+                    try:
+                        # 未钳位的实时 BPM（撞顶时靠它保住 2×/3× 谐波关系）
+                        _rbpm_raw = float(getattr(self.state, "bpm_raw", 0.0) or 0.0)
+                    except Exception:                        # noqa: BLE001
+                        _rbpm_raw = 0.0
                     # ★ 2026-10-27：先记住 fp_lock_gate 给出的结论（strict/warp/recode），
                     #   BPM 校验**通过**时要恢复它 —— 否则 `_last_gate="bpm"` 会从上一帧残留下来，
                     #   日志里出现 `brel=0.083 gate=bpm` 这种自相矛盾的组合（0.083 本该通过）。
                     _gate_before = getattr(self, "_last_gate", "-")
                     self._bpm_ok_flag = None
-                    if _lbpm > 0.0 and _rbpm > 0.0:
-                        _brel = abs(_lbpm - _rbpm) / _lbpm
-                        _bpm_ok = (_brel <= BPM_MATCH_TOL)
-                        if not _bpm_ok:
-                            # 倍频放行用**绝对**容差（±0.15），不能用相对容差：
-                            #   BPM 检测的倍频误差是**精确**的 0.5× / 2×（再叠几 % 检测误差），
-                            #   而相对容差在 2× 处等于 ±30% ⇒ 实测把 194.5 / 110 = 1.77×
-                            #   这种「误匹配」也当成倍频放过（C 组 BV1CEnBzjEAo 就是这一条）。
-                            _ratio = _rbpm / _lbpm
-                            for _k in BPM_OCTAVE_SET:
-                                if abs(_ratio - _k) <= BPM_MATCH_TOL:
-                                    _bpm_ok = True
-                                    break
-                        self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), round(_brel, 3))
+                    _bpm_ok, _brel, _bflag = bpm_gate_ok(_lbpm, _rbpm, _rbpm_raw)
+                    if _bflag is None:
+                        # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
+                        self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
+                    else:
+                        self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1),
+                                          round(_brel, 3) if _brel is not None else None)
                         self._bpm_ok_flag = 1 if _bpm_ok else 0
                         if not _bpm_ok:
                             self._last_gate = "bpm"
                             sid, votes, off = -1, 0, 0.0
                         else:
                             self._last_gate = _gate_before     # 通过：恢复 strict/warp/recode
-                    else:
-                        # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
-                        self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
 
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
@@ -2102,9 +2266,15 @@ class AudioEngine:
                     if int(cur) != _prev_cur and os.environ.get('AUTOVJ_REC_PROBE'):
                         self._lock_evt_sid = int(cur)
                         _lp = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ", "lock_events.log")
+                        # ★ 2026-10-27：把「放行判据」一起记下来。C 组误锁排查时
+                        #   `[R]` 节流抓不到"刚好通过的那一窗"，事后只能靠猜是 strict/warp/
+                        #   recode/streak 哪一条放的行；这里一次性落盘，判据 + 证据数字都在。
                         with io.open(_lp, "a", encoding="utf-8") as _lf:
-                            _lf.write("%.3f\t%d\t%d\t%.2f\n"
-                                      % (time.time(), int(cur), int(votes or 0), float(off or 0.0)))
+                            _lf.write("%.3f\t%d\t%d\t%.2f\t%s\t%s\t%s\n"
+                                      % (time.time(), int(cur), int(votes or 0), float(off or 0.0),
+                                         getattr(self, "_last_gate", "-"),
+                                         getattr(self, "_gate_info", None),
+                                         getattr(self, "_bpm_gate", None)))
                 except Exception:                                # noqa: BLE001
                     pass
                 self._eng_state = (int(cur), int(getattr(eng, "tentative_song_id", -1)),
