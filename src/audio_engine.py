@@ -161,8 +161,17 @@ FP_PREV_HINT_SEC = 2.0   # 上一帧 off 的连续性窗半宽（秒）；0 = �
 #   只有 ±3/5/8% ⇒ 单条 15% 容差就能干净分开，且物理上说得通（同一首歌变速不会差 40%）。
 #   ⚠ 允许**倍频关系**（0.5× / 2×）：BPM 检测的半速/双速（64 vs 128）是常见现象，
 #     不能因为检测成半速就把正确匹配杀掉（那样会引入掉锁回归）。
-BPM_MATCH_TOL = 0.15
+# ★ 2026-10-27 第二轮实机：15% → **20%**。变速 8% 叠上实时 BPM 估计误差
+#   （实测同一首在 126.5~141.5 之间跳，≈12%）就会破 15%，把 D 组正确匹配误杀（只认出 1/3）；
+#   而 C 组误识别是 41%，20% 仍挡得住。倍频放行**也用这个常量**（不写死 0.15）。
+BPM_MATCH_TOL = 0.20
 BPM_OCTAVE_SET = (0.5, 1.0, 2.0)
+# ★★ 2026-10-27 第二轮实机（A 组 off 中位偏差 12.49/14.42s）：hint ±2s 兜不住重复段落
+#   —— 相邻两窗可能**连续**跳到另一处等票候选。改成 off 状态机：
+#   已锁定且同 sid 时，新 off 必须落在「上一**已接受**值 + 墙钟推进」的 ±TOL 内，
+#   否则丢弃本次跳变（保持期望值）并累计异常；连续异常超过 MAX 才认定为真 seek。
+OFF_STATE_TOL_SEC = 2.0
+OFF_STATE_ABNORMAL_MAX = 3
 
 
 # ==========================================================================
@@ -1823,6 +1832,9 @@ class AudioEngine:
                     line += " lbpm=%.1f rbpm=%.1f brel=%s" % (
                         float(_bg_[0]), float(_bg_[1]),
                         "none" if _bg_[2] is None else "%.3f" % float(_bg_[2]))
+                    # ★ 2026-10-27：1=通过 0=被否决 -1=本窗没校验（任一 BPM 为 0）
+                    line += " bpmok=%d" % (getattr(self, "_bpm_ok_flag", None)
+                                           if getattr(self, "_bpm_ok_flag", None) is not None else -1)
             except Exception:                                    # noqa: BLE001
                 pass
             # ★ 门槛前的原始数字：(pick, votes, tot, second_tot, hit_rate)
@@ -2029,6 +2041,11 @@ class AudioEngine:
                         _rbpm = float(getattr(self.state, "bpm_display", 0.0) or 0.0)
                     except Exception:                        # noqa: BLE001
                         _rbpm = 0.0
+                    # ★ 2026-10-27：先记住 fp_lock_gate 给出的结论（strict/warp/recode），
+                    #   BPM 校验**通过**时要恢复它 —— 否则 `_last_gate="bpm"` 会从上一帧残留下来，
+                    #   日志里出现 `brel=0.083 gate=bpm` 这种自相矛盾的组合（0.083 本该通过）。
+                    _gate_before = getattr(self, "_last_gate", "-")
+                    self._bpm_ok_flag = None
                     if _lbpm > 0.0 and _rbpm > 0.0:
                         _brel = abs(_lbpm - _rbpm) / _lbpm
                         _bpm_ok = (_brel <= BPM_MATCH_TOL)
@@ -2043,9 +2060,12 @@ class AudioEngine:
                                     _bpm_ok = True
                                     break
                         self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), round(_brel, 3))
+                        self._bpm_ok_flag = 1 if _bpm_ok else 0
                         if not _bpm_ok:
                             self._last_gate = "bpm"
                             sid, votes, off = -1, 0, 0.0
+                        else:
+                            self._last_gate = _gate_before     # 通过：恢复 strict/warp/recode
                     else:
                         # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
                         self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
@@ -2092,7 +2112,35 @@ class AudioEngine:
                         #   ⇒ 两者叠加 ≈2s，现场表现为「画面比音乐快很多」（用户实测）。
                         #   现在默认 **0.0**（恢复原行为）；确需补偿时用环境变量微调：
                         #     set AUTOVJ_REC_LATENCY=0.3   （单位秒，正数=画面更早，负数=更晚）
-                        self.state.recognized_offset = (off + FP_WIN_SEC * r
+                        # ★★ 2026-10-27（A 组 off 跳变）：**off 状态机**。
+                        #   只在「已锁定 且 sid 与上一窗相同」时生效：新 off 必须落在
+                        #   「上一**已接受**值 + 墙钟推进」的 ±OFF_STATE_TOL_SEC 内；
+                        #   超出就先丢弃（保持期望值）并累计异常，连续异常超
+                        #   OFF_STATE_ABNORMAL_MAX 才认定为真 seek（换歌/首次锁定直接放行）。
+                        #   ⚠ 基准用的是**已接受**的值，不是原始匹配值 —— 否则一次跳变会污染基准。
+                        _off_pub = off
+                        try:
+                            _sv = getattr(self, "_off_state", None)
+                            if _sv is not None and int(_sv.get("sid", -2)) == int(cur) and cur >= 0:
+                                _expect = float(_sv["off"]) + max(0.0, t_read - float(_sv["t"]))
+                                if abs(float(off) - _expect) <= OFF_STATE_TOL_SEC:
+                                    _sv["abn"] = 0
+                                    _sv["off"] = float(off)
+                                else:
+                                    _sv["abn"] = int(_sv.get("abn", 0)) + 1
+                                    if _sv["abn"] <= OFF_STATE_ABNORMAL_MAX:
+                                        _off_pub = _expect          # 丢弃这次跳变
+                                        _sv["off"] = _expect
+                                    else:
+                                        _sv["abn"] = 0              # 真 seek：接受并重新起步
+                                        _sv["off"] = float(off)
+                                _sv["t"] = t_read
+                            else:
+                                self._off_state = {"sid": int(cur), "off": float(off),
+                                                   "t": t_read, "abn": 0}
+                        except Exception:                            # noqa: BLE001
+                            _off_pub = off
+                        self.state.recognized_offset = (_off_pub + FP_WIN_SEC * r
                                                         + float(os.environ.get('AUTOVJ_REC_LATENCY', '0.0') or 0.0))
                         self.state.recognized_t = t_read
                         # 对齐票数交给引擎：低于门槛时 offset 不可信，网格时钟不做任何校正
