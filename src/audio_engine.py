@@ -226,6 +226,20 @@ LOCK_AGREE_VOTES   = 20     # 单点票下限（比 ② 的 15 严）
 #     去掉「2× 领先」以后，光靠 hits+总票就足以让一首无关的歌锁上（实测误锁到「西行谣」）。
 #   而真歌（Raccoon Memes）pv/tot = 0.18~0.27。⇒ 用 pv/tot ≥ 0.12 把两者分开。
 LOCK_AGREE_CONC   = 0.12   # 单点票 / 总票 的集中度下限（真歌 ≥0.18，无关曲 ≤0.05）
+# ★★★ 2026-10-28：**频带分数救援通道（band2）**——用「白化频带相关 + 不重叠印证」
+#   替代票数口径，专治变速（D/E 组：×0.94/×1.05 票被摊薄到 4~8，任何票数通道都够不到）。
+#   为什么不是单窗给阈值：实测无关曲在**全库自由扫位置+倍率**下能拿 0.303，
+#   比真歌（0.19~0.22）还高 ⇒ 单窗分数不能判身份。
+#   但"同一首歌、两次**互不重叠**的窗口、给出同一个（位置+倍率）映射"就不可轻易凑出。
+BAND_RESCUE_ENABLE = True
+BAND_SCORE_MIN = 0.22      # 单窗最低分（真歌实测 0.18~0.39、随机对齐 0.12~0.20）
+BAND_RATE_SET = (0.96, 0.98, 1.00, 1.02, 1.04, 1.06)
+BAND_OFF_SPAN = 0.25       # 在指纹给出的 off 附近 ±0.25s 内找最佳
+BAND_OFF_STEP = 0.10
+BAND_AGREE_MIN_SEC = 4.5   # 两次观测最小间隔（≥ 识别窗长 ⇒ 真正不重叠）
+BAND_AGREE_POS = 0.25      # 两次观测"按各自倍率外推"后允许的位置差（秒）
+BAND_AGREE_RATE = 0.03     # 两次观测的倍率差上限
+
 # ★★★ 2026-10-27 实机三轮定案：**这条通道默认关闭**。
 #   两版实现（连续 3 窗 / 互不重叠 2 窗）都试过，两次上机都在 C 组「无关曲」上误锁：
 #     · v1 连续 3 窗 + 集中度  ⇒ C3 误锁「西行谣」（71s）
@@ -288,6 +302,37 @@ def fp_obs_ok(votes, tot, hit_rate):
             and t >= LOCK_AGREE_TOT
             and hr >= LOCK_AGREE_HIT
             and v >= LOCK_AGREE_CONC * max(1, t))
+
+
+def fp_band_agree_ok(now, sid, off, rate, obs):
+    """「频带观测的不重叠印证」（纯函数，便于离线回归）。
+
+    当前观测 `(now, sid, off, rate)` 与历史里某条观测是否互证：
+      · 同一首；
+      · 相距 ≥ `BAND_AGREE_MIN_SEC`（= 识别窗长 ⇒ 真正不重叠）；
+      · 用旧观测的倍率外推到现在，位置差 ≤ `BAND_AGREE_POS`；
+      · 两次倍率差 ≤ `BAND_AGREE_RATE`。
+    单窗分数给不出身份（无关曲也能到 0.30），但"两次独立窗口给出同一个位置+倍率"给得出。
+    """
+    try:
+        n, s0, o0, r0 = float(now), int(sid), float(off), float(rate)
+    except (TypeError, ValueError):
+        return False
+    for it in obs or ():
+        try:
+            t1, s1, o1, r1 = float(it[0]), int(it[1]), float(it[2]), float(it[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if s1 != s0:
+            continue
+        dt = n - t1
+        if dt < BAND_AGREE_MIN_SEC:
+            continue
+        if abs(r0 - r1) > BAND_AGREE_RATE:
+            continue
+        if abs((o1 + dt * r1) - o0) <= BAND_AGREE_POS:
+            return True
+    return False
 
 
 def fp_agree_ok(now, sid, off, obs, min_sec=None, rate_lo=None, rate_hi=None):
@@ -1675,6 +1720,13 @@ class AudioEngine:
         # 观测环形队列：(t, sid, off)。只存"自身证据达标"的观测，供「不重叠印证」比对。
         # ⚠ 绝不能存"已接受（已锁定）"的结果：一个错锁不许给自己担保（KVJ 同款教训）。
         self._pick_obs = deque(maxlen=16)
+        # ★ 2026-10-28：频带观测队列（供 band2 救援通道的不重叠印证）+ 惰性打开的频带库
+        self._band_obs = deque(maxlen=12)
+        self._band = None
+        self._band_ready = False
+        self._band_ms = 0.0        # 取证：上一窗频带校验耗时（毫秒）
+        self._band_last = None     # 取证：(score, rate, sid)
+        self._band_sid = -2        # 锁变化检测（变了就清空 _band_obs）
         self._eng_state = (0, -1, 0, 0)   # 取证：电荷条 (cur, cand, bar, hits)
         self._rec_err_t = 0.0
         self._genre_lock = threading.Lock()
@@ -1897,6 +1949,42 @@ class AudioEngine:
         """注册"有效 song_id 集合"的提供者；识别线程每 10 秒刷新一次白名单。"""
         self._allowed_provider = fn
 
+    def _band_try(self, sig, sid, off, now):
+        """频带救援通道的一次尝试（识别线程内，**只碰本地小库 + 纯计算**）。
+
+        返回 True 表示「本窗观测与前一次**互不重叠**的观测互证成立」。
+        失败/不可用一律返回 False（绝不因为这条路而放宽原有判据）。
+        """
+        if self._band is None:
+            try:
+                import bandfeat as _bf
+                self._band = _bf.BandStore(
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ"), cache=3)
+                self._band_ready = self._band.ready()
+            except Exception:                                    # noqa: BLE001
+                self._band_ready = False
+        if not self._band_ready:
+            return False
+        got = self._band.get(int(sid))
+        if got is None:
+            return False
+        try:
+            import bandfeat as _bf
+            t0 = time.perf_counter()
+            q = _bf.band_matrix(_bf.to_mono8k(sig, self._fp_sr))
+            score, _weakest, rate, off2 = _bf.verify(
+                q, got[0], float(off), BAND_RATE_SET,
+                span=BAND_OFF_SPAN, step=BAND_OFF_STEP)
+            self._band_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:                                        # noqa: BLE001
+            return False
+        self._band_last = (round(float(score), 3), round(float(rate), 2), int(sid))
+        if score < BAND_SCORE_MIN:
+            return False
+        ok = fp_band_agree_ok(now, sid, off2, rate, self._band_obs)
+        self._band_obs.append((float(now), int(sid), float(off2), float(rate)))
+        return ok
+
     def set_song_bpm_provider(self, fn):
         """注册「song_id → 库内 BPM」的提供者（C 组误识别修复用）。
 
@@ -1995,8 +2083,17 @@ class AudioEngine:
                 line += " allow=%s" % ("-" if _al is None else len(_al))
             except Exception:
                 pass
-            # ★ 本次锁定用的是哪条判据：strict（单点≥80）/ warp（变速兜底）/ recode（重编码兜底）/ none
+            # ★ 本次锁定用的是哪条判据：strict / warp / recode / band2（频带印证）/ none
             line += " gate=%s" % (getattr(self, "_last_gate", "-") or "-")
+            # ★ 2026-10-28：频带校验取证（追加在行尾，不破坏既有 regex）
+            #   bst=score/rate/sid；bms=本窗耗时（毫秒）。没有频带库时 bst=None。
+            try:
+                _bl = getattr(self, "_band_last", None)
+                line += " bst=%s bms=%.1f" % (
+                    ("%s/%s/%s" % tuple(_bl)) if _bl else "None",
+                    float(getattr(self, "_band_ms", 0.0) or 0.0))
+            except Exception:
+                pass
             # ★ 2026-10-27：BPM 一致性校验的原始数字（lbpm=库内 / rbpm=实时 / brel=相对差）
             #   **追加在行尾**，不破坏既有 `[R]` regex。brel=none 表示本窗没做校验（任一为 0）。
             try:
@@ -2232,9 +2329,19 @@ class AudioEngine:
                             _agree_ok = fp_agree_ok(_now, sid, off, self._pick_obs)
                         except Exception:                    # noqa: BLE001
                             _agree_ok = False
-                    if not _gate_ok and not _agree_ok:
+                    # ★★ 2026-10-28：**频带救援**（见 BAND_RESCUE_* 说明）。
+                    #   票数门控全灭时，用「白化频带相关 + 两次不重叠观测互证」再判一次。
+                    _band_ok = False
+                    if (not _gate_ok) and BAND_RESCUE_ENABLE:
+                        try:
+                            _band_ok = self._band_try(sig, int(sid), float(off), _now)
+                        except Exception:                # noqa: BLE001
+                            _band_ok = False
+                    if not _gate_ok and not _agree_ok and not _band_ok:
                         self._last_gate = "none"
                         sid, votes, off = -1, 0, 0.0
+                    elif _band_ok:
+                        self._last_gate = "band2"
                     elif _agree_ok:
                         self._last_gate = "agree2"
                     else:
@@ -2301,6 +2408,15 @@ class AudioEngine:
                 eng.tick(FpResult(matched=(votes > 0), song_id=sid,
                                   aligned_votes=votes, offset_sec=off), _t.time())
                 cur = eng.current_song_id
+                # ★★ 2026-10-28（切歌变慢）：锁一变就清空频带观测队列。
+                #   否则失锁那一瞬间，通道会拿**上一首**的旧观测（相隔 >4.5s、位置外推也吻合）
+                #   立刻把它重新锁回来，把新歌的证据挡在门外 —— 实测 B 组 6/9 掉到 3/9。
+                if int(cur) != int(getattr(self, "_band_sid", -2)):
+                    self._band_sid = int(cur)
+                    try:
+                        self._band_obs.clear()
+                    except Exception:                            # noqa: BLE001
+                        pass
                 # ★ 2026-10-19：**锁定事件**精确时间戳（毫秒），供真机测速脚本读。
                 #   `[R]` 是 2s（或按环境变量）节流，测速误差太大；这一行只在"锁定歌变了"
                 #   时写一次，开销可忽略，却能精确到 10ms。
@@ -2328,6 +2444,14 @@ class AudioEngine:
                     if cur >= 0 and sid == cur and votes > 0:
                         # 估计输入播放速率 r（同一首歌连续识别时累计；Δoff/Δt 即 r）
                         r = self._rate_est.update(cur, off, t_read)
+                        # ★ 2026-10-28：**频带校验给出的倍率优先**。
+                        #   票数口径在变速时 Δoff 抖动大，`_rate_est` 常给出 1.0 或乱值；
+                        #   频带校验是"按倍率找最佳对齐"，实测能稳定指到真倍率
+                        #   （×1.06 → 1.05、×0.94 → 0.94、×1.05 → 1.05）。
+                        #   只在两者同曲时采纳，且用带宽限制防呆。
+                        _bl = getattr(self, "_band_last", None)
+                        if _bl and int(_bl[2]) == int(cur) and 0.80 <= float(_bl[1]) <= 1.25:
+                            r = float(_bl[1])
                         self.state.recognized_rate = r
                         # off 是识别窗口起点在**原曲**时间轴上的秒数，窗口末端≈当前播放秒。
                         # ⚠ 变速倍率 r≠1 时，窗口秒数对应 FP_WIN_SEC*r 秒原曲
@@ -2347,7 +2471,15 @@ class AudioEngine:
                         try:
                             _sv = getattr(self, "_off_state", None)
                             if _sv is not None and int(_sv.get("sid", -2)) == int(cur) and cur >= 0:
-                                _expect = float(_sv["off"]) + max(0.0, t_read - float(_sv["t"]))
+                                # ★★ 2026-10-28（变速锁不住）：期望推进必须乘**播放倍率**。
+                                #   DJ 机台/我的变速样本是「1.06 倍速播放」⇒ 原曲位置每秒前进
+                                #   1.06s，而不是 1.0s。旧写法按 dt 推进 ⇒ 每 30 秒累积 ~1.8s
+                                #   偏差 ⇒ 撞到 OFF_STATE_TOL_SEC=2.0 就判"跳变"并把 off 拉回，
+                                #   实机表现就是「锁上了、几十秒后又掉」。
+                                _rt = float(getattr(self.state, "recognized_rate", 1.0) or 1.0)
+                                if not (0.80 <= _rt <= 1.25):
+                                    _rt = 1.0
+                                _expect = float(_sv["off"]) + max(0.0, t_read - float(_sv["t"])) * _rt
                                 if abs(float(off) - _expect) <= OFF_STATE_TOL_SEC:
                                     _sv["abn"] = 0
                                     _sv["off"] = float(off)

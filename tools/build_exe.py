@@ -45,6 +45,9 @@ cmd = [
     "--hidden-import", "genre_keywords",
     "--hidden-import", "charge_engine",
     "--hidden-import", "fp",
+    # ★ 2026-10-28：频带校验是**函数内惰性 import**，PyInstaller 静态扫描看不到，
+    #   不显式声明就会在 exe 里 ImportError（而且会被 except 吞掉 ⇒ 静默失效）。
+    "--hidden-import", "bandfeat",
     "--hidden-import", "match_engine",
     "--hidden-import", "postprocess",
     "--hidden-import", "colorfx",
