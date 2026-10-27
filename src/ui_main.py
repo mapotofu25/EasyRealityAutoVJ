@@ -3204,6 +3204,20 @@ class MainWindow(QMainWindow):
             except Exception:                                    # noqa: BLE001
                 pass
 
+    def _lib_bpm_of(self, sid):
+        """`song_id → 库内 BPM`（供识别线程做 BPM 一致性校验）。
+
+        ⚠ 本方法在**识别线程**里被逐窗调用 ⇒ 必须无锁、无 IO、只读：
+          · 只读 `engine._song_grid_lookup`（`set_song_grids` 整体替换引用，GIL 下原子）；
+          · 拿不到（没网格 / sid 不在库里）返回 0.0 ⇒ 调用方跳过校验，不误杀。
+        """
+        try:
+            g = (getattr(self.engine, "_song_grid_lookup", None) or {}).get(int(sid)) or {}
+            b = float(g.get("bpm") or 0.0)
+            return b if b > 0.0 else 0.0
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+
     def _allowed_song_ids(self):
         """当前**真实存在**的曲目 id：曲库（music_meta 记的 song_id）+ 码表内嵌曲目。
 
@@ -4385,6 +4399,15 @@ class MainWindow(QMainWindow):
             self.audio.set_recognizer(self._fp_db)
             try:
                 self.audio.set_allowed_provider(self._allowed_song_ids)
+            except Exception:                                    # noqa: BLE001
+                pass
+            # ★★ 2026-10-27（C 组误识别 C：B 站 200BPM 快歌误锁到 142BPM 的歌）：注入
+            #   「song_id → 库内 BPM」提供者，识别线程用它跟实时 bpm_display 做一致性校验。
+            #   取值口径与注入给引擎的网格**同一份**（`_song_grid_lookup` 装的就是
+            #   `effective_grid` 的产物，已含 `grid_manual.bpm_manual` 的手工覆盖）⇒
+            #   用户改过 BPM 的曲子，校验用的也是改后的值，不会自相矛盾。
+            try:
+                self.audio.set_song_bpm_provider(self._lib_bpm_of)
             except Exception:                                    # noqa: BLE001
                 pass
             # ★★ 2026-10-22：**指纹 id 自愈**（后台线程，绝不卡启动）。

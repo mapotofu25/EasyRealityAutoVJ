@@ -149,6 +149,21 @@ def _band_mean(spec, rg):
 
 FP_USE_HINT = False   # 见 `_recognize_loop` 里的对照实验说明
 
+# ★★ 2026-10-27（实机验收 A 组：重复段落 off 乱跳）：
+#   hint 不再用「拍钟预测」（`FP_USE_HINT`，历史踩坑：把 off 锁死在预测附近、落后 8~14s），
+#   改用**上一窗实际匹配到的 off ± 该秒数**作为连续性窗。重复段落有 3~4 个等票位置时，
+#   全局众数会随窗口滑动在几处之间跳（实测 off 14.53 → 176.37 → 18.25 → 331.86 → 22.85）；
+#   限制在「上一帧附近」后，只有当窗内**确实没有候选**（换歌 / seek / 长时间丢锁）才退回
+#   全局众数 —— 那条兜底在 `fp._pick` 里（窗内无候选 ⇒ 走全局），所以换歌不会被粘住。
+FP_PREV_HINT_SEC = 2.0   # 上一帧 off 的连续性窗半宽（秒）；0 = 关闭
+# ★★ 2026-10-27（实机验收 C 组：B 站 200BPM Frenchcore 误锁到 142BPM 的西行谣）：
+#   加「库内 BPM ↔ 实时 BPM」一致性校验。误识别差 41%（200 vs 142），而真正的变速样本
+#   只有 ±3/5/8% ⇒ 单条 15% 容差就能干净分开，且物理上说得通（同一首歌变速不会差 40%）。
+#   ⚠ 允许**倍频关系**（0.5× / 2×）：BPM 检测的半速/双速（64 vs 128）是常见现象，
+#     不能因为检测成半速就把正确匹配杀掉（那样会引入掉锁回归）。
+BPM_MATCH_TOL = 0.15
+BPM_OCTAVE_SET = (0.5, 1.0, 2.0)
+
 
 # ==========================================================================
 # 识别锁定门槛（fp_lock_gate）—— 阈值抽成模块级常量，便于离线回归与 QA 复验
@@ -1700,6 +1715,16 @@ class AudioEngine:
         """注册"有效 song_id 集合"的提供者；识别线程每 10 秒刷新一次白名单。"""
         self._allowed_provider = fn
 
+    def set_song_bpm_provider(self, fn):
+        """注册「song_id → 库内 BPM」的提供者（C 组误识别修复用）。
+
+        `fn(sid) -> float`（拿不到返回 0/None）。识别线程在每个识别窗里取一次，
+        与实时 `state.bpm_display` 做一致性校验：偏差 > `BPM_MATCH_TOL` 且不构成
+        倍频关系 ⇒ 本窗按"没匹配到"处理（宁可不认，也不认错）。
+        `fn=None` 关闭校验（缺省状态，行为与改动前逐值一致）。
+        """
+        self._song_bpm_provider = fn
+
     def set_recognizer(self, fp_db):
         """启用现场识别（main 在曲库就绪后调用）。fp_db=None 禁用。"""
         self._fp_db = fp_db
@@ -1790,6 +1815,16 @@ class AudioEngine:
                 pass
             # ★ 本次锁定用的是哪条判据：strict（单点≥80）/ warp（变速兜底）/ recode（重编码兜底）/ none
             line += " gate=%s" % (getattr(self, "_last_gate", "-") or "-")
+            # ★ 2026-10-27：BPM 一致性校验的原始数字（lbpm=库内 / rbpm=实时 / brel=相对差）
+            #   **追加在行尾**，不破坏既有 `[R]` regex。brel=none 表示本窗没做校验（任一为 0）。
+            try:
+                _bg_ = getattr(self, "_bpm_gate", None)
+                if _bg_:
+                    line += " lbpm=%.1f rbpm=%.1f brel=%s" % (
+                        float(_bg_[0]), float(_bg_[1]),
+                        "none" if _bg_[2] is None else "%.3f" % float(_bg_[2]))
+            except Exception:                                    # noqa: BLE001
+                pass
             # ★ 门槛前的原始数字：(pick, votes, tot, second_tot, hit_rate)
             #   排查"为什么不认"时，这五个数就能直接判断是哪一条没过。
             try:
@@ -1904,35 +1939,31 @@ class AudioEngine:
                 _now = _t.perf_counter()
                 _lm = getattr(self, "_last_match", None)
                 _lm_t = float(getattr(self, "_last_match_t", 0.0) or 0.0)
-                _dt = (_now - _lm_t) if _lm_t > 0.0 else 0.5
+                # ★★ 2026-10-27：hint 改为「**上一窗实际 off** ± FP_PREV_HINT_SEC 秒」。
+                #   为什么不用 _last_match_t 推算"该走到哪"：历史上就是这么干过，实测 off 会
+                #   被锁死在预测附近（连续 8~10s 不动、落后 8~14s）。而用"上一帧实际匹配到的
+                #   off"当锚，只解决**同一位置附近**的重复段落歧义，不引入任何预测误差。
+                _prev_off = None
+                if _lm is not None:
+                    try:
+                        if (int(_lm[0]) >= 0 and int(_lm[1] or 0) >= 4
+                                and float(_lm[2] or 0.0) >= 0.0):
+                            _prev_off = float(_lm[2])
+                    except Exception:                        # noqa: BLE001
+                        _prev_off = None
                 _hint = None
                 _hint_w = None
-                if (_locked is not None and int(_locked) >= 0
-                        and _pred is not None and _pred >= 0.0):
-                    # 已锁定：用拍钟预测（专治重复段落歧义）
+                if FP_USE_HINT and (_locked is not None and int(_locked) >= 0
+                                    and _pred is not None and _pred >= 0.0):
+                    # 旧路径（**默认关闭**，仅供对照实验）：用拍钟预测当 hint。
                     _hint = _pred * _FP_SR / _FP_HOP
                     _hint_w = (float(_pred_w) if (_pred_w is not None and float(_pred_w) > 0.0)
                                else None)
-                elif _lm and int(_lm[0]) >= 0 and int(_lm[1]) >= 4:
-                    # 未锁定：连续性提示（上一窗起点 + 实际间隔），窗口半宽 0.3s
-                    _hint = (_lm[2] + max(0.2, min(1.5, _dt))) * _FP_SR / _FP_HOP
-                    _hint_w = 0.3 * _FP_SR / _FP_HOP
-                try:
-                    _sig_n = int(sig.size)
-                    _sig_rms = float(_np.sqrt(_np.mean(sig * sig))) if _sig_n else 0.0
-                except Exception:                                # noqa: BLE001
-                    _sig_n, _sig_rms = -1, -1.0
-                self._last_sig = (_sig_n, _sig_rms)      # 取证：真正喂给 match 的信号
-                # ★★★ 2026-10-18 对照实验开关：hint 会把识别**锁死在拍钟预测附近**
-                #   （实测 off 连续 8~10 秒不动、位置落后 8~14 秒）。默认关闭，靠全局众数
-                #   + 位置层的大跳变闸门（含"低票距离闸门"）来挡野匹配。
-                if not FP_USE_HINT:
-                    _hint, _hint_w = None, None
-                # ★★★ 2026-10-18 对照实验开关：hint 会把识别**锁死在拍钟预测附近**
-                #   （实测 off 连续 8~10 秒不动、位置落后 8~14 秒）。默认关闭，靠全局众数
-                #   + 位置层的大跳变闸门（含"低票距离闸门"）来挡野匹配。
-                if not FP_USE_HINT:
-                    _hint, _hint_w = None, None
+                elif FP_PREV_HINT_SEC > 0 and _prev_off is not None:
+                    # 新路径（A 组修复）：上一窗 off ± N 秒的连续性窗。
+                    # 窗内无候选时 `fp._pick` 会自动退回全局众数 ⇒ 换歌 / seek 能跳出去。
+                    _hint = _prev_off * _FP_SR / _FP_HOP
+                    _hint_w = FP_PREV_HINT_SEC * _FP_SR / _FP_HOP
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w)
                 # ★★ 2026-10-19：**证据门槛（防误识别）**。
@@ -1980,6 +2011,45 @@ class AudioEngine:
                                             and _tot >= LOCK_LEAD_WARP * max(1, _second_tot))
                             else "recode"
                         )
+                # ★★ 2026-10-27（C 组误识别修复）：**库内 BPM ↔ 实时 BPM 一致性校验**。
+                #   实机验收：B 站 200BPM Frenchcore 误锁到 142BPM 的「西行谣」（差 41%），
+                #   而真正的变速样本只有 ±3/5/8% ⇒ 一条 15% 容差即可干净分开。
+                #   放在 `fp_lock_gate` **之后**：先让票数/证据门槛决定"认不认"，再用 BPM 否决
+                #   "认错曲"，两条判据互不干扰（`gate=bpm` 单独可回看）。
+                #   ⚠ 倍频（0.5×/2×）放行：BPM 检测出半速/双速是常态，不能因此杀正确匹配。
+                if sid >= 0:
+                    _lbpm, _rbpm, _brel = 0.0, 0.0, None
+                    _bprov = getattr(self, "_song_bpm_provider", None)
+                    if _bprov is not None:
+                        try:
+                            _lbpm = float(_bprov(int(sid)) or 0.0)
+                        except Exception:                    # noqa: BLE001
+                            _lbpm = 0.0
+                    try:
+                        _rbpm = float(getattr(self.state, "bpm_display", 0.0) or 0.0)
+                    except Exception:                        # noqa: BLE001
+                        _rbpm = 0.0
+                    if _lbpm > 0.0 and _rbpm > 0.0:
+                        _brel = abs(_lbpm - _rbpm) / _lbpm
+                        _bpm_ok = (_brel <= BPM_MATCH_TOL)
+                        if not _bpm_ok:
+                            # 倍频放行用**绝对**容差（±0.15），不能用相对容差：
+                            #   BPM 检测的倍频误差是**精确**的 0.5× / 2×（再叠几 % 检测误差），
+                            #   而相对容差在 2× 处等于 ±30% ⇒ 实测把 194.5 / 110 = 1.77×
+                            #   这种「误匹配」也当成倍频放过（C 组 BV1CEnBzjEAo 就是这一条）。
+                            _ratio = _rbpm / _lbpm
+                            for _k in BPM_OCTAVE_SET:
+                                if abs(_ratio - _k) <= BPM_MATCH_TOL:
+                                    _bpm_ok = True
+                                    break
+                        self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), round(_brel, 3))
+                        if not _bpm_ok:
+                            self._last_gate = "bpm"
+                            sid, votes, off = -1, 0, 0.0
+                    else:
+                        # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
+                        self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
+
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
                 _prev_off = float(_lm0[2]) if _lm0 else None
