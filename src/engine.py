@@ -1714,7 +1714,12 @@ class AutoVJEngine(QObject):
             buf = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
             # ★ 参数顺序是 (buffer, width, height, …)：之前误写成 (buf, h, w, …) ⇒ 发送端宣告
             #   尺寸转置（1920×1080 → 1080×1920），画面错乱且不报错。此处为 (w, h)，勿再写反。
-            s.sendImage(buf, w, h, glfmt, True, 0)
+            # ★★ 2026-10-28（用户实测：OBS 里 Spout 画面上下颠倒）：
+            #   第 5 个参数 `bInvert` 必须为 **False**。
+            #   依据：`self.canvas` 是 QImage（**行序自上而下**），同一份画布走 NDI 是正的、
+            #   界面的「输出预览」也是正的 ⇒ 数据本来就是 top-down；Spout 再翻一次就成了倒像。
+            #   （OBS 的 Spout2 捕获没有翻转选项，所以这一层必须给对。）
+            s.sendImage(buf, w, h, glfmt, False, 0)
         except Exception as e:                                     # noqa: BLE001
             # ⚠ 失败时**保留已有 `self._spout`**、不丢成 None 重建：源名反复消失/出现更难恢复
             self._output_fail("Spout", now, e)
