@@ -847,6 +847,15 @@ class OutputPanel(QWidget):
         self.ndi_name = QLineEdit()
         self.ndi_name.setPlaceholderText("NDI 源名称")
         go.addWidget(self.ndi_name, 6, 1)
+        # ★ 2026-10-28（用户实测：OBS 里的画面比本地晚零点几秒）：
+        #   NDI SDK 默认 `clock_video=True` ⇒ 发送端**按帧率做时钟节流**，等于给每帧排队。
+        #   局域网直连时这层缓冲就是那零点几秒。打开本项 = 关掉视频时钟节流（帧一到就走）。
+        #   ⚠ 必须「NDI 输出」先开着才有意义 ⇒ 由 set_ndi_enabled() 统一门控。
+        self.chk_ndi_lan = QCheckBox("NDI 局域网发送（低延迟）")
+        self.chk_ndi_lan.setToolTip(
+            T("局域网直连时建议开启：不等帧率排队，画面更跟手。\n"
+              "跨路由/交换机较多时可关掉换稳定性。"))
+        go.addWidget(self.chk_ndi_lan, 7, 0)
         # ★ 2026-10-18 用户要求：**「NDI 传输音频」这一行从界面删除**（复选框 + 提示）。
         #   NDI 音频转发后端（audio_engine 的 ndi_audio_on / ndi_out.send_audio）**原样保留**，
         #   只是不再有 UI 入口；配置文件里 ndi_audio 仍按原逻辑生效。
@@ -860,6 +869,7 @@ class OutputPanel(QWidget):
         self.chk_spout.stateChanged.connect(main.set_spout_enabled)
         self.spout_name.editingFinished.connect(main.set_spout_name)
         self.chk_ndi.stateChanged.connect(main.set_ndi_enabled)
+        self.chk_ndi_lan.stateChanged.connect(main.set_ndi_lan)
         self.ndi_name.editingFinished.connect(main.set_ndi_name)
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
 
@@ -3810,6 +3820,32 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         self.engine._spout = None   # 名字变了重建 sender
 
+    def set_ndi_lan(self, s):
+        """「NDI 局域网发送（低延迟）」开关：落盘 + 立即生效（重建 sender）。"""
+        on = bool(s)
+        self.cfg["output"]["ndi_lan"] = on
+        self.cfg.save()
+        try:
+            ndi = getattr(self.engine, "_ndi", None)
+            if ndi is not None:
+                # set_lan 会 close() 让下一帧按新时钟参数重建（clock_* 只能在 open 前定）
+                ndi.set_lan(on)
+        except Exception:                                        # noqa: BLE001
+            pass
+        print("[NDI] 局域网发送（低延迟）=%s" % ("开" if on else "关"))
+
+    def _ndi_lan_gate(self):
+        """「局域网发送」只在「NDI 输出」开着时可用（用户明确要求）。"""
+        try:
+            on = bool(self.cfg["output"].get("ndi_enabled"))
+            w = self.output_panel.chk_ndi_lan
+            w.setEnabled(on)
+            w.setToolTip(T("先勾选「NDI 输出」才能用") if not on else
+                         T("局域网直连时建议开启：不等帧率排队，画面更跟手。\n"
+                           "跨路由/交换机较多时可关掉换稳定性。"))
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def set_ndi_enabled(self, s):
         s = bool(s)
         if s:
@@ -3840,6 +3876,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.cfg.save()
+                self._ndi_lan_gate()
                 return
             # 运行时没问题 —— 发送端等第一帧来了再按真实分辨率建立（engine._ndi_send）
             name = self.cfg["output"].get("ndi_name") or "EasyRealityAutoVJ"
@@ -3848,6 +3885,11 @@ class MainWindow(QMainWindow):
             self.cfg.save()
             self.engine._ndi = ndi
             self.engine._ndi_fail = False
+            # ★ 局域网发送：跟着配置应用到新 sender（下次重建时生效）
+            try:
+                ndi.set_lan(bool(self.cfg["output"].get("ndi_lan")))
+            except Exception:                                    # noqa: BLE001
+                pass
             print("[NDI] 已启用输出（运行时 %s），发送端将在第一帧按实际分辨率建立" % detail)
         else:
             self.cfg["output"]["ndi_enabled"] = False
@@ -3862,6 +3904,7 @@ class MainWindow(QMainWindow):
                 s and self.cfg["output"].get("ndi_audio", False))
         except Exception:
             pass
+        self._ndi_lan_gate()          # ★ 局域网发送只在 NDI 输出开着时可用
 
     def set_ndi_name(self):
         self.cfg["output"]["ndi_name"] = self.output_panel.ndi_name.text().strip() or "EasyRealityAutoVJ"
@@ -4119,6 +4162,11 @@ class MainWindow(QMainWindow):
         _w.setChecked(bool(o.get("ndi_enabled", False)))
         _w.blockSignals(False)
         self.output_panel.ndi_name.setText(o.get("ndi_name", "EasyRealityAutoVJ"))
+        _wl = self.output_panel.chk_ndi_lan
+        _wl.blockSignals(True)
+        _wl.setChecked(bool(o.get("ndi_lan", False)))
+        _wl.blockSignals(False)
+        self._ndi_lan_gate()
         # 信号被屏蔽了，槽不会再跑 ⇒ 这里显式同步一次采集侧的布尔量（不要在这里做运行时探测：
         # 启动时弹「NDI 不可用」会很烦；真正的探测交给 set_ndi_enabled）
         try:
@@ -4644,29 +4692,17 @@ class MainWindow(QMainWindow):
         self._music_scan.start()
 
     def show_music_info(self, path):
-        """曲目信息：文件/歌名/艺人/曲风/来源/时长/采样率/指纹/路径"""
-        m = self.cfg["music_meta"].get(path) or {}
-        dur = "未知"
-        sr_txt = ""
+        """曲目信息（码表行 / 导入行仍走这个轻量弹窗）。
+
+        ★ 2026-10-28：**本机曲目**改走「曲目信息与详情」合并页（见 panels 曲库右键），
+          这里保留给"本机没有文件、打不开详情页"的行（码表派生行 / 导入包里的歌）。
+          文本统一取 `music_detail.info_text()`，不再各写一份。
+        """
         try:
-            import soundfile as sf
-            info = sf.info(path)
-            dur = f"{info.duration:.0f} 秒"
-            sr_txt = f"{info.samplerate} Hz · {info.channels} 声道"
-        except Exception:
-            pass
-        genres = "、".join(m.get("genres") or []) or "未分析"
-        text = (
-            f"文件：{os.path.basename(path)}\n"
-            f"歌名：{m.get('title') or '未知'}\n"
-            f"艺人：{m.get('artist') or '未知'}\n"
-            f"曲风：{genres}\n"
-            f"曲风来源：{m.get('source') or '未分析'}\n"
-            f"时长：{dur}\n"
-            f"采样率：{sr_txt or '未知'}\n"
-            f"指纹ID：{m.get('song_id') or '-'}\n"
-            f"\n完整路径：\n{path}"
-        )
+            from music_detail import info_text
+            text = info_text(self.cfg, path)
+        except Exception:                                        # noqa: BLE001
+            text = path
         QMessageBox.information(self, T("曲目信息"), text)
 
     def show_clear_music_analysis(self):

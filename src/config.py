@@ -189,6 +189,10 @@ DEFAULTS = {
         "spout_enabled": False,       # Spout 输出：把画面发给本机 OBS/Resolume 等
         "spout_name": "EasyRealityAutoVJ",
         "ndi_enabled": False,         # NDI 输出（音画同步；运行时随包自带，用户无需安装）
+        # ★ 2026-10-28：「NDI 局域网发送」= 发送端**不做时钟节流**（clock_video=False），
+        #   每帧一到就走，不按帧率排队 ⇒ 接收端（OBS）延迟更低。
+        #   只在 ndi_enabled 为真时有意义（UI 上也是这么门控的）。
+        "ndi_lan": False,
         "ndi_name": "EasyRealityAutoVJ",
         "ndi_audio": False,           # NDI 是否随画面一起发声音（默认关：怕双声/回声）
     },

@@ -1871,13 +1871,13 @@ class MusicLibraryPanel(QWidget):
             self.list.setCurrentItem(it)
         solo_loc = (not checked_mode) and (len(loc) == 1 and not imp)  # 单首本机歌=旧版完整菜单
         menu = QMenu(self)
-        edit = rescan = info = detail = None
+        edit = rescan = info = None
         if solo_loc:
             edit = menu.addAction(T("纠正曲风…"))
             rescan = menu.addAction(T("重新分析扫描此曲目"))
-            info = menu.addAction(T("此曲目信息"))
-            # ★ 2026-10-27 曲库识别增强：打开「歌曲详情」（波形上标 BPM/八拍/分段）。
-            detail = menu.addAction(T("歌曲详情…"))
+            # ★ 2026-10-28（用户要求）：把「此曲目信息」与「歌曲详情…」**合并成一个入口**，
+            #   曲目信息作为只读块显示在详情页顶部（同一份数据，不再两个弹窗）。
+            info = menu.addAction(T("曲目信息与详情…"))
             menu.addSeparator()
             # ★ 封面大小（用户要求）：放子菜单里，当前档位打勾。
             #   为什么不做成"拖拽缩放"：曲库是**演出前整理**用的，这里要的是
@@ -1932,11 +1932,9 @@ class MusicLibraryPanel(QWidget):
             self.main.edit_music_genre(path)
         elif act == rescan:
             self.main.rescan_music(path)
-        elif act == detail:
-            self._open_music_detail(path)
         elif act == info:
             if solo_loc:
-                self.main.show_music_info(path)
+                self._open_music_detail(path, with_info=True)
             elif str(path).startswith("@cue:"):
                 self._show_cue_info(path)
             else:
@@ -1949,7 +1947,7 @@ class MusicLibraryPanel(QWidget):
         elif act == rm_imp:
             self._remove_imported(imp)
 
-    def _open_music_detail(self, path):
+    def _open_music_detail(self, path, with_info=False):
         """打开演出端「歌曲详情」对话框（波形上标 BPM / 八拍起点 / BPM 分段）。
 
         写入 `cfg["music_meta"][path]["grid_manual"]`；关闭后立即重新注入引擎，演出中
@@ -1961,7 +1959,14 @@ class MusicLibraryPanel(QWidget):
             QMessageBox.warning(self, T("歌曲详情…"), Tf("打开歌曲详情失败：{}", e))
             return
         try:
-            dlg = MusicDetailDialog(self.main.cfg, path, parent=self)
+            _info = ""
+            if with_info:
+                try:
+                    from music_detail import info_text as _mt_info
+                    _info = _mt_info(self.main.cfg, path)
+                except Exception:                                # noqa: BLE001
+                    _info = ""
+            dlg = MusicDetailDialog(self.main.cfg, path, parent=self, info_text=_info)
             dlg.exec()
             try:
                 self.main._inject_song_grids()

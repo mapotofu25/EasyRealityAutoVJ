@@ -44,6 +44,20 @@ HIGHLIGHTS = [
     ("听歌识曲 + 曲风匹配", "Song ID + genre matching",
      "识别正在播放的歌，按曲风自动挑选匹配的画面",
      "Recognizes the playing track and picks matching visuals by genre"),
+    ("NDI 局域网发送（低延迟）", "NDI LAN send (low latency)",
+     "关掉发送端的帧率时钟节流，帧一到就走 —— 局域网直连时 OBS 里画面更跟手；"
+     "需要先开 NDI 输出才可用",
+     "Turns off the sender-side frame-rate clocking so frames leave immediately — "
+     "tighter picture in OBS on a direct LAN; requires NDI output to be enabled"),
+    ("曲目信息与详情合一", "Track info merged into details",
+     "曲库右键只剩一个入口：文件/歌名/艺人/曲风/时长/采样率/指纹 ID 与波形标注、"
+     "分段 BPM、八拍起点在同一页",
+     "One right-click entry in the library: file / title / artist / genre / duration / "
+     "sample rate / fingerprint ID together with the waveform, segment BPM and downbeats"),
+    ("变速跟得住", "Follows tempo changes",
+     "画面位置按实测播放倍率推进（不再每 30 秒判一次假跳变）",
+     "Playback position advances by the measured rate instead of a fixed 1.0x "
+     "(no more false seek every 30 s)"),
     ("能量算法", "Energy engine",
      "响度 / 低频冲击 / 起伏量多信号融合，扛得住系统音效与压缩",
      "Fuses loudness, low-frequency punch and fluctuation — robust against "
@@ -66,6 +80,8 @@ PROJECTS = [
      "https://github.com/FFmpeg/FFmpeg", "LGPL / GPL"),
     ("SoundCard", "系统回环、麦克风采集", "system loopback & mic capture",
      "https://github.com/bastibe/SoundCard", "BSD 3-Clause"),
+    ("sounddevice (PortAudio)", "详情页试听播放", "preview playback in the detail page",
+     "https://github.com/spatialaudio/python-sounddevice", "MIT"),
     ("PySoundFile (libsndfile)", "音频读写", "audio file I/O",
      "https://github.com/bastibe/python-soundfile", "BSD 3-Clause / LGPL"),
     ("onnxruntime", "本地 AI 曲风识别", "on-device AI genre detection",
@@ -110,6 +126,13 @@ CREDITS = [
      "fine-grained genre keyword table & genre-driven visual switching "
      "(origin of genre_keywords.py)",
      "https://github.com/lbnandy/genre-police-visualizer", "MIT"),
+    ("KVJ / KDJ (kumoSleeping)", "变速与「能不能作准」的思路参考：白化频带相关打分、"
+     "互不重叠的多次印证、按倍率档位检索。**仅参考思路，未取用任何代码**"
+     "（对方为 GPL-3.0，本项目独立实现）",
+     "design reference only for tempo handling and acceptance: whitened spectral-band "
+     "scoring, corroboration across non-overlapping windows, rate-candidate search. "
+     "**No code taken** (upstream is GPL-3.0; implemented independently here)",
+     "https://github.com/kumoSleeping/KVJ", "GPL-3.0 (reference only)"),
     ("Genre Police AutoVJ (lbnandy)", "「演出前分析曲库 + 现场识别曲目 + Spout / NDI 输出」"
      "的整体思路参考",
      "overall reference: pre-show library analysis + live track ID + Spout / NDI output",

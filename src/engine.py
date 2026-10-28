@@ -1744,6 +1744,12 @@ class AutoVJEngine(QObject):
             w, h = self.canvas.width(), self.canvas.height()
             if self._ndi is None:
                 self._ndi = get_ndi(oc.get("ndi_name") or "EasyRealityAutoVJ")
+                # ★ 2026-10-28：把「局域网发送（低延迟）」应用到 sender。
+                #   时钟参数只能在 open() 前定，而 sender 是第一帧才建的 ⇒ 这里设正合适。
+                try:
+                    self._ndi.set_lan(bool(oc.get("ndi_lan")))
+                except Exception:                                # noqa: BLE001
+                    pass
             # ⚠ 必须带**真实分辨率**：发送端的 VideoSendFrame 只能在 open() 之前定死尺寸，
             #   所以 sender 是按第一次发帧的尺寸建立的。旧代码这里不给尺寸 → 直接返回 False
             #   → `_ndi_fail` 被永久置位 → NDI 输出再也不会尝试（静默失效）。

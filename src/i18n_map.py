@@ -268,6 +268,11 @@ ZH2EN = {
         "release package again and retry.",
     "错误详情：": "Error details:",
     "NDI 源名称": "NDI Source Name",
+    "NDI 局域网发送（低延迟）": "NDI LAN Send (low latency)",
+    "先勾选「NDI 输出」才能用": "Enable \"NDI Output\" first",
+    "局域网直连时建议开启：不等帧率排队，画面更跟手。\n跨路由/交换机较多时可关掉换稳定性。":
+        "Recommended on a direct LAN: frames leave immediately instead of queueing, so the "
+        "picture feels tighter. Turn it off if you cross many switches/routers.",
     "全局": "Global",
     "仅窗口": "Window only",
     "不保存": "Don't Save",
@@ -413,6 +418,7 @@ ZH2EN = {
     "纠正曲风…": "Correct Genre…",
     "重新分析扫描此曲目": "Re-analyze this track",
     "此曲目信息": "Track Info",
+    "曲目信息与详情…": "Track Info & Details…",
     "从曲库移除": "Remove from Library",
     "角色（单选）": "Role (single choice)",
     "小": "Small",

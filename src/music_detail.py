@@ -22,9 +22,9 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox,
-                               QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+                               QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QListWidget, QMessageBox, QPushButton,
                                QVBoxLayout)
 
@@ -59,13 +59,57 @@ def _lazy_waveform(path):
         return None
 
 
+def info_text(cfg, path):
+    """曲目信息文本（**唯一真源**）。
+
+    原来「此曲目信息」弹窗在 `ui_main.show_music_info()` 里拼，详情页另有一套；
+    2026-10-28 用户要求把两个菜单项合并 ⇒ 文本收口到这里，两边都调它。
+    """
+    import os as _os
+    # ⚠ `Config` 没有 `.get()`（全项目一律 `cfg[k]`）；dict 也支持 `[]` ⇒ 统一走下标
+    try:
+        _mm = cfg["music_meta"] or {}
+    except Exception:                                            # noqa: BLE001
+        _mm = {}
+    m = _mm.get(path) or {}
+    dur = "未知"
+    sr_txt = ""
+    try:
+        import soundfile as _sf
+        info = _sf.info(path)
+        dur = "%.0f 秒" % info.duration
+        sr_txt = "%d Hz · %d 声道" % (info.samplerate, info.channels)
+    except Exception:                                            # noqa: BLE001
+        pass
+    genres = "、".join(m.get("genres") or []) or "未分析"
+    return (
+        "文件：%s\n"
+        "歌名：%s\n"
+        "艺人：%s\n"
+        "曲风：%s\n"
+        "曲风来源：%s\n"
+        "时长：%s\n"
+        "采样率：%s\n"
+        "指纹ID：%s\n"
+        "\n完整路径：\n%s"
+        % (_os.path.basename(path), m.get("title") or "未知", m.get("artist") or "未知",
+           genres, m.get("source") or "未分析", dur, sr_txt or "未知",
+           m.get("song_id") or "-", path)
+    )
+
+
 class MusicDetailDialog(QDialog):
     """演出端单曲详情编辑对话框（读写 `music_meta[path]["grid_manual"]`）。"""
 
-    def __init__(self, cfg, path, parent=None):
+    def __init__(self, cfg, path, parent=None, info_text=""):
+        # ★ 2026-10-28（用户要求合并「此曲目信息」+「歌曲详情」）：
+        #   `info_text` 非空时，在顶部显示只读的曲目信息（文件/歌名/艺人/曲风/时长/采样率/
+        #   指纹 ID/完整路径）。内容由调用方用 `music_info_text()` 生成，**只有一份真源**，
+        #   避免"信息框"和"详情页"各写一遍然后走样。
         super().__init__(parent)
         self.cfg = cfg
         self.path = str(path)
+        self._info_text = str(info_text or "")
         self._meta = {}
         self._grid = {}
         self._manual = None
@@ -93,6 +137,19 @@ class MusicDetailDialog(QDialog):
         self.lbl_auto = QLabel("自动 BPM：—")
         top.addWidget(self.lbl_auto)
         v.addLayout(top)
+
+        # 曲目信息（只读、可选中复制）——原来独立的「此曲目信息」菜单项的内容并到这里
+        if self._info_text:
+            box = QFrame()
+            box.setFrameShape(QFrame.StyledPanel)
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(8, 6, 8, 6)
+            lab = QLabel(self._info_text)
+            lab.setWordWrap(True)
+            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lab.setStyleSheet("color:palette(mid);")
+            bl.addWidget(lab)
+            v.addWidget(box)
 
         form = QFormLayout()
         self.spin_bpm = QDoubleSpinBox()
