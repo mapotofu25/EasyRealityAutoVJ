@@ -215,6 +215,32 @@ class MusicDetailDialog(QDialog):
 
         right = QVBoxLayout()
         right.addWidget(QLabel("八拍起点（秒）"))
+        # ★ 2026-10-28（用户要求）：**整段相位微调**。
+        #   动机：拿 VDJ 当标准答案实测 50 首，乐句相位差的那 14 首里有 **7 首正好差 4 拍**
+        #   （两小节里选错了一小节）。这 1 bit 纯音频经常无解 —— 工业界也是给按钮让 DJ 自己翻：
+        #   Mixxx 有 `beats_adjust_halve/double`，Traktor 有 Grid 面板。
+        #   所以这里也提供「±1 小节 / ±1 拍」和「÷2 / ×2 BPM」。
+        _nudge = QHBoxLayout()
+        for _t, _k, _tip in (("−1 小节", -4, "整段往前挪一小节（4 拍）"),
+                             ("+1 小节", 4, "整段往后挪一小节（4 拍）"),
+                             ("−1 拍", -1, "整段往前挪 1 拍"),
+                             ("+1 拍", 1, "整段往后挪 1 拍")):
+            _b = QPushButton(_t)
+            _b.setToolTip(_tip)
+            _b.clicked.connect(lambda _c=False, kk=_k: self._nudge_beats(kk))
+            _nudge.addWidget(_b)
+        right.addLayout(_nudge)
+        _scale = QHBoxLayout()
+        _b2 = QPushButton("÷2 BPM")
+        _b2.setToolTip("拍速减半（半速/倍速歧义时用；对齐点不动，只改拍长）")
+        _b2.clicked.connect(lambda _c=False: self._scale_bpm(0.5))
+        _scale.addWidget(_b2)
+        _b3 = QPushButton("×2 BPM")
+        _b3.setToolTip("拍速加倍（半速/倍速歧义时用）")
+        _b3.clicked.connect(lambda _c=False: self._scale_bpm(2.0))
+        _scale.addWidget(_b3)
+        right.addLayout(_scale)
+
         self.lst_anchors = QListWidget()
         self.lst_anchors.setMaximumWidth(220)
         right.addWidget(self.lst_anchors, 1)
@@ -352,6 +378,64 @@ class MusicDetailDialog(QDialog):
             self.lst_segments.addItem("%.1f s · %.1f BPM"
                                       % (float(s.get("t0") or 0.0),
                                          float(s.get("bpm") or 0.0)))
+
+    def _beat_len_now(self):
+        """当前有效拍长（秒）。优先 effective grid，其次手动 BPM。"""
+        try:
+            bl = float((self._grid or {}).get("beat_len") or 0.0)
+            if bl > 0:
+                return bl
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            b = float((self._grid or {}).get("bpm") or 0.0)
+            return 60.0 / b if b > 0 else 0.0
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+
+    def _refresh_grid_preview(self):
+        """把当前手动状态重新合成「有效网格」并推给波形（改完立刻能看到线移动）。"""
+        try:
+            import beatgrid as _bg
+            m = self._effective_manual()
+            self._grid = _bg.effective_grid((self._meta or {}).get("grid") or {}, m)
+            self.wave.set_grid(self._grid)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _nudge_beats(self, k):
+        """整段相位平移 k 拍（k=±4 即一小节）。"""
+        bl = self._beat_len_now()
+        if bl <= 0:
+            QMessageBox.information(self, "整段微调", "这首歌还没有网格（没有 BPM），无法整段平移。")
+            return
+        cur = self.wave.anchors()
+        if not cur:
+            try:
+                base = float((self._grid or {}).get("anchor") or 0.0)
+            except Exception:                                    # noqa: BLE001
+                base = 0.0
+            cur = [base]
+        period = 8.0 * bl                     # 八拍一个周期，等价折叠
+        new = [round((float(a) + k * bl) % period, 4) for a in cur]
+        self.wave.set_anchors(sorted(set(new)))
+        self._refresh_grid_preview()
+        self._mark_dirty()
+        self._refresh_lists()
+
+    def _scale_bpm(self, f):
+        """把 BPM 乘 f（0.5/2）—— 只改拍长，锚点位置不动（对应 Mixxx 的 ÷2 / ×2）。"""
+        cur = float(self.spin_bpm.value() or 0.0)
+        if cur <= 0:
+            cur = float((self._grid or {}).get("bpm") or 0.0)
+        if cur <= 0:
+            QMessageBox.information(self, "拍速", "这首歌还没有 BPM，无法倍速。")
+            return
+        nv = max(30.0, min(300.0, cur * float(f)))
+        self.chk_manual.setChecked(True)
+        self.spin_bpm.setValue(nv)
+        self._refresh_grid_preview()
+        self._mark_dirty()
 
     def _on_anchors_changed(self):
         self._mark_dirty()

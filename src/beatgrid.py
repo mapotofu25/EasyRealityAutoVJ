@@ -313,9 +313,178 @@ def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
 # ==========================================================================
 # 4. 整曲离线分析
 # ==========================================================================
-def analyze_track(path, maxsec=180.0, anchor_hint=None, bpm_hint=None, do_scan=True):
-    """读文件后分析（见 `analyze_signal`）。"""
+# --------------------------------------------------------------------------
+# 倍速消歧 / 多窗投票（2026-10-28）
+# --------------------------------------------------------------------------
+# 背景：拿 VDJ 的网格当标准答案实测 50 首，纯自算是 **BPM 46/50、小节相位 41/50、
+#   乐句相位 36/50**。BPM 那 4 个错里有 2 个是 **2× 错**（99.95→199.73、87.5→175.12）——
+#   不是算不出，是「半速/倍速」这对孪生解里挑错了。
+# 判据：真拍上每一拍都有 kick；被估成 2× 时，**奇数拍槽会明显空**
+#   （实测两类样本的 odd/even 比：真值 ≈0.8~1.0，2× 错 ≈0.2~0.4）。
+OCT_BALANCE_MIN = 0.55   # odd/even 低于此 ⇒ 认为当前 bpm 是 2×，取一半
+OCT_LO, OCT_HI = 60.0, 220.0
+VOTE_WINDOWS = 3         # 多窗投票的窗口数
+VOTE_WIN_SEC = 60.0      # 每窗秒数
+
+
+def beat_slot_energy(f, env, bpm, anchor, half_win=0.12):
+    """按「拍槽」采样 onset 包络 → (偶数拍均值, 奇数拍均值)。
+
+    每拍取 ±`half_win`×拍长 内的**峰值**（不用瞬时值：onset 有抖动，
+    单点采样会随机漏掉）。两组的比值就是"是不是每拍都有 kick"的判据。
+    """
+    try:
+        dt = float(f["dt"])
+        n_env = int(env.shape[0])
+        if bpm <= 0 or n_env <= 8 or dt <= 0:
+            return 0.0, 0.0
+        bl = 60.0 / float(bpm)
+        dur = n_env * dt
+        cnt = int((dur - anchor) / bl)
+        if cnt < 8:
+            return 0.0, 0.0
+        ts = anchor + np.arange(cnt, dtype=np.float64) * bl
+        w = max(1, int(round(half_win * bl / dt)))
+        e = np.asarray(env, dtype=np.float64)
+        vals = np.empty(cnt, dtype=np.float64)
+        for i, t in enumerate(ts):
+            c = int(round(t / dt))
+            lo = max(0, c - w)
+            hi = min(n_env, c + w + 1)
+            vals[i] = e[lo:hi].max() if hi > lo else 0.0
+        even, odd = vals[0::2], vals[1::2]
+        m = min(even.size, odd.size)
+        if m < 4:
+            return 0.0, 0.0
+        return float(even[:m].mean()), float(odd[:m].mean())
+    except Exception:                                            # noqa: BLE001
+        return 0.0, 0.0
+
+
+def octave_fix(f, env, bpm, anchor):
+    """若当前 bpm 是「2× 高估」，返回 bpm/2；否则原样返回。
+
+    ⚠ 只能纠「太快」，纠不了「太慢」：估成半速时每一拍槽都有 kick（奇偶一样满），
+      从能量上看不出任何异常 —— 那是纯音乐歧义，交给用户/VDJ 决定。
+    """
+    try:
+        bpm = float(bpm)
+        if bpm <= 0:
+            return bpm
+        half = bpm / 2.0
+        if half < OCT_LO:
+            return bpm
+        even, odd = beat_slot_energy(f, env, bpm, anchor)
+        if even <= 1e-9:
+            return bpm
+        balance = odd / even
+        if balance < OCT_BALANCE_MIN:
+            return half
+        return bpm
+    except Exception:                                            # noqa: BLE001
+        return bpm
+
+
+def _octave_norm(b, ref):
+    """把 b 折算到「与 ref 同一八度」的值（2 的整数次幂缩放）。"""
+    try:
+        b, ref = float(b), float(ref)
+        if b <= 0 or ref <= 0:
+            return b
+        r = b / ref
+        while r > 1.5:
+            r /= 2.0
+        while r < 0.75:
+            r *= 2.0
+        return ref * r
+    except Exception:                                            # noqa: BLE001
+        return b
+
+
+def analyze_bpm_only(mono, sr):
+    """只估 BPM（features + scan + pick），**不跑 Beat This、不算相位**。
+
+    多窗投票只需要 BPM；这样每窗约 0.6s，比整套分析便宜 3 倍。
+    """
+    try:
+        f = features(mono, sr)
+        env = onset_env(f, "mix")
+        peaks = scan_bpm(f, env)
+        bpm, _ = pick_bpm(peaks)
+        return float(bpm or 0.0)
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def analyze_vote(mono, sr):
+    """整曲主分析 + **额外窗口只投 BPM**。
+
+    ★ 2026-10-28 第二版（第一版踩坑记录）：第一版对 3 个窗口各跑一次完整分析、
+      再把 BPM 与 anchor 一起投票 —— 实测**相位被打崩**（小节 82%→28%）。
+      原因是短窗的小节相位本就比整段差（Beat This 只看 60s），投票反而降级。
+      ⇒ 正确做法：**相位/乐句始终用整段主分析**（那条路有 Beat This 兜底），
+        只有 BPM 这一个维度用多窗投票（BPM 是整曲恒定的，短窗一样准）。
+    """
+    n = len(mono)
+    dur = n / float(sr)
+    a_full = analyze_signal(mono, sr)
+    if not a_full or a_full.get("bpm", 0) <= 0:
+        return a_full
+    win = int(min(VOTE_WIN_SEC, max(20.0, dur / 3.0)) * sr)
+    if n <= win * 1.3:                       # 太短：投票没意义
+        return a_full
+
+    votes = [float(a_full["bpm"])]
+    for f_frac in (0.45, 0.80):
+        st = int(max(0, min(n - win, f_frac * max(0, n - win))))
+        b = analyze_bpm_only(mono[st:st + win], sr)
+        if b > 0:
+            votes.append(b)
+    ref = votes[0]
+    cand = [_octave_norm(b, ref) for b in votes]
+    cand.sort()
+    bpm_vote = cand[len(cand) // 2]
+
+    if abs(bpm_vote - ref) <= 0.5:
+        a_full["vote"] = {"bpms": [round(v, 2) for v in votes], "pick": round(bpm_vote, 2),
+                          "changed": False}
+        return a_full
+
+    # 投票结果与主分析不同 ⇒ 用新 BPM 在**整段**上重算相位（保留 Beat This 的小节头不现实，
+    # 因为它给的 anchor 是按它自己的 BPM；这里退回纯相位估计，并把它标成低置信）
+    period = 60.0 / bpm_vote
+    f = features(mono, sr)
+    env = onset_env(f, "mix")
+    base, conc = phase_of(f, env, period)
+    phrase, contrast, _ = phrase_phase(f, base, period)
+    a_full = dict(a_full)
+    a_full["bpm"] = round(bpm_vote, 4)
+    a_full["bpm_auto"] = round(bpm_vote, 3)
+    a_full["anchor"] = round(base + phrase * period, 4)
+    a_full["base_anchor"] = round(base, 4)
+    a_full["phrase"] = int(phrase)
+    a_full["contrast"] = round(float(contrast), 3)
+    a_full["phase_conc"] = round(float(conc), 3)
+    a_full["bt"] = False
+    a_full["vote"] = {"bpms": [round(v, 2) for v in votes], "pick": round(bpm_vote, 2),
+                      "changed": True}
+    return a_full
+
+
+def analyze_track(path, maxsec=180.0, anchor_hint=None, bpm_hint=None, do_scan=True,
+                  vote=None):
+    """读文件后分析（见 `analyze_signal`）。
+
+    `vote=True` 时走多窗投票（`analyze_vote`）；默认：**没有外部提示 + 需要自算**时开启。
+    """
     mono, sr = load_mono(path, maxsec=maxsec)
+    # ⚠ 2026-10-28 实测：**默认关闭**。多窗投票在这 50 首上整体更差
+    #   （BPM 48→42、小节相位 43→36、乐句 37→32）：短窗的小节相位本来就不如整段，
+    #   投票把好的也拉低了。真要开，显式传 vote=True（代码保留备用）。
+    if vote is None:
+        vote = False
+    if vote:
+        return analyze_vote(mono, sr)
     return analyze_signal(mono, sr, anchor_hint=anchor_hint, bpm_hint=bpm_hint,
                           do_scan=do_scan)
 
@@ -348,15 +517,47 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
         except Exception:                                        # noqa: BLE001
             bt_used = False
 
-    if (do_scan and not bt_used) or not bpm_hint:
+    # ★★ 2026-10-28（BPM 46/50 → 目标更高）：**扫描与 Beat This 交叉校验**。
+    #   实测（VDJ 当标准答案）：`scan_bpm` 的 top-1 大多是对的
+    #     （Extra Pain 99.40 / DeepSleep 175.00 / Cursed Haze 170.00 / Floating Globe 140.00），
+    #   反倒是 **Beat This 给的 BPM 会把它们改坏**（99.4→199.7、175→179.9）。
+    #   所以：BPM 以**扫描**为主；Beat This 只负责它真正擅长的「哪一拍是小节头」。
+    #   ⚠ 但仍保留"扫描不可信时听 Beat This"的退路（两者折叠分数差得多时）。
+    if bt_used:
+        peaks = scan_bpm(f, env)          # 额外做一次扫描（约 0.4s），用于交叉校验
+        bpm_auto, _ = pick_bpm(peaks)
+    elif (do_scan and not bt_used) or not bpm_hint:
         peaks = scan_bpm(f, env)
         bpm_auto, _ = pick_bpm(peaks)
     else:
-        peaks, bpm_auto = [], (float(bpm_hint) if bt_used else 0.0)
+        peaks, bpm_auto = [], (float(bpm_hint) if bpm_hint else 0.0)
 
     bpm = float(bpm_hint) if bpm_hint else bpm_auto
     if bpm <= 0:
         bpm = bpm_auto
+    # ---- 交叉校验：Beat This 的 BPM vs 我们的扫描 ----
+    _bt_bpm = float(bpm_hint) if (bt_used and bpm_hint) else 0.0
+    if _bt_bpm > 0 and bpm_auto > 0:
+        _same = abs(_bt_bpm - bpm_auto) <= 0.03 * bpm_auto
+        _ratio = _bt_bpm / bpm_auto if bpm_auto > 0 else 1.0
+        _double = abs(_ratio - 2.0) < 0.08          # bt 恰好是扫描的 2×
+        if _same:
+            bpm = bpm_auto                      # 一致 ⇒ 用扫描的（细扫精度更高）
+        elif _double:
+            # ★ 只在「正好差 2×」这一种情形改判 —— 这是唯一有硬证据的歧义
+            #   （Extra Pain：bt 199.7 / 扫描 99.4 / VDJ 99.95）。
+            #   ⚠ 不能用"扫描 vs bt 谁分高就信谁"：实测那样整体从 46/50 掉到 44/50，
+            #     因为多数歌 Beat This 的 BPM 本来是对的。
+            try:
+                _t = (np.arange(env.shape[0]) * f["dt"]).astype(np.float64)
+                _e = env.astype(np.float64)
+                _s_auto = float(grid_conc(_t, _e, 60.0 / bpm_auto)[0])
+                _s_bt = float(grid_conc(_t, _e, 60.0 / _bt_bpm)[0])
+            except Exception:                                    # noqa: BLE001
+                _s_auto, _s_bt = 0.0, 1.0
+            if _s_auto > _s_bt:
+                bpm = bpm_auto
+        # 其它不一致（±3%~任意）：**保持 Beat This 的结论**（原行为），不动。
     period = 60.0 / bpm if bpm > 0 else 0.5
 
     if anchor_hint is not None:
@@ -364,11 +565,47 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
         #   折叠会丢掉这个信息，使八拍头整体平移（实测踩过）。
         base = float(anchor_hint)
         conc = 0.0
+    elif bt_used and _bt_bpm > 0 and abs(bpm - _bt_bpm) > 0.5:
+        # BPM 被扫描改掉、但 Beat This 的**拍点位置仍然可用**（它是拍位置，不随倍速变）
+        # ⇒ 以它为先验挑相位，而不是完全丢掉这份信息。
+        base, conc = phase_of(f, env, period)
+        try:
+            _ba = float(anchor_hint) if anchor_hint is not None else 0.0
+            if _ba > 0:
+                _best, _bd = base, 1e9
+                for _i in range(4):          # 4 个候选小节头，取离 bt 拍点最近的那个
+                    _c = base + _i * period
+                    _d = abs((_c - _ba) % (4.0 * period))
+                    _d = min(_d, 4.0 * period - _d)
+                    if _d < _bd:
+                        _best, _bd = _c, _d
+                base = _best
+        except Exception:                                        # noqa: BLE001
+            pass
     else:
         base, conc = phase_of(f, env, period)
 
     phrase, contrast, _ = phrase_phase(f, base, period)
     anchor = base + phrase * period
+
+    # ★ 2026-10-28：**倍速消歧**。只在"没有外部 BPM"时做（VDJ 给了 bpm_hint 就不动）。
+    #   ⚠ Beat This（bt_used）也要纠：它给的 BPM 同样会落在 2× 上
+    #     （实测 Extra Pain 99.95→199.73、System Overloaded 87.5→175.12）；
+    #     但它给的**小节头 anchor 仍然可信**（那是一拍位置，不随倍速变）⇒
+    #     减半后**沿用它的 anchor** 重算乐句相位，不要退回纯相位估计。
+    if bpm_hint is None:
+        bpm2 = octave_fix(f, env, bpm, anchor)
+        if abs(float(bpm2) - float(bpm)) > 0.5:
+            bpm = float(bpm2)
+            bpm_auto = bpm
+            period = 60.0 / bpm
+            if bt_used:
+                base = anchor          # 保留 Beat This 的拍点位置
+                conc = 0.0
+            else:
+                base, conc = phase_of(f, env, period)
+            phrase, contrast, _ = phrase_phase(f, base, period)
+            anchor = base + phrase * period
 
     return {
         "bpm": round(float(bpm), 4),
@@ -648,6 +885,7 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
     bpm_hint = e["bpm"] if e else None
     anchor_hint = e["anchor"] if e else None
     try:
+        # ⚠ 2026-10-28：库扫描**不用**多窗投票（实测更差，见 analyze_track 注释）。
         a = analyze_signal(mono, sr, anchor_hint=anchor_hint, bpm_hint=bpm_hint,
                            do_scan=do_scan)
     except Exception as ex:            # noqa: BLE001
