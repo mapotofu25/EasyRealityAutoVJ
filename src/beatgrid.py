@@ -46,7 +46,18 @@ F_MID = (200.0, 2000.0)    # 人声 / 主奏
 F_HIGH = (2000.0, 9000.0)  # hihat
 
 BPM_MIN, BPM_MAX = 60.0, 220.0   # 上限 220：Frenchcore/Uptempo 200~220 BPM（2026-10-27 高 BPM 支持）
-BPM_PRIOR = (110.0, 190.0)  # DJ 音乐的先验区间：半速歧义时优先取落在这里的候选
+# ★★ 2026-10-29：上界 190 → **210**。
+#   实测（76 首带 VDJ 参照：老曲库 59 首 + `W://qq//新建文件夹` 17 首）：
+#     190 ⇒ 老曲库 51/59、新目录 8/17，合计 59/76
+#     210 ⇒ 老曲库 51/59、新目录 13/17，合计 64/76   ← 老曲库**一首都没退化**
+#   原因：东方同人 / Hardcore / Frenchcore 的主体在 200~210，旧上界把它们整族
+#   挡在区间外 ⇒ `pick_bpm` 退化成 top-1（往往是半速 100），
+#   实测 10 昏樹海 / 11 緋魔殞罪 / 3 Time Massacre / 9 Oblivious 全是这个病症。
+#   ⚠ 再往上扩（220）会开始引入伪峰：200→220 那几档合计掉到 63/76。
+#   ⚠ 下界 110 不动：降到 100 会让"200 BPM 的曲子被判成 100"复辟（合计 61/76）。
+#   ⚠⚠ 编排端 `EasyRealityCue/src/ercue/model/bpm_core.py` 有同一行，**待同步**
+#      （用户 2026-10-29 明确：AutoVJ 全部验完再动 ercue / erlib）。
+BPM_PRIOR = (110.0, 210.0)  # DJ 音乐的先验区间：半速歧义时优先取落在这里的候选
 PHRASE_MIN, PHRASE_MAX = 0.62, 1.30   # 八拍相位对比度阈值（低于此判定"证据不足"）
 
 DEFAULT_VDJ = ""           # 不硬编码路径，统一由 vdj_db_path() 自动探测
@@ -69,9 +80,15 @@ def resample(mono, sr0, sr_target=SR_TARGET):
     n_out = int(len(mono) * sr_target / sr0)
     if n_out <= 1:
         return mono, sr0
-    idx = np.linspace(0.0, len(mono) - 1.0, n_out).astype(np.float32)
-    i0 = np.floor(idx).astype(np.int32)
-    i1 = np.minimum(i0 + 1, len(mono) - 1)
+    # ★★ 2026-10-29 真机抓到（W:\qq\新建文件夹\11 緋魔殞罪 466 秒 FLAC 直接崩）：
+    #   `idx` 原来 `.astype(np.float32)`，而 float32 在 2^24(16777216) 以上最小间隔是 **2**，
+    #   最后一个采样点 22367999 被舍入成 **22368000** ⇒ `i0` 越界 1 个 ⇒ IndexError。
+    #   触发条件：48kHz 下长度 > ≈350 秒（= 16777216/48000），短曲永远测不出来。
+    #   ⇒ 索引用 **float64** 算，并且显式 clip（linspace 的端点浮点误差也不该靠运气）。
+    _n = int(len(mono))
+    idx = np.linspace(0.0, float(_n - 1), n_out)          # float64
+    i0 = np.clip(np.floor(idx), 0, _n - 1).astype(np.int64)
+    i1 = np.minimum(i0 + 1, _n - 1)
     frac = (idx - i0).astype(np.float32)
     out = mono[i0] * (1.0 - frac) + mono[i1] * frac
     return np.ascontiguousarray(out, dtype=np.float32), sr_target
@@ -542,7 +559,8 @@ def scan_bpm(f, env, lo=BPM_MIN, hi=BPM_MAX, coarse=1.0, fine=0.05,
 
 
 def pick_bpm(peaks):
-    """从候选里挑「真实 BPM」：优先落在 DJ 先验区间 [110,190]，且分数足够接近最高分。
+    """从候选里挑「真实 BPM」：优先落在 DJ 先验区间 `BPM_PRIOR`（现 [110,210]），
+    且分数足够接近最高分。
 
     为什么必须这么做：把 onset 按周期折叠时，**半速值（BPM/2）往往得分更高**
     （kick 每 2 拍响一次时，周期翻倍会让所有 kick 落进同一相位）。
@@ -891,38 +909,29 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
     bpm = float(bpm_hint) if bpm_hint else bpm_auto
     if bpm <= 0:
         bpm = bpm_auto
-    # ---- 交叉校验：Beat This 的 BPM vs 我们的扫描 ----
+    # ---- BPM 归属：**同族听扫描、跨族交给命中率仲裁** ----
+    #   ① 同族（两者只差 2^n，含完全相等）⇒ 用扫描的
+    #      `pick_bpm` 已经用「先验区间 [110,210] + 0.7×最高分」把半速歧义定完了，
+    #      Beat This 再翻倍/砍半只会把它改坏。实测（`tools/_eval_bpm_pick.py`）：
+    #        · 11 緋魔殞罪 bt=100.02 / 扫描 200.00 ⇒ 旧逻辑保留 bt ⇒ 半速错
+    #        · 2 Mare Merum bt=74.02 / 扫描 148.00 ⇒ 同上
+    #        · 9 Oblivious bt=98.67 / 扫描 199.95 ⇒ 同上
+    #      这一族错误在新目录里占 5 首，是"200 BPM 全成 100"的主因。
+    #   ② 跨族（连 2^n 都凑不上）⇒ 两者是**不同的节奏假设**，用
+    #      `tempo_fit_score`（前 1/3 段拟合相位、测所有段每拍命中率）仲裁：
+    #      哪边让"整首每一拍都落在鼓点上"，就用哪边。
+    #      基线（老曲库 59 首）里 bt 对而扫描错的曲子靠这一条（`Euphoria In Mind`
+    #      扫描 99.4 落在 3:2 伪峰上、bt 150 才是对的）。
+    #   ⚠ 必须"bt 领先 ≥ TEMPO_FIT_MARGIN 才采纳 bt"：默认用扫描，
+    #     否则会把 `Power Generator`（扫描 147 领先 bt 141.77 达 17.5 点）改回错的。
     _bt_bpm = float(bpm_hint) if (bt_used and bpm_hint) else 0.0
+    if bpm_auto > 0:
+        bpm = bpm_auto
     if _bt_bpm > 0 and bpm_auto > 0:
         _same = abs(_bt_bpm - bpm_auto) <= 0.03 * bpm_auto
-        _ratio = _bt_bpm / bpm_auto if bpm_auto > 0 else 1.0
-        _double = abs(_ratio - 2.0) < 0.08          # bt 恰好是扫描的 2×
-        if _same:
-            bpm = bpm_auto                      # 一致 ⇒ 用扫描的（细扫精度更高）
-        elif _double:
-            # ★ 只在「正好差 2×」这一种情形改判 —— 这是唯一有硬证据的歧义
-            #   （Extra Pain：bt 199.7 / 扫描 99.4 / VDJ 99.95）。
-            #   ⚠ 不能用"扫描 vs bt 谁分高就信谁"：实测那样整体从 46/50 掉到 44/50，
-            #     因为多数歌 Beat This 的 BPM 本来是对的。
-            try:
-                _t = (np.arange(env.shape[0]) * f["dt"]).astype(np.float64)
-                _e = env.astype(np.float64)
-                _s_auto = float(grid_conc(_t, _e, 60.0 / bpm_auto)[0])
-                _s_bt = float(grid_conc(_t, _e, 60.0 / _bt_bpm)[0])
-            except Exception:                                    # noqa: BLE001
-                _s_auto, _s_bt = 0.0, 1.0
-            if _s_auto > _s_bt:
-                bpm = bpm_auto
-        else:
-            # ★★ 2026-10-28（用户报 `Power Generator` BPM 不对、网格对不上）：
-            #   两者差**既非一致也非 2×**（实测 bt 141.77 / 扫描 147.00，差 3.6%），
-            #   旧行为是「保持 Beat This 的结论」⇒ 直接采用了错的 141.77。
-            #   这种「小幅但真实」的错最阴：`grid_conc` 只差 12%（4.74 vs 4.22）判不出，
-            #   但 200 秒后相位累积漂 18 拍，网格后半段完全反相。
-            #   ⇒ 用 `tempo_fit_score`（前 1/3 段拟合相位，测所有段的每拍命中率）：
-            #     这首实测 82%/84%/67%（147）vs 51%/54%/45%（141.8），差 28 个百分点。
-            #   ⚠ 必须「领先 ≥ TEMPO_FIT_MARGIN 且两段以上可比」才改判，
-            #     否则一律保持原行为（多数歌 Beat This 的 BPM 是对的）。
+        _p2 = _octave_norm(_bt_bpm, bpm_auto)
+        _same_oct = abs(_p2 - bpm_auto) <= 0.03 * bpm_auto
+        if not (_same or _same_oct):
             try:
                 _t = (np.arange(env.shape[0]) * f["dt"]).astype(np.float64)
                 _e = env.astype(np.float64)
@@ -931,11 +940,8 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
             except Exception:                                    # noqa: BLE001
                 _fa, _fb, _ra, _rb = 0.0, 0.0, [], []
             if (len(_ra) >= TEMPO_FIT_MIN_SEG and len(_rb) >= TEMPO_FIT_MIN_SEG
-                    and (_fa - _fb) >= TEMPO_FIT_MARGIN):
-                bpm = bpm_auto
-                # 扫描胜出时，若扫描与 bt 同相（相位差 < 1/4 拍）可沿用 bt 的 anchor；
-                # 但 tempo_fit 的相位是按「第一段」拟合的，不能直接当整曲 anchor 用，
-                # 交给下面的 anchor 分支重算（`abs(bpm-_bt_bpm)>0.5` 会进那个分支）。
+                    and (_fb - _fa) >= TEMPO_FIT_MARGIN):
+                bpm = _bt_bpm
     period = 60.0 / bpm if bpm > 0 else 0.5
 
     if anchor_hint is not None:

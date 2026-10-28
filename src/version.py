@@ -59,11 +59,19 @@ HIGHLIGHTS = [
      "right-clicking the waveform"),
     ("本地网格分析与 BPM", "Local beat grid & BPM",
      "自己算拍长和八拍头，不依赖外部软件：拿 VDJ 曲库当标准答案对照 59 首，"
-     "51 首 BPM 一致（86%）、43 首小节相位对齐（73%）；"
+     "52 首 BPM 一致（88%）、44 首小节相位对齐（75%）、42 首乐句对齐（71%）；"
+     "200~210 BPM 的 Hardcore / 东方同人不再被判成半速；"
      "可选神经网络只用来指认「哪一拍是小节头」；详情页还能整段微调或半速/倍速",
      "Computes beat length and downbeats on its own: against 59 rekordbox/VDJ tracks, "
-     "51 agree on BPM (86%) and 43 on bar phase (73%); an optional neural model only "
+     "52 agree on BPM (88%), 44 on bar phase (75%), 42 on phrase (71%); 200-210 BPM "
+     "hardcore no longer collapses to half speed; an optional neural model only "
      "decides which beat starts the bar; the details page can shift or halve/double it"),
+    ("长曲不再崩", "Long tracks no longer crash",
+     "6 分钟以上的曲目做节拍分析时会因索引越界直接中断（float32 在 1600 万以上"
+     "精度只剩 2，末端采样点被舍入到数组外）；改成 float64 并显式钳位",
+     "Beat analysis aborted on tracks longer than ~6 minutes (float32 loses precision "
+     "above 16.7 million, rounding the last sample past the end); now uses float64 "
+     "with an explicit clamp"),
     ("多 BPM 段自动识别", "Auto multi-tempo segments",
      "一首歌里中途变速也能分开：逐段测「当前网格对不对得上」，对不上才局部重估 BPM；"
      "恒速歌多花不到 0.1 秒、结果不变。实测 74 首恒速曲零误判，"

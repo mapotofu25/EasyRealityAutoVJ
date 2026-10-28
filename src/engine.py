@@ -3862,8 +3862,20 @@ class AutoVJEngine(QObject):
                 _rv = float(getattr(_trk, "rate", 1.0))
             except (TypeError, ValueError):
                 _rv = 1.0
+            # ★ 2026-10-29：行尾**追加** `E=`（实测能量）与 `tier=`（当前能量档位）。
+            #   为什么要它：用户要"验证能量识别得准不准"，而 VDJ 的 database.xml
+            #   **没有能量字段**（只有 Volume 增益），唯一的真值来源就是本软件的实测值 ——
+            #   不落盘就完全无法离线核对曲线。
+            #   ⚠ 按铁律**一律追加在行尾**，不改既有字段顺序（既有 regex / 解析脚本不破）。
+            _ev, _tier = 0.0, "-"
+            try:
+                _ev = float(getattr(st, "energy", 0.0) or 0.0)
+                _tier = str(getattr(self, "_last_energy_tier", "") or "-")
+            except (TypeError, ValueError):
+                pass
             line = ("[%s] silent=%.1fs sid=%s votes=%d off=%.2f status=%s pb=%s "
                     "| sheet=%d track=%s rt=%d items=%d pos=%s sub=%d/%d dmax=%.2f spd=%s fw=%d why=%s r=%.3f dark=%.2f/%d"
+                    " E=%.2f tier=%s"
                     % (time.strftime("%H:%M:%S"), silent, sid, int(votes or 0),
                        float(off if off is not None else -1.0), status,
                        ("%.1f" % pb) if pb is not None else "None",
@@ -3877,7 +3889,8 @@ class AutoVJEngine(QObject):
                        (getattr(self, "_cue_tick_why", "") or "-"),
                        _rv,
                        float(getattr(self, "_cue_dark_max", 0.0) or 0.0),
-                       int(getattr(self, "_cue_dark_n", 0) or 0)))
+                       int(getattr(self, "_cue_dark_n", 0) or 0),
+                       _ev, _tier))
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
