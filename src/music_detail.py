@@ -344,6 +344,10 @@ class MusicDetailDialog(QDialog):
         self.wave.set_waveform(self._wf)
         self.wave.set_grid(self._grid)
         self.wave.set_manual(mm)
+        # ★ 2026-10-28：自动分析出的多 BPM 段要显示出来（用户手动分段优先）。
+        #   只做「显示」，不写进 grid_manual —— 见 `_effective_manual` 里的同源判断。
+        if not mm.get("segments") and (self._grid or {}).get("segments"):
+            self.wave.set_segments(self._grid["segments"])
         self.wave.set_playhead(0.0)
         self._dirty = False
         self._refresh_lists()
@@ -354,12 +358,35 @@ class MusicDetailDialog(QDialog):
         bpm_m = self.spin_bpm.value() if self.chk_manual.isChecked() else 0.0
         anchors = self.wave.anchors()
         segments = self.wave.segments()
+        # ★★ 2026-10-28：自动分段「只显示、不落成手动」。
+        #   波形控件只有一份 `_segments`，自动结果也画在那里；若原样写进 grid_manual，
+        #   `effective_grid` 就会走 manual 分支（src="manual"），之后重扫也不更新。
+        #   判据：与自动结果等价 ⇒ 视为「用户没改过」⇒ 不写。
+        auto = (self._grid or {}).get("segments") or []
+        if auto and self._segments_equal(segments, auto):
+            segments = []
         m = {"bpm_manual": round(float(bpm_m), 3),
              "anchors": [round(a, 4) for a in anchors],
              "segments": segments}
         if m["bpm_manual"] <= 0 and not m["anchors"] and not m["segments"]:
             return None
         return m
+
+    @staticmethod
+    def _segments_equal(a, b, tol=0.01):
+        """两串分段是否等价（按 t0+bpm 比，容差 `tol` 秒 / `tol`*bpm）。"""
+        try:
+            if len(a) != len(b):
+                return False
+            for x, y in zip(a, b):
+                if abs(float(x.get("t0") or 0.0) - float(y.get("t0") or 0.0)) > tol:
+                    return False
+                bx, by = float(x.get("bpm") or 0.0), float(y.get("bpm") or 0.0)
+                if abs(bx - by) > max(0.05, tol * max(bx, by)):
+                    return False
+            return True
+        except (TypeError, ValueError, AttributeError):
+            return False
 
     def _update_title(self):
         self.setWindowTitle("歌曲详情%s" % (" *" if self._dirty else ""))

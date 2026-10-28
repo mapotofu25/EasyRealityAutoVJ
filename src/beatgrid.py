@@ -156,6 +156,323 @@ def grid_conc(t, env, period, nbins=32):
     return float(h.max() / (h.mean() + 1e-12)), h
 
 
+TEMPO_FIT_MARGIN = 0.12      # 跨段命中率领先多少个百分点才改判（0.12 = 12 点）
+TEMPO_FIT_MIN_SEG = 2        # 至少这么多段可比才敢改判（短曲退回原行为）
+
+
+def tempo_fit_score(t, env, bpm, tol=0.05, nseg=3, min_beats=32):
+    """跨段一致度（0~1）：用**前 1/nseg 段拟合相位**，再测**所有段**每拍 ±tol 的命中率。
+
+    为什么需要它（真实案例 2026-10-28 `Power Generator`）：
+      扫描给 147.00、Beat This! 给 141.77，差 3.6% —— 既不是「一致」也不是「2×」。
+      `grid_conc` 集中度只差 12%（4.74 vs 4.22，判不出来），但 200 秒后相位累积漂了
+      **18 拍**（后半段完全反相）。跨段命中率差 28 个百分点（82%/84%/67% vs 51%/54%/45%）。
+      ⇒ 「集中度」看整首折叠，对「周期略错」不敏感；「跨段」才会暴露累积漂移。
+
+    ⚠ 必须用**同一个 anchor**去测所有段。每段各自重新拟合相位会把慢漂移抹平，
+      那样两个候选都能对齐，判据失效。
+
+    返回 `(score, anchor, rates)`；样本太少 / 参数非法 ⇒ `(0.0, 0.0, [])`。
+    """
+    try:
+        bl = 60.0 / float(bpm)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0, 0.0, []
+    n = int(len(t))
+    if bl <= 0.0 or n < 16 or len(env) != n:
+        return 0.0, 0.0, []
+    dt = float(t[1] - t[0])
+    if dt <= 0.0:
+        return 0.0, 0.0, []
+    dur = float(t[-1])
+    if dur < bl * min_beats * 2:            # 太短：连两段都凑不出，交给调用方保守处理
+        return 0.0, 0.0, []
+    e = env.astype(np.float64)
+    seg = dur / float(nseg)
+
+    # ① 只用第一段定相位（后面各段都拿它来测）
+    m = (t >= 0.0) & (t < seg)
+    if int(m.sum()) < 8:
+        return 0.0, 0.0, []
+    _sc, h = grid_conc(t[m], e[m], bl, 96)
+    ph = (int(np.argmax(h)) + 0.5) / 96.0 * bl
+    if ph > bl * 0.5:
+        ph -= bl
+
+    # ② 各段命中率（每拍 ±tol 内 onset 最大值 > 0.25 记命中）
+    rates = []
+    for i in range(nseg):
+        a = i * seg
+        b = dur if i + 1 >= nseg else (i + 1) * seg
+        n0 = int(np.ceil((a - ph) / bl))
+        n1 = int(np.floor((b - ph) / bl))
+        if n1 - n0 < 8:
+            continue
+        beats = ph + np.arange(n0, n1 + 1) * bl
+        i0 = np.maximum(0, np.round((beats - tol) / dt).astype(np.int64))
+        i1 = np.minimum(n - 1, np.round((beats + tol) / dt).astype(np.int64))
+        vals = []
+        for s0, s1 in zip(i0, i1):
+            if s1 > s0:
+                vals.append(float(e[s0:s1 + 1].max()))
+        if not vals:
+            continue
+        v = np.asarray(vals)
+        rates.append(float((v > 0.25).mean()))
+    if not rates:
+        return 0.0, ph, []
+    return float(np.mean(rates)), float(ph), rates
+
+
+# ---- 分段 BPM（多 BPM 段的歌，如变速曲 / 拼接曲）----
+SEG_ENABLE = True
+SEG_WIN = 20.0            # 分段判定窗长（秒）
+SEG_STEP = 5.0            # 滑窗步长
+SEG_MIN_DUR = 30.0        # 一段至少 30 秒（20s 会放过「过渡/加花」假段）
+SEG_BAD_HIT = 0.55        # 全曲 BPM 下命中率低于此 ⇒ 该窗可疑
+SEG_GOOD_HIT = 0.70       # 换成局部 BPM 后至少这么高才算「这段是另一个 BPM」
+SEG_GAIN = 0.15           # 且要比原来高出这么多（百分点）
+SEG_BPM_TOL = 0.05        # 差 <5% 视为同一段（噪声/过渡段的量级）
+SEG_LOW_ENERGY = 0.25     # 窗能量低于全局中位的这个比例 ⇒ 没鼓（前奏/间奏），不参与
+SEG_HOP = 256             # 分段检测专用高帧率（默认 HOP=1024 时每拍只有 ~7 帧，不够）
+
+
+def _seg_hit_rate(t, e, bpm, anchor, t0, t1, tol=0.05, rel=70.0, floor=0.12):
+    """每拍 ±tol 内 onset 最大值，超过「该段 onset 的 `rel` 分位」记命中。
+
+    ⚠ 阈值必须**按段自适应**：固定 0.25 会把轻节奏段整段判死
+      （实测 `Dust` 的 128 BPM 段 onset 峰值只有 0.20~0.25，明明对齐了却记 0 命中）。
+    """
+    try:
+        bl = 60.0 / float(bpm)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    dt = float(t[1] - t[0]) if len(t) > 1 else 0.0
+    if bl <= 0 or dt <= 0:
+        return 0.0
+    n0 = int(math.ceil((t0 - anchor) / bl))
+    n1 = int(math.floor((t1 - anchor) / bl))
+    if n1 - n0 < 4:
+        return 0.0
+    beats = anchor + np.arange(n0, n1 + 1) * bl
+    i0 = np.maximum(0, np.round((beats - tol) / dt).astype(np.int64))
+    i1 = np.minimum(len(e) - 1, np.round((beats + tol) / dt).astype(np.int64))
+    vals = [float(e[a:b + 1].max()) for a, b in zip(i0, i1) if b > a]
+    if not vals:
+        return 0.0
+    m = (t >= t0) & (t < t1)
+    thr = floor
+    if int(m.sum()) >= 8:
+        thr = max(floor, float(np.percentile(e[m], rel)))
+    return float((np.asarray(vals) > thr).mean())
+
+
+def _seg_local_anchor(tw, ew, bpm, nbins=128):
+    """该 BPM 下最集中的相位（秒，归一到 [-bl/2, bl/2)，全局时间轴坐标）。"""
+    if len(tw) < 8 or bpm <= 0:
+        return 0.0
+    bl = 60.0 / bpm
+    _sc, h = grid_conc(tw, ew, bl, nbins)
+    ph = (int(np.argmax(h)) + 0.5) / nbins * bl
+    if ph > bl * 0.5:
+        ph -= bl
+    return float(ph)
+
+
+def _seg_local_bpm(t, e, t0, t1, lo=BPM_MIN, hi=BPM_MAX):
+    """局部区间 BPM（粗 1.0 → 细 0.05，与 `scan_bpm` 同一套两级做法）。"""
+    m = (t >= t0) & (t < t1)
+    if int(m.sum()) < 30:
+        return 0.0
+    tw, ew = t[m], e[m]
+    best_b, best_s = 0.0, 0.0
+    for b in np.arange(lo, hi + 1e-9, 1.0):
+        s = grid_conc(tw, ew, 60.0 / b, 64)[0]
+        if s > best_s:
+            best_b, best_s = float(b), float(s)
+    if best_b <= 0:
+        return 0.0
+    for b in np.arange(max(lo, best_b - 1.0), min(hi, best_b + 1.0) + 1e-9, 0.05):
+        s = grid_conc(tw, ew, 60.0 / b, 64)[0]
+        if s > best_s:
+            best_b, best_s = float(b), float(s)
+    return best_b
+
+
+def detect_segments(mono, sr, f, env, bpm0, anchor0, enable=None):
+    """**多 BPM 段检测**（用户 2026-10-28 问「一首歌有多个 BPM 段怎么办」）。
+
+    返回 `[{"t0","t1","bpm","beat_len","anchor"}, …]`；判定为恒速 ⇒ 返回 `[]`
+    （调用方就保持「全曲单 BPM」，行为与以前完全一致）。
+
+    ## 为什么这么设计
+    - **恒速歌零额外成本**：先用低帧率逐窗测「全曲 BPM 下的命中率」，全过关就直接返回 `[]`。
+      只有过关失败的（可疑变速）才重算 `SEG_HOP` 高帧率 —— 46ms/帧 时 175 BPM 每拍只有
+      7 帧，相位直方图稀疏到会随机翻边，152/175 分辨不出来（实测）。
+    - **判据三条缺一不可**：① 该窗在全曲 BPM 下命中率塌了；② 该窗有鼓（不是前奏）；
+      ③ 换局部 BPM 后命中率明显更高。否则宁可判恒速 —— 误分段会让原本对的歌全乱。
+
+    ⚠ 边界一定「前段 t1 == 后段 t0」：`segment_at()` 是按 t0 取段的，
+      重叠会让引擎在重叠区取错段。
+    """
+    if enable is None:
+        enable = SEG_ENABLE
+    if not enable:
+        return []
+    try:
+        bpm0 = float(bpm0)
+    except (TypeError, ValueError):
+        return []
+    if bpm0 <= 0:
+        return []
+    return _detect_segments_impl(mono, sr, f, env, bpm0, float(anchor0 or 0.0))
+
+
+def _detect_segments_impl(mono, sr, f, env, bpm0, an0):
+    dt = f["dt"]
+    t = (np.arange(env.shape[0]) * dt).astype(np.float64)
+    e = env.astype(np.float64)
+    dur = float(t[-1])
+    if dur < SEG_WIN * 2:
+        return []
+
+    # ① 预检：恒速歌在这里就结束
+    wins = []
+    for w0 in np.arange(0.0, max(1.0, dur - SEG_WIN), SEG_STEP):
+        w1 = min(dur, w0 + SEG_WIN)
+        m = (t >= w0) & (t < w1)
+        if int(m.sum()) < 8:
+            continue
+        wins.append([float(w0), float(w1), float(e[m].mean())])
+    if not wins:
+        return []
+    ens = np.array([w[2] for w in wins])
+    med = float(np.median(ens)) or 1e-9
+    bad = 0
+    for w0, w1, en in wins:
+        if en < SEG_LOW_ENERGY * med:
+            continue
+        if _seg_hit_rate(t, e, bpm0, an0, w0, w1) < SEG_BAD_HIT:
+            bad += 1
+    if bad == 0:
+        return []
+
+    # ② 可疑 ⇒ 换高帧率重算（相位分辨率才够）
+    try:
+        f2 = features(mono, sr, hop=SEG_HOP)
+        env2 = onset_env(f2, "mix")
+    except Exception:                                        # noqa: BLE001
+        return []
+    dt = f2["dt"]
+    t = (np.arange(env2.shape[0]) * dt).astype(np.float64)
+    e = env2.astype(np.float64)
+    dur = float(t[-1])
+    peaks = scan_bpm(f2, env2)
+    bpm0, _ = pick_bpm(peaks)
+    if bpm0 <= 0:
+        return []
+    _sc, h = grid_conc(t, e, 60.0 / bpm0, 128)
+    an0 = (int(np.argmax(h)) + 0.5) / 128 * (60.0 / bpm0)
+    if an0 > 30.0 / bpm0:
+        an0 -= 60.0 / bpm0
+
+    wins = []
+    for w0 in np.arange(0.0, max(1.0, dur - SEG_WIN), SEG_STEP):
+        w1 = min(dur, w0 + SEG_WIN)
+        m = (t >= w0) & (t < w1)
+        if int(m.sum()) < 20:
+            continue
+        wins.append([float(w0), float(w1), float(e[m].mean()), 0.0, 0.0])
+    if not wins:
+        return []
+    ens = np.array([w[2] for w in wins])
+    med = float(np.median(ens)) or 1e-9
+
+    # ③ 逐窗判定
+    for w in wins:
+        w0, w1, en = w[0], w[1], w[2]
+        hr = _seg_hit_rate(t, e, bpm0, an0, w0, w1)
+        w[3], w[4] = bpm0, hr
+        if en < SEG_LOW_ENERGY * med or hr >= SEG_BAD_HIT:
+            continue
+        lb = _seg_local_bpm(t, e, w0, w1)
+        if lb <= 0:
+            continue
+        lb = min([lb, lb / 2.0, lb * 2.0], key=lambda x: abs(x - bpm0))
+        m = (t >= w0) & (t < w1)
+        if int(m.sum()) < 20:
+            continue
+        ph = _seg_local_anchor(t[m], e[m], lb)
+        lh = _seg_hit_rate(t, e, lb, ph, w0, w1)
+        if abs(lb / bpm0 - 1.0) > SEG_BPM_TOL and lh >= SEG_GOOD_HIT \
+                and lh - hr >= SEG_GAIN:
+            w[3], w[4] = lb, lh
+
+    # ④ run-length（边界相接，绝不重叠）
+    segs = []
+    for w in wins:
+        b = w[3]
+        if segs and abs(b / segs[-1]["bpm"] - 1.0) <= SEG_BPM_TOL:
+            segs[-1]["t1"] = w[1]
+        else:
+            if segs:
+                segs[-1]["t1"] = w[0]
+            segs.append({"t0": w[0], "t1": w[1], "bpm": b})
+    # 段内用整段重新估 BPM（逐窗值噪声大）
+    for s in segs:
+        lb = _seg_local_bpm(t, e, s["t0"], s["t1"])
+        if lb > 0:
+            s["bpm"] = lb
+    # 相邻同 BPM 合并
+    i = 1
+    while i < len(segs):
+        if abs(segs[i]["bpm"] / segs[i - 1]["bpm"] - 1.0) <= SEG_BPM_TOL:
+            segs[i - 1]["t1"] = segs[i]["t1"]
+            segs.pop(i)
+        else:
+            i += 1
+    # 短段并入更接近的邻居
+    changed = True
+    while changed and len(segs) > 1:
+        changed = False
+        for i, s in enumerate(segs):
+            if s["t1"] - s["t0"] >= SEG_MIN_DUR:
+                continue
+            tgt = i - 1 if i > 0 else None
+            if i + 1 < len(segs):
+                if tgt is None or abs(segs[i + 1]["bpm"] / s["bpm"] - 1.0) < \
+                        abs(segs[tgt]["bpm"] / s["bpm"] - 1.0):
+                    tgt = i + 1
+            if tgt is None:
+                continue
+            if tgt < i:
+                segs[tgt]["t1"] = s["t1"]
+            else:
+                segs[tgt]["t0"] = s["t0"]
+            segs.pop(i)
+            changed = True
+            break
+
+    if len(segs) < 2 or min(s["t1"] - s["t0"] for s in segs) < SEG_MIN_DUR:
+        return []                     # 判定为恒速 ⇒ 与旧行为一致
+
+    # ⑤ 补齐 beat_len / anchor（anchor = 段内落在真实拍上的位置）
+    out = []
+    for s in segs:
+        bl = 60.0 / s["bpm"]
+        m = (t >= s["t0"]) & (t < s["t1"])
+        try:
+            ph = _seg_local_anchor(t[m], e[m], s["bpm"]) if int(m.sum()) >= 8 else 0.0
+        except Exception:                                    # noqa: BLE001
+            ph = 0.0
+        n = int(math.ceil((s["t0"] - ph) / bl))
+        out.append({"t0": round(float(s["t0"]), 3),
+                    "bpm": round(float(s["bpm"]), 3),
+                    "beat_len": round(float(bl), 6),
+                    "anchor": round(float(ph + n * bl), 4)})
+    return out
+
+
 def scan_bpm(f, env, lo=BPM_MIN, hi=BPM_MAX, coarse=1.0, fine=0.05,
              topk=3, nbins=32):
     """粗扫 + 细扫两级，返回 [(bpm, score), …]（降序）。
@@ -557,7 +874,29 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
                 _s_auto, _s_bt = 0.0, 1.0
             if _s_auto > _s_bt:
                 bpm = bpm_auto
-        # 其它不一致（±3%~任意）：**保持 Beat This 的结论**（原行为），不动。
+        else:
+            # ★★ 2026-10-28（用户报 `Power Generator` BPM 不对、网格对不上）：
+            #   两者差**既非一致也非 2×**（实测 bt 141.77 / 扫描 147.00，差 3.6%），
+            #   旧行为是「保持 Beat This 的结论」⇒ 直接采用了错的 141.77。
+            #   这种「小幅但真实」的错最阴：`grid_conc` 只差 12%（4.74 vs 4.22）判不出，
+            #   但 200 秒后相位累积漂 18 拍，网格后半段完全反相。
+            #   ⇒ 用 `tempo_fit_score`（前 1/3 段拟合相位，测所有段的每拍命中率）：
+            #     这首实测 82%/84%/67%（147）vs 51%/54%/45%（141.8），差 28 个百分点。
+            #   ⚠ 必须「领先 ≥ TEMPO_FIT_MARGIN 且两段以上可比」才改判，
+            #     否则一律保持原行为（多数歌 Beat This 的 BPM 是对的）。
+            try:
+                _t = (np.arange(env.shape[0]) * f["dt"]).astype(np.float64)
+                _e = env.astype(np.float64)
+                _fa, _pa, _ra = tempo_fit_score(_t, _e, bpm_auto)
+                _fb, _pb, _rb = tempo_fit_score(_t, _e, _bt_bpm)
+            except Exception:                                    # noqa: BLE001
+                _fa, _fb, _ra, _rb = 0.0, 0.0, [], []
+            if (len(_ra) >= TEMPO_FIT_MIN_SEG and len(_rb) >= TEMPO_FIT_MIN_SEG
+                    and (_fa - _fb) >= TEMPO_FIT_MARGIN):
+                bpm = bpm_auto
+                # 扫描胜出时，若扫描与 bt 同相（相位差 < 1/4 拍）可沿用 bt 的 anchor；
+                # 但 tempo_fit 的相位是按「第一段」拟合的，不能直接当整曲 anchor 用，
+                # 交给下面的 anchor 分支重算（`abs(bpm-_bt_bpm)>0.5` 会进那个分支）。
     period = 60.0 / bpm if bpm > 0 else 0.5
 
     if anchor_hint is not None:
@@ -607,6 +946,15 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
             phrase, contrast, _ = phrase_phase(f, base, period)
             anchor = base + phrase * period
 
+    # ★★ 2026-10-28：多 BPM 段检测（用户问「一首歌有多个 BPM 段怎么办」）。
+    #   恒速歌在 `detect_segments` 的预检里就返回 [] ⇒ 零额外成本、结果与以前完全一致；
+    #   只有「全曲 BPM 逐窗对不上」时才会重算高帧率并真的分段。
+    segs = []
+    try:
+        segs = detect_segments(mono, sr, f, env, bpm, anchor)
+    except Exception:                                        # noqa: BLE001
+        segs = []
+
     return {
         "bpm": round(float(bpm), 4),
         "bpm_auto": round(float(bpm_auto), 3),
@@ -619,6 +967,7 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
         "peaks": [(round(b, 2), round(s, 3)) for b, s in peaks[:4]],
         "dur_analyzed": round(dur, 2),
         "bt": bt_used,          # 是否用了 Beat This 的小节头（_assemble 据此定 src）
+        "segments": segs,       # 多 BPM 段（空 = 恒速，行为与以前一致）
     }
 
 
@@ -920,6 +1269,7 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
         "vdj_delta": a.get("bpm_delta", 0.0),
         "remix": list(e["remix"]) if e else [],
         "peaks": a["peaks"],
+        "segments": list(a.get("segments") or []),   # 多 BPM 段（空 = 恒速）
         "grid_ver": GRID_VER,
     }
 

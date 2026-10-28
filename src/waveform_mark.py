@@ -91,6 +91,31 @@ def grid_times(anchor, beat_len, dur):
         k += 1
 
 
+def grid_times_range(anchor, beat_len, t_start, t_end):
+    """限定区间 `[t_start, t_end]` 内的拍位（多 BPM 段用）。
+
+    与 `grid_times` 的区别：只在**这一段的区间**里画，`k` 以该段自己的 `anchor`
+    为基准（与 `beatgrid.segment_at` / `grid_anchor_after_v2` 的语义一致）——
+    段与段之间 BPM 变了，共用一条网格会把后半段画错。
+    """
+    try:
+        bl = float(beat_len or 0.0)
+        a = float(anchor or 0.0)
+        t0 = float(t_start or 0.0)
+        t1 = float(t_end or 0.0)
+    except (TypeError, ValueError):
+        return
+    if bl <= 0.0 or t1 < t0:
+        return
+    k = int((t0 - a) // bl)          # 从段起点前最近的一拍开始
+    t = a + k * bl
+    while t <= t1 + 1e-9:
+        if t >= t0 - 1e-9:
+            yield k, t
+        t += bl
+        k += 1
+
+
 class WaveformMarkWidget(QWidget):
     """波形标记控件。用法见模块 docstring。"""
 
@@ -441,6 +466,22 @@ class WaveformMarkWidget(QWidget):
 
         # ---- 3b) 拍网（浅灰）/ 八拍头（更亮）—— 画在波形**之上**，否则会被彩色填充盖住
         bl = self._beat_len()
+        # ★ 有分段时用**最密的段**判密度（否则慢段判"可画"、快段糊成条纹）
+        _seg_list = [x for x in (self._segments or []) if isinstance(x, dict)]
+        if _seg_list:
+            _bls = []
+            for _x in _seg_list:
+                try:
+                    v = float(_x.get("beat_len") or 0.0)
+                    if v <= 0:
+                        _b = float(_x.get("bpm") or 0.0)
+                        v = 60.0 / _b if _b > 0 else 0.0
+                except (TypeError, ValueError):
+                    v = 0.0
+                if v > 0:
+                    _bls.append(v)
+            if _bls:
+                bl = min(_bls)
         if bl and bl > 0 and d > 0:
             # ★ 密度门限：全曲可视时 128BPM 的拍间距只有 ~1.4px，逐拍画会变成一片竖条纹
             #   （实测截图有明显条纹噪声）。拍间距 <4px 时只画八拍头线；八拍也 <4px 就不画。
@@ -453,7 +494,29 @@ class WaveformMarkWidget(QWidget):
             #   （实测这首歌 anchor=66.0s）⇒ 旧代码 `t = a` 只往后画，
             #   **前 66 秒一条线都没有**。拍网是周期性的，必须从 anchor 往回退到 ≤0 再画。
             #   ⚠ 序列生成抽到模块级 `grid_times()`（纯函数）以便回归测试覆盖。
-            for _k, t in grid_times(a, bl, d):
+            # ★★ 2026-10-28（多 BPM 段的歌）：分段时每段用各自 bpm/anchor，
+            #   共用一条网格会把变过速的段落全画错（`grid_times_range`）。
+            if _seg_list:
+                pairs = []
+                for _i, _sg in enumerate(_seg_list):
+                    try:
+                        _s0 = float(_sg.get("t0") or 0.0)
+                        _s1 = (float(_seg_list[_i + 1].get("t0") or d)
+                               if _i + 1 < len(_seg_list) else d)
+                        _sbl = float(_sg.get("beat_len") or 0.0)
+                        if _sbl <= 0:
+                            _b = float(_sg.get("bpm") or 0.0)
+                            _sbl = 60.0 / _b if _b > 0 else 0.0
+                        _san = float(_sg.get("anchor")
+                                     if _sg.get("anchor") is not None else _s0)
+                    except (TypeError, ValueError):
+                        continue
+                    if _sbl <= 0 or _s1 <= _s0:
+                        continue
+                    pairs.extend(grid_times_range(_san, _sbl, _s0, _s1))
+            else:
+                pairs = grid_times(a, bl, d)
+            for _k, t in pairs:
                 x = self._x_of_sec(t)
                 if -2.0 <= x <= w + 2.0:
                     is_phrase = (_k % 8 == 0)

@@ -55,12 +55,20 @@ HIGHLIGHTS = [
      "One right-click entry in the library: file / title / artist / genre / duration / "
      "sample rate / fingerprint ID together with the waveform, segment BPM and downbeats"),
     ("本地网格分析与 BPM", "Local beat grid & BPM",
-     "自己算拍长和八拍头，不依赖外部软件：按 VDJ 曲库对照，50 首里 48 首 BPM 一致、"
-     "43 首小节相位对齐；可选神经网络只用来指认「哪一拍是小节头」；"
-     "详情页还能整段微调或半速/倍速",
-     "Computes beat length and downbeats on its own: against a rekordbox/VDJ library, "
-     "48 of 50 tracks agree on BPM and 43 on bar phase; an optional neural model only "
+     "自己算拍长和八拍头，不依赖外部软件：拿 VDJ 曲库当标准答案对照 59 首，"
+     "51 首 BPM 一致（86%）、43 首小节相位对齐（73%）；"
+     "可选神经网络只用来指认「哪一拍是小节头」；详情页还能整段微调或半速/倍速",
+     "Computes beat length and downbeats on its own: against 59 rekordbox/VDJ tracks, "
+     "51 agree on BPM (86%) and 43 on bar phase (73%); an optional neural model only "
      "decides which beat starts the bar; the details page can shift or halve/double it"),
+    ("多 BPM 段自动识别", "Auto multi-tempo segments",
+     "一首歌里中途变速也能分开：逐段测「当前网格对不对得上」，对不上才局部重估 BPM；"
+     "恒速歌多花不到 0.1 秒、结果不变。实测 74 首恒速曲零误判，"
+     "152→175、144→128 两种拼接样本都能分对",
+     "Handles tracks that change tempo: each window is scored against the current grid "
+     "and only failing windows re-estimate BPM locally. Constant-tempo tracks cost "
+     "under 0.1 s and are unchanged; 74 real tracks produce zero false splits, while "
+     "152→175 and 144→128 spliced samples are split correctly"),
     ("拍网铺满整首", "Beat grid covers the whole track",
      "八拍竖线从中段锚点往前往后都画 —— 修掉了「左半段没有刻度」的问题",
      "Downbeat lines are drawn both directions from a mid-track anchor — "
