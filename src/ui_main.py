@@ -3987,9 +3987,18 @@ class MainWindow(QMainWindow):
             _gd = bool((self.cfg["perf"] or {}).get("gpu_decode", False))
         except Exception:
             _gd = False
-        self.settings.chk_gpu.setChecked(_gd)
-        # 工具条上的同一个开关也要跟上（两个入口共享状态；上面 setChecked 若值没变
-        # 不会发信号，所以这里显式同步一次）
+        # ★★ 2026-10-28（现场：开了 GPU 解码就只剩启动画面、主窗口永不来）：
+        #   `chk_gpu` 连的是 `main.set_gpu_decode`（会同步跑 `mm.gpu_status()` 探测）。
+        #   启动回填时控件默认 False、config 可能是 True ⇒ 值变了 ⇒ 触发信号 ⇒
+        #   在 `__init__` 里同步阻塞（GLWorker 不就绪时直接冻死）。
+        #   ⇒ 回填状态必须 blockSignals；真正的 `mm.set_gpu_decode(_gd)` 下面单独调，
+        #     探测留给用户手动点开关时再做（那时界面已经起来了）。
+        try:
+            self.settings.chk_gpu.blockSignals(True)
+            self.settings.chk_gpu.setChecked(_gd)
+        finally:
+            self.settings.chk_gpu.blockSignals(False)
+        # 工具条上的同一个开关也要跟上（两个入口共享状态）
         try:
             self.btn_gpu.blockSignals(True)
             self.btn_gpu.setChecked(_gd)

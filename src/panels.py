@@ -20,6 +20,7 @@ from PySide6.QtGui import (QColor, QPixmap, QImage, QDrag, QAction, QPainter, QP
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSlider,
     QComboBox, QScrollArea, QListWidget, QListWidgetItem, QListView, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QMenu, QDialog, QCheckBox, QProgressBar, QDialogButtonBox,
     QSizePolicy, QApplication, QDoubleSpinBox, QSpinBox, QGroupBox, QToolBox,
     QInputDialog, QLineEdit, QRadioButton, QButtonGroup, QSplitter,
@@ -1195,7 +1196,11 @@ class MusicLibraryPanel(QWidget):
     DUR_FILTERS = [("全部", None), ("时长未知", "none"), ("<3 分钟", (0, 180)),
                    ("3–5 分钟", (180, 300)), ("5–7 分钟", (300, 420)),
                    ("≥7 分钟", (420, 1e9))]
-    SORTS = [("原顺序", "orig"), ("曲名", "title"), ("艺人", "artist"),
+    # ★ 2026-10-28（用户要求「默认顺序改成歌曲的导入顺序」）：
+    #   第一项即默认项。`import` = 按 `music_library` 的加入顺序**倒序**（新的在前）；
+    #   `orig` 是物理顺序（扫描时是字母序，看着不像"导入顺序"）。
+    SORTS = [("导入顺序（新的在前）", "import"), ("原顺序", "orig"),
+             ("曲名", "title"), ("艺人", "artist"),
              ("BPM 从低到高", "bpm"), ("BPM 从高到低", "bpm_d"),
              ("时长从短到长", "dur"), ("时长从长到短", "dur_d")]
 
@@ -1311,7 +1316,39 @@ class MusicLibraryPanel(QWidget):
         self.progress.hide()
         right.addWidget(self.progress)
 
-        self.list = QListWidget()
+        # ★★ 2026-10-28（用户要求「改成表格显示」）：QListWidget → QTableWidget。
+        #   5 列：曲名（含封面/复选框）｜ 曲风 ｜ 来源 ｜ BPM ｜ 时长。
+        #   ⚠ 语义全部挂在**第 0 列**（`Qt.UserRole`=路径、checkState、icon），
+        #     其余列只做显示 ⇒ 遍历统一 `item(i, 0)`。
+        #   ⚠ 不启用表头点击排序：开了就会按列 0 重排、破坏「导入顺序」；
+        #     排序仍走左侧 `cb_sort` 下拉。
+        self.list = QTableWidget(0, 5)
+        self.list.setHorizontalHeaderLabels(
+            [T("曲目"), T("曲风"), T("来源"), "BPM", T("时长")])
+        self.list.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.list.setShowGrid(False)
+        self.list.setWordWrap(False)
+        self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list.verticalHeader().setVisible(False)
+        self.list.verticalHeader().setDefaultSectionSize(30)
+        _hv = self.list.horizontalHeader()
+        _hv.setSectionsMovable(False)
+        _hv.setHighlightSections(False)
+        # ⚠ 列 0 不用 Stretch：嵌套布局里控件还没拿到真实宽度时它就算了一次，
+        #   实测被挤到 75px 且之后不重算 ⇒ 改成 Interactive + `_fit_cols()` 按
+        #   viewport 宽度显式分配（在 resizeEvent / refresh 里调）。
+        self._COL_FIXED = ((1, 210), (2, 158), (3, 72), (4, 66))
+        for _c, _w in ((0, 360),) + self._COL_FIXED:
+            _hv.setSectionResizeMode(_c, QHeaderView.ResizeMode.Interactive)
+            self.list.setColumnWidth(_c, _w)
+        # ★ 2026-10-28（用户要求「可以左右拖动调整列宽」）：
+        #   Interactive 本来就能拖，但 `resizeEvent → _fit_cols()` 会把用户拖的宽度盖掉。
+        #   这里记住「用户动过列宽」，之后不再自动分配（`_fitting` 屏蔽程序自身设宽触发）。
+        self._cols_manual = False
+        self._fitting = False
+        _hv.sectionResized.connect(self._on_section_resized)
         # ★ 2026-10-09（用户要求）：支持**多选**批量删除（Ctrl/Shift 点选）。
         #   ⚠ 这里可以安全用 ExtendedSelection：曲库面板的列表**没有拖拽**
         #     （素材库那边不行 —— 拖拽会被拉框多选抢掉点击，见 LibraryGrid）。
@@ -1321,7 +1358,6 @@ class MusicLibraryPanel(QWidget):
         # 封面尺寸：从配置恢复（老配置里没有/值不合法都回退默认档）
         self.cover_size = self._load_cover_size()
         self.list.setIconSize(QSize(self.cover_size, self.cover_size))
-        self.list.setSpacing(1)
         self._cover_job = None
         # ★ 2026-10-09（用户要求①）：复选框多选的状态位。
         #   `_building`：refresh 重建列表期间置 True —— 逐行 setCheckState /
@@ -1391,6 +1427,9 @@ class MusicLibraryPanel(QWidget):
     def _sort_key(self, key, meta):
         def k(path):
             rec = meta.get(path) or {}
+            if key == "import":
+                # 新的在前；派生行（导入包/码表）不在 music_library 里 ⇒ 排最后
+                return (-self._order_index.get(path, -1),)
             bpm, dur, _e = self._info(meta, path)
             # ⚠ 码表派生行的 key 是伪路径（`@cue:<表路径>#…`），basename 没有意义 ⇒
             #   按曲名排序。本机行保持原行为（按文件名），避免改变既有排序结果。
@@ -1493,6 +1532,13 @@ class MusicLibraryPanel(QWidget):
                 if only_miss and (exists or imp or cue):
                     continue
                 rows.append((p, bpm, dur, exists))
+            # ★★ 2026-10-28：「导入顺序」= `music_library` 的加入顺序倒序（新的在前）。
+            #   ⚠ 必须用**原始 music_library**，不能用上面被拼过的 `lib`：
+            #     `lib = 本机 + 导入包 + 码表` ⇒ 派生行索引最大 ⇒ key 最负
+            #     ⇒ 码表/导入包全排到本机歌前面（实测第一行是码表里的歌）。
+            #   派生行不在 music_library 里 ⇒ `get(..., -1)` ⇒ key=+1 ⇒ 排最后。
+            self._order_index = {p: i for i, p in enumerate(
+                self.main.cfg['music_library'] or [])}
             sk = self.SORTS[self.cb_sort.currentIndex()][1]
             if sk != "orig":
                 order = {p: i for i, p in enumerate(lib)}
@@ -1500,7 +1546,8 @@ class MusicLibraryPanel(QWidget):
                                          order.get(r[0], 0)))
             self._building = True
             try:
-                self.list.clear()
+                self.list.clearContents()
+                self.list.setRowCount(0)
                 need_cover = []
                 for p, bpm, dur, exists in rows:
                     m = view_meta.get(p) or {}
@@ -1545,11 +1592,19 @@ class MusicLibraryPanel(QWidget):
                         disp = os.path.basename(p)
                         if not exists:
                             bits.append(T("文件缺失"))
-                    txt = "%s    →    %s    (%s)  ｜ %s" % (
-                        disp, genres, src, " ｜ ".join(bits))
-                    it = QListWidgetItem(
-                        cover_icon_for(m, p, self.cover_size, need_cover), txt)
+                    # ★★ 2026-10-28：一行拆成 5 列（原来是一串拼接文本）。
+                    #   `bits`（未入库/指纹/文件缺失）并进「来源」列，避免列太多。
+                    _src_txt = src or ""
+                    if bits:
+                        _src_txt = (_src_txt + " · " + " · ".join(bits)).strip(" ·")
+                    _bpm_txt = ("%.0f" % bpm) if bpm else "—"
+                    _dur_txt = ("%d:%02d" % (int(dur) // 60, int(dur) % 60)) if dur else "—"
+                    _row = self.list.rowCount()
+                    self.list.insertRow(_row)
+                    it = QTableWidgetItem(
+                        cover_icon_for(m, p, self.cover_size, need_cover), disp)
                     it.setData(Qt.UserRole, p)
+                    it.setToolTip(disp)
                     # ★ 复选框（①）：默认未勾选；按重建前的勾选键恢复勾选
                     it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     it.setCheckState(
@@ -1563,7 +1618,17 @@ class MusicLibraryPanel(QWidget):
                         it.setForeground(QColor(CUE_ROW_COLOR))
                     elif not exists:
                         it.setForeground(QColor("#e06666"))
-                    self.list.addItem(it)
+                    self.list.setItem(_row, 0, it)
+                    for _c, _txt in ((1, genres), (2, _src_txt),
+                                     (3, _bpm_txt), (4, _dur_txt)):
+                        _ci = QTableWidgetItem(_txt)
+                        _ci.setToolTip(_txt)
+                        if _c >= 3:
+                            _ci.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                                 | Qt.AlignmentFlag.AlignVCenter)
+                        _ci.setForeground(it.foreground())
+                        self.list.setItem(_row, _c, _ci)
+                    self.list.setRowHeight(_row, int(self.cover_size) + 6)
             finally:
                 self._building = False
             # ⚠ 「已分析」只数本机/导入库的曲目：码表派生行没有任何本机分析数据，
@@ -1574,20 +1639,65 @@ class MusicLibraryPanel(QWidget):
                           "rows": len(rows), "imp": len(imp_lib),
                           "cue": len(cue_lib)}
             self._update_lbl()
+            self._fit_cols()
             self.lbl_filter.setText(Tf("筛选后 {} / {} 首", len(rows), len(lib)))
             # 缺封面 ⇒ 起一次后台补图，补完再刷一遍（不阻塞、不重复起）
             self._start_cover_backfill(need_cover)
         except Exception:                                          # noqa: BLE001
             pass
 
+    def _on_section_resized(self, _idx, _old, _new):
+        """用户拖了列宽 ⇒ 之后不再自动分配（程序自己设宽时 `_fitting` 为真，忽略）。"""
+        if not self._fitting:
+            self._cols_manual = True
+
+    def _fit_cols(self):
+        """按 viewport 实际宽度分配列宽：列 0 吃掉剩余，其余固定。
+
+        ⚠ 用户**手动拖过**列宽（`_cols_manual`）之后就不再自动分配 —— 否则每次
+          窗口 resize / 列表 refresh 都会把用户调好的宽度盖回去。
+        """
+        if not hasattr(self, 'list') or self.list is None:
+            return                      # resizeEvent 可能在 self.list 建好之前就来
+        if getattr(self, '_cols_manual', False):
+            return
+        self._fitting = True
+        try:
+            vw = int(self.list.viewport().width())
+        except Exception:                                          # noqa: BLE001
+            vw = 0
+        if vw < 200:
+            vw = max(360, int(self.list.width()) - 4)
+        _fixed = sum(w for _c, w in self._COL_FIXED)
+        self.list.setColumnWidth(0, max(180, vw - _fixed - 4))
+        for _c, _w in self._COL_FIXED:
+            self.list.setColumnWidth(_c, _w)
+        self._fitting = False
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit_cols()
+
+    def _selected_paths(self):
+        """当前**选中的行**对应的路径（表格化后一行有 5 个单元格，必须按行取）。"""
+        out = []
+        try:
+            for idx in self.list.selectionModel().selectedRows():
+                _it = self.list.item(idx.row(), 0)
+                if _it is not None:
+                    out.append(_it.data(Qt.UserRole))
+        except Exception:                                          # noqa: BLE001
+            pass
+        return out
+
     # ---------------- 复选框多选（用户要求①）----------------
     def _checked_keys(self):
         """当前列表里**已勾选**行的键集合（本机=路径，导入=`@imported:<sid>`）。"""
         out = set()
         try:
-            for i in range(self.list.count()):
-                it = self.list.item(i)
-                if it.checkState() == Qt.CheckState.Checked:
+            for i in range(self.list.rowCount()):
+                it = self.list.item(i, 0)
+                if it is not None and it.checkState() == Qt.CheckState.Checked:
                     out.add(it.data(Qt.UserRole))
         except Exception:                                          # noqa: BLE001
             pass
@@ -1597,9 +1707,9 @@ class MusicLibraryPanel(QWidget):
         """当前列表里已勾选的 QListWidgetItem 列表（顺序 = 列表顺序）。"""
         out = []
         try:
-            for i in range(self.list.count()):
-                it = self.list.item(i)
-                if it.checkState() == Qt.CheckState.Checked:
+            for i in range(self.list.rowCount()):
+                it = self.list.item(i, 0)
+                if it is not None and it.checkState() == Qt.CheckState.Checked:
                     out.append(it)
         except Exception:                                          # noqa: BLE001
             pass
@@ -1614,8 +1724,10 @@ class MusicLibraryPanel(QWidget):
         st = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
         self._building = True
         try:
-            for i in range(self.list.count()):
-                self.list.item(i).setCheckState(st)
+            for i in range(self.list.rowCount()):
+                _it0 = self.list.item(i, 0)
+                if _it0 is not None:
+                    _it0.setCheckState(st)
         finally:
             self._building = False
         self._update_lbl()
@@ -1815,6 +1927,7 @@ class MusicLibraryPanel(QWidget):
         self.cover_size = px
         try:
             self.list.setIconSize(QSize(px, px))
+            self.list.verticalHeader().setDefaultSectionSize(int(px) + 6)
         except Exception:                                          # noqa: BLE001
             pass
         try:
@@ -1851,7 +1964,10 @@ class MusicLibraryPanel(QWidget):
         return loc, imp, mode
 
     def _ctx_menu(self, pos):
-        it = self.list.itemAt(pos)
+        _hit = self.list.itemAt(pos)
+        if _hit is None:
+            return
+        it = self.list.item(_hit.row(), 0)      # 语义只在第 0 列
         if it is None:
             return
         path = it.data(Qt.UserRole)
@@ -1859,7 +1975,7 @@ class MusicLibraryPanel(QWidget):
         #   否则只对它自己（并让它成为唯一选中，行为与旧版一致）。
         # ★ 2026-10-09（用户要求①）：**只要有勾选**，删除一律针对勾选集。
         checked = [x.data(Qt.UserRole) for x in self._checked_items()]
-        selected = [x.data(Qt.UserRole) for x in self.list.selectedItems()]
+        selected = self._selected_paths()
         loc, imp, checked_mode = self._resolve_targets(path, checked, selected)
         # ★ 码表派生行：**不可移除**（没有实体，删了下次 refresh 又回来）。
         #   这里单独取一份，只提供「查看信息 + 跟随码表」的说明。
@@ -1868,7 +1984,7 @@ class MusicLibraryPanel(QWidget):
             _pool = [path]
         cue = [p for p in _pool if str(p).startswith("@cue:")]
         if not checked_mode and path not in selected:
-            self.list.setCurrentItem(it)
+            self.list.setCurrentCell(int(self.list.row(it)), 0)
         solo_loc = (not checked_mode) and (len(loc) == 1 and not imp)  # 单首本机歌=旧版完整菜单
         menu = QMenu(self)
         edit = rescan = info = None
