@@ -23,14 +23,31 @@ import os
 import sys
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox,
-                               QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel,
-                               QListWidget, QMessageBox, QPushButton,
-                               QVBoxLayout)
+from PySide6.QtWidgets import (QCheckBox, QDialog, QDoubleSpinBox, QFormLayout,
+                               QFrame, QHBoxLayout, QInputDialog, QLabel, QMenu,
+                               QMessageBox, QPushButton, QVBoxLayout)
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+
+
+def _spin_silent(spin, val):
+    """静默设置 `QDoubleSpinBox`（不触发 valueChanged）。
+
+    ⚠ 必须 `blockSignals`：否则 `_load` 回填 BPM 时会走 `_on_bpm_edited`，
+      把「刚读进来的手动值」当成「用户刚改的」，立刻标脏并弹提示。
+    """
+    try:
+        spin.blockSignals(True)
+        spin.setValue(float(val))
+    except (TypeError, ValueError):
+        pass
+    finally:
+        try:
+            spin.blockSignals(False)
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 def _lazy_waveform(path):
@@ -151,111 +168,51 @@ class MusicDetailDialog(QDialog):
             bl.addWidget(lab)
             v.addWidget(box)
 
+        # ★ 2026-10-28（用户要求「去掉手动覆盖 BPM 这个选项 改了就是手动」）：
+        #   不再有勾选框 —— 值一旦与自动值不同就视为手动（见 `_effective_manual`）。
         form = QFormLayout()
         self.spin_bpm = QDoubleSpinBox()
         self.spin_bpm.setRange(30.0, 300.0)
         self.spin_bpm.setDecimals(1)
         self.spin_bpm.setSingleStep(0.5)
-        self.spin_bpm.valueChanged.connect(self._mark_dirty)
-        self.chk_manual = QCheckBox("手动覆盖 BPM")
-        self.chk_manual.toggled.connect(self._mark_dirty)
-        row = QHBoxLayout()
-        row.addWidget(self.spin_bpm)
-        row.addWidget(self.chk_manual)
-        form.addRow("手动 BPM", row)
+        self.spin_bpm.setToolTip("改动这个值即为手动覆盖（与自动值相同则仍走自动）")
+        self.spin_bpm.valueChanged.connect(self._on_bpm_edited)
+        form.addRow("BPM", self.spin_bpm)
         v.addLayout(form)
 
         # ★ self.wave 必须**先创建**（工具栏 lambda / 吸附 checkbox 在 build 期就引用它）。
         from waveform_mark import WaveformMarkWidget
         self.wave = WaveformMarkWidget()
-        self.wave.anchorsChanged.connect(self._on_anchors_changed)
         self.wave.segmentsChanged.connect(self._on_segments_changed)
-        self.wave.segmentSelected.connect(self._on_segment_selected)
-        self.wave.bpmPicked.connect(self._on_bpm_picked)
         self.wave.playheadMoved.connect(self._on_playhead_moved)
+        self.wave.contextMenuRequested.connect(self._on_wave_context_menu)
         # 操作提示（用户点名要 ERCUE 的键位：Ctrl+滚轮缩放）
         self.wave.setToolTip("Ctrl+滚轮 缩放 · Shift+滚轮 / 普通滚轮 平移 · "
-                             "在波形上拖动可移动播放头（播放从这里开始）")
+                             "拖动可移动播放头（播放从这里开始） · 右键编辑 BPM 分段")
 
+        # ★ 2026-10-28（用户要求）：
+        #   · 去掉「选择/拖动 · 标八拍 · 标分段 · 标 BPM」模式按钮 —— 固定为选择/拖动；
+        #   · 播放 / 暂停 / 停止 三个按钮合成**一个切换键**。
         bar = QHBoxLayout()
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.setExclusive(True)
-        for key, label in (("select", "选择/拖动"), ("anchor", "标八拍"),
-                           ("segment", "标分段"), ("bpm", "标 BPM")):
-            b = QPushButton(label)
-            b.setCheckable(True)
-            self._mode_group.addButton(b)
-            bar.addWidget(b)
-            if key == "select":
-                b.setChecked(True)
-            b.clicked.connect(lambda _=False, k=key: self.wave.set_mode(k))
-        bar.addStretch(1)
-        # ★ 试听控制（用户要求）：播放起点 = 波形上的播放头竖线位置。
+        self.wave.set_mode("select")
         self.btn_play = QPushButton("▶ 播放")
-        self.btn_play.setToolTip("从播放头竖线所在位置开始播放")
-        self.btn_play.clicked.connect(self._on_play)
+        self.btn_play.setToolTip("从播放头竖线所在位置开始播放；播放中再点就是暂停")
+        self.btn_play.clicked.connect(self._on_play_toggle)
         bar.addWidget(self.btn_play)
-        self.btn_pause = QPushButton("⏸ 暂停")
-        self.btn_pause.clicked.connect(self._on_pause)
-        bar.addWidget(self.btn_pause)
-        self.btn_stop = QPushButton("⏹ 停止")
-        self.btn_stop.clicked.connect(self._on_stop)
-        bar.addWidget(self.btn_stop)
         self.lbl_pos = QLabel("位置 0.00s")
         self.lbl_pos.setMinimumWidth(150)
         bar.addWidget(self.lbl_pos)
+        bar.addStretch(1)
         self.chk_snap = QCheckBox("吸附到拍")
         self.chk_snap.setChecked(True)
         self.chk_snap.toggled.connect(self.wave.set_snap)
         bar.addWidget(self.chk_snap)
         v.addLayout(bar)
 
+        # ★ 2026-10-28：右侧「八拍起点 / BPM 分段」整块去掉 —— 波形占满宽度；
+        #   多 BPM 分段的编辑改到**波形右键菜单**（见 `_on_wave_context_menu`）。
         body = QHBoxLayout()
         body.addWidget(self.wave, 1)
-
-        right = QVBoxLayout()
-        right.addWidget(QLabel("八拍起点（秒）"))
-        # ★ 2026-10-28（用户要求）：**整段相位微调**。
-        #   动机：拿 VDJ 当标准答案实测 50 首，乐句相位差的那 14 首里有 **7 首正好差 4 拍**
-        #   （两小节里选错了一小节）。这 1 bit 纯音频经常无解 —— 工业界也是给按钮让 DJ 自己翻：
-        #   Mixxx 有 `beats_adjust_halve/double`，Traktor 有 Grid 面板。
-        #   所以这里也提供「±1 小节 / ±1 拍」和「÷2 / ×2 BPM」。
-        _nudge = QHBoxLayout()
-        for _t, _k, _tip in (("−1 小节", -4, "整段往前挪一小节（4 拍）"),
-                             ("+1 小节", 4, "整段往后挪一小节（4 拍）"),
-                             ("−1 拍", -1, "整段往前挪 1 拍"),
-                             ("+1 拍", 1, "整段往后挪 1 拍")):
-            _b = QPushButton(_t)
-            _b.setToolTip(_tip)
-            _b.clicked.connect(lambda _c=False, kk=_k: self._nudge_beats(kk))
-            _nudge.addWidget(_b)
-        right.addLayout(_nudge)
-        _scale = QHBoxLayout()
-        _b2 = QPushButton("÷2 BPM")
-        _b2.setToolTip("拍速减半（半速/倍速歧义时用；对齐点不动，只改拍长）")
-        _b2.clicked.connect(lambda _c=False: self._scale_bpm(0.5))
-        _scale.addWidget(_b2)
-        _b3 = QPushButton("×2 BPM")
-        _b3.setToolTip("拍速加倍（半速/倍速歧义时用）")
-        _b3.clicked.connect(lambda _c=False: self._scale_bpm(2.0))
-        _scale.addWidget(_b3)
-        right.addLayout(_scale)
-
-        self.lst_anchors = QListWidget()
-        self.lst_anchors.setMaximumWidth(220)
-        right.addWidget(self.lst_anchors, 1)
-        self.btn_del_anchor = QPushButton("删除选中八拍")
-        self.btn_del_anchor.clicked.connect(self._del_anchor)
-        right.addWidget(self.btn_del_anchor)
-
-        right.addWidget(QLabel("BPM 分段"))
-        self.lst_segments = QListWidget()
-        self.lst_segments.setMaximumWidth(220)
-        right.addWidget(self.lst_segments, 1)
-        self.btn_del_seg = QPushButton("删除选中分段")
-        self.btn_del_seg.clicked.connect(self._del_segment)
-        right.addWidget(self.btn_del_seg)
-        body.addLayout(right)
         v.addLayout(body, 1)
 
         bot = QHBoxLayout()
@@ -338,8 +295,9 @@ class MusicDetailDialog(QDialog):
             bpm_m = float(bpm_m)
         except (TypeError, ValueError):
             bpm_m = 0.0
-        self.chk_manual.setChecked(bpm_m > 0)
-        self.spin_bpm.setValue(bpm_m if bpm_m > 0 else (self._auto_bpm or 120.0))
+        # ★ 无勾选框了：手动值 > 0 就显示手动值，否则显示自动值。
+        _spin_silent(self.spin_bpm, bpm_m if bpm_m > 0 else (self._auto_bpm or 120.0))
+        self._bpm_auto_shown = float(self._auto_bpm or 0.0)
 
         self.wave.set_waveform(self._wf)
         self.wave.set_grid(self._grid)
@@ -354,8 +312,17 @@ class MusicDetailDialog(QDialog):
         self._update_title()
 
     def _effective_manual(self):
-        """把当前控件状态归一化成 grid_manual dict；全空 → None（回退自动）。"""
-        bpm_m = self.spin_bpm.value() if self.chk_manual.isChecked() else 0.0
+        """把当前控件状态归一化成 grid_manual dict；全空 → None（回退自动）。
+
+        ★ 2026-10-28：没有「手动覆盖」勾选框了 —— **BPM 与自动值不同即为手动**。
+          否则每次打开详情页都会把手动值写死一遍，之后重扫也不更新。
+        """
+        try:
+            bpm_now = float(self.spin_bpm.value())
+        except (TypeError, ValueError):
+            bpm_now = 0.0
+        auto = float(getattr(self, "_bpm_auto_shown", 0.0) or 0.0)
+        bpm_m = bpm_now if (bpm_now > 0 and (auto <= 0 or abs(bpm_now - auto) > 0.05)) else 0.0
         anchors = self.wave.anchors()
         segments = self.wave.segments()
         # ★★ 2026-10-28：自动分段「只显示、不落成手动」。
@@ -395,16 +362,9 @@ class MusicDetailDialog(QDialog):
         self._dirty = True
         self._update_title()
 
-    # ---------------- 列表 ----------------
+    # ---------------- 列表（2026-10-28：右侧列表已删，保留空壳供旧调用点） ----------------
     def _refresh_lists(self):
-        self.lst_anchors.clear()
-        for a in self.wave.anchors():
-            self.lst_anchors.addItem("%.2f s" % a)
-        self.lst_segments.clear()
-        for s in self.wave.segments():
-            self.lst_segments.addItem("%.1f s · %.1f BPM"
-                                      % (float(s.get("t0") or 0.0),
-                                         float(s.get("bpm") or 0.0)))
+        return
 
     def _beat_len_now(self):
         """当前有效拍长（秒）。优先 effective grid，其次手动 BPM。"""
@@ -430,89 +390,171 @@ class MusicDetailDialog(QDialog):
         except Exception:                                        # noqa: BLE001
             pass
 
-    def _nudge_beats(self, k):
-        """整段相位平移 k 拍（k=±4 即一小节）。"""
-        bl = self._beat_len_now()
-        if bl <= 0:
-            QMessageBox.information(self, "整段微调", "这首歌还没有网格（没有 BPM），无法整段平移。")
-            return
-        cur = self.wave.anchors()
-        if not cur:
-            try:
-                base = float((self._grid or {}).get("anchor") or 0.0)
-            except Exception:                                    # noqa: BLE001
-                base = 0.0
-            cur = [base]
-        period = 8.0 * bl                     # 八拍一个周期，等价折叠
-        new = [round((float(a) + k * bl) % period, 4) for a in cur]
-        self.wave.set_anchors(sorted(set(new)))
-        self._refresh_grid_preview()
-        self._mark_dirty()
-        self._refresh_lists()
-
-    def _scale_bpm(self, f):
-        """把 BPM 乘 f（0.5/2）—— 只改拍长，锚点位置不动（对应 Mixxx 的 ÷2 / ×2）。"""
-        cur = float(self.spin_bpm.value() or 0.0)
-        if cur <= 0:
-            cur = float((self._grid or {}).get("bpm") or 0.0)
-        if cur <= 0:
-            QMessageBox.information(self, "拍速", "这首歌还没有 BPM，无法倍速。")
-            return
-        nv = max(30.0, min(300.0, cur * float(f)))
-        self.chk_manual.setChecked(True)
-        self.spin_bpm.setValue(nv)
-        self._refresh_grid_preview()
-        self._mark_dirty()
-
-    def _on_anchors_changed(self):
-        self._mark_dirty()
-        self._refresh_lists()
-
+    # ★ 2026-10-28：`_nudge_beats` / `_scale_bpm` / `_on_anchors_changed` /
+    #   `_del_anchor` / `_del_segment` 随右侧面板一起去掉
+    #   （用户要求去掉手工八拍与八拍起点；±1 小节/±1 拍/÷2/×2 改为右键菜单里的
+    #   「切分到此处」与「整段 ÷2 / ×2」）。
     def _on_segments_changed(self):
         self._mark_dirty()
-        self._refresh_lists()
 
-    def _del_anchor(self):
-        r = self.lst_anchors.currentRow()
-        if r < 0:
-            return
-        anchors = self.wave.anchors()
-        if 0 <= r < len(anchors):
-            anchors.pop(r)
-            self.wave.set_anchors(anchors)
-            self._mark_dirty()
-            self._refresh_lists()
+    # ---------------- 交互：波形右键 → BPM 分段 ----------------
+    def _segments_now(self):
+        """当前生效的分段（手动优先，否则自动）；空列表 ⇒ 单段模式。"""
+        segs = [dict(x) for x in (self.wave.segments() or []) if isinstance(x, dict)]
+        if segs:
+            return segs
+        auto = (self._grid or {}).get("segments") or []
+        return [dict(x) for x in auto if isinstance(x, dict)]
 
-    def _del_segment(self):
-        r = self.lst_segments.currentRow()
-        if r < 0:
-            return
-        segs = self.wave.segments()
-        if 0 <= r < len(segs):
-            segs.pop(r)
-            if segs:
-                segs[0]["t0"] = 0.0
-            self.wave.set_segments(segs)
-            self._mark_dirty()
-            self._refresh_lists()
+    def _seg_at(self, sec):
+        """返回 (索引, 段) —— `sec` 落在哪一段（按 t0 升序）。"""
+        segs = self._segments_now()
+        idx = 0
+        for i, s in enumerate(segs):
+            try:
+                if float(s.get("t0") or 0.0) <= sec:
+                    idx = i
+            except (TypeError, ValueError):
+                pass
+        if not segs:
+            return 0, {"t0": 0.0, "bpm": float(self.spin_bpm.value() or 0.0)}
+        return idx, segs[idx]
 
-    # ---------------- 交互 ----------------
-    def _on_segment_selected(self, t0, t1):
-        bpm, ok = QInputDialog.getDouble(
-            self, "分段 BPM", "该段（%.1fs ~ %.1fs）的 BPM：" % (t0, t1),
-            self._auto_bpm or 128.0, 30.0, 300.0, 1)
-        if not ok:
-            return
-        self.wave.add_segment(t0, t1, bpm, default_bpm=self._auto_bpm)
+    def _apply_segments(self, segs):
+        """写回分段并立刻刷新预览（首段强制从 0 开始、按 t0 升序）。"""
+        segs = [dict(x) for x in segs if isinstance(x, dict)]
+        segs.sort(key=lambda x: float(x.get("t0") or 0.0))
+        if segs:
+            segs[0]["t0"] = 0.0
+        for x in segs:
+            try:
+                b = float(x.get("bpm") or 0.0)
+            except (TypeError, ValueError):
+                b = 0.0
+            if b > 0:
+                x["beat_len"] = round(60.0 / b, 6)
+        self.wave.set_segments(segs)
+        self._refresh_grid_preview()
         self._mark_dirty()
-        self._refresh_lists()
 
-    def _on_bpm_picked(self, sec):
-        bpm = self._auto_bpm
-        if bpm > 0:
-            self.chk_manual.setChecked(True)
-            self.spin_bpm.setValue(bpm)
+    def _build_seg_menu(self, sec):
+        """构造右键菜单（**只构造不弹出** —— 便于单测；`_on_wave_context_menu` 负责 exec）。
+
+        返回 `(menu, {"cut":act, "edit":act, "del":act, "half":act, "dbl":act,
+        "clear":act}, idx, segs, cur_bpm)`。
+        """
+        segs = self._segments_now()
+        idx, cur = self._seg_at(sec)
+        try:
+            cur_bpm = float(cur.get("bpm") or 0.0)
+        except (TypeError, ValueError):
+            cur_bpm = 0.0
+        if cur_bpm <= 0:
+            cur_bpm = float(self.spin_bpm.value() or 0.0)
+
+        menu = QMenu(self)
+        acts = {}
+        acts["cut"] = menu.addAction("在 %.2fs 处切分（输入该段 BPM）…" % sec)
+        acts["edit"] = menu.addAction("修改本段 BPM（当前 %.1f）…" % cur_bpm)
+        acts["del"] = menu.addAction("删除本段（%.2fs 起，%.1f BPM）"
+                                     % (float(cur.get("t0") or 0.0), cur_bpm))
+        menu.addSeparator()
+        acts["half"] = menu.addAction("整段 ÷2 BPM（半速歧义）")
+        acts["dbl"] = menu.addAction("整段 ×2 BPM（倍速歧义）")
+        menu.addSeparator()
+        acts["clear"] = menu.addAction("清除全部分段（回到自动网格）")
+        # 首段不能删（网格必须从 0 开始）；单段也没有「删除本段」的意义
+        acts["del"].setEnabled(len(segs) >= 2 and idx > 0)
+        acts["edit"].setEnabled(bool(segs) or cur_bpm > 0)
+        acts["clear"].setEnabled(len(segs) >= 2 or bool(self.wave.segments()))
+        return menu, acts, idx, segs, cur_bpm
+
+    def _run_seg_action(self, key, idx, segs, cur_bpm, sec):
+        """执行右键菜单里的某一项（`key` 见 `_build_seg_menu` 的 acts）。"""
+        if key == "cut":
+            if sec < 1.0:
+                QMessageBox.information(self, "切分分段",
+                                        "切分点太靠前（< 1 秒），网格必须从 0 开始。")
+                return False
+            bpm, ok = QInputDialog.getDouble(
+                self, "切分分段",
+                "从 %.2fs 起改用哪个 BPM？（该点之前那段保持不变）" % sec,
+                cur_bpm or 128.0, 30.0, 300.0, 1)
+            if not ok:
+                return False
+            # ★ 单段（`segs` 为空）时必须先补出「首段」，
+            #   否则新段会被 `_apply_segments` 的首段归一化改成 t0=0 ⇒ 等于没切。
+            base = [dict(x) for x in segs] or [{"t0": 0.0, "bpm": cur_bpm}]
+            new = [x for x in base if float(x.get("t0") or 0.0) < sec - 1e-6]
+            new.append({"t0": sec, "bpm": float(bpm)})
+            self._apply_segments(new)
+            return True
+        if key == "edit":
+            bpm, ok = QInputDialog.getDouble(
+                self, "修改本段 BPM", "本段 BPM：", cur_bpm or 128.0, 30.0, 300.0, 1)
+            if not ok:
+                return False
+            if segs:
+                segs[idx]["bpm"] = float(bpm)
+                self._apply_segments(segs)
+            else:
+                self._spin_set(bpm)
+                self._refresh_grid_preview()
+                self._mark_dirty()
+            return True
+        if key == "del":
+            if len(segs) >= 2 and idx > 0:
+                segs.pop(idx)
+                self._apply_segments(segs)
+                return True
+            return False
+        if key in ("half", "dbl"):
+            f = 0.5 if key == "half" else 2.0
+            if segs:
+                for x in segs:
+                    try:
+                        b = float(x.get("bpm") or 0.0)
+                    except (TypeError, ValueError):
+                        b = 0.0
+                    if b > 0:
+                        x["bpm"] = max(30.0, min(300.0, b * f))
+                self._apply_segments(segs)
+            else:
+                self._spin_set(max(30.0, min(300.0, cur_bpm * f)))
+                self._refresh_grid_preview()
+                self._mark_dirty()
+            return True
+        if key == "clear":
+            self.wave.set_segments([])
+            self._refresh_grid_preview()
             self._mark_dirty()
+            return True
+        return False
+
+    def _on_wave_context_menu(self, sec, gpos):
+        """波形右键：多 BPM 段落的全部编辑入口（用户 2026-10-28 指定）。"""
+        try:
+            sec = float(sec)
+        except (TypeError, ValueError):
+            sec = 0.0
+        menu, acts, idx, segs, cur_bpm = self._build_seg_menu(sec)
+        act = menu.exec(gpos)
+        if act is None:
+            return
+        for k, a in acts.items():
+            if a is act:
+                self._run_seg_action(k, idx, segs, cur_bpm, sec)
+                return
+
+    # ---------------- BPM 输入框（改了就是手动） ----------------
+    def _spin_set(self, val):
+        """静默设置 BPM（不触发 `_on_bpm_edited` 的脏标记链）。"""
+        _spin_silent(self.spin_bpm, val)
+
+    def _on_bpm_edited(self, _v=None):
+        """BPM 一改就是手动：立刻重算网格预览（无勾选框）。"""
+        self._refresh_grid_preview()
+        self._mark_dirty()
 
     # ---------------- 试听播放（起点 = 播放头竖线） ----------------
     def _ensure_player(self):
@@ -571,28 +613,19 @@ class MusicDetailDialog(QDialog):
         else:
             self.lbl_pos.setText("无法播放：%s" % (p.error or "未知原因"))
 
-    def _on_pause(self):
+    def _on_play_toggle(self):
+        """一个键管播放/暂停（用户 2026-10-28 要求三键合一）。"""
         p = self._player
-        if p is None:
-            return
-        if p.is_playing():
+        if self._playing and p is not None and p.is_playing():
             p.pause()
-        self._playing = False
-        self._pending_play = False
-        self.btn_play.setText("▶ 播放")
-        pos = p.position_sec()
-        self.wave.set_playhead(pos)          # 暂停后竖线留在原位
-        self.lbl_pos.setText("已暂停 %.2fs" % pos)
-
-    def _on_stop(self):
-        p = self._player
-        if p is not None:
-            p.stop()
-        self._playing = False
-        self._pending_play = False
-        self.btn_play.setText("▶ 播放")
-        self.wave.set_playhead(0.0)
-        self.lbl_pos.setText("位置 0.00s")
+            self._playing = False
+            self._pending_play = False
+            self.btn_play.setText("▶ 播放")
+            pos = p.position_sec()
+            self.wave.set_playhead(pos)      # 暂停后竖线留在原位
+            self.lbl_pos.setText("已暂停 %.2fs" % pos)
+            return
+        self._on_play()
 
     def _on_tick(self):
         """播放中：竖线跟着音频走；就绪后自动补起播；播完复位按钮。"""

@@ -50,10 +50,13 @@ HIGHLIGHTS = [
      "Publishes the picture as the NDI source 'Easy Reality Output' — loopback over TCP "
      "on the same machine, direct on a LAN; just pick it in OBS"),
     ("曲目信息与详情合一", "Track info merged into details",
-     "曲库右键只剩一个入口：文件/歌名/艺人/曲风/时长/采样率/指纹 ID 与波形标注、"
-     "分段 BPM、八拍起点在同一页",
+     "曲库右键只剩一个入口：文件/歌名/艺人/曲风/时长/采样率/指纹 ID 与波形、"
+     "BPM 分段在同一页；BPM 一改即生效（不用再勾「手动覆盖」），"
+     "多段 BPM 在波形上右键编辑",
      "One right-click entry in the library: file / title / artist / genre / duration / "
-     "sample rate / fingerprint ID together with the waveform, segment BPM and downbeats"),
+     "sample rate / fingerprint ID together with the waveform and BPM segments; "
+     "editing BPM applies immediately, and multi-tempo tracks are edited by "
+     "right-clicking the waveform"),
     ("本地网格分析与 BPM", "Local beat grid & BPM",
      "自己算拍长和八拍头，不依赖外部软件：拿 VDJ 曲库当标准答案对照 59 首，"
      "51 首 BPM 一致（86%）、43 首小节相位对齐（73%）；"

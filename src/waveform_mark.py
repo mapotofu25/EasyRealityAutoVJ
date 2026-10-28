@@ -124,6 +124,9 @@ class WaveformMarkWidget(QWidget):
     bpmPicked = Signal(float)              # 手动 BPM 点选：该点的秒
     segmentSelected = Signal(float, float)  # 分段拖选：t0, t1（秒）
     playheadMoved = Signal(float)           # 播放头被拖动：新位置（秒）
+    # ★ 2026-10-28（用户要求「多段不同的 bpm 修改改到在波形图上右键选项」）：
+    #   右键菜单由**宿主窗口**弹（控件不懂业务）。参数 = (光标秒, 全局坐标 QPoint)。
+    contextMenuRequested = Signal(float, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -726,11 +729,14 @@ class WaveformMarkWidget(QWidget):
     def mousePressEvent(self, ev):
         x = ev.position().x()
         if ev.button() == Qt.MouseButton.RightButton:
-            bi = self._anchor_near(x)
-            if bi >= 0:
-                self._anchors.pop(bi)
-                self.update()
-                self.anchorsChanged.emit()
+            # ★ 2026-10-28：右键改为「把坐标交给宿主弹菜单」（原来这里是删八拍头，
+            #   但用户要求去掉手工八拍功能，右键腾出来做 BPM 分段编辑）。
+            ev.accept()
+            try:
+                _g = ev.globalPosition().toPoint()
+            except AttributeError:                               # Qt5 兼容
+                _g = ev.globalPos()
+            self.contextMenuRequested.emit(float(self._sec_of_x(x)), _g)
             return
         if ev.button() != Qt.MouseButton.LeftButton:
             return
