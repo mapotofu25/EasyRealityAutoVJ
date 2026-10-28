@@ -841,7 +841,7 @@ class OutputPanel(QWidget):
         self.spout_name = QLineEdit()
         self.spout_name.setPlaceholderText("Sender 名称（OBS 里显示的名字）")
         go.addWidget(self.spout_name, 5, 1)
-        self.chk_ndi = QCheckBox("NDI 输出（音画同步）")
+        self.chk_ndi = QCheckBox(T("NDI 输出"))
         self.chk_ndi.setToolTip("通过网络发送画面+声音（运行时已随软件自带，无需安装；接收端需装 NDI Runtime）")
         go.addWidget(self.chk_ndi, 6, 0)
         self.ndi_name = QLineEdit()
@@ -851,10 +851,11 @@ class OutputPanel(QWidget):
         #   NDI SDK 默认 `clock_video=True` ⇒ 发送端**按帧率做时钟节流**，等于给每帧排队。
         #   局域网直连时这层缓冲就是那零点几秒。打开本项 = 关掉视频时钟节流（帧一到就走）。
         #   ⚠ 必须「NDI 输出」先开着才有意义 ⇒ 由 set_ndi_enabled() 统一门控。
-        self.chk_ndi_lan = QCheckBox("NDI 局域网发送（低延迟）")
+        self.chk_ndi_lan = QCheckBox(T("NDI 局域网发送"))
         self.chk_ndi_lan.setToolTip(
-            T("局域网直连时建议开启：不等帧率排队，画面更跟手。\n"
-              "跨路由/交换机较多时可关掉换稳定性。"))
+            T("另开一路 NDI 源（名字带 (LAN)）给局域网里的机器；"
+              "本机接收端仍走上面那一路。\n"
+              "局域网直连时建议开启：不等帧率排队，画面更跟手。"))
         go.addWidget(self.chk_ndi_lan, 7, 0)
         # ★ 2026-10-18 用户要求：**「NDI 传输音频」这一行从界面删除**（复选框 + 提示）。
         #   NDI 音频转发后端（audio_engine 的 ndi_audio_on / ndi_out.send_audio）**原样保留**，
@@ -3821,18 +3822,24 @@ class MainWindow(QMainWindow):
         self.engine._spout = None   # 名字变了重建 sender
 
     def set_ndi_lan(self, s):
-        """「NDI 局域网发送（低延迟）」开关：落盘 + 立即生效（重建 sender）。"""
+        """「NDI 局域网发送」开关：独立的一路 NDI 源（名字带 (LAN)），只管局域网。"""
         on = bool(s)
         self.cfg["output"]["ndi_lan"] = on
         self.cfg.save()
         try:
-            ndi = getattr(self.engine, "_ndi", None)
-            if ndi is not None:
-                # set_lan 会 close() 让下一帧按新时钟参数重建（clock_* 只能在 open 前定）
-                ndi.set_lan(on)
+            if not on:
+                # 关掉：释放那一路的 encoder 线程（本机那一路不受影响）
+                import ndi_out as _nd
+                _nd.close_ndi_lan()
+                self.engine._ndi_lan = None
+            else:
+                # 开：清掉退避，下一帧由 engine._ndi_send 按需建立
+                self.engine._ndi_lan = None
+                self.engine._ndi_lan_fails = 0
+                self.engine._ndi_lan_retry_at = 0.0
         except Exception:                                        # noqa: BLE001
             pass
-        print("[NDI] 局域网发送（低延迟）=%s" % ("开" if on else "关"))
+        print("[NDI] 局域网发送 = %s（独立源，名字带 (LAN)）" % ("开" if on else "关"))
 
     def _ndi_lan_gate(self):
         """「局域网发送」只在「NDI 输出」开着时可用（用户明确要求）。"""
@@ -3897,6 +3904,13 @@ class MainWindow(QMainWindow):
             if self.engine._ndi is not None:
                 self.engine._ndi.close()
                 self.engine._ndi = None
+            # 局域网那一路也一起停（它依赖 NDI 输出这个总开关）
+            try:
+                import ndi_out as _nd
+                _nd.close_ndi_lan()
+                self.engine._ndi_lan = None
+            except Exception:                                    # noqa: BLE001
+                pass
         # NDI 音频：**必须 NDI 输出开着 + 配置里 ndi_audio 为真**才发。
         # 给采集循环同步一个布尔量：False 时它连每块的 asarray/reshape/copy 都省掉。
         try:
@@ -3910,6 +3924,7 @@ class MainWindow(QMainWindow):
         self.cfg["output"]["ndi_name"] = self.output_panel.ndi_name.text().strip() or "EasyRealityAutoVJ"
         self.cfg.save()
         self.engine._ndi = None
+        self.engine._ndi_lan = None
 
     def _ndi_audio_feed(self, pcm, sr):
         """把采集到的 PCM 投递给 NDI 发送端（运行在**音频转发线程**里）。

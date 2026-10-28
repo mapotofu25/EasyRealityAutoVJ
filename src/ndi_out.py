@@ -837,11 +837,20 @@ class NDIOutput:
 
 
 # 全局单例（引擎线程 + 采集线程共享）
+# ★ 2026-10-28（用户要求「NDI 输出管本地、局域网发送管局域网」）：
+#   两个**互相独立**的发送端 —— 本机接收端（OBS 同机）拿 `_inst`，
+#   局域网内的机器拿 `_inst_lan`（名字带 " (LAN)" 后缀，且关掉视频时钟节流）。
+#   为什么要分开：低延迟要关时钟节流，但关掉后对"同机接收"没有必要冒险；
+#   分成两路后本机那路保持原样，局域网那路单独调低延迟，互不影响。
 _inst = None
+_inst_lan = None
 _inst_lock = threading.Lock()
+
+LAN_SUFFIX = " (LAN)"
 
 
 def get_ndi(name):
+    """本机输出的 NDI 发送端（源名 = name）。"""
     global _inst
     with _inst_lock:
         if _inst is None:
@@ -850,3 +859,30 @@ def get_ndi(name):
             _inst.close()
             _inst = NDIOutput(name)
         return _inst
+
+
+def get_ndi_lan(name):
+    """**局域网**输出的 NDI 发送端（源名 = name + " (LAN)"，默认关时钟节流）。"""
+    global _inst_lan
+    lan_name = str(name) + LAN_SUFFIX
+    with _inst_lock:
+        if _inst_lan is None:
+            _inst_lan = NDIOutput(lan_name)
+            _inst_lan.set_lan(True)
+        elif _inst_lan.name != lan_name:
+            _inst_lan.close()
+            _inst_lan = NDIOutput(lan_name)
+            _inst_lan.set_lan(True)
+        return _inst_lan
+
+
+def close_ndi_lan():
+    """关掉局域网发送端（UI 取消勾选时调用，释放 encoder 线程）。"""
+    global _inst_lan
+    with _inst_lock:
+        if _inst_lan is not None:
+            try:
+                _inst_lan.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+            _inst_lan = None
