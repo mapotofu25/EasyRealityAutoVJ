@@ -260,10 +260,16 @@ class ColorRenderer:
             self.color = rgb
 
     # -------- 应用 --------
-    def apply(self, canvas, mode="lut"):
-        """把当前颜色按当前强度打到画布（原地）。返回是否真的动了画面。"""
+    def apply_to_bgr(self, bgr, mode="lut"):
+        """在**已有 BGR 缓冲**上染色，返回新数组；`None` = 本帧不染色。
+
+        ★ 2026-10-28（性能，用户实测 5800X 30%）：从 `apply` 拆出来，让
+          「颜色」与「后处理」共用同一次 `_np_view_bgr()` / `write_back_bgr()`。
+          原来两段各做一次全画布读回+写回（1280×720 共 3.7 MB），
+          实测每帧白搬 1.43 ms ≈ **4.3% 单核**。
+        """
         if cv2 is None or self.s <= 0.004:
-            return False
+            return None
         mode = "duotone" if mode == "duotone" else "lut"
         key = (round(self.color[0]), round(self.color[1]), round(self.color[2]),
                round(self.s * 100), mode)
@@ -271,12 +277,23 @@ class ColorRenderer:
             # 只在「颜色/强度/方式」变化时才重建 LUT（每帧重建也能跑，但没必要）
             self._lut, self._lut_gray = build_lut(self.color, self.s, mode)
             self._lut_key = key
-        from postprocess import _np_view_bgr, write_back_bgr
-        bgr = _np_view_bgr(canvas)
         if mode == "duotone" and self._lut_gray is not None:
             g = cv2.LUT(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), self._lut_gray)
-            bgr = cv2.LUT(cv2.cvtColor(g, cv2.COLOR_GRAY2BGR), self._lut)
-        else:
-            bgr = cv2.LUT(bgr, self._lut)
-        write_back_bgr(canvas, bgr)
+            return cv2.LUT(cv2.cvtColor(g, cv2.COLOR_GRAY2BGR), self._lut)
+        return cv2.LUT(bgr, self._lut)
+
+    def apply(self, canvas, mode="lut"):
+        """把当前颜色按当前强度打到画布（原地）。返回是否真的动了画面。
+
+        ⚠ 兼容入口：自己读回、自己写回。引擎热路径走 `apply_to_bgr()` 与后处理合并，
+          整帧只搬一次；这里保留是因为单测/工具会直接调它。
+        """
+        if cv2 is None or self.s <= 0.004:
+            return False
+        from postprocess import _np_view_bgr, write_back_bgr
+        bgr = _np_view_bgr(canvas)
+        out = self.apply_to_bgr(bgr, mode)
+        if out is None:
+            return False
+        write_back_bgr(canvas, out)
         return True

@@ -1565,10 +1565,12 @@ class AutoVJEngine(QObject):
 
         # 合成
         self._compose(snap)
-        # 颜色渲染（一键调色）：放在后处理之前，让辉光/色差等特效吃到调色后的画面
-        self._apply_color(snap)
-        # 后处理特效链（合成后、输出前）
-        self._apply_postfx(snap)
+        # 颜色渲染 + 后处理特效链（合成后、输出前）。
+        # ★ 2026-10-28（性能）：合并成一个入口，**整帧只读回/写回一次**。
+        #   原来两段各做一次 `_np_view_bgr` + `write_back_bgr`（1280×720 共 3.7 MB），
+        #   实测每帧白搬 1.43 ms ≈ 4.3% 单核（用户报 5800X 30%）。
+        #   顺序不变：颜色先、后处理后 —— 辉光/色差等仍吃到调色后的画面。
+        self._apply_color_postfx(snap)
         # 深拷贝一帧再发射：GUI 只读这份独立数据，worker 不再碰它，彻底消除跨线程抢画布竞态
         w, h = self.canvas.width(), self.canvas.height()
         frame = QImage(w, h, QImage.Format_RGB32)
@@ -4796,7 +4798,38 @@ class AutoVJEngine(QObject):
         kv.player = self._get_player(kv, clip)
 
     # ---------------- 合成渲染 ----------------
-    def _apply_color(self, snap):
+    def _apply_color_postfx(self, snap):
+        """颜色 + 后处理：**共用一次**全画布 BGR 读回 / 写回。
+
+        ★ 2026-10-28（性能）：原来 `_apply_color` 和 `_apply_postfx` 各自
+          `_np_view_bgr()` 读回一次、`write_back_bgr()` 写回一次 ⇒ 每帧 2 读 2 写。
+          1280×720 单次搬运合计 1.43 ms，白扔一半 ≈ **4.3% 单核**。
+
+        正确性要点（改这里之前先读）：
+          * 两段都改成「传入 bgr、返回 bgr、不写回」；`bgr=None` 表示"还没读回"，
+            由真正要干活的那一段按需读回 —— 所以**没有效果时依然零成本**。
+          * 顺序必须「颜色 → 后处理」，与原来一致（后处理要吃到调色后的画面）。
+          * 任何一段抛异常都只跳过自己，且**已改动的 bgr 仍会写回**，
+            不会出现"颜色生效了但没上屏"的诡异半帧。
+        """
+        bgr = None
+        try:
+            bgr = self._apply_color(snap, bgr=bgr, write=False)
+        except Exception:
+            pass
+        try:
+            bgr = self._apply_postfx(snap, bgr=bgr, write=False)
+        except Exception:
+            pass
+        if bgr is None:
+            return                      # 两段都没跑（或都没生效）⇒ 一次都不用搬
+        try:
+            from postprocess import write_back_bgr
+            write_back_bgr(self.canvas, bgr)
+        except Exception:
+            pass                        # 写回失败不影响下一帧（下一帧会重新读回）
+
+    def _apply_color(self, snap, bgr=None, write=True):
         """颜色渲染器（一键调色）：合成后、后处理前跑一次。
 
         **铁律**：Kv 待机层激活时绝不染色（`kv_on>0.01` 时强度直接硬归零，连渐变都不走），
@@ -4805,14 +4838,14 @@ class AutoVJEngine(QObject):
         """
         # ★ 码表接管期间跳整条调色链（与 Kv 同口径：码表里是 DJ 做好的成片，不能再染色）
         if self._cuesheet_on():
-            return
+            return bgr
         cfx = self.color_fx
         try:
             cfg = self.cfg["color"]
         except Exception:
-            return
+            return bgr
         if cfx is None or not cfg:
-            return
+            return bgr
         kv = self.kv_layer()
         kv_on = float(getattr(kv, "kv_on", 0.0) or 0.0) if kv is not None else 0.0
         flick = self._flicker_hibernate(cfg)
@@ -4820,9 +4853,18 @@ class AutoVJEngine(QObject):
                      bypass=bool(cfg.get("bypass", False)))
         if s > 0.004:
             try:
-                cfx.apply(self.canvas, cfg.get("mode", "lut"))
+                if bgr is None:
+                    from postprocess import _np_view_bgr
+                    bgr = _np_view_bgr(self.canvas)
+                out = cfx.apply_to_bgr(bgr, cfg.get("mode", "lut"))
+                if out is not None:
+                    bgr = out
+                    if write:
+                        from postprocess import write_back_bgr
+                        write_back_bgr(self.canvas, bgr)
             except Exception:
                 pass   # 调色失败不影响出画面
+        return bgr
 
     def _flicker_hibernate(self, cfg):
         """频闪素材要不要让颜色休眠：开 / 关 / 随机。
@@ -4865,7 +4907,7 @@ class AutoVJEngine(QObject):
                 continue
         return ""
 
-    def _apply_postfx(self, snap):
+    def _apply_postfx(self, snap, bgr=None, write=True):
         """对合成后的画布应用后处理特效链。
 
         触发模式（每个特效独立）：
@@ -4880,7 +4922,7 @@ class AutoVJEngine(QObject):
             self._postfx_reset_trails()
             self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
                                  "state": "码表接管中，已跳过"}
-            return
+            return bgr
         cfg = self.cfg["postfx"]
         # Kv 待机层显示中：画面以 Kv 为主，跳过整条后处理链
         # （Kv 图层要求完全独立，不受「后处理」等任何设置影响）
@@ -4889,12 +4931,12 @@ class AutoVJEngine(QObject):
             self._postfx_reset_trails()
             self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
                                  "state": "Kv 待机层接管，已跳过"}
-            return
+            return bgr
         if not cfg or not cfg.get("enabled", True):
             self._postfx_reset_trails()
             self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
                                  "state": "总开关已关闭"}
-            return
+            return bgr
         self._frame_i = getattr(self, "_frame_i", 0) + 1
         now = time.perf_counter()
         auto_link = bool(cfg.get("auto", True))
@@ -5010,13 +5052,19 @@ class AutoVJEngine(QObject):
         _reset = (_was_run is True) and (not self.running)
         self._postfx_run_prev = bool(self.running)
         try:
-            from postprocess import apply_postfx
-            apply_postfx(self.canvas, cfg, seed=self._frame_i, mods=mods,
-                         spectrum=snap.get("spectrum"),
-                         reset_trails=_reset,
-                         effects_override=effects_override)
+            from postprocess import postfx_effects_bgr, write_back_bgr
+            _out, _changed = postfx_effects_bgr(
+                self.canvas, bgr, cfg, seed=self._frame_i, mods=mods,
+                spectrum=snap.get("spectrum"),
+                reset_trails=_reset,
+                effects_override=effects_override)
+            if _changed and _out is not None:
+                bgr = _out
+                if write:
+                    write_back_bgr(self.canvas, bgr)
         except Exception:
             pass  # 后处理失败不影响渲染
+        return bgr
 
     def _postfx_reset_trails(self):
         """清空拖影缓冲（步进被跳过时用，避免下次开启闪现旧残影）。

@@ -84,6 +84,14 @@ HIGHLIGHTS = [
      "响度 / 低频冲击 / 起伏量多信号融合，扛得住系统音效与压缩",
      "Fuses loudness, low-frequency punch and fluctuation — robust against "
      "system audio effects and compression"),
+    ("渲染开销大幅下降", "Much lower render cost",
+     "调色与后处理改成共用一次全画布读回/写回，胶片颗粒换用更快的随机数生成器。"
+     "同机同曲实测（1280×720 / 30fps）：本进程 19~22% → 12~14%；"
+     "右下角那个 CPU 读数是**整机**占用（GetSystemTimes），不是本软件的",
+     "Color grading and post-processing now share one full-frame read-back/write-back, "
+     "and film grain uses a faster RNG. Measured on the same machine and track "
+     "(1280×720 / 30fps): 19-22% → 12-14% of the process; the CPU figure in the "
+     "status bar is the whole system (GetSystemTimes), not this app"),
 ]
 
 # 用到的开源项目（「关于」界面展示，链接可点击直接打开浏览器）

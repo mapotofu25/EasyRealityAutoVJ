@@ -2,6 +2,6 @@
 # 由 tools/build_version.py 自动生成，请勿手改（每次打包会覆盖）。
 # 版本号规则：年份.月.日.当日第几次生成（两位数）。
 BUILD_DATE = "2026-10-28"
-BUILD_SEQ = 24
-BUILD_VER = "2026.10.28.24"
-ZIP_NAME = "EasyRealityAutoVJ_测试版102824.zip"
+BUILD_SEQ = 26
+BUILD_VER = "2026.10.28.26"
+ZIP_NAME = "EasyRealityAutoVJ_测试版102826.zip"
