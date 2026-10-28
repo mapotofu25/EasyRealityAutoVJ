@@ -196,6 +196,16 @@ class WaveformMarkWidget(QWidget):
         self._segments = [dict(s) for s in (segments or []) if isinstance(s, dict)]
         self.update()
 
+    # ---- 能量段落（用户 2026-10-28）：只读展示，编辑在详情页的对话框里 ----
+    def energy_sections(self):
+        return [dict(s) for s in (getattr(self, "_energy_sections", None) or [])]
+
+    def set_energy_sections(self, sections):
+        """段落色带（按档位着色）。数据与 `sections.normalize()` 同 schema。"""
+        self._energy_sections = [dict(s) for s in (sections or [])
+                                 if isinstance(s, dict)]
+        self.update()
+
     def add_segment(self, t0, t1, bpm, default_bpm=None):
         """新增/归一化一个分段（详情页在 `segmentSelected` 后回填调用）。
 
@@ -466,6 +476,41 @@ class WaveformMarkWidget(QWidget):
         # ---- 3) 彩色波形（按振幅渐变：青蓝 → 黄 → 红）----
         if self._wf and self._wf.get("amp"):
             self._paint_waveform(p, w, plot_top, plot_bot)
+
+        # ---- 3a) 能量段落底色带（用户 2026-10-28）----
+        #   画在波形**之上**、拍网之下：alpha 只有 26 ⇒ 像"染色"而不是"盖住"，
+        #   读波形依然清楚；顶部 3px 实色条用来一眼看到段落边界在哪。
+        #   档位配色与详情页对话框里的色块一致，避免"两处颜色对不上"。
+        _esec = [x for x in (getattr(self, "_energy_sections", None) or [])
+                 if isinstance(x, dict)]
+        if _esec and d > 0:
+            _tc = {"low": (80, 140, 220), "mid": (222, 190, 90),
+                   "high": (232, 88, 88)}
+            _ph = max(1.0, float(plot_bot) - float(plot_top))
+            for _s in _esec:
+                try:
+                    _a0 = float(_s.get("t0") or 0.0)
+                    _a1 = float(_s.get("t1") or d)
+                except (TypeError, ValueError):
+                    continue
+                if _a1 <= _a0:
+                    continue
+                _x0 = self._x_of_sec(_a0)
+                _x1 = self._x_of_sec(_a1)
+                if _x1 < -2.0 or _x0 > w + 2.0:
+                    continue
+                _c = _tc.get(str(_s.get("tier") or "mid"), (150, 150, 150))
+                _bw = max(1.0, _x1 - _x0)
+                # 底色 alpha 45：第一版用 26 太淡，被彩色波形（青→黄→红）完全淹没，
+                # 截图里根本看不出段落 —— 提亮到 45 才"看得见但不挡读波形"。
+                p.fillRect(QRectF(_x0, float(plot_top), _bw, _ph),
+                           QColor(_c[0], _c[1], _c[2], 45))
+                # 顶部 10px 实色标尺：段落边界一眼可见（3px 在 720p 下太细）
+                p.fillRect(QRectF(_x0, float(plot_top), _bw, 10.0),
+                           QColor(_c[0], _c[1], _c[2], 225))
+                # 边界竖线（段与段的交界画一条，比标尺更能定位"到底切在哪一秒"）
+                p.setPen(QPen(QColor(_c[0], _c[1], _c[2], 235), 2))
+                p.drawLine(int(_x0), int(plot_top), int(_x0), int(plot_bot))
 
         # ---- 3b) 拍网（浅灰）/ 八拍头（更亮）—— 画在波形**之上**，否则会被彩色填充盖住
         bl = self._beat_len()

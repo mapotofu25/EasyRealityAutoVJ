@@ -124,8 +124,14 @@ class ColorRenderer:
 
     # -------- 决策 --------
     def tick(self, cfg, snap, *,
-             kv_on=0.0, flicker=False, bypass=False):
-        """推进一帧决策，返回当前染色强度 0..1。"""
+             kv_on=0.0, flicker=False, bypass=False, rotate_hint=None):
+        """推进一帧决策，返回当前染色强度 0..1。
+
+        `rotate_hint`：**要不要在这一帧换色**，由调用方判定。
+          · `None`（默认）= 不做判定，按 `rotate_sec` 秒数走（旧行为，逐值不变）；
+          · `True` / `False` = 用调用方的结论。引擎传的是「按八拍算出来的到期」，
+            这样换色点能踩在波形图的八拍头上（用户 2026-10-28 要求）。
+        """
         now = time.perf_counter()
         c = cfg or {}
         on = bool(c.get("on", True))
@@ -201,7 +207,10 @@ class ColorRenderer:
                 if E - lo >= 0.18 and E >= TIER_HIGH and now - self.t_burst > 6.0:
                     burst = True
                     self.t_burst = now
-            if self.palette_i < 0 or burst or (now - self.t_rotate) >= rotate:
+            # 换色判定：有 `rotate_hint` 就用调用方的（引擎按八拍算），否则旧行为
+            _due = ((now - self.t_rotate) >= rotate) if rotate_hint is None \
+                else bool(rotate_hint)
+            if self.palette_i < 0 or burst or _due:
                 self._pick_from_pool(pool, now)
                 if burst:
                     self.last_state += "·突变刷新"

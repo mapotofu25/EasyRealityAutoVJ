@@ -107,6 +107,25 @@ class CuePositionTracker:
         self.last_status = "lost"
 
     # ---------------- 状态查询 ----------------
+    def pos_sec_at(self, t_wall):
+        """原曲秒（`pos_beats_at` 的秒数版本）。不可信时返回 None。
+
+        ★ 2026-10-28（能量段落）：段落表按秒存，所以消费方要的是秒而不是拍。
+          `pos_beats_at() * beat_len` 恰好等于 `_pos_sec + dt * rate`，
+          即"原曲秒 + 挂钟推进"，与拍长取值无关 —— 所以这里乘回去就行，
+          不要另起一套自己的外推逻辑（那会和码表位置分叉）。
+        """
+        pb = self.pos_beats_at(t_wall)
+        if pb is None:
+            return None
+        try:
+            bl = float(self.beat_len)
+        except (TypeError, ValueError):
+            bl = DEFAULT_BEAT_LEN
+        if bl <= 1e-6:
+            bl = DEFAULT_BEAT_LEN
+        return float(pb) * bl
+
     def pos_beats_at(self, t_wall):
         """两次 `feed()` 之间按挂钟推进（`rate` = 播放倍率）。不可信时返回 None。"""
         if self._pos_sec < 0.0 or self.song_id < 0:

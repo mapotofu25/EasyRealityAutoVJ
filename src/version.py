@@ -92,6 +92,18 @@ HIGHLIGHTS = [
      "and film grain uses a faster RNG. Measured on the same machine and track "
      "(1280×720 / 30fps): 19-22% → 12-14% of the process; the CPU figure in the "
      "status bar is the whole system (GetSystemTimes), not this app"),
+    ("能量段落（到点直接切池）", "Energy sections (instant pool switch)",
+     "给每首歌标好「哪一段到哪一段、目标能量和档位」（详情页波形右键 → 编辑能量段落）。"
+     "演出时指纹一对齐就按这张表走：进 drop 那一帧直接换素材池，不再等实测能量慢慢爬、"
+     "也不等 2 秒稳定和 8/16 拍排期。段落边界、素材切换、效果切换、颜色轮换全部对齐"
+     "波形图的八拍网格（anchor + 8n×beat_len）；没标段落的歌仍然按原来的实测能量走",
+     "Mark each track's sections (time range + target energy / tier) from the waveform "
+     "right-click menu. Once the fingerprint locks, playback follows that table: the "
+     "pool switches on the exact frame you enter the drop, instead of waiting for the "
+     "measured energy to climb plus 2s of debounce and the 8/16-beat schedule. Section "
+     "boundaries, clip switching, effect switching and colour rotation all snap to the "
+     "same 8-beat grid as the waveform (anchor + 8n×beat_len); tracks without sections "
+     "keep the old measured-energy behaviour"),
 ]
 
 # 用到的开源项目（「关于」界面展示，链接可点击直接打开浏览器）

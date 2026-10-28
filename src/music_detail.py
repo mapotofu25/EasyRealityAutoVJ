@@ -31,6 +31,9 @@ _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+import sections as S                                        # noqa: E402
+from section_ui import EnergySectionDialog                   # noqa: E402  能量段落编辑框
+
 
 def _spin_silent(spin, val):
     """静默设置 `QDoubleSpinBox`（不触发 valueChanged）。
@@ -306,6 +309,11 @@ class MusicDetailDialog(QDialog):
         #   只做「显示」，不写进 grid_manual —— 见 `_effective_manual` 里的同源判断。
         if not mm.get("segments") and (self._grid or {}).get("segments"):
             self.wave.set_segments(self._grid["segments"])
+        # ★ 2026-10-28：能量段落色带（演出时就按这张表立即切池，见 src/sections.py）
+        try:
+            self.wave.set_energy_sections(self._energy_rows())
+        except Exception:                                     # noqa: BLE001
+            pass
         self.wave.set_playhead(0.0)
         self._dirty = False
         self._refresh_lists()
@@ -454,6 +462,9 @@ class MusicDetailDialog(QDialog):
 
         menu = QMenu(self)
         acts = {}
+        # 能量段落放在最前：它决定**演出时**什么时候换素材池，与 BPM 分段是不同的东西
+        acts["esec"] = menu.addAction("编辑能量段落（演出到点直接切池）…")
+        menu.addSeparator()
         acts["cut"] = menu.addAction("在 %.2fs 处切分（输入该段 BPM）…" % sec)
         acts["edit"] = menu.addAction("修改本段 BPM（当前 %.1f）…" % cur_bpm)
         acts["del"] = menu.addAction("删除本段（%.2fs 起，%.1f BPM）"
@@ -471,6 +482,8 @@ class MusicDetailDialog(QDialog):
 
     def _run_seg_action(self, key, idx, segs, cur_bpm, sec):
         """执行右键菜单里的某一项（`key` 见 `_build_seg_menu` 的 acts）。"""
+        if key == "esec":
+            return self._edit_energy_sections(sec)
         if key == "cut":
             if sec < 1.0:
                 QMessageBox.information(self, "切分分段",
@@ -678,6 +691,89 @@ class MusicDetailDialog(QDialog):
                 p.close()
             except Exception:                                    # noqa: BLE001
                 pass
+
+    # ---------------- 能量段落 ----------------
+    def _energy_rows(self):
+        """当前曲目的段落表（normalize 过、已按八拍吸附）。取不到返回 []。"""
+        try:
+            meta = (self.cfg["music_meta"] or {}).get(self.path) or {}
+            raw = meta.get("sections") or []
+        except Exception:                                     # noqa: BLE001
+            return []
+        if not raw:
+            return []
+        return S.normalize(raw, self._dur_now(), self._grid_for_snap() or None)
+
+    def _dur_now(self):
+        try:
+            d = float((self._wf or {}).get("dur") or 0.0)
+        except (TypeError, ValueError):
+            d = 0.0
+        if d > 0:
+            return d
+        try:
+            return float((self._grid or {}).get("dur") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _grid_for_snap(self):
+        """给段落吸附用的 `{anchor, beat_len}`；没 BPM 时返回 {}（不吸附）。"""
+        g = self._grid or {}
+        try:
+            bl = float(g.get("beat_len") or 0.0)
+        except (TypeError, ValueError):
+            bl = 0.0
+        if bl <= 1e-6:
+            try:
+                bpm = float(g.get("bpm") or 0.0)
+            except (TypeError, ValueError):
+                bpm = 0.0
+            bl = 60.0 / bpm if bpm > 0 else 0.0
+        if bl <= 1e-6:
+            return {}
+        try:
+            a = float(g.get("anchor") or 0.0)
+        except (TypeError, ValueError):
+            a = 0.0
+        return {"anchor": a, "beat_len": bl}
+
+    def _edit_energy_sections(self, sec):
+        """打开编辑框；确定后写回 `music_meta[path]["sections"]` 并落盘。
+
+        ⚠ 保存时**替换成新 list**（不是原地 append）：引擎那边按 `raw is cached_raw`
+          判缓存，引用一变就自动重算，不需要额外的"通知引擎"调用（少一个易漏点）。
+        """
+        try:
+            meta = (self.cfg["music_meta"] or {}).get(self.path) or {}
+            raw = meta.get("sections") or []
+        except Exception:                                     # noqa: BLE001
+            raw = []
+        dlg = EnergySectionDialog(self, sections=raw, dur=self._dur_now(),
+                                  grid=self._grid_for_snap(),
+                                  cur_sec=float(sec or 0.0))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        got = dlg.sections()
+        try:
+            mm = self.cfg["music_meta"]
+            rec = mm.get(self.path)
+            if not isinstance(rec, dict):
+                rec = {}
+                mm[self.path] = rec
+            if got:
+                rec["sections"] = [dict(x) for x in got]      # ★ 新 list ⇒ 引擎缓存按引用失效
+            else:
+                rec.pop("sections", None)
+            self.cfg.save()
+        except Exception as e:                                # noqa: BLE001
+            QMessageBox.warning(self, "能量段落", "保存失败：%s" % e)
+            return False
+        try:
+            self.wave.set_energy_sections(got)
+        except Exception:                                     # noqa: BLE001
+            pass
+        self._mark_dirty()
+        return True
 
     # ---------------- 保存 / 回退 ----------------
     def _write_manual(self, manual):

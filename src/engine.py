@@ -27,6 +27,7 @@ from PySide6.QtGui import QImage, QPainter, QColor
 from media_manager import make_player, _STALL_SECS
 from match_engine import match_clips
 from beatgrid import GridClock
+import sections                     # 能量段落表（曲库预设，见 src/sections.py）
 from fp import hint_window_frames
 from cue_position import CuePositionTracker, choose_sheet   # 位置层（指纹→拍位，带回滞）
 from cue_seek_policy import CueSeekPolicy      # 码表 seek 策略（纯逻辑，见 tools/cue_should_seek_test.py）
@@ -802,6 +803,21 @@ class AutoVJEngine(QObject):
         # 能量跨档即时切换：能量从高(>0.6)跌到低(<0.4)或反向时，不等拍位立即换素材动态档
         self._last_energy_tier = "mid"   # high / mid / low
         self._tier_since = None          # 新档位首次出现时刻（防抖）
+        # ---------------- 能量段落（曲库预设，用户 2026-10-28 要求）----------------
+        # 见 src/sections.py。三条同时满足才接管：认到歌 / 位置可信 / 该歌有段落表。
+        # 任一不满足 ⇒ 下面全部回到空/None，行为与改动前逐字一致。
+        self._sec_list = []              # 当前生效的段落表（已 normalize）
+        self._sec_idx = -1               # 当前段索引
+        self._sec_applied_idx = -1       # 上次**执行过切换**的段索引
+        self._sec_energy = None          # 段落目标能量（None = 不接管，用实测）
+        self._sec_tier = None            # 段落目标档位
+        self._sec_path = ""              # 段落表属于哪首歌（换歌要复位）
+        self._sec_seen_path = None       # 上一次见过 path（判断"是否换歌"）
+        self._sec_cache = None           # (path, sections) 缓存
+        self._sec_info = {}              # 取证：状态/段索引/目标值
+        self._sec_switch_n = 0           # 段落触发的切换次数（取证）
+        self._sec_reset_n = 0            # 段落状态被重置的次数（换歌/无表，取证用）
+        self._sec_why = ""               # 最近一次切换/重置的原因（取证用）
         self.canvas = QImage(1280, 720, QImage.Format_RGB32)
         self.canvas.fill(Qt.black)
         # 颜色渲染器（一键调色）。状态机在 colorfx.ColorRenderer 里，每帧 tick 一次；
@@ -1281,7 +1297,8 @@ class AutoVJEngine(QObject):
                 return
         self._last_genres = key
         self._auto_refresh_t = now
-        energy = snap_energy(snap)   # 注意：0.0 就是 0.0，不能当成 0.5（见 snap_energy 注释）
+        # ★ 段落接管时用目标能量（见 `_energy_for_switch`）
+        energy = self._energy_for_switch(snap)   # 注意：0.0 就是 0.0，不能当成 0.5
         changed = []
         for lay in self.layers:
             if not getattr(lay, "auto_mode", False):
@@ -1332,12 +1349,234 @@ class AutoVJEngine(QObject):
         if changed:
             self.auto_layers_changed.emit(changed)
 
+    # ---------------- 能量段落（曲库预设）----------------
+    def _sections_for_sid(self, sid):
+        """`song_id` → 该歌的段落表（已 normalize，带缓存）。取不到返回 `[]`。
+
+        存储位置 `cfg["music_meta"][path]["sections"]`（与 `grid` 并列，随曲库走）。
+        曲长优先取 `meta["dur"]`，退化到 `grid["dur"]`；都没有就只用手填的末段 t1。
+        """
+        try:
+            path = self._cue_song_path(int(sid)) if int(sid) >= 0 else ""
+        except (TypeError, ValueError):
+            path = ""
+        if not path:
+            return []
+        raw, dur, grid = [], 0.0, {}
+        try:
+            rec = (self.cfg["music_meta"] or {}).get(path) or {}
+            raw = rec.get("sections") or []
+            dur = float(rec.get("dur") or 0.0)
+            grid = rec.get("grid") or {}
+            if dur <= 0:
+                dur = float(grid.get("dur") or 0.0)
+        except Exception:                                     # noqa: BLE001
+            raw, dur, grid = [], 0.0, {}
+        # ★ 缓存按 **raw 列表的引用** 失效：详情页保存时替换成新 list ⇒ 这里 `is` 判否
+        #   ⇒ 自动重算。这样不需要"保存后记得通知引擎"，少一个易漏的跨模块调用。
+        cached = getattr(self, "_sec_cache", None)
+        if cached is not None and cached[0] == path and cached[1] is raw:
+            return cached[2]
+        # ★ 传 grid ⇒ `normalize` 会把每个 t0 吸附到最近的八拍头
+        #   （与 waveform_mark.grid_times 同一组 anchor/beat_len）。
+        secs = sections.normalize(raw, dur, grid if grid else None) if raw else []
+        self._sec_cache = (path, raw, secs)
+        self._sec_path = path
+        return secs
+
+    def _energy_for_switch(self, snap):
+        """「选池 / 切档 / 候选偏好 / 过渡时长」该用的能量。
+
+        有段落目标就用目标，否则用实测（`snap_energy` 的唯一正确取法）。
+
+        ⚠ **不改写 `snap["energy"]`**：那个值还要给界面显示、给后处理的
+          `drive=energy` 用。改成段落值等于给用户看假能量、后处理强度也跟着假。
+        """
+        tgt = getattr(self, "_sec_energy", None)
+        if tgt is not None:
+            return float(tgt)
+        return snap_energy(snap)
+
+    def _section_log(self, msg):
+        """段落取证：写一行 `[S]` 到 `cue_health.log`（失败静默，绝不影响渲染）。"""
+        try:
+            path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
+                                "cue_health.log")
+            d = os.path.dirname(path)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("[%s] [S] %s\n" % (time.strftime("%H:%M:%S"), msg))
+            # 环形裁剪：超过 800 行只留最后 400 行（与 layer_health 同风格）
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                if len(lines) > 800:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.writelines(lines[-400:])
+            except Exception:                                 # noqa: BLE001
+                pass
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    def _section_tick(self, snap):
+        """按「曲库预设段落表」推进能量档位（0.2s 级成本，每帧调也不贵）。
+
+        接管条件三条全中：
+          ① 指纹认到歌（`CuePositionTracker.song_id >= 0`）；
+          ② 位置可信（`pos_sec_at()` 非 None —— 内部已含丢票保持 / 过期不外推）；
+          ③ 这首歌在曲库里存了段落表。
+        任一不满足 ⇒ `_sec_energy=None`，完全退回「实测能量 + 滞回 + 2s 稳定」。
+
+        ⚠ 不用 `_cue_pos_beat_len()` 换秒：那是**码表**拍长（没装表时退化成 1.0），
+          而段落表里存的就是秒。直接要原曲秒，与 BPM / 码表是否装表都无关。
+        """
+        trk = getattr(self, "_cue_pos_tracker", None)
+        sid = -1
+        sec = None
+        now = time.perf_counter()
+        try:
+            sid = int(getattr(trk, "song_id", -1))
+            pss = getattr(trk, "pos_sec_at", None)
+            if callable(pss):
+                sec = pss(now)
+        except Exception:                                     # noqa: BLE001
+            sid, sec = -1, None
+
+        if sid < 0 or sec is None:
+            # 没认到歌 / 位置过期：**不接管**，但**不清段索引**。
+            # 为什么不清：短暂丢票（HOLD_N 次内）之后位置会回来，清空会让
+            # "丢一帧 → 回落实测能量 → 掉档 → 位置回来再升档"抖一次，现场看得见。
+            self._sec_energy = None
+            self._sec_tier = None
+            self._sec_info = {"state": "无位置"}
+            if getattr(self, "_sec_last_state", None) != "无位置":
+                self._sec_last_state = "无位置"
+                self._section_log("未接管：没认到歌或位置过期（退回实测能量）")
+            return
+
+        secs = self._sections_for_sid(sid)
+        if not secs:
+            # ★★ 2026-10-28 真机抓到（r35 一首歌切了 15 次）：**绝对不能在这里清
+            #   `_sec_applied_idx`**。指纹在两首歌之间抖动时（`sig` 短暂失效 / 误识别成
+            #   别的不带段落表的歌），每一抖都会走到这条分支；一清掉索引，认回来时
+            #   `i != -1` 又成立 ⇒ 又切一次 ⇒ 变成「每隔几秒重切一次」。
+            #   实测 r36 的日志加了 `why=` / `reset=N` 之后定位：正常一首歌 `reset`
+            #   只有 1 次（首次绑定），出问题时 `reset` 会涨到 15。
+            #   表要清（不能用上一首的表），但**索引要留着**（同一首歌认回来就不该重切）。
+            self._sec_list = []
+            self._sec_idx = -1
+            self._sec_energy = None
+            self._sec_tier = None
+            self._sec_reset_n += 1
+            self._sec_why = "no-table"
+            self._sec_info = {"state": "本曲无段落表"}
+            if getattr(self, "_sec_last_state", None) != "本曲无段落表":
+                self._sec_last_state = "本曲无段落表"
+                self._section_log("未接管：sid=%s 这首歌没存段落表（退回实测能量）" % sid)
+            return
+
+        # 换歌 ⇒ 段索引必须重来，否则新歌开场会沿用上一首 drop 的档位
+        if self._sec_seen_path != self._sec_path:
+            self._sec_seen_path = self._sec_path
+            self._sec_idx = -1
+            self._sec_applied_idx = -1
+            self._sec_reset_n += 1
+            self._sec_why = "song-change"
+
+        self._sec_list = secs
+        i, cur = sections.section_at(secs, sec)
+        self._sec_idx = i
+        self._sec_tier = cur["tier"]
+        self._sec_energy = cur["energy"]
+        self._sec_info = {"state": "ok", "i": i, "n": len(secs),
+                          "sec": round(float(sec), 2),
+                          "tier": cur["tier"], "e": cur["energy"],
+                          "name": cur["name"]}
+        # ★★ 只认**段索引变化**（2026-10-28 真机验收修复）：
+        #   原来还带了 `or prev_tier != cur["tier"]`，而 `_sec_tier` 会在「位置短暂失效」
+        #   分支被清成 None ⇒ 位置一恢复 `None != "mid"` 就再切一次 ⇒ 实测 150 秒内
+        #   重复切了 15 次（同一段在 88/91/93 秒反复切，间隔正好是位置层的 STALE 节奏）。
+        #   档位由段决定（tier 是段里的字段），同一段不会变档位，所以那个条件本来就多余。
+        if i != self._sec_applied_idx:
+            self._sec_applied_idx = i
+            if self._sec_why not in ("no-table", "song-change"):
+                self._sec_why = "seg"
+            self._apply_section_switch(snap, cur)
+
+    def _apply_section_switch(self, snap, cur):
+        """段落切换的**立即执行**：换池 + 换素材 + 过渡时长，全都不等拍位排期。
+
+        与 `_energy_tier_switch` 的差别就是这个函数存在的全部理由：
+          · 不做「新档位稳定 2.0 秒」的防抖 —— 那是给**实测能量抖动**用的，
+            段落边界是预置的确定事件，没有抖动可防（175 BPM 下 2 秒 = 5.8 拍，
+            正是用户说的"等 5~8 拍"）；
+          · 不等 `_next_switch_due` 的 8/16 拍排期；
+          · 过渡时长取段落里写的 `trans_ms`（默认 0 = 硬切）。
+
+        不动的图层（与 `_auto_switch_tick` 同口径，别自作主张放宽）：
+        固定(`fixed>=0`)、空池、全局锁定、Kv 待机层、码表容器层。
+        """
+        if not getattr(self, "running", False):
+            return                        # 没点「开始」：只记状态，不动画面
+        tier = cur.get("tier") or "mid"
+        tms = cur.get("trans_ms", None)
+        # ① 重 roll 素材池（mid 不强制过滤，与 _energy_tier_switch 同口径）
+        try:
+            self._refresh_auto_layers(
+                snap, force_tier=(tier if tier in ("low", "high") else None))
+        except Exception:                                     # noqa: BLE001
+            pass
+        # ② 把档位状态机直接推到目标档，避免下一帧 _energy_tier_switch 又按实测能量改回去
+        self._last_energy_tier = tier
+        self._tier_since = None
+        # ③ 重置切换排期 —— 「不等几拍」的关键一步
+        try:
+            self.switch_pos = self._beat_pos(snap)
+        except Exception:                                     # noqa: BLE001
+            pass
+        self._next_due = None
+        # ④ 立刻逐层切一次
+        _n_sw = 0
+        for lay in self.layers:
+            if getattr(lay, "fixed", -1) >= 0 or not getattr(lay, "clips", None):
+                continue
+            if self.locked:
+                continue
+            if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
+                continue
+            try:
+                if tms is not None:
+                    lay.trans_ms = int(tms)
+                self._switch_layer_random(lay, snap)
+                _n_sw += 1
+            except Exception:                                 # noqa: BLE001
+                continue
+        self._sec_switch_n = getattr(self, "_sec_switch_n", 0) + 1
+        _sec = self._sec_info.get("sec", -1.0)
+        _trk = getattr(self, "_cue_pos_tracker", None)
+        self._section_log(
+            "段落切换 #%d → %s/%s(E=%.2f) 原曲%.2fs 第%d/%d段 "
+            "换池=%s 切层=%d 排期已重置 | sid=%s reset=%d why=%s"
+            % (self._sec_switch_n, (cur.get("name") or "-"), tier,
+               float(cur.get("energy") or 0.0), float(_sec),
+               self._sec_idx + 1, len(self._sec_list or [None]),
+               tier if tier in ("low", "high") else "不强制", _n_sw,
+               getattr(_trk, "song_id", "?"), getattr(self, "_sec_reset_n", 0),
+               getattr(self, "_sec_why", "?")))
+
     def _energy_tier_switch(self, snap):
         """能量跨档即时切换：能量从高(>0.6)跌到低(<0.4)或反向时，立即换素材动态档。
 
         之前只靠拍位切换点(_next_switch_due 对齐 4 拍小节线)换素材，切换间隔 8~32 拍，
         能量变了要等十几秒才换到对应动态档。这里在能量跨档、新档位稳定 1.5s 后（防抖），
         立即对所有非固定图层切一次，让「高潮→高动态 / 缓和→低动态」跟上能量。"""
+        # ★ 2026-10-28：**段落表接管期间整段跳过**。
+        #   这条路径的 2 秒稳定期 + 滞回是为「实测能量抖动」设计的；
+        #   段落边界是预置的确定事件，由 `_section_tick` 直接执行（不等拍位、不等 2 秒）。
+        #   两条同时跑会互相打架：本函数会把段落刚设好的档位按实测能量改回去。
+        if getattr(self, "_sec_energy", None) is not None:
+            return
         E = snap_energy(snap)   # 0.0 必须当成 0.0（旧写法 `or 0.5` 会让档位卡在中档）
         # 这里**刻意不做静音门控**：档位必须照常评估，否则「能量算成 0」时档位永远停在
         # 上一档，低动态池一辈子 roll 不出来（用户反馈：能量为 0 时不 roll 低动态池）。
@@ -1561,6 +1800,10 @@ class AutoVJEngine(QObject):
         # · 没有码表图层时直接返回（实测 0.41µs/帧，见 tools/cue_tick_test.py）；
         # · 内部异常已被吞掉（清空本帧 + 限流记日志），绝不影响下面的合成。
         self._cue_auto_position()      # 自动跟拍：低频轮询（0.2s），不进 _compose
+        # ★ 2026-10-28（能量段落）：按曲库预设的段落表推进档位。
+        #   必须放在 `_cue_auto_position()` **之后** —— 它要先有可信的原曲秒。
+        #   改到前面会让段落判定永远晚 0.2s（用的是上一次的位置）。
+        self._section_tick(snap)
         self._cuesheet_tick(snap)
 
         # 合成
@@ -1902,7 +2145,7 @@ class AutoVJEngine(QObject):
             # 满间隔重新数（用户反馈：快切数到 2 突然变慢切又跳到 30，体验割裂）。
 
     def _score_modes(self, snap):
-        E = snap["energy"]
+        E = self._energy_for_switch(snap)
         OD = min(1.0, snap["onset_density"] / 4.0)          # 瞬态密度归一（每秒强拍数，drop≈4）
         BS = snap["bpm_stab"]                                # BPM 稳定性
         BC = snap["beat_clarity"]                            # 节拍清晰度
@@ -2159,7 +2402,7 @@ class AutoVJEngine(QObject):
         # 兼容仍有区间的模式（未来扩展）：按能量在 lo~hi 间线性插值
         TR = max(-1.0, min(1.0, snap["energy_trend"]))
         sens = int(self.cfg["mode"].get("sensitivity", 1))
-        E = max(0.0, min(1.0, snap["energy"]))
+        E = max(0.0, min(1.0, self._energy_for_switch(snap)))
         f = E + TR * 0.15 + (-0.1, 0.0, 0.1)[max(0, min(2, sens))]
         f = max(0.0, min(1.0, f))
         return hi - (hi - lo) * f   # f=1(高能)→lo；f=0(低能)→hi
@@ -2193,6 +2436,31 @@ class AutoVJEngine(QObject):
         if remain is None:
             return None
         return max(0, int(math.ceil(float(remain)) - 1))
+
+    def _snap_to_phrase(self, target, snap, forward=False):
+        """把拍位吸附到最近的栅格线（网格模式 = 八拍头，否则 = 4 拍小节线）。
+
+        与 `_next_switch_due` 用**同一组** `_align_width` / `_bar_off` —— 所以
+        「素材切换落在哪」和「效果切换 / 段落切换落在哪」必然是**同一条网格**，
+        这正是用户 2026-10-28 要求的一致性（不能各算一套）。
+
+        `forward=True`：只许往后吸。用于"到期点"——否则 `round` 可能把到期点吸到
+        当前拍位之前，下一帧就立刻判"已到期"，效果会每帧重挑一次。
+        """
+        try:
+            w = float(self._align_width(snap))
+            off = float(self._bar_off(snap))
+            t = float(target)
+        except Exception:                                     # noqa: BLE001
+            try:
+                return float(target)
+            except (TypeError, ValueError):
+                return 0.0
+        if not (math.isfinite(w) and math.isfinite(off) and math.isfinite(t)) or w <= 0:
+            return t
+        if forward:
+            return off + math.ceil((t - off) / w - 1e-9) * w
+        return off + round((t - off) / w) * w
 
     def _align_width(self, snap):
         """切换点对齐的栅格宽度（拍）：网格模式=8（八拍乐句头），否则=4（4/4 小节线，现状）。"""
@@ -2337,7 +2605,7 @@ class AutoVJEngine(QObject):
             # 过渡时长：区间内微调（高能/快切时更短）
             TR = max(-1.0, min(1.0, snap["energy_trend"]))
             sens = int(self.cfg["mode"].get("sensitivity", 1))
-            E = max(0.0, min(1.0, snap["energy"]))
+            E = max(0.0, min(1.0, self._energy_for_switch(snap)))
             f = E + TR * 0.15 + (-0.1, 0.0, 0.1)[max(0, min(2, sens))]
             f = max(0.0, min(1.0, f))
             trans_ms = int(meta["trans_ms"] * (1.3 - f * 0.3))  # 区间内微调过渡时长
@@ -2370,9 +2638,11 @@ class AutoVJEngine(QObject):
                 elif DYNAMIC_MID in tags:
                     mid.append(i)
                 # 未标动态：不分类（低能量不选）
-            if snap["energy"] >= 0.65 and hi:
+            # ★ 用目标能量判偏好：否则段落选了 drop、候选却还按实测低能量挑低动态素材
+            _E_sel = self._energy_for_switch(snap)
+            if _E_sel >= 0.65 and hi:
                 prefer = hi                    # 高潮段：优先高动态/频闪
-            elif snap["energy"] < 0.50:
+            elif _E_sel < 0.50:
                 # 缓和段：只低动态；低动态被 cooldown/recent 过滤完→中动态兜底（少选）；
                 # 无低/中动态→避开高动态/频闪（未标动态做最后手段）。绝不选未标/高动态/频闪优先。
                 if lo:
@@ -4829,6 +5099,54 @@ class AutoVJEngine(QObject):
         except Exception:
             pass                        # 写回失败不影响下一帧（下一帧会重新读回）
 
+    def _color_rotate_due(self, snap, cfg):
+        """「这一帧该不该换颜色」——按**八拍**判定（用户 2026-10-28）。
+
+        原来 `colorfx` 只看 `rotate_sec`（纯秒数），与音乐无关：16 秒在 128 BPM 是
+        4 个八拍、在 175 BPM 是 6 个八拍，换色点会落在拍子中间。
+
+        这里把 `rotate_sec` 换算成「几个八拍」：`round(rotate_sec / (8×beat_len))`，至少 1，
+        再用八拍序号推进 —— 于是**每次换色都踩在八拍头上**，而"大约多少秒换一次"
+        的用户预期仍然成立（BPM 变了间隔跟着变）。
+
+        返回：True=本帧可换色 / False=还不到 / None=没网格（调用方退回旧的按秒行为）。
+        """
+        try:
+            st = self._grid_state(snap)
+        except Exception:                                     # noqa: BLE001
+            st = None
+        if not st:
+            return None                      # 没进网格模式：保持旧行为（按秒），零回归
+        try:
+            bl = float(st[1])
+            rot = max(1.0, float(cfg.get("rotate_sec", 45) or 45))
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not math.isfinite(bl) or bl <= 1e-6:
+            return None
+        try:
+            pos = float(self._beat_pos(snap))
+            off = float(self._bar_off(snap))
+        except Exception:                                     # noqa: BLE001
+            return None
+        w = sections.PHRASE_BEATS            # 8
+        step = bl * w                        # 一个八拍多少秒
+        n = max(1, int(round(rot / max(1e-6, step))))
+        idx = math.floor((pos - off) / w + 1e-9)
+        last = getattr(self, "_color_phrase", None)
+        last_pos = float(getattr(self, "_color_phrase_pos", 0.0) or 0.0)
+        if last is None or pos < last_pos - 0.5:
+            # 首次 / 拍钟重置（换歌）：对齐到当前八拍，但**本帧不换**
+            # （否则每次换歌都会立刻闪一下颜色）
+            self._color_phrase = idx
+            self._color_phrase_pos = pos
+            return False
+        self._color_phrase_pos = pos
+        if idx - int(last) >= n:
+            self._color_phrase = idx
+            return True
+        return False
+
     def _apply_color(self, snap, bgr=None, write=True):
         """颜色渲染器（一键调色）：合成后、后处理前跑一次。
 
@@ -4849,8 +5167,12 @@ class AutoVJEngine(QObject):
         kv = self.kv_layer()
         kv_on = float(getattr(kv, "kv_on", 0.0) or 0.0) if kv is not None else 0.0
         flick = self._flicker_hibernate(cfg)
+        try:
+            _rot = self._color_rotate_due(snap, cfg) if bool(cfg.get("auto", True)) else None
+        except Exception:                                     # noqa: BLE001
+            _rot = None
         s = cfx.tick(cfg, snap, kv_on=kv_on, flicker=flick,
-                     bypass=bool(cfg.get("bypass", False)))
+                     bypass=bool(cfg.get("bypass", False)), rotate_hint=_rot)
         if s > 0.004:
             try:
                 if bgr is None:
@@ -4992,7 +5314,11 @@ class AutoVJEngine(QObject):
                         or getattr(self, "_fx_hold_genres", None) != gkey)
                 if need:
                     self._fx_hold_pick = self._auto_pick_effects(snap, genres_now)
-                    self._fx_hold_due = pos + hold
+                    # ★ 2026-10-28：到期点**吸附到八拍头**（用户要求"画面效果里的选项
+                    #   也要和波形图八拍对齐"）。原写法 `pos + hold` 会落在任意拍上 ——
+                    #   换效果就切在半拍里，跟素材切换不在同一条网格上。
+                    self._fx_hold_due = self._snap_to_phrase(pos + hold, snap,
+                                                             forward=True)
                     self._fx_hold_genres = gkey
                 chosen = self._fx_hold_pick
             effects_override = {n: {"on": True, "level": 100} for n in chosen}
