@@ -64,6 +64,33 @@ _PLAYHEAD_COLOR = QColor(80, 255, 190)
 _WAVE_OUTLINE = QColor(150, 210, 255, 200)
 
 
+def grid_times(anchor, beat_len, dur):
+    """拍网时间序列（秒）——**纯函数，供 paintEvent 与测试共用**。
+
+    产出 `(k, t)`：`k` 是相对 `anchor` 的拍序号（`k % 8 == 0` 即八拍头），`t` 是秒。
+
+    ⚠⚠ 为什么不能从 `anchor` 单向往后画（2026-10-28 用户报「左边空的没有八拍划分」）：
+    `anchor` 只是**某一处**八拍头，VDJ 的 `Phase` 常落在曲子中段（实测某曲 66.0s）⇒
+    只往后画会让 anchor 之前的整段一条线都没有。拍网是**周期性的**，
+    因此必须从 anchor 往回退到 ≤0（`k` 取负）再一路画到曲尾。
+    """
+    try:
+        bl = float(beat_len or 0.0)
+        d = float(dur or 0.0)
+        a = float(anchor or 0.0)
+    except (TypeError, ValueError):
+        return
+    if bl <= 0.0 or d <= 0.0:
+        return
+    # 往回退到第一个 ≤ 0 的拍位：k = -(floor(a/bl) + 1)
+    k = -(int(a / bl) + 1) if a > 0.0 else 0
+    t = a + k * bl
+    while t <= d + 1e-9:
+        yield k, t
+        t += bl
+        k += 1
+
+
 class WaveformMarkWidget(QWidget):
     """波形标记控件。用法见模块 docstring。"""
 
@@ -421,17 +448,20 @@ class WaveformMarkWidget(QWidget):
             draw_beat = bl_px >= 4.0
             draw_phrase = bl_px * 8.0 >= 4.0
             a = float(self._grid.get("anchor") or 0.0) if self._grid else 0.0
-            t = a
-            while t <= d + 1e-9:
+            # ★★ 2026-10-28（用户报「左边空的没有八拍划分」）：
+            #   `anchor` 是**某一处八拍头**，VDJ 的 Phase 常在曲子中段
+            #   （实测这首歌 anchor=66.0s）⇒ 旧代码 `t = a` 只往后画，
+            #   **前 66 秒一条线都没有**。拍网是周期性的，必须从 anchor 往回退到 ≤0 再画。
+            #   ⚠ 序列生成抽到模块级 `grid_times()`（纯函数）以便回归测试覆盖。
+            for _k, t in grid_times(a, bl, d):
                 x = self._x_of_sec(t)
                 if -2.0 <= x <= w + 2.0:
-                    is_phrase = (round((t - a) / bl) % 8 == 0)
+                    is_phrase = (_k % 8 == 0)
                     if draw_beat or (is_phrase and draw_phrase):
                         pen = QPen(QColor(120, 140, 150, 70) if not is_phrase
                                    else QColor(220, 230, 240, 120), 1)
                         p.setPen(pen)
                         p.drawLine(int(x), int(plot_top), int(x), int(plot_bot))
-                t += bl
 
         # ---- 4) 分段边界线 ----
         p.setPen(QPen(QColor(255, 255, 255, 120), 1))

@@ -44,6 +44,7 @@ waveforms/
 # ---------- 真机验证截图（每次跑 tools/_verify_*.py 都会重写）----------
 tools/_verify_*.png
 tools/_qa_*_exe*.png
+tools/_shot_*.png
 
 # ---------- 附带的诊断小工具（含 exe，另行发布）----------
 音源排查/

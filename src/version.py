@@ -44,16 +44,27 @@ HIGHLIGHTS = [
     ("听歌识曲 + 曲风匹配", "Song ID + genre matching",
      "识别正在播放的歌，按曲风自动挑选匹配的画面",
      "Recognizes the playing track and picks matching visuals by genre"),
-    ("NDI 局域网发送（低延迟）", "NDI LAN send (low latency)",
-     "关掉发送端的帧率时钟节流，帧一到就走 —— 局域网直连时 OBS 里画面更跟手；"
-     "需要先开 NDI 输出才可用",
-     "Turns off the sender-side frame-rate clocking so frames leave immediately — "
-     "tighter picture in OBS on a direct LAN; requires NDI output to be enabled"),
+    ("NDI 输出", "NDI output",
+     "画面作为 NDI 源「Easy Reality Output」直出：本机走 TCP 回环，局域网走直连，"
+     "OBS 里直接选它就行",
+     "Publishes the picture as the NDI source 'Easy Reality Output' — loopback over TCP "
+     "on the same machine, direct on a LAN; just pick it in OBS"),
     ("曲目信息与详情合一", "Track info merged into details",
      "曲库右键只剩一个入口：文件/歌名/艺人/曲风/时长/采样率/指纹 ID 与波形标注、"
      "分段 BPM、八拍起点在同一页",
      "One right-click entry in the library: file / title / artist / genre / duration / "
      "sample rate / fingerprint ID together with the waveform, segment BPM and downbeats"),
+    ("本地网格分析与 BPM", "Local beat grid & BPM",
+     "自己算拍长和八拍头，不依赖外部软件：按 VDJ 曲库对照，50 首里 48 首 BPM 一致、"
+     "43 首小节相位对齐；可选神经网络只用来指认「哪一拍是小节头」；"
+     "详情页还能整段微调或半速/倍速",
+     "Computes beat length and downbeats on its own: against a rekordbox/VDJ library, "
+     "48 of 50 tracks agree on BPM and 43 on bar phase; an optional neural model only "
+     "decides which beat starts the bar; the details page can shift or halve/double it"),
+    ("拍网铺满整首", "Beat grid covers the whole track",
+     "八拍竖线从中段锚点往前往后都画 —— 修掉了「左半段没有刻度」的问题",
+     "Downbeat lines are drawn both directions from a mid-track anchor — "
+     "fixes the reported 'no grid on the left half'"),
     ("变速跟得住", "Follows tempo changes",
      "画面位置按实测播放倍率推进（不再每 30 秒判一次假跳变）",
      "Playback position advances by the measured rate instead of a fixed 1.0x "
