@@ -4136,8 +4136,7 @@ class MainWindow(QMainWindow):
                 from ndi_out import get_ndi, probe_runtime
                 _ok, _detail = probe_runtime()
                 if _ok:
-                    eng._ndi = get_ndi(o.get("ndi_name") or "EasyRealityAutoVJ",
-                                       fps=(self.cfg.get("perf", {}) or {}).get("ndi_fps", 0))
+                    eng._ndi = get_ndi(o.get("ndi_name") or "EasyRealityAutoVJ")
                     eng._ndi_fail = False
                     print("[NDI] 启动恢复输出（运行时 %s）；发送端等第一帧按实际分辨率建立"
                           % _detail)

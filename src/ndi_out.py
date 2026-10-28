@@ -300,15 +300,6 @@ class NDIOutput:
         self._inited = False
         self._last_err = ""
         self._dropped = 0        # 因缓冲未就绪而丢掉的帧数（诊断用，正常应接近 0）
-        # ★★ 2026-10-28（性能）：NDI 提交可限帧（`perf.ndi_fps`）。
-        #   ⚠ 实测结论要老实说：**受控 A/B（固定素材、关自动切换）下，NDI 开/关中位值
-        #     完全一样（60.9% vs 60.9%）** ⇒ NDI 在本机不是主要开销；
-        #     先前"NDI 开 164% / 关 90%"是自动切素材带来的解码负载干扰，不是 NDI。
-        #   ⇒ **默认 0 = 不限频，行为与以前完全一致**；只是把开关留出来，
-        #     谁在 4K/高帧率下发现 NDI 吃不消，可以设 `perf.ndi_fps=20` 换 CPU。
-        self._ndi_fps = 0
-        self._last_send_t = 0.0
-        self._throttled = 0     # 因限频而跳过的帧数（诊断）
         # ---- 音频（2026-10-01 修：原来三个错叠在一起，NDI 音频从来没响过）----
         self._audio_sr = 48000   # 采集采样率提示（**已不再用于帧设置**：帧固定 48k，见 _AUDIO_SR）
         self._audio_ok = 0       # 成功发出的音频块数（诊断）
@@ -527,19 +518,6 @@ class NDIOutput:
             if item is None:
                 continue
             snap, w, h = item
-            # ★ 限帧：跳过这一帧（队列只留最新帧，跳过不丢画面，只是这一拍不发）
-            try:
-                _fps = float(self._ndi_fps or 0.0)
-                if _fps > 0.0:
-                    _gap = 1.0 / _fps
-                    _now2 = time.perf_counter()
-                    if _now2 - self._last_send_t < _gap * 0.92:
-                        self._throttled += 1
-                        self._vbuf_pool.release(snap)
-                        continue
-                    self._last_send_t = _now2
-            except Exception:                                    # noqa: BLE001
-                pass
             t0 = time.perf_counter()
             try:
                 with self._vlock:
@@ -845,8 +823,7 @@ _inst = None
 _inst_lock = threading.Lock()
 
 
-def get_ndi(name, fps=None):
-    """取 NDI 单例。`fps` = 每秒最多提交几帧（None=不改，0=不限频）。"""
+def get_ndi(name):
     global _inst
     with _inst_lock:
         if _inst is None:
@@ -854,9 +831,4 @@ def get_ndi(name, fps=None):
         elif _inst.name != name:
             _inst.close()
             _inst = NDIOutput(name)
-        if fps is not None:
-            try:
-                _inst._ndi_fps = float(fps)
-            except (TypeError, ValueError):
-                pass
         return _inst

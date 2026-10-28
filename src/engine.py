@@ -1743,9 +1743,7 @@ class AutoVJEngine(QObject):
             import numpy as _np
             w, h = self.canvas.width(), self.canvas.height()
             if self._ndi is None:
-                # ★ 2026-10-28：NDI 提交限帧开关（`perf.ndi_fps`，默认 0 = 不限，行为不变）。
-                self._ndi = get_ndi(oc.get("ndi_name") or "EasyRealityAutoVJ",
-                                    fps=(self.cfg.get("perf", {}) or {}).get("ndi_fps", 0))
+                self._ndi = get_ndi(oc.get("ndi_name") or "EasyRealityAutoVJ")
             # ⚠ 必须带**真实分辨率**：发送端的 VideoSendFrame 只能在 open() 之前定死尺寸，
             #   所以 sender 是按第一次发帧的尺寸建立的。旧代码这里不给尺寸 → 直接返回 False
             #   → `_ndi_fail` 被永久置位 → NDI 输出再也不会尝试（静默失效）。
