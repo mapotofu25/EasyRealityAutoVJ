@@ -300,12 +300,6 @@ class NDIOutput:
         self._inited = False
         self._last_err = ""
         self._dropped = 0        # 因缓冲未就绪而丢掉的帧数（诊断用，正常应接近 0）
-        # ★ 2026-10-28：局域网发送模式（低延迟）。
-        #   NDI SDK 的 `clock_video=True` 会**按提交帧率做时钟节流**，等于给每帧加一层排队；
-        #   局域网直连时这层缓冲就是用户看到的「OBS 比本地晚零点几秒」。
-        #   打开后建 sender 时传 `clock_video=False` ⇒ 帧一到就走。
-        #   ⚠ 只能在「NDI 输出」已开启时生效（UI 门控 + engine 侧也只看这个字段）。
-        self._lan = False
         # ---- 音频（2026-10-01 修：原来三个错叠在一起，NDI 音频从来没响过）----
         self._audio_sr = 48000   # 采集采样率提示（**已不再用于帧设置**：帧固定 48k，见 _AUDIO_SR）
         self._audio_ok = 0       # 成功发出的音频块数（诊断）
@@ -364,9 +358,7 @@ class NDIOutput:
             from cyndilib.sender import Sender
             from cyndilib.video_frame import VideoSendFrame
             from cyndilib.audio_frame import AudioSendFrame
-            # clock_video = not lan：局域网模式关掉视频时钟节流（见 self._lan 说明）。
-            # clock_audio 保持 True —— 音频块是按时间推进的，关掉反而会突发。
-            s = Sender(self.name, "", not bool(self._lan), True)
+            s = Sender(self.name)
             # ⚠ cyndilib 的 Sender **没有 set_ndi_name() 方法**（只有 name / ndi_name 属性）。
             # 2026-09-24 实测报 `'Sender' object has no attribute 'set_ndi_name'`，
             # 而这个异常被本函数的 except 吃掉 → NDI 输出**一直静默不可用**。
@@ -492,16 +484,6 @@ class NDIOutput:
             self._ensure_vthread()
         except Exception as e:                                     # noqa: BLE001
             self._last_err = str(e)[:160]
-
-    def set_lan(self, on):
-        """切换「局域网发送（低延迟）」。改变了就重建 sender（时钟参数只能在 open 前定）。"""
-        on = bool(on)
-        if on == bool(self._lan):
-            return False
-        self._lan = on
-        if self.enabled:
-            self.close()          # 下一帧会按新参数重建
-        return True
 
     def _ensure_vthread(self):
         """确保视频提交线程在跑（首次入队时惰性启动）。"""
@@ -837,16 +819,8 @@ class NDIOutput:
 
 
 # 全局单例（引擎线程 + 采集线程共享）
-# ★ 2026-10-28（用户要求「NDI 输出管本地、局域网发送管局域网」）：
-#   两个**互相独立**的发送端 —— 本机接收端（OBS 同机）拿 `_inst`，
-#   局域网内的机器拿 `_inst_lan`（名字带 " (LAN)" 后缀，且关掉视频时钟节流）。
-#   为什么要分开：低延迟要关时钟节流，但关掉后对"同机接收"没有必要冒险；
-#   分成两路后本机那路保持原样，局域网那路单独调低延迟，互不影响。
 _inst = None
-_inst_lan = None
 _inst_lock = threading.Lock()
-
-LAN_SUFFIX = " (LAN)"
 
 
 def get_ndi(name):
@@ -861,28 +835,3 @@ def get_ndi(name):
         return _inst
 
 
-def get_ndi_lan(name):
-    """**局域网**输出的 NDI 发送端（源名 = name + " (LAN)"，默认关时钟节流）。"""
-    global _inst_lan
-    lan_name = str(name) + LAN_SUFFIX
-    with _inst_lock:
-        if _inst_lan is None:
-            _inst_lan = NDIOutput(lan_name)
-            _inst_lan.set_lan(True)
-        elif _inst_lan.name != lan_name:
-            _inst_lan.close()
-            _inst_lan = NDIOutput(lan_name)
-            _inst_lan.set_lan(True)
-        return _inst_lan
-
-
-def close_ndi_lan():
-    """关掉局域网发送端（UI 取消勾选时调用，释放 encoder 线程）。"""
-    global _inst_lan
-    with _inst_lock:
-        if _inst_lan is not None:
-            try:
-                _inst_lan.close()
-            except Exception:                                    # noqa: BLE001
-                pass
-            _inst_lan = None

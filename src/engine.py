@@ -756,10 +756,6 @@ class AutoVJEngine(QObject):
         self._spout_log_at = 0.0       # 上次写"失败"日志的时刻（30s 限流）
         # NDI 输出（懒加载，音画同步；缺 Runtime 时静默禁用）
         self._ndi = None
-        # ★ 2026-10-28：局域网独立发送端（与 `_ndi` 完全分开；见 ndi_out.get_ndi_lan 说明）
-        self._ndi_lan = None
-        self._ndi_lan_fails = 0
-        self._ndi_lan_retry_at = 0.0
         self._ndi_fail = False         # True=当前处于"失败退避"态（ui_main 置 False ⇒ 立即重试）
         # NDI 退避重试状态（见 `_ndi_send` / `_output_fail`）
         self._ndi_fails = 0
@@ -1747,7 +1743,6 @@ class AutoVJEngine(QObject):
             import numpy as _np
             w, h = self.canvas.width(), self.canvas.height()
             if self._ndi is None:
-                # 本机那一路**保持默认**（按时钟节流）；局域网是另一路，见下方 ndi_lan 分支。
                 self._ndi = get_ndi(oc.get("ndi_name") or "EasyRealityAutoVJ")
             # ⚠ 必须带**真实分辨率**：发送端的 VideoSendFrame 只能在 open() 之前定死尺寸，
             #   所以 sender 是按第一次发帧的尺寸建立的。旧代码这里不给尺寸 → 直接返回 False
@@ -1760,21 +1755,6 @@ class AutoVJEngine(QObject):
             # 传给 NDI 的是 BGRA 连续缓冲（画布 RGB32 = BGRA 内存序）。
             # send_video 自己返回真实提交结果；这里仅用于诊断，不把单帧丢弃当成异常。
             self._ndi.send_video(bgra, w, h)
-            # ---- 局域网那一路（独立 sender，失败**不影响**本机输出）----
-            if oc.get("ndi_lan") and now >= self._ndi_lan_retry_at:
-                try:
-                    from ndi_out import get_ndi_lan
-                    if self._ndi_lan is None:
-                        self._ndi_lan = get_ndi_lan(oc.get("ndi_name") or "EasyRealityAutoVJ")
-                    if self._ndi_lan._ensure(w, h):
-                        self._ndi_lan.send_video(bgra, w, h)
-                    self._ndi_lan_fails = 0
-                except Exception as e2:                            # noqa: BLE001
-                    # 独立退避：局域网那路挂了绝不影响本机输出
-                    self._ndi_lan_fails += 1
-                    self._ndi_lan_retry_at = now + min(5.0, 0.5 * self._ndi_lan_fails)
-                    if self._ndi_lan_fails in (1, 10):
-                        print("[NDI-LAN] 发送失败（第 %d 次）：%s" % (self._ndi_lan_fails, e2))
         except Exception as e:                                     # noqa: BLE001
             # ⚠ 失败时**保留已有 `self._ndi`**（不丢成 None 重建）：NDI 源名在接收端反复
             #   消失/出现会让接收端更难恢复；复用同一 sender，故障消失后接着推同一源。
@@ -5414,12 +5394,6 @@ class AutoVJEngine(QObject):
             except Exception:
                 pass
             self._spout = None
-        if self._ndi_lan is not None:
-            try:
-                self._ndi_lan.close()
-            except Exception:                                    # noqa: BLE001
-                pass
-            self._ndi_lan = None
         if self._ndi is not None:
             try:
                 self._ndi.close()

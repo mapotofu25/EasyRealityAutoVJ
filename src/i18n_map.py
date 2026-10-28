@@ -239,11 +239,6 @@ ZH2EN = {
     "Sender 名称（OBS 里显示的名字）": "Sender Name (shown in OBS)",
     "NDI 输出（音画同步）": "NDI Output (A/V synced)",
     "NDI 输出": "NDI Output",
-    "NDI 局域网发送": "NDI LAN Send",
-    "另开一路 NDI 源（名字带 (LAN)）给局域网里的机器；本机接收端仍走上面那一路。\n局域网直连时建议开启：不等帧率排队，画面更跟手。":
-        "Opens a second NDI source (name ends with \"(LAN)\") for machines on the LAN; "
-        "the local receiver keeps using the source above. Recommended on a direct LAN: "
-        "frames leave immediately instead of queueing.",
     "通过网络发送画面+声音（运行时已随软件自带，无需安装；接收端需装 NDI Runtime）":
         "Send video + audio over the network (runtime is bundled - nothing to install; the receiver needs NDI Runtime)",
     "渲染帧率": "Render FPS",
