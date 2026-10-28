@@ -190,16 +190,53 @@ def tempo_fit_score(t, env, bpm, tol=0.05, nseg=3, min_beats=32):
     e = env.astype(np.float64)
     seg = dur / float(nseg)
 
-    # ① 只用第一段定相位（后面各段都拿它来测）
-    m = (t >= 0.0) & (t < seg)
-    if int(m.sum()) < 8:
-        return 0.0, 0.0, []
-    _sc, h = grid_conc(t[m], e[m], bl, 96)
-    ph = (int(np.argmax(h)) + 0.5) / 96.0 * bl
+    def _hit_of_phase(phase):
+        """给定相位，返回该相位下全曲每拍命中率（自适应阈值，同 ② 的算法）。"""
+        tot, good = 0, 0
+        for i in range(nseg):
+            a = i * seg
+            b = dur if i + 1 >= nseg else (i + 1) * seg
+            n0 = int(np.ceil((a - phase) / bl))
+            n1 = int(np.floor((b - phase) / bl))
+            if n1 - n0 < 8:
+                continue
+            mseg = (t >= a) & (t < b)
+            thr = (max(0.12, float(np.percentile(e[mseg], 70)))
+                   if int(mseg.sum()) >= 8 else 0.25)
+            beats = phase + np.arange(n0, n1 + 1) * bl
+            i0 = np.maximum(0, np.round((beats - tol) / dt).astype(np.int64))
+            i1 = np.minimum(n - 1, np.round((beats + tol) / dt).astype(np.int64))
+            for s0, s1 in zip(i0, i1):
+                if s1 > s0:
+                    tot += 1
+                    if float(e[s0:s1 + 1].max()) > thr:
+                        good += 1
+        return (good / float(tot)) if tot > 0 else 0.0
+
+    # ① 定相位：**按命中率直接搜**，不用相位直方图。
+    #   ⚠ 2026-10-28（INTERNET YAMERO 实测）：`grid_conc` 用 96 桶，而 onset 帧率只有
+    #   46ms/帧（185 BPM 一个周期才 7 帧）⇒ 桶比帧细 13 倍，argmax 落在稀疏噪声上。
+    #   实测把 185（正确答案）拟合成相位 -0.140，而真值是 -0.006（差 0.41 拍），
+    #   于是 185 的跨段命中率只有 11%，比错误答案 182.5（27%）还低 —— 判据彻底失效。
+    #   既然最终判据就是"每拍命中率"，相位也应该**按同一指标**搜。
+    best_ph, best_sc = 0.0, -1.0
+    for k in range(24):                       # 粗搜 1/24 拍
+        ph = k * bl / 24.0
+        sc = _hit_of_phase(ph)
+        if sc > best_sc:
+            best_ph, best_sc = ph, sc
+    for k in range(-2, 3):                    # 细搜 ±1/12 拍
+        ph = best_ph + k * bl / 96.0
+        sc = _hit_of_phase(ph)
+        if sc > best_sc:
+            best_ph, best_sc = ph, sc
+    ph = best_ph
     if ph > bl * 0.5:
         ph -= bl
 
-    # ② 各段命中率（每拍 ±tol 内 onset 最大值 > 0.25 记命中）
+    # ② 各段命中率（每拍 ±tol 内 onset 最大值，超过**该段 onset 的 70 分位**记命中）
+    #   ⚠ 阈值必须按段自适应：固定 0.25 会让 onset 整体偏弱的歌（INTERNET YAMERO 实测
+    #   峰值只有 0.2~0.3）整首判成 3%~5%，连正确答案都认不出来 ⇒ 判据彻底失效。
     rates = []
     for i in range(nseg):
         a = i * seg
@@ -208,6 +245,8 @@ def tempo_fit_score(t, env, bpm, tol=0.05, nseg=3, min_beats=32):
         n1 = int(np.floor((b - ph) / bl))
         if n1 - n0 < 8:
             continue
+        mseg = (t >= a) & (t < b)
+        thr = max(0.12, float(np.percentile(e[mseg], 70))) if int(mseg.sum()) >= 8 else 0.25
         beats = ph + np.arange(n0, n1 + 1) * bl
         i0 = np.maximum(0, np.round((beats - tol) / dt).astype(np.int64))
         i1 = np.minimum(n - 1, np.round((beats + tol) / dt).astype(np.int64))
@@ -218,7 +257,7 @@ def tempo_fit_score(t, env, bpm, tol=0.05, nseg=3, min_beats=32):
         if not vals:
             continue
         v = np.asarray(vals)
-        rates.append(float((v > 0.25).mean()))
+        rates.append(float((v > thr).mean()))
     if not rates:
         return 0.0, ph, []
     return float(np.mean(rates)), float(ph), rates

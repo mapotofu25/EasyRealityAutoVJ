@@ -6393,7 +6393,16 @@ class MainWindow(QMainWindow):
         `bpm` 只在「众数 ∈ [115,185] 且足够集中」时才 >0，所以慢歌 / 极快曲 /
         被估成半速的曲子会**一直显示 0**（用户 2026-09-24 报的现象）。
         `bpm_display` 由票数≥10 且集中度≥0.40 就发布，未锁定时前面加「≈」区分。
+
+        ★★ 2026-10-28（用户报「本地分析 185 / 实时 182~183」）：
+          认出歌以后优先显示 **`lib_bpm`（库内 BPM，离线整曲细扫）**——
+          实时自相关在 fps≈86 时 1 帧就有 3.6 BPM 粒度，收敛值会低 1~2 BPM
+          （实测 185.00 vs 181.5，集中度 4.02 vs 1.35、命中率 52% vs 31%）。
+          库内值更准且与网格一致，所以不再挂「≈」。
         """
+        lib = snap.get("lib_bpm") or 0.0
+        if lib > 0:
+            return "%s%.1f" % (prefix, float(lib))
         v = snap.get("bpm_display") or snap.get("bpm") or 0.0
         if not v:
             return prefix + "--"

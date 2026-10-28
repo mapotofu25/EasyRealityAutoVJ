@@ -589,6 +589,15 @@ class AudioState:
         #   所以「显示」与「驱动拍钟」必须解耦：这个字段只给界面看，不参与任何节奏计算。
         self.bpm_display = 0.0
         self.bpm_locked = False     # bpm_display 是否已是锁定值（界面据此加「≈」前缀）
+        # ★★ 2026-10-28（用户报「本地分析 185 / 实时 182~183」）：
+        #   实时 BPM 是「自相关找鼓点周期 + 60s 1BPM 直方图众数 + 指数平滑」，
+        #   fps≈86 时 1 帧 = 3.6 BPM，靠抛物线插值细化也只能到 ±1 帧量级；
+        #   而离线是**整曲两级细扫（0.05 步长）+ 网格集中度**。
+        #   INTERNET YAMERO 实测：离线 185.00（集中度 4.02 / 命中 52%），
+        #   实时收敛到 181.5（集中度 1.35 / 命中 31%）⇒ **离线对**。
+        #   所以认到歌且 BPM 校验通过时，界面直接显示库内值（这个字段只给界面用，
+        #   不参与拍钟/网格 —— 网格始终用 grid.beat_len）。
+        self.lib_bpm = 0.0
         self.beat_phase = 0.0       # 0..1 拍内相位
         self.beat_count = 0         # 总拍数
         self.bar_count = 0          # 4/4 小节数（按识别出的小节头起算）
@@ -660,6 +669,7 @@ class AudioState:
                 "level": self.level, "bass": self.bass, "mid": self.mid,
                 "high": self.high, "energy": self.energy, "bpm": self.bpm,
                 "bpm_display": self.bpm_display, "bpm_locked": self.bpm_locked,
+                "lib_bpm": self.lib_bpm,
                 "beat_phase": self.beat_phase, "beat_count": self.beat_count,
                 "bar_count": self.bar_count, "downbeat_off": self.downbeat_off,
                 "downbeat_conf": self.downbeat_conf, "drop": self.drop,
@@ -2346,6 +2356,7 @@ class AudioEngine:
                 #   放在 `fp_lock_gate` **之后**：先让票数/证据门槛决定"认不认"，再用 BPM 否决
                 #   "认错曲"，两条判据互不干扰（`gate=bpm` 单独可回看）。
                 #   ⚠ 倍频（0.5×/2×）放行：BPM 检测出半速/双速是常态，不能因此杀正确匹配。
+                _lbpm = 0.0        # ★ sid<0 时也要有定义（下面「显示用库内 BPM」要用）
                 if sid >= 0:
                     _lbpm, _rbpm, _brel = 0.0, 0.0, None
                     _bprov = getattr(self, "_song_bpm_provider", None)
@@ -2376,6 +2387,17 @@ class AudioEngine:
                             sid, votes, off = -1, 0, 0.0
                         else:
                             self._last_gate = _gate_before     # 通过：恢复 strict/warp/recode
+
+                # ★ 2026-10-28：界面显示用的库内 BPM（离线整曲细扫，比实时自相关准一个量级）。
+                #   只有「认到歌 + BPM 校验通过 + 库里有值」才发布；其余一律清零，
+                #   免得没认到歌时还挂着上一首的 BPM。
+                try:
+                    if (sid >= 0 and _lbpm > 0 and self._bpm_ok_flag != 0):
+                        self.state.lib_bpm = float(_lbpm)
+                    else:
+                        self.state.lib_bpm = 0.0
+                except Exception:                            # noqa: BLE001
+                    pass
 
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
