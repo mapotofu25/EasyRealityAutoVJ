@@ -520,6 +520,16 @@ CHROMA_FINE_SLOPE_HALF = 0.02   # 精扫 slope 半宽
 #   只差 0.07 ⇒ 被 0.10 挡住 ⇒ 一律报原速 ⇒ 前馈倍率停在 1.000。
 #   离线复查（3 首 × 原速/0.80/1.20）：0.06 时**原速仍全部报 1.000**，不会误跳。
 CHROMA_SLOPE_MARGIN = 0.06
+# ★★★ 2026-10-29 照 KDJ 作者公布的判据补的三项（都有离实测标定）：
+CHROMA_SEG = 3               # 查询窗分三段分别算（原文「分三段分别算」）
+CHROMA_ULTRA_STEP = 0.001    # 精扫斜率步长（原文「收到 ±0.1%」）
+CHROMA_LEAD_SEC = 0.8        # 「别的位置」至少离开最优这么远（秒）
+# 三条门槛。离线标定（3 首 × 1.00/0.80/1.20，tools/_test_kdj_gate2.py）：
+#   正值 得分 0.62~0.97、最弱 0.53~0.96、领先 +0.32~+0.82
+#   负值 得分 0.15~0.21、最弱 0.06~0.17、领先 +0.04~+0.08
+# 真机分数比离线低一截（实测 0.72 对应离线 0.78），所以门槛取离线最低再降一档。
+CHROMA_WEAK_MIN = 0.42       # 最弱窗下限
+CHROMA_LEAD_MIN = 0.15       # 领先下限
 
 
 def chroma_verify(q, ref, coarse_step=None):
@@ -572,104 +582,147 @@ def chroma_verify(q, ref, coarse_step=None):
     return best
 
 
+def _win_norm(m):
+    """按窗口去均值 → 逐帧 L2 归一化。
+
+    ★ 查询端和参考端**必须都过这一步**。漏掉参考端时点积变成
+      「去均值单位向量 · 未去均值单位向量」，实测 chroma 同曲从 0.96 掉到 0.18、
+      1.20× 还会出负分。抽成独立函数是为了让回归测试能把它换掉做反向复现。
+    """
+    m = m - m.mean(axis=0, keepdims=True)
+    nrm = np.sqrt((m * m).sum(axis=1, keepdims=True))
+    return m / np.maximum(nrm, 1e-8)
+
+
 def chroma_verify_near(q, ref, target_hint, rate_hint=1.0,
                        target_span=30, rate_span=None):
-    """**现场用的版本**：位置限定在已知附近，倍率**全量程扫**（不靠猜）。
+    """**现场用的版本**：位置限定在已知附近，倍率在 `rate_hint ± rate_span` 内搜。
 
-    为什么倍率不能靠 `rate_hint` 限范围（2026-10-29 实测）：
-      `rate_hint` 来自上一帧，而变速工况下 `_rate_est` 常年停在 1.000
-      ⇒ 若按 ±0.08 限定，范围只有 0.92~1.08，**1.20 永远扫不到**，
-      实测 1.20× 的三首歌全部退化成 0.28/0.12/0.51。
-      ⇒ 倍率改用「全量程粗扫（0.80~1.25 步长 0.02）+ 对 top-4 精扫（0.005）」，
-        位置仍由 `target_hint` 限定（这一步才是省时间的关键，也防止跳到重复段落）。
+    2026-10-29 照 KDJ 作者公开的校验判据重写，三处实质改动（都有离实测数据）：
+
+    ① **改成「粗扫 0.02 → 精扫 0.001」两阶段**（原文「位置和速度从粗到细收窄，
+       从 ±4% 收到 ±0.1%」）。旧实现是「粗扫 0.02 → 只对 top-4 用 0.005 精扫」，
+       而且**没有把位置一起精扫**。实测（3 首 × 1.00/0.80/1.20）：
+         rate   旧（0.005，top-4）  新（0.001，位置也细扫）
+         1.00   0.97               0.96
+         0.80   0.64~0.85          0.76~0.87
+         1.20   **0.15~0.30**      **0.81~0.88**   ← 关键改善
+       位置误差同时从 0.3~0.6 秒降到 **0.00 秒**。
+       ⚠ 但「0.001 一定比 0.02 准」不成立（实测 1.205 vs 1.200，真值 1.20，
+         相关峰本身有平台）—— 撑住精度的是**两阶段结构**，不是某一步的步长。
+
+    ② **三段拆分 ⇒ 最弱窗**（原文「查询窗分三段分别算，得出得分和最弱窗」）。
+       均分能把「两段对、一段错」糊过去；最弱窗直接暴露它。
+
+    ③ **领先**（原文「得分减次选是领先」）。次选取「离开最优位置 > 0.8 秒、
+       速度相近」的最高分 —— 也就是**重复段落的另一处**。这是防「锁到同一首歌的
+       错位置」最有效的判据：实测正值 +0.32~+0.82、负值 +0.04~+0.08。
 
     :param target_hint: 查询第 0 帧对应的参考帧（引擎给，单位 100ms 帧）
-    :param rate_hint:   仅用于「与 1.0 的边际比较」时的参考，不限制搜索范围
-    :return: `(score, slope, target_frame)`；全越界时返回 (-1, rate_hint, -1)
+    :param rate_hint:   倍率搜索中心
+    :param rate_span:   倍率搜索半宽（None ⇒ 0.12，逐步爬升）
+    :return: dict（`score` / `weak` / `lead` / `slope` / `target` / `second`）；
+             全越界返回 None
     """
     if q is None or ref is None:
-        return -1.0, float(rate_hint or 1.0), -1
-    n = q.shape[0]
+        return None
+    n = int(q.shape[0])
     if n < CHROMA_MIN_FRAMES or ref.shape[0] < n + 8:
-        return -1.0, float(rate_hint or 1.0), -1
+        return None
+    # 查询端：按窗口去均值 → 逐帧归一化（参考端在 _sweep 里做**同样**的处理）
+    qf = _win_norm(q[:n])
 
-    def _best_at(slope, step=1):
-        span = int(round(n * slope))
-        lo = max(0, int(target_hint) - int(target_span))
-        hi = min(ref.shape[0] - span, int(target_hint) + int(target_span))
-        bb = (-2.0, float(slope), -1)
-        for t in range(lo, max(lo + 1, hi + 1), step):
-            v = chroma_score_at(q, ref, t, slope, phrase=n)
-            if v > bb[0]:
-                bb = (v, float(slope), int(t))
-        return bb
+    def _sweep(slopes, t_lo, t_hi):
+        """对一批斜率、一段 target 范围搜。返回全部候选 `(得分, 最弱, 斜率, 位置)`。
 
-    # ---- 1. 粗扫：slope 限定在「上一帧倍率 ±rate_span」，位置步长 10 帧 ----
-    # ★★ 2026-10-29 真机（`cr=1.230` 在原速播放时出现，直接造成一次位置窜动 4.27 拍/秒）：
-    #   全量程扫会让 chroma 一步跳到 1.23 —— 因为 hint 位置本身有偏差时，
-    #   「换个倍率 + 换个位置」总能凑出更高的分。而引擎的前馈会被它带跑。
-    #   ⇒ 倍率只允许**逐步爬升**：搜索范围 = 上一帧 ±0.12。
-    #     原速时范围 0.88~1.12（够不到 1.23）⇒ 不会被带跑；
-    #     真变速时两窗内就能爬到 1.20（1.00 → 1.12 → 1.20）。
+        向量化：`P = qf @ sub.T` 是逐帧点积（两端都逐帧归一化 ⇒ 就是余弦），
+        再按 `target + round(i*slope)` 取对角线。一次算完一整档斜率的所有位置。
+        """
+        cands = []
+        t_lo = max(0, int(t_lo))
+        for s in slopes:
+            step = np.rint(np.arange(n) * float(s)).astype(np.int64)
+            spanf = int(step[-1]) + 1
+            lo = t_lo
+            hi = min(int(ref.shape[0]), int(t_hi) + spanf + 1)
+            if hi - lo <= spanf:
+                continue
+            sub = _win_norm(ref[lo:hi])
+            P = qf @ sub.T
+            T = sub.shape[0] - spanf + 1
+            j = np.arange(T)[:, None] + step[None, :]
+            per = P[np.arange(n)[None, :], j]              # (T, n)
+            parts = np.array_split(per, CHROMA_SEG, axis=1)
+            mm = np.stack([p.mean(axis=1) for p in parts])
+            sc, wk = mm.mean(axis=0), mm.min(axis=0)
+            # ★★★ 必须保留**每一档斜率的整条位置曲线**，不能只留 argmax：
+            #   「落后」的定义是「得分 − **别的位置**的次高」，只留 argmax 的话
+            #   次选会退化成"别的斜率"，语义完全变了（2026-10-29 被回归测试抓到：
+            #   重复段落的两处会给出 lead=+0.81，等于这条判据完全失效）。
+            for k in range(T):
+                cands.append((float(sc[k]), float(wk[k]), float(s), lo + k))
+        return cands
+
     _rs = 0.12 if rate_span is None else float(rate_span)
     _rh = float(rate_hint or 1.0)
     if not (CHROMA_SLOPE_LO <= _rh <= CHROMA_SLOPE_HI):
         _rh = 1.0
-    coarse = []
-    sl = max(CHROMA_SLOPE_LO, round(_rh - _rs, 4))
-    sl_hi = min(CHROMA_SLOPE_HI, round(_rh + _rs, 4))
-    while sl <= sl_hi + 1e-9:
-        b = _best_at(sl, step=10)
-        if b[2] >= 0 and b[0] > 0.02:
-            coarse.append(b)
-        sl = round(sl + CHROMA_COARSE_SLOPE, 4)
-    if not coarse:
-        return -1.0, float(rate_hint or 1.0), -1
-    coarse.sort(key=lambda x: -x[0])
-    # ---- 2. 精扫：对 top-4 细化 slope(0.005) 与位置(1 帧) ----
-    best = (-2.0, 1.0, -1)
-    seen = []
-    for _v, csl, ct in coarse[:4]:
-        if any(abs(ct - t0) <= 12 and abs(csl - s0) <= 0.03 for t0, s0 in seen):
-            continue
-        seen.append((ct, csl))
-        a = max(CHROMA_SLOPE_LO, csl - 0.02)
-        a_hi = min(CHROMA_SLOPE_HI, csl + 0.02)
-        while a <= a_hi + 1e-9:
-            span = int(round(n * a))
-            lo = max(0, ct - 10)
-            hi = min(ref.shape[0] - span, ct + 10)
-            for t in range(lo, max(lo + 1, hi + 1)):
-                v = chroma_score_at(q, ref, t, a, phrase=n)
-                if v > best[0]:
-                    best = (v, round(float(a), 4), int(t))
-            a = round(a + CHROMA_FINE_SLOPE, 4)
+    s_lo = max(CHROMA_SLOPE_LO, _rh - _rs)
+    s_hi = min(CHROMA_SLOPE_HI, _rh + _rs)
+    h = int(target_hint)
+    # ---- 1. 粗扫：斜率 0.02 一档，位置步长 5 帧 ----
+    coarse_slopes = []
+    a = s_lo
+    while a <= s_hi + 1e-9:
+        coarse_slopes.append(round(a, 4))
+        a = round(a + CHROMA_COARSE_SLOPE, 4)
+    tg = list(range(h - int(target_span), h + int(target_span) + 1, 5))
+    if not tg:
+        return None
+    cands = _sweep(coarse_slopes, tg[0], tg[-1])
+    if not cands:
+        return None
+    best = max(cands, key=lambda x: x[0])
+    # ---- 2. 精扫：斜率 ±0.012 步长 0.001，位置 ±8 帧步长 1 ----
+    #    文档「从 ±4% 收到 ±0.1%」；0.001 是本轮离线标定出来的拐点
+    #    （0.005 时 1.20× 只有 0.15~0.30，0.001 时 0.62~0.88）。
+    fine_s = [float(x) for x in np.round(
+        np.arange(best[2] - 0.012, best[2] + 0.0121, CHROMA_ULTRA_STEP), 4)
+        if CHROMA_SLOPE_LO <= x <= CHROMA_SLOPE_HI]
+    fine = _sweep(fine_s, max(0, best[3] - 8), best[3] + 8)
+    cands.extend(fine)
+    b2 = max(fine, key=lambda x: x[0]) if fine else None
+    if b2 is not None and b2[0] > best[0]:
+        best = b2
     # ---- 3. 边际要求：变速必须明显优于 slope=1.0，否则报 1.0（不猜） ----
-    if best[2] >= 0 and abs(best[1] - 1.0) > 1e-9:
-        base = _best_at(1.0, step=1)
-        if best[0] < base[0] + CHROMA_SLOPE_MARGIN:
-            return base
-    return best
+    base = None
+    if abs(best[2] - 1.0) > 1e-9:
+        bl = _sweep([1.0], tg[0], tg[-1])
+        base = max(bl, key=lambda x: x[0]) if bl else None
+        if base is not None and best[0] < base[0] + CHROMA_SLOPE_MARGIN:
+            best = base
+    # ---- 4. 领先：同速度、位置差 > 0.8 秒的最高分 ----
+    tol = max(2, int(round(CHROMA_LEAD_SEC / 0.1)))
+    sec = -1.0
+    for c in cands:
+        if abs(c[3] - best[3]) > tol and abs(c[2] - best[2]) <= 0.03:
+            sec = max(sec, c[0])
+    return {"score": float(best[0]), "weak": float(best[1]), "slope": float(best[2]),
+            "target": int(best[3]), "second": float(sec),
+            "lead": float(best[0] - sec)}
 
 
-# ---------------------------------------------------------------- 冷启动全曲扫描
-# ★★★ 2026-10-29：变速时票会被摊到几十个位置，`fp_lock_gate` 的「领先 2 倍」过不去
-#   （真机 0.80× 实测 ptot=166 vs 第二名 141，要求 332）⇒ 锁不上 ⇒ chroma 复核
-#   根本没机会运行（它只在已锁定后工作）。要救冷启动只能让 chroma **自己找人**。
-#
-#   做法照 KDJ `fuzzy.rs` 的检索形态：先把查询与参考的**逐帧点积**一次性算成矩阵
-#   `P = q · ref.T`（每帧都是 L2 归一化的 12 维，所以 P 就是余弦相似度），
-#   再按 `target + round(i*slope)` 取对角线求平均 —— 这样 46 档斜率、全部 target
-#   位置**一次算完**，不用 Python 循环（原来那样 6000+ 次调用要 300~400 ms）。
-#
-#   ⚠ 这里**不减窗口均值**（与 `chroma_score_at` 不同）。这是 KDJ 的原版形态，
-#     它的 0.32/0.40 阈值就是在这一版上调出来的；减均值是为了抑制"同调"，
-#     但那是滑窗操作、没法向量化，代价是几百倍耗时。
-# 冷启动放行门槛。标定依据（tools/_test_chroma_cold.py，97 首全库）：
-#   同曲各倍速                       0.41 ~ 0.95（最低是 Black Warrior 1.20x 的 0.411）
-#   同一查询扫**库里别的歌**的最高分   0.20 ~ 0.30
-#   ⇒ 取 0.34：比库外最高高 0.04、比同曲最低低 0.07，两边都有余量。
-CHROMA_COLD_GATE = 0.34
+# 冷启动放行门槛（引擎侧 `audio_engine` 也有同名常量、数值相同 —— 故意重复，
+# 因为 bandfeat 在引擎里是惰性 import，不能让它变成硬依赖）。
+# 标定依据（tools/_test_chroma_cold.py，97 首全库）：
+#   同曲各倍速 0.41~0.95（最低是 Black Warrior 1.20x 的 0.411）
+#   同一查询扫库里别的歌 0.20~0.30
+# ★ 2026-10-29 加了「最弱窗 / 领先」两条后重新标定（4 首 × 3 档 × 扫全库）：
+#   真曲 12 条 分 0.412~0.948 / 弱 0.320~0.931 / 领 +0.098~+0.576
+#   异曲 48 条 分 0.139~0.288 / 弱 -0.020~0.229 / 领 +0.000~+0.070
+CHROMA_COLD_GATE = 0.34       # 得分门槛
+CHROMA_COLD_WEAK = 0.25       # 最弱窗下限
+CHROMA_COLD_LEAD = 0.06       # 领先下限
 CHROMA_COLD_TOPN = 3          # 只对指纹**总票**最高的 N 首做冷启动扫描
 CHROMA_COLD_COOLDOWN = 2.0    # 最短间隔（秒）
 
@@ -698,7 +751,7 @@ def _scan_prep(q, ref):
 
 
 def chroma_scan_full(q, ref, slopes=None, step_t=1, target_range=None, topk=1):
-    """全曲自由扫描（向量化）。返回 `[(score, slope, target_frame), ...]`（降序）。
+    """全曲自由扫描（向量化）。返回 `[(score, slope, target, weak, lead), ...]`（降序）。
 
     做法：先算逐帧点积矩阵 `P = q · ref.T`（两端都是单位向量 ⇒ P 就是余弦），
     再按 `target + round(i*slope)` 取**对角线**求平均 —— 46 档斜率 × 全部 target
@@ -737,9 +790,20 @@ def chroma_scan_full(q, ref, slopes=None, step_t=1, target_range=None, topk=1):
         if idx_t.size == 0:
             continue
         j_idx = idx_t[None, :] + step[:, None]                 # (n, K)
-        sc = P[i_idx, j_idx].mean(axis=0)                      # (K,)
+        per = P[i_idx, j_idx]                                  # (n, K)
+        sc = per.mean(axis=0)                                  # (K,)
         k = int(np.argmax(sc))
-        out.append((float(sc[k]), float(slope), int(idx_t[k])))
+        # ★ 2026-10-29：把「最弱窗」和「领先」一起算出来（KDJ 原文的两条判据）。
+        #   自由扫全曲时这两条比均值管用得多：重复段落的另一处均值也能凑得很高，
+        #   但它会和最优位置**打平**（领先接近 0），而且总有一段对不齐（最弱窗低）。
+        _p = np.array_split(per[:, k], CHROMA_SEG)
+        _m = [float(x.mean()) for x in _p if x.size]
+        weak = min(_m) if _m else float(sc[k])
+        tol = max(2, int(round(CHROMA_LEAD_SEC / 0.1)))
+        mask = np.abs(idx_t - idx_t[k]) > tol
+        second = float(sc[mask].max()) if bool(mask.any()) else -1.0
+        out.append((float(sc[k]), float(slope), int(idx_t[k]), float(weak),
+                    float(sc[k] - second)))
     out.sort(key=lambda x: -x[0])
     return out[:max(1, int(topk))]
 
@@ -751,17 +815,20 @@ def chroma_scan_refine(q, ref, slope0, target0, slope_half=0.02, target_span=6):
     a_hi = min(CHROMA_SLOPE_HI, float(slope0) + float(slope_half))
     while a <= a_hi + 1e-9:
         sl.append(round(a, 4))
-        a = round(a + CHROMA_FINE_SLOPE, 4)
+        # ★ 2026-10-29：与 `chroma_verify_near` 统一用 0.001
+        #   （0.005 在 4.5 秒窗上会让窗尾漂 2.25 帧 = 0.22 秒，斜率就白算了）
+        a = round(a + CHROMA_ULTRA_STEP, 4)
     lo = max(0, int(target0) - int(target_span))
     hi = int(target0) + int(target_span)
     top = chroma_scan_full(q, ref, slopes=sl, step_t=1, target_range=(lo, hi), topk=1)
     if not top:
-        return -1.0, float(slope0), int(target0)
+        return -1.0, float(slope0), int(target0), -1.0, -1.0
     return top[0]
 
 
 def chroma_coldstart(q, refs, slopes=None, step_t=2, refine=True):
-    """冷启动：在一组候选参考里全库扫描，返回 `(sid, score, slope, target)` 或 None。
+    """冷启动：在一组候选参考里全库扫描，返回
+    `(sid, score, slope, target, weak, lead)` 或 None。
 
     :param refs: `[(sid, chroma_matrix), ...]` —— 必须由调用方按**指纹总票**排序，
                  总票第一的排最前（分数完全相同时用它决胜：库里有同源版本时
@@ -772,15 +839,18 @@ def chroma_coldstart(q, refs, slopes=None, step_t=2, refine=True):
         top = chroma_scan_full(q, cm, slopes=slopes, step_t=step_t, topk=1)
         if not top:
             continue
-        sc, sl, tg = top[0]
+        sc, sl, tg, wk, ld = top[0]
         if best is None or sc > best[1] + 1e-9:
-            best = (int(sid), float(sc), float(sl), int(tg))
+            best = (int(sid), float(sc), float(sl), int(tg), float(wk), float(ld))
     if best is None or not refine:
         return best
     cm = next((c for s_, c in refs if int(s_) == int(best[0])), None)
     if cm is None:
         return best
-    sc2, sl2, tg2 = chroma_scan_refine(q, cm, best[2], best[3])
+    sc2, sl2, tg2, wk2, _ld = chroma_scan_refine(q, cm, best[2], best[3])
     if sc2 >= 0:
-        return (best[0], float(sc2), float(sl2), int(tg2))
+        # ⚠⚠ `lead` 必须沿用**全曲粗扫**的那个值。refine 只在 ±6 帧内搜，
+        #   范围里根本没有"别的位置"，次选会取不到 ⇒ 领先是假的 +1.1~+1.2
+        #   （= 得分 − (−1) 的哨兵值），量出来全是噪声。得分/位置/最弱窗用精扫的。
+        return (best[0], float(sc2), float(sl2), int(tg2), float(wk2), float(best[5]))
     return best

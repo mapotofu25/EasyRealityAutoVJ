@@ -247,6 +247,13 @@ CHROMA_GATE = 0.55           # 放行门槛（同曲实测 0.60~0.98、异曲 0.
 # chroma 高分时可以**纠正** BPM 比值（两者差 >0.10 才动手）。实测同曲 1.00x=0.97、
 # 1.08x=0.86、1.20x=0.81，而异曲 0.14~0.30 ⇒ 0.70 是干净的分界。
 CHROMA_TRUST_SCORE = 0.70
+# ★ 2026-10-29：最弱窗 / 领先的门槛。数值与 `bandfeat.CHROMA_WEAK_MIN/CHROMA_LEAD_MIN`
+#   一致（标定依据写在那边），这里**故意重复定义**而不是 import ——
+#   `bandfeat` 在引擎里一直是**惰性 import**（侧车库不存在时整条通道降级、
+#   主功能照跑）。改成模块级 import 会让 bandfeat 变成硬依赖，一旦它出问题
+#   整个引擎起不来。宁可重复两个数字。
+CHROMA_WEAK_MIN = 0.42       # 最弱窗下限（三段里最低的一段）
+CHROMA_LEAD_MIN = 0.15       # 领先下限（得分减次选）
 # 全量程搜索时"变速"必须比"原速"明显更好（否则一律报 1.0）。
 # 真机实测：原速播放时自由扫会把 1.08~1.23 的次优峰刷到 0.64（只比 1.0 处低一点），
 # 采信它就会把前馈带跑（一次 4.27 拍/秒的位置窜动）。0.10 是能分开的量级。
@@ -261,12 +268,23 @@ CHROMA_COOLDOWN = 0.0        # 每窗都做（实测 ~100ms；需要减负时调
 #   实测（3 首候选含精扫）：14~25 ms，分数 0.41~0.95（真曲）对 0.18~0.30（无关曲）。
 CHROMA_COLD_ON = True        # 总开关（关掉就退回"只靠票数门槛"）
 CHROMA_COLD_GATE = 0.34      # 分数门槛（见 bandfeat.CHROMA_COLD_GATE 的标定）
+# ★ 2026-10-29 照 KDJ 原文补的两条（「最弱窗」和「领先」），冷启动也一样要过。
+#   离线标定（4 首 × 1.00/0.80/1.20，各扫全库）：
+#     真曲 12 条：分 0.412~0.948  弱 0.320~0.931  领 +0.098~+0.576
+#     异曲 48 条：分 0.139~0.288  弱 -0.020~0.229 领 +0.000~+0.070
+#   ⇒ 三条同时卡：正 100% / 负 0%（tools 里那一轮原话见 _test_kdj_gate2 注释）。
+#   门槛比离线最低再降一档，给真机的分数衰减留余量。
+CHROMA_COLD_WEAK = 0.25      # 冷启动：最弱窗下限
+CHROMA_COLD_LEAD = 0.06      # 冷启动：领先下限
 CHROMA_COLD_TOPN = 3         # 只看指纹总票前 N 首
 # ⚠ 必须 ≤ 识别 tick 周期（0.5s）：`ChargeBarEngine.DELTA_ADVANCE_SEC=0.5` 要求
 #   相邻拍的偏移推进恰好 0.5 秒，跳窗一次就变成 1.0 ⇒ 被判"不连续"而永远确认不了。
 CHROMA_COLD_COOLDOWN = 0.4   # 两次尝试的最小间隔（秒）
 CHROMA_COLD_POS_TOL = 1.5    # 两窗位置推进的自洽容差（秒）
-CHROMA_COLD_SLOPES = [round(0.80 + i * 0.05, 3) for i in range(10)]
+# 0.80~1.25 分 **19 档**（原文「0.80-1.25× 分 19 档」）。
+# 之前是 10 档（步长 0.05），粗扫偏差最大 0.025 —— refine 的 ±0.02 补不回来，
+# 真曲分数被白白压低一截。
+CHROMA_COLD_SLOPES = [round(0.80 + i * 0.025, 3) for i in range(19)]
 BAND_RESCUE_ENABLE = False
 BAND_SCORE_MIN = 0.22      # 单窗最低分（真歌实测 0.18~0.39、随机对齐 0.12~0.20）
 BAND_RATE_SET = (0.96, 0.98, 1.00, 1.02, 1.04, 1.06)
@@ -1868,7 +1886,10 @@ class AudioEngine:
         self._last_gate_win = "-"   # "long" / "long_fail"，便于日志区分
         # chroma 复核（见 _chroma_try）：本窗分数/倍率/耗时
         self._chroma_score = None
+        self._chroma_weak = None
+        self._chroma_lead = None
         self._chroma_rate = None
+        self._chroma_rhist = []      # [(sid, slope, wall_t)] 最近 8 秒的斜率（见门控处）
         self._chroma_ms = 0.0
         self._chroma_t = 0.0
         # 冷启动 chroma（见 _chroma_coldstart_try）：待确认的候选与计时
@@ -2210,15 +2231,13 @@ class AudioEngine:
             import bandfeat as _bf
             t0 = time.perf_counter()
             q = _bf.chroma_matrix(_bf.to_mono8k(sig, self._fp_sr))
-            score, slope, tgt = _bf.chroma_verify_near(
+            res = _bf.chroma_verify_near(
                 q, got[0], float(target_hint_frame), float(rate_hint),
                 target_span=CHROMA_TARGET_SPAN, rate_span=rate_span)
             self._chroma_ms = (time.perf_counter() - t0) * 1000.0
         except Exception:                                        # noqa: BLE001
             return None
-        if tgt < 0:
-            return None
-        return float(score), float(slope), int(tgt)
+        return res
 
     def set_song_bpm_provider(self, fn):
         """注册「song_id → 库内 BPM」的提供者（C 组误识别修复用）。
@@ -2366,8 +2385,13 @@ class AudioEngine:
                 # ★ 2026-10-29 chroma 复核取证：cx = 分数，cr = 它给的倍率，cms = 耗时
                 _cxs = getattr(self, "_chroma_score", None)
                 _cxr = getattr(self, "_chroma_rate", None)
-                line += " cx=%s cr=%s cms=%.0f" % (
+                #   cw = 最弱窗（三段里最低的一段），cl = 领先（得分减次选）
+                _cxw = getattr(self, "_chroma_weak", None)
+                _cxl = getattr(self, "_chroma_lead", None)
+                line += " cx=%s cw=%s cl=%s cr=%s cms=%.0f" % (
                     ("%.2f" % float(_cxs)) if _cxs is not None else "nan",
+                    ("%.2f" % float(_cxw)) if _cxw is not None else "nan",
+                    ("%+.2f" % float(_cxl)) if _cxl is not None else "nan",
                     ("%.3f" % float(_cxr)) if _cxr is not None else "nan",
                     float(getattr(self, "_chroma_ms", 0.0) or 0.0))
                 # ★ 冷启动取证：cold = 冷启动分数（nan = 本窗没跑/没结果），
@@ -2744,8 +2768,11 @@ class AudioEngine:
                                     _cur_lk = int(getattr(eng, "current_song_id", -1))
                                 except Exception:            # noqa: BLE001
                                     _cur_lk = -1
-                                _cold_ok_use = (_cold is not None
-                                                and float(_cold[1]) >= CHROMA_COLD_GATE)
+                                _cold_ok_use = (
+                                    _cold is not None
+                                    and float(_cold[1]) >= CHROMA_COLD_GATE
+                                    and float(_cold[4]) >= CHROMA_COLD_WEAK
+                                    and float(_cold[5]) >= CHROMA_COLD_LEAD)
                                 _cold_fix = (_cold is not None and _cur_lk >= 0
                                              and int(_cold[0]) == _cur_lk)
                                 if _cold_ok_use or _cold_fix:
@@ -2960,6 +2987,8 @@ class AudioEngine:
                         #   分数门槛 0.55（同曲实测 0.60~0.98、异曲 0.14~0.17），
                         #   只在「已锁定的这一首」上做（见 _chroma_try 的范围说明）。
                         self._chroma_score = None
+                        self._chroma_weak = None
+                        self._chroma_lead = None
                         self._chroma_rate = None
                         _now_c = _t.perf_counter()
                         if (_now_c - float(getattr(self, "_chroma_t", 0.0) or 0.0)
@@ -2981,12 +3010,42 @@ class AudioEngine:
                                                        rate_span=0.50)
                             except Exception:                # noqa: BLE001
                                 _cx = None
+                            # ★★★ 2026-10-29 照 KDJ 作者公布的判据：**三条一起看** ——
+                            #   得分（平均）+ 最弱窗（三段里最低的一段）+ 领先（减次选）。
+                            #   只看得分时，重复段落的「另一处」也能拿到差不多的分
+                            #   （实测库外曲 0.38 vs 真曲 0.45，只差 17%，分不开）；
+                            #   而两者的**领先**差 4 倍以上（真曲 +0.32~+0.82 / 干扰 +0.04~+0.08）。
+                            #   最弱窗则挡住「两段对、一段错」的偶然对齐。
                             if _cx is not None:
                                 self._chroma_t = _now_c
-                                self._chroma_score = float(_cx[0])
-                                if float(_cx[0]) >= CHROMA_GATE:
-                                    r = float(_cx[1])
-                                    self._chroma_rate = float(_cx[1])
+                                self._chroma_score = float(_cx["score"])
+                                self._chroma_weak = float(_cx["weak"])
+                                self._chroma_lead = float(_cx["lead"])
+                                if (self._chroma_score >= CHROMA_GATE
+                                        and self._chroma_weak >= CHROMA_WEAK_MIN
+                                        and self._chroma_lead >= CHROMA_LEAD_MIN):
+                                    _ns = float(_cx["slope"])
+                                    # ★★★ 2026-10-29 真机回归抓到的：**单窗判据挡不住
+                                    #   「换个倍率 + 换个位置凑分」**。Nimbus 原速播放时
+                                    #   chroma 报 cr=1.174，而且三条门槛全过
+                                    #   （cx=0.67 cw=0.60 cl=+0.52）—— 因为在给定的
+                                    #   `target_hint` 附近，1.174 那档确实拟合得更好。
+                                    #   前馈被它带跑 ⇒ 位置一路超前 ⇒ dmax 1.22、
+                                    #   4 个点超 0.6（三首回归里 Nimbus 就这么挂的）。
+                                    #   ⇒ 判据必须加**时间维度**：真变速会连续两三窗
+                                    #     都一样，凑出来的只会出现一次。要求最近 8 秒内
+                                    #     至少两窗给出互相 ≤0.03 的斜率才发布。
+                                    _hist = [x for x in
+                                             (getattr(self, "_chroma_rhist", None) or [])
+                                             if int(x[0]) == int(sid)
+                                             and _now_c - float(x[2]) <= 8.0]
+                                    _hist.append((int(sid), _ns, _now_c))
+                                    self._chroma_rhist = _hist[-4:]
+                                    _vs = [x[1] for x in self._chroma_rhist]
+                                    if len(_vs) >= 2 and (max(_vs) - min(_vs)) <= 0.03:
+                                        _vs.sort()
+                                        r = float(_vs[len(_vs) // 2])   # 中位数
+                                        self._chroma_rate = r
                         # ★★ 2026-10-29：**BPM 比值兜底** —— 这是与指纹完全独立的证据。
                         #   真机 1.20× 实测：指纹票被摊到 60 个位置（pv 才 7~17），
                         #   `_rate_est` 又常攒不够基线 ⇒ 前三种来源都停在 1.0，
