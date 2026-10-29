@@ -23,9 +23,10 @@ import os
 import sys
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDoubleSpinBox, QFormLayout,
-                               QFrame, QHBoxLayout, QInputDialog, QLabel, QMenu,
-                               QMessageBox, QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox,
+                               QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+                               QLabel, QMenu, QMessageBox, QPushButton,
+                               QRadioButton, QVBoxLayout, QWidget)
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
@@ -206,10 +207,24 @@ class MusicDetailDialog(QDialog):
         self.lbl_pos.setMinimumWidth(150)
         bar.addWidget(self.lbl_pos)
         bar.addStretch(1)
-        self.chk_snap = QCheckBox("吸附到拍")
-        self.chk_snap.setChecked(True)
-        self.chk_snap.toggled.connect(self.wave.set_snap)
-        bar.addWidget(self.chk_snap)
+        # ★★ 2026-10-29 用户要求：原来是一个「吸附到拍」复选框，现在改成
+        #   「吸附到拍 / 吸附到小节」**二选一**（互斥单选，必须选一个）。
+        #   用 QRadioButton + QButtonGroup：同组自动互斥，不需要自己管状态。
+        snap_box = QWidget()
+        snap_lay = QHBoxLayout(snap_box)
+        snap_lay.setContentsMargins(0, 0, 0, 0)
+        snap_lay.setSpacing(8)
+        snap_lay.addWidget(QLabel("吸附："))
+        self.rb_snap_beat = QRadioButton("拍")
+        self.rb_snap_bar = QRadioButton("小节")
+        self.rb_snap_beat.setChecked(True)
+        self.snap_grp = QButtonGroup(self)
+        self.snap_grp.addButton(self.rb_snap_beat, 1)
+        self.snap_grp.addButton(self.rb_snap_bar, 4)
+        snap_lay.addWidget(self.rb_snap_beat)
+        snap_lay.addWidget(self.rb_snap_bar)
+        self.snap_grp.buttonClicked.connect(self._on_snap_granularity)
+        bar.addWidget(snap_box)
         v.addLayout(bar)
 
         # ★ 2026-10-28：右侧「八拍起点 / BPM 分段」整块去掉 —— 波形占满宽度；
@@ -625,6 +640,26 @@ class MusicDetailDialog(QDialog):
             self.lbl_pos.setText("播放中（从 %.2fs）" % pos)
         else:
             self.lbl_pos.setText("无法播放：%s" % (p.error or "未知原因"))
+
+    def _on_snap_granularity(self, _btn=None):
+        """「吸附到拍 / 吸附到小节」二选一 ⇒ 立刻把粒度推给波形控件。
+
+        `QButtonGroup` 的 id 就是拍数（1 = 拍 / 4 = 小节），直接用，不再判断按钮对象。
+        """
+        try:
+            n = int(self.snap_grp.checkedId())
+        except (TypeError, ValueError):
+            n = 1
+        self.wave.set_snap_beats(4 if n == 4 else 1)
+        self._refresh_snap_hint()
+
+    def _refresh_snap_hint(self):
+        """位置标签后面挂一句当前吸附粒度（用户看不出"现在到底吸在哪"时能自查）。"""
+        try:
+            n = self.wave.snap_beats()
+        except Exception:                                         # noqa: BLE001
+            n = 1
+        self._snap_hint = (" · 吸附到%s" % ("小节" if n == 4 else "拍"))
 
     def _on_play_toggle(self):
         """一个键管播放/暂停（用户 2026-10-28 要求三键合一）。"""

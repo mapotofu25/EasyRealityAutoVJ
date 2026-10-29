@@ -144,6 +144,9 @@ class WaveformMarkWidget(QWidget):
         self._anchors = []                 # 秒，升序
         self._segments = []                # [{t0,bpm,beat_len,anchor}]
         self._snap = True
+        # ★ 2026-10-29 用户要求：「吸附到拍」和「吸附到小节」二选一。
+        #   `_snap_beats` 是吸附步长的**拍数**：1 = 每拍，4 = 每小节。
+        self._snap_beats = 1
         self._mode = MODE_SELECT
         self._drag = None                  # 拖拽状态 {type: anchor/playhead, ...}
         self._rubber = None                # 分段拖选 (x0, x1)
@@ -179,6 +182,19 @@ class WaveformMarkWidget(QWidget):
 
     def set_snap(self, on):
         self._snap = bool(on)
+
+    def set_snap_beats(self, n):
+        """吸附步长（拍）。1 = 吸附到拍，4 = 吸附到小节。"""
+        try:
+            v = int(n)
+        except (TypeError, ValueError):
+            v = 1
+        self._snap_beats = 4 if v == 4 else 1
+        self._snap = True                    # 选了粒度就一定是"开"
+        self.update()
+
+    def snap_beats(self):
+        return int(getattr(self, "_snap_beats", 1) or 1)
 
     def set_mode(self, mode):
         if mode in (MODE_SELECT, MODE_ANCHOR, MODE_SEGMENT, MODE_BPM):
@@ -382,7 +398,9 @@ class WaveformMarkWidget(QWidget):
                     a = _bg.anchor_for(self._grid, sec)   # 多锚时取 offset 前最近一个
                 except Exception:                          # noqa: BLE001
                     a = float(self._grid.get("anchor") or 0.0)
-            return round(a + round((sec - a) / bl) * bl, 4)
+            # 步长 = 一拍 × 拍数（1=拍 / 4=小节）。原来固定按一拍吸。
+            step = bl * float(self.snap_beats())
+            return round(a + round((sec - a) / step) * step, 4)
         return round(sec, 3)
 
     def _sec_of_x(self, x):
