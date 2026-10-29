@@ -254,6 +254,22 @@ CHROMA_TRUST_SCORE = 0.70
 #   整个引擎起不来。宁可重复两个数字。
 CHROMA_WEAK_MIN = 0.42       # 最弱窗下限（三段里最低的一段）
 CHROMA_LEAD_MIN = 0.15       # 领先下限（得分减次选）
+# ★★★ 2026-10-29 真机（用户放「System Overloaded」一分钟一次都没认出来）：
+#   BPM 否决发生在**任何验证之前**，所以 chroma 根本没机会说话。实测那一窗：
+#   `hit=268/278`（96% 命中率，歌肯定在库里）、`pick` 也对，但实时 BPM 检测锁到
+#   **219.5**（这首歌实际 175，219.5/175 = 1.254 是 5:4 的节奏层级关系），
+#   直通容差 20% 与「2 的幂」谐波全不合格 ⇒ `bpmok=0` ⇒ 整窗作废。
+#   ⚠ 不能直接跳过 BPM 校验（2026-10-27 C 组就是这么误锁的），
+#     而是**先让 chroma 复核**：它是整段音频与库内逐帧对齐，不依赖节拍层级，
+#     而且离线标定过假阳性（异曲 得分 ≤0.29 / 最弱 ≤0.23 / 领先 ≤0.07）。
+#   门槛比常规复核更严 —— 这是**推翻一条护栏**，宁可漏也不能错。
+CHROMA_BPMVETO_ON = True
+CHROMA_BPMVETO_SCORE = 0.65
+CHROMA_BPMVETO_WEAK = 0.45
+CHROMA_BPMVETO_LEAD = 0.20
+# 允许推翻的前提：指纹本身证据够硬（真机那一窗 hit=0.96、tot=163）
+CHROMA_BPMVETO_HIT = 0.90
+CHROMA_BPMVETO_TOT = 120
 # 全量程搜索时"变速"必须比"原速"明显更好（否则一律报 1.0）。
 # 真机实测：原速播放时自由扫会把 1.08~1.23 的次优峰刷到 0.64（只比 1.0 处低一点），
 # 采信它就会把前馈带跑（一次 4.27 拍/秒的位置窜动）。0.10 是能分开的量级。
@@ -1890,6 +1906,7 @@ class AudioEngine:
         self._chroma_lead = None
         self._chroma_rate = None
         self._chroma_rhist = []      # [(sid, slope, wall_t)] 最近 8 秒的斜率（见门控处）
+        self._cx2 = None             # BPM 否决时那次 chroma 复核的结果（取证用）
         self._chroma_ms = 0.0
         self._chroma_t = 0.0
         # 冷启动 chroma（见 _chroma_coldstart_try）：待确认的候选与计时
@@ -2385,6 +2402,13 @@ class AudioEngine:
                 # ★ 2026-10-29 chroma 复核取证：cx = 分数，cr = 它给的倍率，cms = 耗时
                 _cxs = getattr(self, "_chroma_score", None)
                 _cxr = getattr(self, "_chroma_rate", None)
+                #   bv = BPM 否决时 chroma 复核的「得分/最弱/领先」（nan = 没做）
+                _bv = getattr(self, "_cx2", None)
+                if _bv is not None:
+                    line += " bv=%.2f/%.2f/%+.2f" % (
+                        float(_bv["score"]), float(_bv["weak"]), float(_bv["lead"]))
+                else:
+                    line += " bv=nan"
                 #   cw = 最弱窗（三段里最低的一段），cl = 领先（得分减次选）
                 _cxw = getattr(self, "_chroma_weak", None)
                 _cxl = getattr(self, "_chroma_lead", None)
@@ -2851,8 +2875,42 @@ class AudioEngine:
                                           round(_brel, 3) if _brel is not None else None)
                         self._bpm_ok_flag = 1 if _bpm_ok else 0
                         if not _bpm_ok:
-                            self._last_gate = "bpm"
-                            sid, votes, off = -1, 0, 0.0
+                            # ★★★ 2026-10-29：**否决之前先让 chroma 复核**。
+                            #   实测「System Overloaded」：指纹命中率 96%、pick 正确，
+                            #   但实时 BPM 检测锁到 219.5（实际 175，差 5:4 的节奏层级），
+                            #   于是每窗 bpmok=0，放了一分钟一次都没认出来。
+                            #   chroma 与节拍无关，正是这种场景的仲裁者；成本 5~6 毫秒。
+                            _cx2 = None
+                            # ⚠ 只在**指纹本身很硬**时才允许推翻：命中率 ≥0.90 且总票
+                            #   ≥120。否则等于让一次低票误匹配借 chroma 上位
+                            #   （2026-10-29 三首回归里的 dmax 10.68 就是 `votes=37`
+                            #    的低票位置，虽然它来自指纹本身，但不该给同类开口子）。
+                            _hit_now = float(getattr(fp_db, "last_hit_rate", 0.0) or 0.0)
+                            _strong = (_hit_now >= CHROMA_BPMVETO_HIT
+                                       and int(_tot or 0) >= CHROMA_BPMVETO_TOT)
+                            try:
+                                if CHROMA_BPMVETO_ON and _strong:
+                                    _cx2 = self._chroma_try(
+                                        sig, int(sid), float(off) * 10.0,
+                                        float(getattr(self.state, "recognized_rate",
+                                                      1.0) or 1.0),
+                                        rate_span=0.50)
+                            except Exception:                # noqa: BLE001
+                                _cx2 = None
+                            self._cx2 = _cx2
+                            if (_cx2 is not None
+                                    and float(_cx2["score"]) >= CHROMA_BPMVETO_SCORE
+                                    and float(_cx2["weak"]) >= CHROMA_BPMVETO_WEAK
+                                    and float(_cx2["lead"]) >= CHROMA_BPMVETO_LEAD):
+                                # 位置改用 chroma 给的（它比指纹的整帧偏移细）
+                                off = float(_cx2["target"]) / 10.0
+                                self._last_gate = "bpm+cx"
+                                # 2 = 否决被推翻；`!= 0` 的判据都按"通过"处理
+                                #    （界面上的"库内 BPM"照常发布）
+                                self._bpm_ok_flag = 2
+                            else:
+                                self._last_gate = "bpm"
+                                sid, votes, off = -1, 0, 0.0
                         else:
                             self._last_gate = _gate_before     # 通过：恢复 strict/warp/recode
 
