@@ -112,6 +112,21 @@ HIGHLIGHTS = [
      "boundaries, clip switching, effect switching and colour rotation all snap to the "
      "same 8-beat grid as the waveform (anchor + 8n×beat_len); tracks without sections "
      "keep the old measured-energy behaviour"),
+    ("变速认歌（DJ 打碟 / 机台推速）", "Song ID under DJ speed changes",
+     "DJ 机台 beatmatch 时保留音高、只改速度，原来的指纹票会被摊到几十个位置上、"
+     "单点票掉到十几票而锁不上。现在补了两条：① 短视频票不够时自动用 9 秒长窗再认一次"
+     "（票数超线性于窗长）；② 变速与「实时 BPM ↔ 库内 BPM 比值」互为印证，"
+     "并且允许撞顶（BPM 上限 220 的钳位）造成的 2 倍关系。"
+     "实测 0.80× 由「全程无画面」变为可跟牌，1.20× 的前馈倍率从 1.000 修到 1.196"
+     "（真值 1.20）、码表位置误差降到 0.2 秒内",
+     "When a DJ beatmatches (pitch kept, speed changed) the landmark votes get spread "
+     "over dozens of positions and the per-position count collapses below the lock "
+     "threshold. Two fixes: (1) when the short window cannot lock, a 9-second window is "
+     "retried automatically (vote count grows faster than window length); (2) the speed "
+     "is cross-checked with the live-vs-library BPM ratio, including the 2x relation "
+     "created by the BPM detector's 220 clamp. Measured: 0.80x went from no picture at "
+     "all to tracking, and 1.20x's feed-forward rate went from 1.000 to 1.196 (truth "
+     "1.20) with cue position error under 0.2 s"),
 ]
 
 # 用到的开源项目（「关于」界面展示，链接可点击直接打开浏览器）

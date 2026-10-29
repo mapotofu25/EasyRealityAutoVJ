@@ -259,14 +259,41 @@ BAND_AGREE_RATE = 0.03     # 两次观测的倍率差上限
 LOCK_AGREE_ENABLE = False
 
 
-def bpm_gate_ok(lbpm, rbpm):
+# ★★★ 2026-10-29 真机定案：**必须加"变速档"**。
+#   0.80× 播放时实时 BPM 估到 **111.5**、库内 140.0 ⇒ `brel = 0.204`，只比 20% 容差
+#   多 0.4 个百分点，就被一票否决 ⇒ **整个 0.80× 相位一帧都没出**（真机实测
+#   `gate=bpm` 连发、`na=0`、`why=no_rt`）。而 111.5 本来就是 140×0.80 的正确答案
+#   —— 这不是误识别，是 DJ beatmatch 的正常形态。
+#   ⇒ 放宽容差是错的（`180/219.5` 那条 C3 误锁会被放进来，单测也覆盖了它）；
+#     正解是**加一条证据更强的通道**：比值落在 ±26%（覆盖 DJ ±20% + 估计误差）
+#     **且** 命中率 ≥0.80 **且** 总票 ≥120 才按"变速"放行。
+#   ⚠ 撞顶值（rbpm ≥ BPM_RAIL）**绝不走变速档** —— 那是 `min(220)` 钳位出来的假数，
+#     拿它当"变速证据"等于把护栏拆了（Round7 的教训）。
+BPM_WARP_TOL = 0.26        # 变速档：|rb/lb - 1| 的允许范围
+BPM_WARP_HIT = 0.80        # 变速档：命中率下限（与 fp_obs_ok 同档）
+BPM_WARP_TOT = 120         # 变速档：总票下限（与 LOCK_TOT_WARP 同档）
+# ★★ 撞顶变速档（2026-10-29 真机 0.80× 抓到）：BPM 估计器有 `min(220)` 钳位，
+#   0.80× 播放 140 BPM 的歌时真实是 **112**，检测器却常常给 **219.5**（= 2×112 被压平）。
+#   219.5/140 = 1.568，哪条通道都过不了 ⇒ 该相位一帧都没出（`na=0` 全程）。
+#   ⇒ 撞顶时**只认 2× 这一支**（撞顶的成因就是 2×），且证据门槛抬到比常规变速档高
+#     一截 —— C 组误锁的实测是 `hit 0.96~0.99 / tot 98~208`，`tot<300` 就能把它们挡在外面。
+#   ⚠ 绝不放宽到 3× 或"任意 k"：那样 `lbpm×k ≈ rbpm` 几乎总能凑上，BPM 否决就废了
+#     （2026-10-27 Round7 的原话）。
+BPM_WARP_HIT_RAIL = 0.92   # 撞顶变速档：命中率下限
+BPM_WARP_TOT_RAIL = 300    # 撞顶变速档：总票下限（C 组误锁最高 208）
+
+
+def bpm_gate_ok(lbpm, rbpm, hit_rate=None, tot=None):
     """「库内 BPM ↔ 实时 BPM」一致性校验（纯函数，便于离线回归）。
 
     返回 `(ok, brel, flag)`：
       · `ok`   —— 是否允许这条匹配成立
       · `brel` —— 相对偏差（用于取证；任一为 0 时 None）
-      · `flag` —— 1 通过 / 0 拒绝 / -2 拒绝且当窗撞顶 / None 无法校验（有一边为 0）
+      · `flag` —— 1 直通/谐波 / 0 拒绝 / -2 拒绝且当窗撞顶 /
+                  3 **按变速放行** / None 无法校验（有一边为 0）
 
+    :param hit_rate: 可选，本窗哈希命中率；与 `tot` 一起给出才启用「变速档」。
+    :param tot:      可选，本窗该曲总票。
     """
     try:
         lb = float(lbpm or 0.0)
@@ -289,6 +316,20 @@ def bpm_gate_ok(lbpm, rbpm):
     for _k in BPM_HARM_SET:
         if abs(ratio - _k) <= BPM_MATCH_TOL:
             return True, brel, 1
+    # ★ 变速档（见 BPM_WARP_TOL 说明）：只在证据够强、且实时值没撞顶时放行
+    if (hit_rate is not None and tot is not None
+            and rb < BPM_RAIL
+            and abs(ratio - 1.0) <= BPM_WARP_TOL
+            and float(hit_rate) >= BPM_WARP_HIT
+            and int(tot) >= BPM_WARP_TOT):
+        return True, brel, 3
+    # ★ 撞顶变速档（见 BPM_WARP_HIT_RAIL 说明）：撞顶 ⇒ 只认 2× 这一支
+    if (hit_rate is not None and tot is not None
+            and rb >= BPM_RAIL
+            and abs(ratio / 2.0 - 1.0) <= BPM_WARP_TOL
+            and float(hit_rate) >= BPM_WARP_HIT_RAIL
+            and int(tot) >= BPM_WARP_TOT_RAIL):
+        return True, brel, 4
     return False, brel, (-2 if rb >= BPM_RAIL else 0)
 
 
@@ -1620,6 +1661,27 @@ class _Analyzer:
 #   `recognized_offset = off + FP_WIN_SEC * r`（窗口起点→窗口末端的原曲秒数）。
 #   以前两处各写一个 4.5，改一处就会让「现在放到第几秒」整体偏移几秒（很难查）。
 FP_WIN_SEC = 4.5
+# ★★ 2026-10-29 变速认歌：4.5 秒窗票不够时，用「长窗」再认一次。
+#   依据（离线实测，ffmpeg atempo 保音高变速，4 首 × 2 位置 × 5 档，见 tools/_test_win_len.py）：
+#     窗口    4.5s   6.0s   9.0s   12s      （均单点票）
+#       原速   115    198    386    556
+#       1.08x   51     71    103    119
+#   票数**超线性**于窗长 —— 因为更长的窗里"同一段 loop 只出现一次"的概率更高，
+#   重复段落对票的摊平被稀释。1.08 倍速在 9 秒窗上就回到 103 票（过 strict 门槛 80），
+#   而 4.5 秒窗只有 51（永远锁不上）。
+#   ⇒ 默认值 9.0；设 0 可关闭（回退实验用）。⚠ 只在「短窗没锁上」时触发，稳的时候零成本。
+FP_WIN_LONG_SEC = float(os.environ.get("AUTOVJ_FP_WIN_LONG", "9.0") or 0)
+#: 长窗重试的**最小间隔**（秒）：认不出时每窗都重试会让识别线程负载翻倍。
+#: 2.0 = 最多每 2 秒试一次长窗（短窗仍每窗照跑）。
+FP_WIN_LONG_COOLDOWN = 2.0
+
+
+def _env_flag(name, default=False):
+    """读布尔型环境变量（"0"/"off"/"false"/"" ⇒ False）。"""
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    return str(v).strip().lower() not in ("0", "off", "false", "no")
 
 
 class _AudioRing:
@@ -1735,6 +1797,12 @@ class AudioEngine:
         self._recognizer_engine = None
         # 输入音乐播放速率估计（识别链路用；见 RateEstimator）
         self._rate_est = RateEstimator()
+        # ★ 2026-10-29 变速对齐（见 fp.FingerprintDB.fit_rates / FP_WIN_LONG_SEC）
+        self._fit_rate = None       # 本窗「斜率拟合」给出的倍率（None = 没拟合出来）
+        self._win_used_sec = FP_WIN_SEC   # 本窗实际用的窗口长度（长窗重试成功时会变）
+        self._long_t = 0.0          # 上次长窗重试的挂钟时刻（冷却用）
+        self._long_hits = 0         # 长窗重试成功次数（取证用）
+        self._last_gate_win = "-"   # "long" / "long_fail"，便于日志区分
         self._recognize_thread = threading.Thread(
             target=self._recognize_loop, daemon=True, name="autovj-recognize")
         self._recognize_thread.start()
@@ -2111,6 +2179,21 @@ class AudioEngine:
                     line += " pick=%d pv=%d ptot=%d p2=%d phr=%.2f" % _gi
             except Exception:                                    # noqa: BLE001
                 pass
+            # ★ 2026-10-29 变速对齐取证（**追加在行尾**，不破坏既有 regex）：
+            #   win = 本窗用的识别窗长（4.5 短窗 / 9.0 长窗重试成功）
+            #   lw  = 长窗重试结果（long / long_fail / - 表示没触发）
+            #   fr  = 斜率拟合出的倍率（nan = 本窗没拟合出来）
+            #   看现场"变速认不出"时直接查这三个：win=9 说明长窗救回来了；
+            #   fr=1.19 说明确实在变速；lw=long_fail 且 pv 很低说明长窗也不够。
+            try:
+                _frv = getattr(self, "_fit_rate", None)
+                line += " win=%.1f lw=%s fr=%s lh=%d" % (
+                    float(getattr(self, "_win_used_sec", FP_WIN_SEC) or FP_WIN_SEC),
+                    str(getattr(self, "_last_gate_win", "-")),
+                    ("%.3f" % float(_frv)) if _frv is not None else "nan",
+                    int(getattr(self, "_long_hits", 0) or 0))
+            except Exception:                                    # noqa: BLE001
+                pass
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
                                 "cue_health.log")
             _d = os.path.dirname(path)
@@ -2128,6 +2211,44 @@ class AudioEngine:
                 pass
         except Exception:                                        # noqa: BLE001
             pass
+
+    def _match_with_win(self, fp_db, win_sec, hint, hint_w, hint_sid):
+        """用指定窗口长度（秒）重认一次。
+
+        返回 `(sid, votes, off, tot, second, second_tot, hr, win_sec)`；窗口里
+        数据不够（刚启动 / 刚清空）返回 None。
+
+        ⚠ `off` 是**这个窗口起点**在原曲里的秒数 —— 调用方做「窗口末端补偿」时
+          必须用返回元组里的 `win_sec`，不能写死 `FP_WIN_SEC`（这正是以前那两个
+          4.5 写死导致的偏几秒问题的同类陷阱）。
+        """
+        import numpy as _np
+        n = int(self._fp_sr * float(win_sec))
+        with self._genre_lock:
+            if int(getattr(self._fp_buf, "filled", 0) or 0) < n:
+                return None
+            buf = self._fp_buf.last(n)
+        try:
+            sig = _np.asarray(buf, dtype=_np.float32)
+            sid, votes, off = fp_db.match(sig, self._fp_sr,
+                                          hint_delta=hint, hint_w=hint_w,
+                                          hint_sid=hint_sid)
+        except Exception:                                        # noqa: BLE001
+            return None
+        if int(sid) < 0:
+            return None
+        try:
+            _tv = getattr(fp_db, "last_song_votes", {}) or {}
+            tot = int(_tv.get(sid, 0))
+            second = 0
+            second_tot = 0
+            _sv = getattr(fp_db, "last_song_best", {}) or {}
+            second = max((int(v) for k, v in _sv.items() if k != sid), default=0)
+            second_tot = max((int(v) for k, v in _tv.items() if k != sid), default=0)
+            hr = float(getattr(fp_db, "last_hit_rate", 0.0) or 0.0)
+        except Exception:                                        # noqa: BLE001
+            tot, second, second_tot, hr = int(votes or 0), 0, 0, 0.0
+        return int(sid), int(votes or 0), float(off or 0.0), tot, second, second_tot, hr, float(win_sec)
 
     def _recognize_loop(self):
         """现场识别：每 0.5s 取最近 4.5s 音频 → 指纹匹配 → 电池引擎确认 → 发布 song_id"""
@@ -2265,6 +2386,9 @@ class AudioEngine:
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w,
                                               hint_sid=(_prev_sid if _hint is not None else None))
+                # ★ 本窗用的是哪个长度的窗口（决定下面「窗口起点→末端」补偿用几秒）。
+                #   默认短窗；下面长窗重试成功时会被改写。
+                self._win_used_sec = FP_WIN_SEC
                 # ★★ 2026-10-27（对照 KVJ 源码重写）：把"本窗观测"记进环形队列，
                 #   供**互不重叠印证**使用。只有"自身证据达标"的窗口才入库 ——
                 #   弱窗口存进去只会制造假证据。
@@ -2314,6 +2438,66 @@ class AudioEngine:
                                        int(_second_tot), round(_hr, 2))
                     _gate_ok = fp_lock_gate(sid, int(votes or 0), _tot,
                                             _second, _second_tot, _hr)
+                    # ★★ 2026-10-29 变速认歌：短窗票不够 ⇒ 用**长窗**再认一次。
+                    #   票数超线性于窗长（见 FP_WIN_LONG_SEC 的实测表）：1.08 倍速在
+                    #   4.5s 窗上只有 51 票（永远锁不上），9.0s 窗上有 103 票（过 80）。
+                    #   只在短窗没过门槛时触发 ⇒ 正常播放（票 100~300）零额外开销。
+                    _win_used = FP_WIN_SEC
+                    if (not _gate_ok) and FP_WIN_LONG_SEC > FP_WIN_SEC + 0.1:
+                        try:
+                            _now_l = _t.perf_counter()
+                            if _now_l - float(getattr(self, "_long_t", 0.0) or 0.0) >= FP_WIN_LONG_COOLDOWN:
+                                self._long_t = _now_l
+                                _r2 = self._match_with_win(fp_db, FP_WIN_LONG_SEC,
+                                                           _hint, _hint_w, _prev_sid)
+                                if _r2 is not None:
+                                    (_s2, _v2, _o2, _t2, _sec2, _sect2, _hr2, _w2) = _r2
+                                    _tot2 = int(_t2)
+                                    # ★ 这一窗的 off 是**长窗起点**，比短窗起点早
+                                    #   (长窗 - 短窗) 秒的原曲时间 ⇒ 后面做"窗口末端
+                                    #   补偿"时必须用 _w2，不能写死 FP_WIN_SEC。
+                                    if fp_lock_gate(_s2, int(_v2), _tot2, int(_sec2), int(_sect2), _hr2):
+                                        # ★★ 2026-10-29（真机偶发位置窜动）：
+                                        #   长窗票多，但**在重复段落上更容易锁到"另一处出现"**
+                                        #   —— 实测西行谣 1 次 dmax=1.65s / 位置速率 4.96 拍/秒
+                                        #   （spd 被带成 1.30）。短窗那边有 `hint` 兜着，
+                                        #   位置反而更可信。
+                                        #   ⇒ 同一首歌 + 位置分歧时，**只借长窗的票数过门槛，
+                                        #     位置和窗长都保持短窗的**；换歌 / 位置一致才整体采纳。
+                                        _r_now = 1.0
+                                        try:
+                                            _r_now = float(getattr(self.state, "recognized_rate", 1.0) or 1.0)
+                                        except Exception:                # noqa: BLE001
+                                            _r_now = 1.0
+                                        if not (0.80 <= _r_now <= 1.25):
+                                            _r_now = 1.0
+                                        _o2_norm = float(_o2) + (float(_w2) - FP_WIN_SEC) * _r_now
+                                        _same_pos = (int(sid) < 0
+                                                     or abs(_o2_norm - float(off)) <= 1.5)
+                                        if int(_s2) == int(sid) and not _same_pos:
+                                            # 只借票数：sid/off/窗长全保持短窗口径
+                                            votes = int(_v2)
+                                            _tot, _second, _second_tot, _hr = _tot2, _sec2, _sect2, _hr2
+                                            _gate_ok = True
+                                            _win_used = FP_WIN_SEC
+                                            self._last_gate_win = "long_vote"
+                                            self._long_hits = int(getattr(self, "_long_hits", 0)) + 1
+                                        else:
+                                            sid, votes, off = _s2, _v2, _o2
+                                            _tot, _second, _second_tot, _hr = _tot2, _sec2, _sect2, _hr2
+                                            _gate_ok = True
+                                            _win_used = _w2
+                                            self._last_gate_win = "long"
+                                            self._long_hits = int(getattr(self, "_long_hits", 0)) + 1
+                                    else:
+                                        self._last_gate_win = "long_fail"
+                        except Exception:                        # noqa: BLE001
+                            _win_used = FP_WIN_SEC
+                    self._win_used_sec = float(_win_used)
+                    # ★ 把长窗重试后的最终数字回写取证行（`[R]` 的 pick/pv/ptot/p2）
+                    if _win_used != FP_WIN_SEC:
+                        self._gate_info = (int(sid), int(votes or 0), int(_tot),
+                                           int(_second_tot), round(_hr, 2))
                     # ★ 第四条放行通道：互不重叠印证（见 LOCK_AGREE_* 常量说明）。
                     _agree_ok = False
                     if not _gate_ok and LOCK_AGREE_ENABLE:
@@ -2374,7 +2558,11 @@ class AudioEngine:
                     #   日志里出现 `brel=0.083 gate=bpm` 这种自相矛盾的组合（0.083 本该通过）。
                     _gate_before = getattr(self, "_last_gate", "-")
                     self._bpm_ok_flag = None
-                    _bpm_ok, _brel, _bflag = bpm_gate_ok(_lbpm, _rbpm)
+                    # ★ 2026-10-29：把本窗「命中率 + 总票」一起交给校验，供变速档判证据
+                    _bpm_ok, _brel, _bflag = bpm_gate_ok(
+                        _lbpm, _rbpm,
+                        hit_rate=float(getattr(fp_db, "last_hit_rate", 0.0) or 0.0),
+                        tot=int(_tot or 0))
                     if _bflag is None:
                         # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
                         self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
@@ -2399,10 +2587,59 @@ class AudioEngine:
                 except Exception:                            # noqa: BLE001
                     pass
 
+                # ★★ 2026-10-29 变速对齐精修（**只对「已经锁定的那一首」做**）
+                #   票沿 `d = rate·q + delta` 摊平时，单点票选出的 delta 会系统性偏：
+                #   倍率越远离 1、票散得越开，选中的桶越可能不是真位置。
+                #   拟合出整条直线后，"位置"与"倍率"同时变准。离线实测（atempo 保音高，
+                #   4 首 × 2 位置，`tools/_test_warp.py`）：
+                #     真倍率 1.08 → 拟合 1.082、位置误差 **0.02s**（单点 0.19s）
+                #     真倍率 1.20 → 拟合 1.196、位置误差 **0.02s**（单点 0.61s）
+                #   ⇒ 已锁定时用拟合的 off/rate 替代单点值；票数取两者较大（身份不变）。
+                #   ⚠ 只在「票数不算高」（<2×strict）时做，票很足的窗没必要花这 20ms；
+                #     拟合不可信（倍率越界 / 票明显更低）时**原样不动**，绝不用坏数据。
+                self._fit_rate = None
+                if (int(sid) >= 0 and int(_locked) == int(sid)
+                        and int(votes or 0) < LOCK_VOTES_STRICT * 2):
+                    try:
+                        _fr = fp_db.fit_rates(getattr(fp_db, "last_hs", None), [int(sid)])
+                        _one = (_fr or {}).get(int(sid))
+                        if _one is not None:
+                            _frr, _frv, _frd = float(_one[0]), int(_one[1]), float(_one[2])
+                            # ⚠ 必须**真的多聚到票**才用：拟合的意义是把摊平的票收回来，
+                            #   如果收回来还没单点票多，说明这条线没意义，宁可用单点结果。
+                            if (0.86 <= _frr <= 1.16
+                                    and _frv >= max(int(votes or 0) + 3,
+                                                    int(int(votes or 0) * 1.2))):
+                                self._fit_rate = _frr
+                                off = _frd * float(_FP_HOP) / float(_FP_SR)
+                                if _frv > int(votes or 0):
+                                    votes = _frv
+                    except Exception:                        # noqa: BLE001
+                        self._fit_rate = None
+
+                # ★★ 2026-10-29 口径统一（长窗引入的坑）：`off` 是"**本次这个窗口**的起点"，
+                #   窗长一变（4.5 ⇄ 9.0）起点就差 4.5×rate 秒。下游三处都当它是固定口径用：
+                #     ① `_rate_est`（Δoff/Δt 估速率）
+                #     ② `_off_state`（连续性检查，容差 2 秒）
+                #     ③ `_prev_off` → 下一窗的 hint（窗口半宽才 2.5 拍 ≈ 1 秒）
+                #   混用会让状态机每换一次窗长就判一次"跳变"并连丢 6 次
+                #   ⇒ 实机表现「位置持续偏 1~4 秒」（2026-10-29 三首回归：开长窗时
+                #   西行谣 dmax 4.09s，关掉立刻回到 0.37s）。
+                #   ⇒ 一律先换算到「FP_WIN_SEC 窗起点」这一种口径再往下传。
+                _win_now = float(getattr(self, "_win_used_sec", FP_WIN_SEC) or FP_WIN_SEC)
+                _r_prev = 1.0
+                try:
+                    _r_prev = float(getattr(self.state, "recognized_rate", 1.0) or 1.0)
+                except Exception:                            # noqa: BLE001
+                    _r_prev = 1.0
+                if not (0.80 <= _r_prev <= 1.25):
+                    _r_prev = 1.0
+                _off_norm = float(off or 0.0) + (_win_now - FP_WIN_SEC) * _r_prev
+
                 # 原始匹配票数（未过确认门槛）—— 取证用：区分"匹配不到"与"没确认"
                 _lm0 = getattr(self, "_last_match", None)
                 _prev_off = float(_lm0[2]) if _lm0 else None
-                self._last_match = (sid, int(votes or 0), float(off or 0.0),
+                self._last_match = (sid, int(votes or 0), float(_off_norm),
                                     1 if _hint is not None else 0)
                 self._last_match_t = _now
                 # 电荷条内部状态取证：adv = 本次 offset 是否比上次推进 0.5s±0.4（充电判据）
@@ -2446,7 +2683,7 @@ class AudioEngine:
                     self.state.recognized_song_id = cur
                     if cur >= 0 and sid == cur and votes > 0:
                         # 估计输入播放速率 r（同一首歌连续识别时累计；Δoff/Δt 即 r）
-                        r = self._rate_est.update(cur, off, t_read)
+                        r = self._rate_est.update(cur, _off_norm, t_read)
                         # ★ 2026-10-28：**频带校验给出的倍率优先**。
                         #   票数口径在变速时 Δoff 抖动大，`_rate_est` 常给出 1.0 或乱值；
                         #   频带校验是"按倍率找最佳对齐"，实测能稳定指到真倍率
@@ -2455,6 +2692,34 @@ class AudioEngine:
                         _bl = getattr(self, "_band_last", None)
                         if _bl and int(_bl[2]) == int(cur) and 0.80 <= float(_bl[1]) <= 1.25:
                             r = float(_bl[1])
+                        # ★★ 2026-10-29：**斜率拟合给出的倍率最优先**。
+                        #   它是对整窗 (qoff,dboff) 点集直接解出来的斜率，不像
+                        #   `_rate_est` 靠相邻窗 off 的差分（Δoff 抖动大），也不像频带
+                        #   校验要额外算一遍谱相关。离线实测 1.08 → 1.082、1.20 → 1.196。
+                        #   ⚠ 拟合不出来（重复段落/无可靠斜线）时保持 None，退回上面两条。
+                        _fr2 = getattr(self, "_fit_rate", None)
+                        if _fr2 is not None and 0.86 <= float(_fr2) <= 1.16:
+                            r = float(_fr2)
+                        # ★★ 2026-10-29：**BPM 比值兜底** —— 这是与指纹完全独立的证据。
+                        #   真机 1.20× 实测：指纹票被摊到 60 个位置（pv 才 7~17），
+                        #   `_rate_est` 又常攒不够基线 ⇒ 前三种来源都停在 1.0，
+                        #   而实时 BPM 估到 168（= 140×1.2）却一直没被用上。
+                        #   BPM 检测走自相关，**不受指纹票数影响**，在变速时反而更稳。
+                        #   ⚠ 只在 `r` 仍是 1.0（前三条都没结论）时才用，不覆盖更可靠的来源；
+                        #     半速/双速由 0.78~1.25 的区间挡掉（0.5×/2× 不在区间内）。
+                        if abs(float(r) - 1.0) < 0.01 and _lbpm > 0.0 and _rbpm > 0.0:
+                            _rr = float(_rbpm) / float(_lbpm)
+                            if 0.78 <= _rr <= 1.25:
+                                r = _rr
+                        # ★★ 2026-10-29（真机抓到 r=1.300）：发布前**一律钳到 DJ 合理区间**。
+                        #   根因是 `_rate_est` 在"刚锁定、历史点还只有 2~3 个"时，单点
+                        #   0.15 秒的识别误差会被放大成 30% 的速率误差（dt=0.5s 时
+                        #   Δoff=0.65 ⇒ r=1.30），随后被前馈直接下发给播放器（实测
+                        #   `spd=1.30`），位置立刻被带跑。±18% 之外的值一律当噪声。
+                        #   ⚠ 上界必须 ≥1.22：真机 1.20× 相位的真值就是 1.20，写到 1.18
+                        #     会把它当成噪声钳成 1.0（实测就是这么"前馈没跟上"的）。
+                        if not (0.78 <= float(r) <= 1.25):
+                            r = 1.0
                         self.state.recognized_rate = r
                         # off 是识别窗口起点在**原曲**时间轴上的秒数，窗口末端≈当前播放秒。
                         # ⚠ 变速倍率 r≠1 时，窗口秒数对应 FP_WIN_SEC*r 秒原曲
@@ -2470,7 +2735,8 @@ class AudioEngine:
                         #   超出就先丢弃（保持期望值）并累计异常，连续异常超
                         #   OFF_STATE_ABNORMAL_MAX 才认定为真 seek（换歌/首次锁定直接放行）。
                         #   ⚠ 基准用的是**已接受**的值，不是原始匹配值 —— 否则一次跳变会污染基准。
-                        _off_pub = off
+                        # ⚠ 状态机只吃 `_off_norm`（统一口径），绝不用原始 `off`
+                        _off_pub = _off_norm
                         try:
                             _sv = getattr(self, "_off_state", None)
                             if _sv is not None and int(_sv.get("sid", -2)) == int(cur) and cur >= 0:
@@ -2483,9 +2749,9 @@ class AudioEngine:
                                 if not (0.80 <= _rt <= 1.25):
                                     _rt = 1.0
                                 _expect = float(_sv["off"]) + max(0.0, t_read - float(_sv["t"])) * _rt
-                                if abs(float(off) - _expect) <= OFF_STATE_TOL_SEC:
+                                if abs(float(_off_norm) - _expect) <= OFF_STATE_TOL_SEC:
                                     _sv["abn"] = 0
-                                    _sv["off"] = float(off)
+                                    _sv["off"] = float(_off_norm)
                                 else:
                                     _sv["abn"] = int(_sv.get("abn", 0)) + 1
                                     if _sv["abn"] <= OFF_STATE_ABNORMAL_MAX:
@@ -2493,15 +2759,19 @@ class AudioEngine:
                                         _sv["off"] = _expect
                                     else:
                                         _sv["abn"] = 0              # 真 seek：接受并重新起步
-                                        _sv["off"] = float(off)
+                                        _sv["off"] = float(_off_norm)
                                 _sv["t"] = t_read
                             else:
-                                self._off_state = {"sid": int(cur), "off": float(off),
+                                self._off_state = {"sid": int(cur), "off": float(_off_norm),
                                                    "t": t_read, "abn": 0}
                         except Exception:                            # noqa: BLE001
-                            _off_pub = off
-                        self.state.recognized_offset = (_off_pub + FP_WIN_SEC * r
-                                                        + float(os.environ.get('AUTOVJ_REC_LATENCY', '0.0') or 0.0))
+                            _off_pub = _off_norm
+                        # `_off_pub` 已是「FP_WIN_SEC 窗起点」口径 ⇒ 这里固定加
+                        # FP_WIN_SEC·r 得窗口末端（不能再乘本次实际窗长，否则会多算
+                        # (长窗-短窗)·r 秒 —— 2026-10-29 实测就是这么偏出 4.5 秒的）。
+                        self.state.recognized_offset = (
+                            _off_pub + FP_WIN_SEC * r
+                            + float(os.environ.get('AUTOVJ_REC_LATENCY', '0.0') or 0.0))
                         self.state.recognized_t = t_read
                         # 对齐票数交给引擎：低于门槛时 offset 不可信，网格时钟不做任何校正
                         self.state.recognized_votes = int(votes)
@@ -2510,8 +2780,18 @@ class AudioEngine:
                         self.state.recognized_votes = 0
                         if cur < 0:
                             self.state.recognized_offset = -1.0
-                            self.state.recognized_rate = 1.0
-                            self._rate_est.reset()
+                            # ★★★ 2026-10-29 真机（1.20×/0.80× 的 r 全程 1.000）：
+                            #   **掉锁 ≠ 音乐变回原速**。这里原来既清 rate 又 reset 估计器，
+                            #   而变速工况下"票少 ⇒ 频繁掉锁"是常态 ⇒ 每 2~3 秒就被清一次
+                            #   ⇒ `RateEstimator` 永远攒不够 `MIN_SPAN=3s` 的基线 ⇒ r 恒为 1.0
+                            #   ⇒ 前馈按原速走 ⇒ 位置每秒落后 (rate-1) 秒 ⇒ 更容易掉锁，
+                            #   形成**恶性循环**。
+                            #   `RateEstimator` 自己带断档保护（`MAX_DT`：dt 超 2 秒就重新起锚），
+                            #   外部再 reset 只会把它砸死。⇒ 掉锁时**保持**倍率，
+                            #   只在「静音超时回待机」和「换歌」两处清（那两处有独立入口）。
+                            # self.state.recognized_rate = 1.0
+                            # self._rate_est.reset()
+                            pass
             except Exception:                                    # noqa: BLE001
                 # ⚠⚠ 原来是 `pass`：认不出歌时任何异常都被吞掉，日志只有 raw=0，
                 #   分不清"没匹配到"还是"炸了"。现在写 traceback（10s 限流）。

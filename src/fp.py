@@ -265,9 +265,64 @@ def meta_needs_fp(rec, legacy=False):
     return not (fp_id and fmd5)
 
 
+# ==========================================================================
+# 变速（倍率）对齐 —— 「票数最多的那条直线」
+# ==========================================================================
+# ★★★ 2026-10-29：**为什么需要它**
+#   本库的 hash 是 `SHA1(f1|f2|Δt)`，Δt 被量化成 4 帧（185ms）的桶。DJ 机台
+#   beatmatch 时**保留音高、只改速度** ⇒ 频率部分完全命中，但
+#     ① Δt 随倍率缩放 ⇒ 只有 Δt 小的那批 hash 还落在同一个桶里（其余丢掉）；
+#     ② 同一个事件在查询窗里的帧坐标 `q` 与在库里的帧坐标 `d` 满足
+#        **`d = rate·q + delta`**（rate = 播放倍率、delta = 对齐偏移）。
+#   旧实现只统计 `dboff - qoff`（等价于写死 rate=1）⇒ 一条斜线上的票被切成
+#   一片片单点，1.02 变速就能把单点票打掉一个数量级。
+#   这不是本库独有的现象：audfprint 官方实测（225s 查询、同一段音频重采样）
+#     stretch 1.000 → 固定偏移票 340 / 允许线性 warp 票 340
+#             1.001 → 127 / 325
+#             1.005 → 15  / 131
+#             1.010 → 4   / 49
+#             1.020 → 2   / 11
+#   —— 票没消失，是**沿一条直线摊开了**。所以修法是在匹配端补「找票数最多的
+#   那条直线」（Hough/RANSAC 的思路，等于 audfprint 的 `-warpmax` 的推广版：
+#   不是"允许小漂移"，而是直接解出最优斜率）。
+#   ⚠ 不动指纹库、不动 hash 格式、不改建库流程 ⇒ 老库直接可用。
+#
+# 假阳性风险评估（决定阈值怎么取）：
+#   无关曲的 (q,d) 点是**随机散布**，在 71 个候选斜率里挑最大值，期望峰值
+#   ≈ N/跨度 ≈ 4000/200000 = 0.02 票 ⇒ 拟合票要上 80 是不可能的。真正需要
+#   防的是「同专辑/同曲风共用采样的另一首歌」—— 那种情况点**真的会成线**，
+#   所以身份判据必须保留「对第二名的领先倍数」和 BPM 交叉校验，不能只看绝对票数。
+WARP_RATE_LO = 0.80        # 允许的播放倍率下界（-20%；DJ 极端降速也够）
+WARP_RATE_HI = 1.25        # 上界（+25%）
+WARP_COARSE_STEP = 0.010   # 粗扫步长
+WARP_FINE_HALF = 0.012     # 细扫半宽（在粗扫最优点附近）
+WARP_FINE_STEP = 0.002     # 细扫步长
+WARP_MAX_PTS = 4000        # 单曲参与拟合的点数上限（超出固定种子下采样，结果可复现）
+# ★★★ 2026-10-29 真机验证：**40 不能降**。
+#   试过降到 12 让它在"单点票只有 11~17"的变速窗上也能出手 —— 结果 1.20× 的
+#   dmax 从 0.59 恶化到 **7.19 秒**（9 个点超 0.6、位置窜动 1 次）。
+#   根因：十几个点凑一条线太容易，`_span_ok` 只能要求"铺满窗口"，挡不住
+#   "铺满窗口的错线"（重复段落的另一处出现同样铺满）。**低信噪比下宁可不用拟合**，
+#   位置退回单点票结果（有 `_off_state` 兜着），也不会被错线带跑。
+WARP_MIN_PTS = 40          # 少于此数直接放弃（统计上凑不出线）
+WARP_TOL_FRAME = 1.0       # 「落在线上」的容差（帧）；与 match 的精确到帧口径一致
+# ★★★ 2026-10-29 实测（真实 DJ 直播素材）发现必须加「跨度覆盖」约束：
+#   没有它时，拟合会稳定给出 **0.72（= 当时的搜索下界）** —— 因为 `delta = d - a·q`
+#   在 a 变小时 q 的权重降低、delta 更接近 d 本身；只要这首歌的命中集中在若干重复
+#   段落上，d 的方差本来就小 ⇒ **a 越小票越多**。这是纯数学偏向，与"真倍率"无关。
+#   ⇒ 除了收窄量程，还要求内点**在 q 上铺开**：真斜线必须横跨整个窗口，
+#     而"a 偏小挤出来的假集中"只会堆在 q 的一端。
+WARP_SPAN_MIN = 0.55       # 内点在 q 上的跨度 / 全部点的 q 跨度 的最小比例
+WARP_SEG_N = 3             # 把 q 等分成几段做"每段都得有内点"的检查
+WARP_SEG_NEED = 2          # 至少几段有内点（不是每段都要：窗内有静音/淡出会让某段空）
+# ★ 单测发现：只比"相对跨度"挡不住「票本来就全挤在一小段」的情况（自身跨度=100%）。
+#   斜率要可辨识，点集本身得横跨足够长的时间 —— 少于 25 帧（≈1.16s）时，
+#   a 变化 0.01 只让 b 变 0.25 帧，任何斜率都能凑出高票 ⇒ 必须直接拒绝。
+WARP_MIN_QSPAN = 25.0      # 参与拟合的点在 q 上的最小跨度（帧）
+
+
 class FingerprintDB:
     """指纹库：add_song 建库，match 现场匹配（返回对齐票数，供音乐电池引擎消费）"""
-
     def __init__(self, path):
         # check_same_thread=False：指纹库在主线程创建、识别线程读取（扫描建库在后台线程写）
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -481,6 +536,9 @@ class FingerprintDB:
           重试时复用（否则每次都重算谱峰，7 个档位就慢 7 倍）。"""
         if hs is None:
             hs = fingerprint_audio(sig, sr)
+        # ★ 2026-10-29：留一份引用给 `fit_rates()` 复用（变速对齐要同一份 hash 再查一次
+        #   单曲的 (qoff, dboff)）。只是一个 list 引用，零拷贝、零计算。
+        self.last_hs = hs
         if not hs:
             self.last_hit_rate = 0.0
             self.last_song_best = {}
@@ -531,6 +589,163 @@ class FingerprintDB:
             return -1, 0, 0.0
         (song_id, delta), cnt = picked
         return song_id, cnt, delta * HOP_SIZE / SAMPLE_RATE
+
+    # ==================================================================
+    # 变速对齐：对候选曲拟合「票数最多的直线」 d = rate·q + delta
+    # ==================================================================
+    @staticmethod
+    def _line_votes(b):
+        """一维投票：返回 (最多票数, 该桶代表值)。b 为浮点数组（已量化到帧前）。"""
+        bi = np.rint(b).astype(np.int64)
+        if bi.size == 0:
+            return 0, 0
+        u, c = np.unique(bi, return_counts=True)
+        k = int(c.argmax())
+        return int(c[k]), int(u[k])
+
+    @staticmethod
+    def _span_ok(qf, df, a, b0):
+        """这条斜线的内点是否**真的铺开在整个窗口上**。
+
+        见 `WARP_SPAN_MIN` 的说明：不加这条约束时，拟合会稳定收敛到搜索下界
+        （a 越小 ⇒ delta 越接近 d 本身 ⇒ 重复段落的小方差被当成"高票"）。
+        真斜线的内点必然横跨整个 q 区间；假集中只会堆在一端。
+        """
+        b = df - a * qf
+        inl = np.abs(b - b0) <= WARP_TOL_FRAME
+        k = int(inl.sum())
+        if k < WARP_MIN_PTS:
+            return False
+        span = float(qf.max() - qf.min())
+        if span <= 1e-9:
+            return False
+        qi = qf[inl]
+        if float(qi.max() - qi.min()) < WARP_SPAN_MIN * span:
+            return False
+        edges = np.linspace(qf.min(), qf.max(), WARP_SEG_N + 1)
+        seg_hit = 0
+        for i in range(WARP_SEG_N):
+            lo_, hi_ = edges[i], edges[i + 1]
+            m = (qi >= lo_) & ((qi <= hi_) if i == WARP_SEG_N - 1 else (qi < hi_))
+            if bool(m.any()):
+                seg_hit += 1
+        return seg_hit >= WARP_SEG_NEED
+
+    def _fit_one(self, q, d):
+        """对一首歌的点集做斜率搜索。返回 `(rate, votes, delta_frames)` 或 None。
+
+        `q` = 查询窗内的帧坐标（0 起），`d` = 库里同一 hash 的帧坐标。
+        遍历候选斜率 a，把点投到 `b = d - a·q` 上做直方图；最大桶的票数就是
+        「这条斜率下能对上的票」。最后用内点做一次最小二乘精修，把 a 的量化
+        误差从 ±0.01 压到 ±0.0005（否则窗口两端的 b 会差半帧）。
+
+        ★ 每个候选斜率都要过 `_span_ok`（内点铺满窗口）—— 见 `WARP_SPAN_MIN`。
+        """
+        n = int(q.size)
+        if n < WARP_MIN_PTS:
+            return None
+        if n > WARP_MAX_PTS:
+            rs = np.random.RandomState(12345)      # 固定种子 ⇒ 同一输入结果可复现
+            idx = rs.choice(n, WARP_MAX_PTS, replace=False)
+            q, d = q[idx], d[idx]
+        qf = q.astype(np.float64)
+        df = d.astype(np.float64)
+        # 斜率可辨识的前提：点集本身横跨足够长的时间（见 WARP_MIN_QSPAN）
+        if float(qf.max() - qf.min()) < WARP_MIN_QSPAN:
+            return None
+        cand = []
+        for a in np.arange(WARP_RATE_LO, WARP_RATE_HI + 1e-9, WARP_COARSE_STEP):
+            v, b0 = self._line_votes(df - a * qf)
+            if v >= WARP_MIN_PTS:
+                cand.append((int(v), float(a), int(b0)))
+        if not cand:
+            return None
+        cand.sort(key=lambda t: -t[0])
+        # 票数最多的前几个里，挑第一个「内点铺满窗口」的；都不满足 ⇒ 认不出这条线
+        pick = None
+        for v, a, b0 in cand[:6]:
+            if self._span_ok(qf, df, a, b0):
+                pick = (v, a, b0)
+                break
+        if pick is None:
+            return None
+        best_v, best_a, best_b0 = pick
+        lo = max(WARP_RATE_LO, best_a - WARP_FINE_HALF)
+        hi = min(WARP_RATE_HI, best_a + WARP_FINE_HALF)
+        for a in np.arange(lo, hi + 1e-9, WARP_FINE_STEP):
+            v, b0 = self._line_votes(df - a * qf)
+            if v > best_v and self._span_ok(qf, df, a, b0):
+                best_v, best_a, best_b0 = int(v), float(a), int(b0)
+        # 内点最小二乘精修：只拿「确实落在这条线上」的点重解 a、b
+        b = df - best_a * qf
+        b0 = float(best_b0)
+        inl = np.abs(b - b0) <= WARP_TOL_FRAME
+        if int(inl.sum()) >= WARP_MIN_PTS:
+            qi, di = qf[inl], df[inl]
+            _mq, _md = qi.mean(), di.mean()
+            _den = float(((qi - _mq) ** 2).sum())
+            if _den > 1e-9:
+                a2 = float(((qi - _mq) * (di - _md)).sum() / _den)
+                if WARP_RATE_LO <= a2 <= WARP_RATE_HI:
+                    d2 = _md - a2 * _mq
+                    v2, _ = self._line_votes(df - a2 * qf)
+                    if v2 >= best_v and self._span_ok(qf, df, a2, _md - a2 * _mq):
+                        return a2, int(v2), float(d2)
+        return best_a, int(best_v), float(b0)
+
+    def fit_rates(self, hs, sids):
+        """对给定候选曲各自做变速拟合。返回 `{song_id: (rate, votes, delta_frames)}`。
+
+        :param hs:   本窗指纹 `[(hash, qoff_frame), ...]`（= `match` 收的同一份）。
+        :param sids: 要尝试的 song_id 序列（调用方给「总票 top-N」，通常 3 个）。
+        :return: 只包含「点集足够 + 拟合成功」的曲目；调用方按 votes 排序取第一。
+
+        ⚠ 这里**不做身份判定**，只回答"这首歌按某个倍率能对上多少票"。
+          认不认由调用方的门槛（票数下限 + 对第二名的领先 + BPM 校验）决定。
+        ⚠ 白名单 `self.allowed` 与 `match` 保持同一口径：过期指纹不参与。
+        """
+        if not hs or not sids:
+            return {}
+        want = set()
+        for s in sids:
+            try:
+                want.add(int(s))
+            except (TypeError, ValueError):
+                pass
+        if not want:
+            return {}
+        qoff_map = {}
+        for h, qoff in hs:
+            qoff_map.setdefault(h, []).append(qoff)
+        if not qoff_map:
+            return {}
+        hashes = list(qoff_map.keys())
+        acc = {}
+        for i in range(0, len(hashes), 500):
+            chunk = hashes[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            for (h, song_id, dboff) in self.conn.execute(
+                    f"SELECT hash, song_id, offset FROM fingerprints "
+                    f"WHERE hash IN ({ph})", chunk):
+                if song_id not in want:
+                    continue
+                if self.allowed is not None and song_id not in self.allowed:
+                    continue
+                for qoff in qoff_map.get(h, ()):
+                    e = acc.get(song_id)
+                    if e is None:
+                        e = acc[song_id] = ([], [])
+                    e[0].append(int(qoff))
+                    e[1].append(int(dboff))
+        out = {}
+        for song_id, (qs, ds) in acc.items():
+            try:
+                r = self._fit_one(np.asarray(qs, np.int64), np.asarray(ds, np.int64))
+            except Exception:                                    # noqa: BLE001
+                r = None
+            if r is not None:
+                out[int(song_id)] = r
+        return out
 
     def close(self):
         self.conn.close()
