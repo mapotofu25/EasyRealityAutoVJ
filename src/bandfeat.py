@@ -515,7 +515,11 @@ CHROMA_FINE_TARGET = 20         # 精扫 target 半宽（帧）
 CHROMA_FINE_SLOPE = 0.005       # 精扫 slope 步长
 CHROMA_FINE_SLOPE_HALF = 0.02   # 精扫 slope 半宽
 # 变速必须"明显更好"才采信（防止原速时凑出 1.08，实测会发生）
-CHROMA_SLOPE_MARGIN = 0.08
+# ★★ 2026-10-29 真机标定：0.10 太严。真机上（WASAPI 回环 + 播放器 keylock）chroma 的
+#   区分度比离线低一大截 —— 实测 0.80× 播放时最佳 slope 0.72、slope=1.0 处 0.65，
+#   只差 0.07 ⇒ 被 0.10 挡住 ⇒ 一律报原速 ⇒ 前馈倍率停在 1.000。
+#   离线复查（3 首 × 原速/0.80/1.20）：0.06 时**原速仍全部报 1.000**，不会误跳。
+CHROMA_SLOPE_MARGIN = 0.06
 
 
 def chroma_verify(q, ref, coarse_step=None):
@@ -645,4 +649,138 @@ def chroma_verify_near(q, ref, target_hint, rate_hint=1.0,
         base = _best_at(1.0, step=1)
         if best[0] < base[0] + CHROMA_SLOPE_MARGIN:
             return base
+    return best
+
+
+# ---------------------------------------------------------------- 冷启动全曲扫描
+# ★★★ 2026-10-29：变速时票会被摊到几十个位置，`fp_lock_gate` 的「领先 2 倍」过不去
+#   （真机 0.80× 实测 ptot=166 vs 第二名 141，要求 332）⇒ 锁不上 ⇒ chroma 复核
+#   根本没机会运行（它只在已锁定后工作）。要救冷启动只能让 chroma **自己找人**。
+#
+#   做法照 KDJ `fuzzy.rs` 的检索形态：先把查询与参考的**逐帧点积**一次性算成矩阵
+#   `P = q · ref.T`（每帧都是 L2 归一化的 12 维，所以 P 就是余弦相似度），
+#   再按 `target + round(i*slope)` 取对角线求平均 —— 这样 46 档斜率、全部 target
+#   位置**一次算完**，不用 Python 循环（原来那样 6000+ 次调用要 300~400 ms）。
+#
+#   ⚠ 这里**不减窗口均值**（与 `chroma_score_at` 不同）。这是 KDJ 的原版形态，
+#     它的 0.32/0.40 阈值就是在这一版上调出来的；减均值是为了抑制"同调"，
+#     但那是滑窗操作、没法向量化，代价是几百倍耗时。
+# 冷启动放行门槛。标定依据（tools/_test_chroma_cold.py，97 首全库）：
+#   同曲各倍速                       0.41 ~ 0.95（最低是 Black Warrior 1.20x 的 0.411）
+#   同一查询扫**库里别的歌**的最高分   0.20 ~ 0.30
+#   ⇒ 取 0.34：比库外最高高 0.04、比同曲最低低 0.07，两边都有余量。
+CHROMA_COLD_GATE = 0.34
+CHROMA_COLD_TOPN = 3          # 只对指纹**总票**最高的 N 首做冷启动扫描
+CHROMA_COLD_COOLDOWN = 2.0    # 最短间隔（秒）
+
+
+def _unit_frames(m):
+    """逐帧 L2 归一化。"""
+    nrm = np.sqrt((m ** 2).sum(axis=1, keepdims=True))
+    return np.divide(m, np.maximum(nrm, 1e-8), out=np.zeros_like(m), where=nrm > 1e-8)
+
+
+def _scan_prep(q, ref):
+    """冷启动用的两端预处理：**各减自己的整段均值**再逐帧归一化。
+
+    ★★★ 2026-10-29 标定出来的（这是整条冷启动路的支点）：
+      同曲 1.00 / 1.20 / 0.80 三种预处理方式下的分数：
+        不减均值      0.258 / 0.232 / 0.166   ← 共同基线把区分度压平了
+        减整段均值    0.938 / 0.792 / 0.737   ← 采用
+        减滑窗均值    0.967 / 0.814 / —       ← 最准，但要构造 (T,n,12) 数组，慢几十倍
+      「减整段均值」几乎追平精确版，而且能完全向量化（一次矩阵乘 + 对角线取值）。
+      对查询来说「整段」就是那 4.5 秒窗，对参考来说是整首歌 —— 两边各自消除自己的
+      调性基线，剩下的动态部分才是可比的。
+    """
+    qh = _unit_frames(q - q.mean(axis=0, keepdims=True))
+    rh = _unit_frames(ref - ref.mean(axis=0, keepdims=True))
+    return qh, rh
+
+
+def chroma_scan_full(q, ref, slopes=None, step_t=1, target_range=None, topk=1):
+    """全曲自由扫描（向量化）。返回 `[(score, slope, target_frame), ...]`（降序）。
+
+    做法：先算逐帧点积矩阵 `P = q · ref.T`（两端都是单位向量 ⇒ P 就是余弦），
+    再按 `target + round(i*slope)` 取**对角线**求平均 —— 46 档斜率 × 全部 target
+    一次算完，不用 Python 循环。实测单曲 10 档只要 **5 ms**（原来 6000+ 次
+    Python 调用要 300~400 ms）。
+
+    :param step_t:       target 扫描步长（帧）。粗扫用 2，精扫用 1。
+    :param target_range: `(lo, hi)` 限定 target 范围（精扫时用）
+    """
+    if q is None or ref is None:
+        return []
+    n = int(q.shape[0])
+    if n < CHROMA_MIN_FRAMES or ref.shape[0] < n + 8:
+        return []
+    qh, rh = _scan_prep(q, ref)
+    P = qh @ rh.T                                            # (n, T_ref)
+    t_ref = rh.shape[0]
+    i_idx = np.arange(n)[:, None]
+    sl = chroma_slopes() if slopes is None else list(slopes)
+    out = []
+    for slope in sl:
+        step = np.rint(np.arange(n) * float(slope)).astype(np.int64)
+        span = int(step[-1]) + 1
+        T = t_ref - span + 1
+        if T <= 0:
+            continue
+        lo, hi = 0, T - 1
+        if target_range is not None:
+            lo = max(0, int(target_range[0]) // max(1, int(step_t)))
+            hi = min(T - 1, int(target_range[1]) // max(1, int(step_t)))
+            if hi < lo:
+                continue
+        st = max(1, int(step_t))
+        idx_t = np.arange(lo, hi + 1) * st
+        idx_t = idx_t[idx_t < T]
+        if idx_t.size == 0:
+            continue
+        j_idx = idx_t[None, :] + step[:, None]                 # (n, K)
+        sc = P[i_idx, j_idx].mean(axis=0)                      # (K,)
+        k = int(np.argmax(sc))
+        out.append((float(sc[k]), float(slope), int(idx_t[k])))
+    out.sort(key=lambda x: -x[0])
+    return out[:max(1, int(topk))]
+
+
+def chroma_scan_refine(q, ref, slope0, target0, slope_half=0.02, target_span=6):
+    """在 `(slope0, target0)` 附近精扫到 1 帧 / 0.005 档。返回 `(score, slope, target)`。"""
+    sl = []
+    a = max(CHROMA_SLOPE_LO, float(slope0) - float(slope_half))
+    a_hi = min(CHROMA_SLOPE_HI, float(slope0) + float(slope_half))
+    while a <= a_hi + 1e-9:
+        sl.append(round(a, 4))
+        a = round(a + CHROMA_FINE_SLOPE, 4)
+    lo = max(0, int(target0) - int(target_span))
+    hi = int(target0) + int(target_span)
+    top = chroma_scan_full(q, ref, slopes=sl, step_t=1, target_range=(lo, hi), topk=1)
+    if not top:
+        return -1.0, float(slope0), int(target0)
+    return top[0]
+
+
+def chroma_coldstart(q, refs, slopes=None, step_t=2, refine=True):
+    """冷启动：在一组候选参考里全库扫描，返回 `(sid, score, slope, target)` 或 None。
+
+    :param refs: `[(sid, chroma_matrix), ...]` —— 必须由调用方按**指纹总票**排序，
+                 总票第一的排最前（分数完全相同时用它决胜：库里有同源版本时
+                 两首的 chroma 分数会一模一样，此时应该听指纹的）。
+    """
+    best = None
+    for sid, cm in refs:
+        top = chroma_scan_full(q, cm, slopes=slopes, step_t=step_t, topk=1)
+        if not top:
+            continue
+        sc, sl, tg = top[0]
+        if best is None or sc > best[1] + 1e-9:
+            best = (int(sid), float(sc), float(sl), int(tg))
+    if best is None or not refine:
+        return best
+    cm = next((c for s_, c in refs if int(s_) == int(best[0])), None)
+    if cm is None:
+        return best
+    sc2, sl2, tg2 = chroma_scan_refine(q, cm, best[2], best[3])
+    if sc2 >= 0:
+        return (best[0], float(sc2), float(sl2), int(tg2))
     return best

@@ -244,7 +244,29 @@ LOCK_AGREE_CONC   = 0.12   # 单点票 / 总票 的集中度下限（真歌 ≥0
 CHROMA_TARGET_SPAN = 30      # 位置搜索半宽（100ms 帧）= ±3 秒
 CHROMA_RATE_SPAN = 0.08      # 倍率搜索半宽
 CHROMA_GATE = 0.55           # 放行门槛（同曲实测 0.60~0.98、异曲 0.14~0.17）
+# chroma 高分时可以**纠正** BPM 比值（两者差 >0.10 才动手）。实测同曲 1.00x=0.97、
+# 1.08x=0.86、1.20x=0.81，而异曲 0.14~0.30 ⇒ 0.70 是干净的分界。
+CHROMA_TRUST_SCORE = 0.70
+# 全量程搜索时"变速"必须比"原速"明显更好（否则一律报 1.0）。
+# 真机实测：原速播放时自由扫会把 1.08~1.23 的次优峰刷到 0.64（只比 1.0 处低一点），
+# 采信它就会把前馈带跑（一次 4.27 拍/秒的位置窜动）。0.10 是能分开的量级。
+CHROMA_SLOPE_MARGIN_FULL = 0.10
 CHROMA_COOLDOWN = 0.0        # 每窗都做（实测 ~100ms；需要减负时调到 1.0）
+# ★★★ 2026-10-29 冷启动 chroma（真正的「变速也能认出来」那一环）
+#   问题：0.80× 时指纹票被摊到几十个位置，`fp_lock_gate` 的「领先 2 倍」过不去
+#   （真机实测 ptot=166 vs 第二名 141，要求 332）⇒ 锁不上 ⇒ `_chroma_try` 根本
+#   没机会运行（它只在已锁定后工作）。要救冷启动只能让 chroma 自己找人。
+#   做法：拿指纹**总票** top-N 当候选（实测 9/9 倍速下总票第一都是真曲，只是
+#   `match` 按单点票选曲会在变速时选错），对这 N 首各做一次全曲 chroma 扫描。
+#   实测（3 首候选含精扫）：14~25 ms，分数 0.41~0.95（真曲）对 0.18~0.30（无关曲）。
+CHROMA_COLD_ON = True        # 总开关（关掉就退回"只靠票数门槛"）
+CHROMA_COLD_GATE = 0.34      # 分数门槛（见 bandfeat.CHROMA_COLD_GATE 的标定）
+CHROMA_COLD_TOPN = 3         # 只看指纹总票前 N 首
+# ⚠ 必须 ≤ 识别 tick 周期（0.5s）：`ChargeBarEngine.DELTA_ADVANCE_SEC=0.5` 要求
+#   相邻拍的偏移推进恰好 0.5 秒，跳窗一次就变成 1.0 ⇒ 被判"不连续"而永远确认不了。
+CHROMA_COLD_COOLDOWN = 0.4   # 两次尝试的最小间隔（秒）
+CHROMA_COLD_POS_TOL = 1.5    # 两窗位置推进的自洽容差（秒）
+CHROMA_COLD_SLOPES = [round(0.80 + i * 0.05, 3) for i in range(10)]
 BAND_RESCUE_ENABLE = False
 BAND_SCORE_MIN = 0.22      # 单窗最低分（真歌实测 0.18~0.39、随机对齐 0.12~0.20）
 BAND_RATE_SET = (0.96, 0.98, 1.00, 1.02, 1.04, 1.06)
@@ -475,6 +497,41 @@ def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
             and tot >= LOCK_LEAD_RECODE * max(1, second_tot)):
         return True
     return False
+
+
+def bpm_ratio_rate(lbpm, rbpm, flag=None):
+    """由「实时 BPM / 库内 BPM」推播放倍率，并归一化到 [0.78, 1.25]。
+
+    变速时 `实时BPM = 库内BPM × r` ⇒ 比值就是 r。BPM 检测走**自相关**，
+    不受指纹票数影响 —— 这是变速工况下唯一稳定可用的独立来源。
+
+    `flag` 来自 `bpm_gate_ok`：
+      · 4（撞顶档）⇒ BPM 估计器的 `min(220)` 把 2× 压平了，比值要先除 2
+      · 其它 ⇒ 直接取比值，再把 2 的幂折掉（半速/双速检测是常态：
+        `rb/lb = 2.0` 实际是原速，折成 1.0 才对）
+
+    返回 None 表示「这个比值不落在支持区间」，调用方应保持原值。
+    """
+    try:
+        lb = float(lbpm or 0.0)
+        rb = float(rbpm or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if lb <= 0.0 or rb <= 0.0:
+        return None
+    ratio = rb / lb
+    if flag == 4:
+        ratio /= 2.0
+    for _ in range(4):
+        if ratio > 1.25:
+            ratio /= 2.0
+        elif ratio < 0.78:
+            ratio *= 2.0
+        else:
+            break
+    if 0.78 <= ratio <= 1.25:
+        return ratio
+    return None
 
 
 class RateEstimator:
@@ -1814,6 +1871,13 @@ class AudioEngine:
         self._chroma_rate = None
         self._chroma_ms = 0.0
         self._chroma_t = 0.0
+        # 冷启动 chroma（见 _chroma_coldstart_try）：待确认的候选与计时
+        self._cold_pending = None      # (sid, off_sec, rate, wall_t)
+        self._cold_t = 0.0
+        self._cold_ms = 0.0
+        self._cold_score = None        # 取证：本窗冷启动分数
+        self._cold_hits = 0            # 取证：冷启动成功锁定次数
+        self._cold_why = "-"           # 取证：冷启动为什么没结果（见 _chroma_coldstart_try）
         self._recognize_thread = threading.Thread(
             target=self._recognize_loop, daemon=True, name="autovj-recognize")
         self._recognize_thread.start()
@@ -2024,21 +2088,81 @@ class AudioEngine:
         """注册"有效 song_id 集合"的提供者；识别线程每 10 秒刷新一次白名单。"""
         self._allowed_provider = fn
 
+    def _band_store(self):
+        """侧车库的惰性初始化（三个通道共用；失败后不再重试，避免反复碰磁盘）。"""
+        if self._band is None:
+            try:
+                import bandfeat as _bf
+                self._band = _bf.BandStore(
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ"), cache=8)
+                self._band_ready = self._band.ready()
+            except Exception:                                    # noqa: BLE001
+                self._band_ready = False
+        return self._band if self._band_ready else None
+
+    def _chroma_coldstart_try(self, sig):
+        """冷启动：对指纹**总票** top-N 候选做全曲 chroma 扫描。
+
+        返回 `(sid, score, slope, target_frame)` 或 None。target_frame 是**窗起点**
+        在参考曲上的位置（100 ms 帧），与引擎的 `off` 口径一致。
+
+        ⚠ 候选必须按总票排序，不能按 `match` 返回的 sid —— 实测 0.80× 时
+          `match` 会选中另一首（单点票 3 票），而**总票第一始终是真曲**。
+        """
+        self._cold_why = "enter"
+        # ⚠ `_t` 是 `_band_try` / `_recognize_loop` 里各自的**局部别名**
+        #   （`import time as _t`），跨方法不可见 —— 这里必须用模块级的 `time`。
+        #   2026-10-29 真机：写成 `_t.perf_counter()` 直接 NameError，被外层
+        #   `except Exception` 吞掉，日志里只剩 `cwhy=call_exc:NameError`。
+        t0 = time.perf_counter()
+        self._cold_why = "start"
+        store = self._band_store()
+        if store is None:
+            self._cold_why = "no_store"
+            return None
+        if self._fp_db is None:
+            self._cold_why = "no_db"
+            return None
+        tv = getattr(self._fp_db, "last_song_votes", None) or {}
+        if not tv:
+            self._cold_why = "no_votes"
+            return None
+        order = sorted(tv.items(), key=lambda kv: (-int(kv[1]), int(kv[0])))
+        refs = []
+        _miss = 0
+        for sid, _v in order[:max(1, CHROMA_COLD_TOPN)]:
+            try:
+                got = store.get_chroma(int(sid))
+            except Exception as _e:                              # noqa: BLE001
+                got = None
+                self._cold_why = "get_exc:" + type(_e).__name__
+            if got is not None:
+                refs.append((int(sid), got[0]))
+            else:
+                _miss += 1
+        if not refs:
+            self._cold_why = "no_refs(%d/%d miss)" % (
+                _miss, min(len(order), max(1, CHROMA_COLD_TOPN)))
+            return None
+        try:
+            import bandfeat as _bf
+            q = _bf.chroma_matrix(_bf.to_mono8k(sig, self._fp_sr))
+            got = _bf.chroma_coldstart(q, refs, slopes=CHROMA_COLD_SLOPES, step_t=2)
+            self._cold_ms = (time.perf_counter() - t0) * 1000.0
+            self._cold_why = "ok(q=%d,%d)" % (q.shape[0], len(refs))
+        except Exception as _e:                                  # noqa: BLE001
+            self._cold_why = "exc:" + type(_e).__name__ + ":" + str(_e)[:40]
+            self._cold_ms = (time.perf_counter() - t0) * 1000.0
+            return None
+        return got
+
     def _band_try(self, sig, sid, off, now):
         """频带救援通道的一次尝试（识别线程内，**只碰本地小库 + 纯计算**）。
 
         返回 True 表示「本窗观测与前一次**互不重叠**的观测互证成立」。
         失败/不可用一律返回 False（绝不因为这条路而放宽原有判据）。
         """
-        if self._band is None:
-            try:
-                import bandfeat as _bf
-                self._band = _bf.BandStore(
-                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ"), cache=3)
-                self._band_ready = self._band.ready()
-            except Exception:                                    # noqa: BLE001
-                self._band_ready = False
-        if not self._band_ready:
+        if self._band_store() is None:
             return False
         got = self._band.get(int(sid))
         if got is None:
@@ -2060,7 +2184,7 @@ class AudioEngine:
         self._band_obs.append((float(now), int(sid), float(off2), float(rate)))
         return ok
 
-    def _chroma_try(self, sig, sid, target_hint_frame, rate_hint):
+    def _chroma_try(self, sig, sid, target_hint_frame, rate_hint, rate_span=None):
         """chroma 复核（**只对已锁定的那一首**）。返回 `(score, slope, target_frame)` 或 None。
 
         为什么只对已锁定曲目做（2026-10-29 实测）：
@@ -2074,15 +2198,7 @@ class AudioEngine:
           同曲 1.00 / 1.08 / 1.20 → 0.97 / 0.86 / 0.81（三首歌都在 0.60~0.98）
           异曲 → 0.14 ~ 0.17
         """
-        if self._band is None:
-            try:
-                import bandfeat as _bf
-                self._band = _bf.BandStore(
-                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ"), cache=3)
-                self._band_ready = self._band.ready()
-            except Exception:                                    # noqa: BLE001
-                self._band_ready = False
-        if not self._band_ready:
+        if self._band_store() is None:
             return None
         try:
             got = self._band.get_chroma(int(sid))
@@ -2096,7 +2212,7 @@ class AudioEngine:
             q = _bf.chroma_matrix(_bf.to_mono8k(sig, self._fp_sr))
             score, slope, tgt = _bf.chroma_verify_near(
                 q, got[0], float(target_hint_frame), float(rate_hint),
-                target_span=CHROMA_TARGET_SPAN, rate_span=CHROMA_RATE_SPAN)
+                target_span=CHROMA_TARGET_SPAN, rate_span=rate_span)
             self._chroma_ms = (time.perf_counter() - t0) * 1000.0
         except Exception:                                        # noqa: BLE001
             return None
@@ -2254,6 +2370,14 @@ class AudioEngine:
                     ("%.2f" % float(_cxs)) if _cxs is not None else "nan",
                     ("%.3f" % float(_cxr)) if _cxr is not None else "nan",
                     float(getattr(self, "_chroma_ms", 0.0) or 0.0))
+                # ★ 冷启动取证：cold = 冷启动分数（nan = 本窗没跑/没结果），
+                #   ch = 冷启动成功锁定次数，cdms = 冷启动耗时（ms）
+                _cds = getattr(self, "_cold_score", None)
+                line += " cold=%s ch=%d cdms=%.0f cwhy=%s" % (
+                    ("%.2f" % float(_cds)) if _cds is not None else "nan",
+                    int(getattr(self, "_cold_hits", 0) or 0),
+                    float(getattr(self, "_cold_ms", 0.0) or 0.0),
+                    str(getattr(self, "_cold_why", "-")))
             except Exception:                                    # noqa: BLE001
                 pass
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
@@ -2582,6 +2706,71 @@ class AudioEngine:
                     if not _gate_ok and not _agree_ok and not _band_ok:
                         self._last_gate = "none"
                         sid, votes, off = -1, 0, 0.0
+                        self._cold_why = "-"     # 冷启动原因码（见 _chroma_coldstart_try）
+                        self._cold_why = "-"     # 冷启动原因码（见 _chroma_coldstart_try）
+                        # ★★★ 2026-10-29 冷启动 chroma：票数门槛全灭时用音级能量相关直接找人。
+                        #   为什么放在**这个分支里**：只有这里能保证 `_gate_ok is False`
+                        #   （前面放在 `eng.tick` 之前那种位置实测一次都没进过，日志里
+                        #   `cwhy=-` 说明方法根本没被调用）。
+                        #   之后 `eng.tick` 会拿它当一次普通观测 —— `ChargeBarEngine` 自带
+                        #   `CONFIRM_VOTES=10` / `DELTA_ADVANCE_SEC=0.5±0.4`（偏移必须每拍
+                        #   推进 0.5 秒）/ `FIRST_TRACK_HITS=2` 三条时序判据 ⇒ **白拿一套
+                        #   "连续两窗都自洽"的验证**，单窗蒙对也确认不了。
+                        #   ⚠ 票数是等效票（分数×40 ⇒ 16~38）：高于 CONFIRM_VOTES 能充电，
+                        #     低于 STRONG_VOTES(60) 不至于"单拍算两拍"直接确认。
+                        _now_c = _t.perf_counter()
+                        _cd_gap = _now_c - float(getattr(self, "_cold_t", 0.0) or 0.0)
+                        if CHROMA_COLD_ON and _cd_gap >= CHROMA_COLD_COOLDOWN:
+                                self._cold_t = _now_c
+                                _fn = getattr(self, "_chroma_coldstart_try", None)
+                                if _fn is None:
+                                    _cold = None
+                                    self._cold_why = "no_method"
+                                else:
+                                    try:
+                                        _cold = _fn(sig)
+                                    except Exception as _e:      # noqa: BLE001
+                                        _cold = None
+                                        self._cold_why = "call_exc:%s:%s" % (
+                                            type(_e).__name__, str(_e)[:60])
+                                self._cold_score = (float(_cold[1]) if _cold else None)
+                                # 已锁定（eng 已经用两窗自洽 + 偏移推进确认过曲目）时，
+                                # **不要求冷启动分数过门槛**：这时只需要一个位置，而
+                                # chroma 给的位置精度是 0.1 秒级。真机 0.80× 实测：
+                                # gate 每窗都失败 ⇒ `sid=-1` ⇒ 位置不更新 ⇒ 码表虽然装了
+                                # 却一直 `no_pos`（24/28 个采样），sub_active 掉到 0。
+                                _cur_lk = -1
+                                try:
+                                    _cur_lk = int(getattr(eng, "current_song_id", -1))
+                                except Exception:            # noqa: BLE001
+                                    _cur_lk = -1
+                                _cold_ok_use = (_cold is not None
+                                                and float(_cold[1]) >= CHROMA_COLD_GATE)
+                                _cold_fix = (_cold is not None and _cur_lk >= 0
+                                             and int(_cold[0]) == _cur_lk)
+                                if _cold_ok_use or _cold_fix:
+                                    sid = int(_cold[0])
+                                    off = float(_cold[3]) / 10.0
+                                    if _cold_ok_use:
+                                        votes = max(1, int(round(float(_cold[1]) * 40.0)))
+                                    else:
+                                        # 位置校正路径：票数只是"让下游认这一窗有证据"，
+                                        # 取 1 即可（真值取证仍在 `_gate_info` 里，未被改写）
+                                        votes = max(1, int(votes or 0))
+                                    # ⚠ `_tot` 也要抬：后面 BPM 校验的变速档要求
+                                    #   `tot >= BPM_WARP_TOT(120)`，而冷启动场景下原始
+                                    #   总票常常只有 34~90（BPM 会二次否决）
+                                    _tot = max(int(_tot or 0), int(votes))
+                                    _win_used = FP_WIN_SEC
+                                    self._win_used_sec = FP_WIN_SEC
+                                    if _cold_ok_use:
+                                        self._last_gate = "cold"
+                                        self._cold_hits = int(getattr(self, "_cold_hits", 0)) + 1
+                                        # 全新证据链：清掉旧基准让连续性检查重新起步
+                                        self._off_state = None
+                                    else:
+                                        # 已锁定的"位置校正"：保持连续性基准，不清
+                                        self._last_gate = "cold_fix"
                     elif _band_ok:
                         self._last_gate = "band2"
                     elif _agree_ok:
@@ -2603,6 +2792,8 @@ class AudioEngine:
                 #   "认错曲"，两条判据互不干扰（`gate=bpm` 单独可回看）。
                 #   ⚠ 倍频（0.5×/2×）放行：BPM 检测出半速/双速是常态，不能因此杀正确匹配。
                 _lbpm = 0.0        # ★ sid<0 时也要有定义（下面「显示用库内 BPM」要用）
+                _rbpm = 0.0
+                _bflag = None      # ★ 同上：`_bflag` 是 BPM 校验的放行档（见 bpm_gate_ok）
                 if sid >= 0:
                     _lbpm, _rbpm, _brel = 0.0, 0.0, None
                     _bprov = getattr(self, "_song_bpm_provider", None)
@@ -2773,9 +2964,21 @@ class AudioEngine:
                         _now_c = _t.perf_counter()
                         if (_now_c - float(getattr(self, "_chroma_t", 0.0) or 0.0)
                                 >= CHROMA_COOLDOWN):
+                            # ★★ 2026-10-29 真机 0.80×：chroma 的搜索范围原来跟着**上一帧 r**
+                            #   走，而变速工况下 r 常年停在 1.0 ⇒ 范围只有 0.88~1.12，
+                            #   **0.80 永远扫不到**，于是它老老实实报 1.000。
+                            #   ⇒ 改用 BPM 比值当提示（112.5/140=0.804，误差 0.5%），
+                            #     它不受票数影响、也不受"上一帧错值"传染。
+                            # ★★ 2026-10-29 真机：原本把 BPM 比值当搜索提示，但**BPM 检测
+                            #   本身在抖动**（同一段 0.80× 音频实测在 111.5 / 219.5 / 140
+                            #   之间跳），提示错一次就整窗搜错范围（0.80 被搜成 1.0）。
+                            #   ⇒ 改成**全量程搜**（0.80~1.25），防呆交给里层的边际要求
+                            #     `CHROMA_SLOPE_MARGIN_FULL`：变速必须比原速明显更好才认。
                             try:
                                 _cx = self._chroma_try(sig, int(sid),
-                                                       float(_off_norm) * 10.0, float(r))
+                                                       float(_off_norm) * 10.0,
+                                                       float(r),
+                                                       rate_span=0.50)
                             except Exception:                # noqa: BLE001
                                 _cx = None
                             if _cx is not None:
@@ -2791,10 +2994,34 @@ class AudioEngine:
                         #   BPM 检测走自相关，**不受指纹票数影响**，在变速时反而更稳。
                         #   ⚠ 只在 `r` 仍是 1.0（前三条都没结论）时才用，不覆盖更可靠的来源；
                         #     半速/双速由 0.78~1.25 的区间挡掉（0.5×/2× 不在区间内）。
-                        if abs(float(r) - 1.0) < 0.01 and _lbpm > 0.0 and _rbpm > 0.0:
-                            _rr = float(_rbpm) / float(_lbpm)
-                            if 0.78 <= _rr <= 1.25:
-                                r = _rr
+                        #   ★★ 2026-10-29 真机 0.80× 修正：原来只在「r 仍是 1.0」时才用，
+                        #     而 `_rate_est` 给了 **0.938** 就把这条挡死了 —— 可 BPM 比值
+                        #     112.5/140 = **0.804** 才是真值。`_rate_est` 靠 Δoff/Δt，
+                        #     在票被摊平的变速工况下只是个折中值，本来就该让位给自相关。
+                        #   ⇒ 改为：**chroma 没给出非 1.0 的斜率时，就用 BPM 比值**。
+                        #     它比 `_rate_est` / 拟合 / 频带都准，只排在 chroma 之后
+                        #     （chroma 是整段音频对齐，实测 1.08→1.080、1.20→1.200）。
+                        #   ⇒ 排序：**BPM 比值优先**，chroma 高置信时纠正它。
+                        #     理由：BPM 是自相关直接量的（112.5 vs 140 = 0.804，误差 0.5%），
+                        #     而 chroma 的斜率受搜索范围约束、`_rate_est` 受票数摊平影响。
+                        #     chroma 只有在「分数 ≥0.70 且与 BPM 差 >0.10」时才推翻它 ——
+                        #     那说明 BPM 检测本身出错了（同曲实测 0.81~0.97、异曲 0.14~0.30）。
+                        _rr = bpm_ratio_rate(_lbpm, _rbpm, _bflag)
+                        _cxr_now = self._chroma_rate
+                        if _rr is not None and _cxr_now is not None:
+                            # 两者都有结论：**一致才采纳 BPM**（它更精细），
+                            # 冲突时听 chroma —— 真机 Nimbus 原速播放时 BPM 检测偏了 13%
+                            # （143.6 → 162.4），单听 BPM 会把 r 带成 1.131，
+                            # 前馈把播放器加速、位置一路超前（实测 spd=1.41 期望 2.39、
+                            # dmax 0.52、判"位置窜动 1 次"）。而 chroma 那时报 1.000。
+                            if abs(float(_cxr_now) - float(_rr)) <= 0.06:
+                                r = float(_rr)
+                            else:
+                                r = float(_cxr_now)
+                        elif _rr is not None:
+                            r = float(_rr)
+                        elif _cxr_now is not None:
+                            r = float(_cxr_now)
                         # ★★ 2026-10-29（真机抓到 r=1.300）：发布前**一律钳到 DJ 合理区间**。
                         #   根因是 `_rate_est` 在"刚锁定、历史点还只有 2~3 个"时，单点
                         #   0.15 秒的识别误差会被放大成 30% 的速率误差（dt=0.5s 时

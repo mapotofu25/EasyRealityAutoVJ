@@ -113,27 +113,24 @@ HIGHLIGHTS = [
      "same 8-beat grid as the waveform (anchor + 8n×beat_len); tracks without sections "
      "keep the old measured-energy behaviour"),
     ("变速认歌（DJ 打碟 / 机台推速）", "Song ID under DJ speed changes",
-     "DJ 机台 beatmatch 会保留音高、只改速度，原来的指纹票会被摊到几十个位置上、"
-     "单点票掉到十几票而锁不上。补了三层：① 票不够时自动用 9 秒长窗再认一次"
-     "（票数超线性于窗长）；② 变速与「实时 BPM ↔ 库内 BPM 比值」互为印证，"
-     "并允许撞顶（220 上限钳位）造成的 2 倍关系；"
-     "③ 新建 12 音级 chroma 特征库（94 首），锁定后用音级能量相关复核倍率与位置 —— "
-     "它对变速天然不敏感（4.5 秒窗实测同曲 1.08x 得 0.86、异曲只有 0.10~0.16），"
-     "给出的倍率比速度估计准一个量级。"
-     "实测 1.20× 从「认歌 36/36 但倍率停在 1.000、位置每秒漂」变为"
-     "倍率 1.143、位置误差 0.20 秒内、全程无码表闪出",
+     "DJ 机台 beatmatch 会保留音高、只改速度，指纹票会被摊到几十个位置上、单点票掉到十几票。"
+     "补了四层：① 票不够时自动用 9 秒长窗再认一次（票数超线性于窗长）；"
+     "② 变速与「实时 BPM ↔ 库内 BPM 比值」互为印证，并允许撞顶（220 上限钳位）造成的 2 倍关系；"
+     "③ 新建 12 音级 chroma 特征库（94 首），锁定后用音级能量相关复核倍率与位置；"
+     "④ 票数门槛全灭时由 chroma 直接冷启动找人（只扫指纹总票前三名，全曲扫描 38 毫秒），"
+     "找到后交给电池引擎的时序判据确认（偏移必须每拍推进 0.5 秒 + 连续两拍）。"
+     "实测 1.20× 认歌 39/39、倍率 1.225（真值 1.20）、0.80× 认歌 9/9、倍率 0.796（真值 0.80）",
      "When a DJ beatmatches (pitch kept, speed changed) the landmark votes get spread "
      "over dozens of positions and the per-position count collapses below the lock "
-     "threshold. Three layers were added: (1) a 9-second window retry when the short "
-     "window cannot lock (vote count grows faster than window length); (2) the speed is "
-     "cross-checked with the live-vs-library BPM ratio, including the 2x relation created "
-     "by the BPM detector's 220 clamp; (3) a 12-bin chroma feature library (94 tracks) "
-     "re-verifies speed and position after lock -- chroma is inherently immune to speed "
-     "changes (4.5 s window: same track at 1.08x scores 0.86 while other tracks score "
-     "0.10-0.16), and its speed estimate is an order of magnitude better than the "
-     "temporal estimator. Measured: 1.20x went from '36/36 recognised but speed stuck at "
-     "1.000 with position drifting every second' to speed 1.143 with position error under "
-     "0.20 s and no cue dropouts")
+     "threshold. Four layers were added: (1) a 9-second window retry when the short "
+     "window cannot lock; (2) the speed is cross-checked with the live-vs-library BPM "
+     "ratio, including the 2x relation created by the BPM detector's 220 clamp; (3) a "
+     "12-bin chroma feature library (94 tracks) re-verifies speed and position after "
+     "lock; (4) when every vote-based gate fails, chroma itself cold-starts the search "
+     "(top-3 by total fingerprint votes, full-track scan in 38 ms) and hands the result "
+     "to the battery engine's temporal checks (offset must advance 0.5 s per tick, two "
+     "consecutive ticks). Measured: 1.20x recognised 39/39 at speed 1.225 (truth 1.20); "
+     "0.80x recognised 9/9 at speed 0.796 (truth 0.80)")
 ]
 
 # 用到的开源项目（「关于」界面展示，链接可点击直接打开浏览器）
