@@ -239,6 +239,12 @@ LOCK_AGREE_CONC   = 0.12   # 单点票 / 总票 的集中度下限（真歌 ≥0
 #   把身份判定换成"分段对齐"（KDJ sections.rs 的做法）之后，这条通道可以再接回来。
 #   ★ 与它同批上机的「倍率感知位置推进」（off 期望 = dt×rate）**保留生效**，
 #     那是纯粹的时序正确性修复，不参与认不认的判定。
+# ★★ 2026-10-29：chroma 复核（KDJ 式的 12 音级能量相关）。
+#   只对**已锁定**的曲目做，用上一帧位置/倍率限定搜索范围（±30 帧 / ±0.08）。
+CHROMA_TARGET_SPAN = 30      # 位置搜索半宽（100ms 帧）= ±3 秒
+CHROMA_RATE_SPAN = 0.08      # 倍率搜索半宽
+CHROMA_GATE = 0.55           # 放行门槛（同曲实测 0.60~0.98、异曲 0.14~0.17）
+CHROMA_COOLDOWN = 0.0        # 每窗都做（实测 ~100ms；需要减负时调到 1.0）
 BAND_RESCUE_ENABLE = False
 BAND_SCORE_MIN = 0.22      # 单窗最低分（真歌实测 0.18~0.39、随机对齐 0.12~0.20）
 BAND_RATE_SET = (0.96, 0.98, 1.00, 1.02, 1.04, 1.06)
@@ -1803,6 +1809,11 @@ class AudioEngine:
         self._long_t = 0.0          # 上次长窗重试的挂钟时刻（冷却用）
         self._long_hits = 0         # 长窗重试成功次数（取证用）
         self._last_gate_win = "-"   # "long" / "long_fail"，便于日志区分
+        # chroma 复核（见 _chroma_try）：本窗分数/倍率/耗时
+        self._chroma_score = None
+        self._chroma_rate = None
+        self._chroma_ms = 0.0
+        self._chroma_t = 0.0
         self._recognize_thread = threading.Thread(
             target=self._recognize_loop, daemon=True, name="autovj-recognize")
         self._recognize_thread.start()
@@ -2049,6 +2060,50 @@ class AudioEngine:
         self._band_obs.append((float(now), int(sid), float(off2), float(rate)))
         return ok
 
+    def _chroma_try(self, sig, sid, target_hint_frame, rate_hint):
+        """chroma 复核（**只对已锁定的那一首**）。返回 `(score, slope, target_frame)` 或 None。
+
+        为什么只对已锁定曲目做（2026-10-29 实测）：
+          · 限定范围的版本 91~127 ms；自由扫全曲要 300~400 ms，而且**会跳到重复段落**
+            （实测 Black Warrior 45 秒处的查询，自由扫描给 target=112，真值 450）。
+            引擎本来就知道"哪首 + 大概第几秒"，没理由重新自由扫。
+          · 拿它当**独立证据**用：score ≥ `CHROMA_VERIFY_SCORE`(0.55) 时，
+            它的 slope 比 `_rate_est` 准一个量级（实测 1.080/1.200 精确命中真倍率，
+            而 `_rate_est` 在这种"票少频繁掉锁"的工况下常年停在 1.000）。
+        实测分数（4.5 秒窗，限定 ±30 帧 / ±0.08 倍率）：
+          同曲 1.00 / 1.08 / 1.20 → 0.97 / 0.86 / 0.81（三首歌都在 0.60~0.98）
+          异曲 → 0.14 ~ 0.17
+        """
+        if self._band is None:
+            try:
+                import bandfeat as _bf
+                self._band = _bf.BandStore(
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ"), cache=3)
+                self._band_ready = self._band.ready()
+            except Exception:                                    # noqa: BLE001
+                self._band_ready = False
+        if not self._band_ready:
+            return None
+        try:
+            got = self._band.get_chroma(int(sid))
+        except Exception:                                        # noqa: BLE001
+            got = None
+        if got is None:
+            return None
+        try:
+            import bandfeat as _bf
+            t0 = time.perf_counter()
+            q = _bf.chroma_matrix(_bf.to_mono8k(sig, self._fp_sr))
+            score, slope, tgt = _bf.chroma_verify_near(
+                q, got[0], float(target_hint_frame), float(rate_hint),
+                target_span=CHROMA_TARGET_SPAN, rate_span=CHROMA_RATE_SPAN)
+            self._chroma_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:                                        # noqa: BLE001
+            return None
+        if tgt < 0:
+            return None
+        return float(score), float(slope), int(tgt)
+
     def set_song_bpm_provider(self, fn):
         """注册「song_id → 库内 BPM」的提供者（C 组误识别修复用）。
 
@@ -2192,6 +2247,13 @@ class AudioEngine:
                     str(getattr(self, "_last_gate_win", "-")),
                     ("%.3f" % float(_frv)) if _frv is not None else "nan",
                     int(getattr(self, "_long_hits", 0) or 0))
+                # ★ 2026-10-29 chroma 复核取证：cx = 分数，cr = 它给的倍率，cms = 耗时
+                _cxs = getattr(self, "_chroma_score", None)
+                _cxr = getattr(self, "_chroma_rate", None)
+                line += " cx=%s cr=%s cms=%.0f" % (
+                    ("%.2f" % float(_cxs)) if _cxs is not None else "nan",
+                    ("%.3f" % float(_cxr)) if _cxr is not None else "nan",
+                    float(getattr(self, "_chroma_ms", 0.0) or 0.0))
             except Exception:                                    # noqa: BLE001
                 pass
             path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
@@ -2700,6 +2762,28 @@ class AudioEngine:
                         _fr2 = getattr(self, "_fit_rate", None)
                         if _fr2 is not None and 0.86 <= float(_fr2) <= 1.16:
                             r = float(_fr2)
+                        # ★★★ 2026-10-29：**chroma 复核 —— 倍率的最高优先级来源**。
+                        #   实测 `_rate_est` 在"票少 ⇒ 频繁掉锁"的变速工况下常年停在
+                        #   1.000（它靠 Δoff/Δt，掉锁就攒不够基线）；而 chroma 的 slope
+                        #   在 1.08× / 1.20× 时给出 1.080 / 1.200，几乎精确。
+                        #   分数门槛 0.55（同曲实测 0.60~0.98、异曲 0.14~0.17），
+                        #   只在「已锁定的这一首」上做（见 _chroma_try 的范围说明）。
+                        self._chroma_score = None
+                        self._chroma_rate = None
+                        _now_c = _t.perf_counter()
+                        if (_now_c - float(getattr(self, "_chroma_t", 0.0) or 0.0)
+                                >= CHROMA_COOLDOWN):
+                            try:
+                                _cx = self._chroma_try(sig, int(sid),
+                                                       float(_off_norm) * 10.0, float(r))
+                            except Exception:                # noqa: BLE001
+                                _cx = None
+                            if _cx is not None:
+                                self._chroma_t = _now_c
+                                self._chroma_score = float(_cx[0])
+                                if float(_cx[0]) >= CHROMA_GATE:
+                                    r = float(_cx[1])
+                                    self._chroma_rate = float(_cx[1])
                         # ★★ 2026-10-29：**BPM 比值兜底** —— 这是与指纹完全独立的证据。
                         #   真机 1.20× 实测：指纹票被摊到 60 个位置（pv 才 7~17），
                         #   `_rate_est` 又常攒不够基线 ⇒ 前三种来源都停在 1.0，

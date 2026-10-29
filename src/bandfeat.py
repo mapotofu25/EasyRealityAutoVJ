@@ -62,6 +62,84 @@ def band_matrix(x8k):
     return out
 
 
+# ---------------------------------------------------------------- chroma（12 音级）
+# ★★★ 2026-10-29：照 KDJ `crates/kdj-analysis/src/alignment/fuzzy.rs:39` 的 chroma。
+#   为什么必须加这一列：现有 16 个**对数频带**每带约 0.375 个八度（≈4.5 个半音），
+#   折不出 12 个半音级；而 chroma 是**音级能量聚合**，对相位不敏感 ——
+#   这正是 landmark 票数在变速下崩掉时仍然稳的那种特征。
+#   实测（tools/_test_chroma.py，同一首 20 秒，atempo 保音高变速）：
+#     倍速   相似度   最佳 slope 命中
+#     1.00   1.000   1.000
+#     1.04   0.777   1.040
+#     1.08   0.687   1.080
+#     1.15   0.754   1.150
+#     1.20   0.745   1.200
+#   而**异曲最高只有 0.105**（两首同专辑的都不超过 0.11）⇒ 分离度 7 倍以上。
+#   KDJ 的阈值 0.32/0.30/0.40 在两边都有充足余量。
+CHROMA_NFFT = 2048         # 2048 @ 8kHz = 4 Hz 分辨率（60Hz 处一个半音才 3.6Hz）
+CHROMA_HOP = 800           # 100 ms
+CHROMA_MIDI = (48, 108)    # C3 ~ C8
+_HANN_C = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(CHROMA_NFFT)
+                             / (CHROMA_NFFT - 1))).astype(np.float32)
+
+
+def _note_bins():
+    """每个 MIDI 音（48~108）对应的 rfft bin 下标数组。"""
+    bins = np.arange(1, CHROMA_NFFT // 2 + 1)
+    freq = bins * SR / float(CHROMA_NFFT)
+    midi = 69.0 + 12.0 * np.log2(freq / 440.0)
+    out = []
+    for note in range(CHROMA_MIDI[0], CHROMA_MIDI[1] + 1):
+        out.append(np.nonzero(np.abs(midi - note) < 0.5)[0])
+    return out
+
+
+_NOTE_BINS = _note_bins()
+
+
+def chroma_matrix(x8k, demean=True):
+    """→ (帧数, 12)。逐帧 L2 归一化 →（可选）减均值 → 再归一化。
+
+    减均值那一步是 KDJ 原注释点明的关键：`Remove each recording's persistent tonal
+    colour, so sharing a key alone contributes little.` —— 不去掉的话，
+    两首**同一个调**的歌会有很高的基础相似度。
+
+    ★★★ 2026-10-29 落库自检抓到的坑：**建库时必须 `demean=False`**。
+      KDJ 之所以能"减全曲均值"，是因为它两端都是完整录音（整个视频 vs 整首歌）。
+      而我们是「12 秒现场查询 vs 整首歌参考」—— 库里存的是整曲均值，
+      查询减的是自己 12 秒的均值，**两边基准不同**，相似度会直接崩到 0.006
+      （实测）。⇒ 库里存**未减均值**的版本，打分时让参考的那一小段自己减均值，
+        两端才是同一把尺子。
+
+    ⚠ 返回值逐帧已 L2 归一化，所以两帧的余弦相似度就是点积，不用再除范数。
+    """
+    n = 1 + max(0, (len(x8k) - CHROMA_NFFT) // CHROMA_HOP)
+    if n <= 0:
+        return np.zeros((0, 12), dtype=np.float32)
+    out = np.zeros((n, 12), dtype=np.float32)
+    # 分块，避免长时间录音一次性构造 (帧数 × 2048) 的大矩阵
+    blk = 512
+    for a in range(0, n, blk):
+        b = min(n, a + blk)
+        idx = (np.arange(CHROMA_NFFT)[None, :]
+               + CHROMA_HOP * np.arange(a, b)[:, None])
+        spec = np.abs(np.fft.rfft(x8k[idx] * _HANN_C, axis=1)) ** 2
+        for note, sel in enumerate(_NOTE_BINS):
+            if sel.size:
+                out[a:b, note % 12] += np.sqrt(spec[:, sel].sum(axis=1))
+    nrm = np.sqrt((out ** 2).sum(axis=1, keepdims=True))
+    out = np.divide(out, np.maximum(nrm, 1e-8), out=np.zeros_like(out), where=nrm > 1e-8)
+    if demean:
+        out = out - out.mean(axis=0, keepdims=True)
+        nrm = np.sqrt((out ** 2).sum(axis=1, keepdims=True))
+        out = np.divide(out, np.maximum(nrm, 1e-8), out=np.zeros_like(out),
+                        where=nrm > 1e-8)
+    return out
+
+
+CHROMA_Q = 255.0           # 固定量化：未减均值版 v ∈ [0,1] ⇔ q ∈ [0,255]
+
+
 # ---------------------------------------------------------------- 建库（离线）
 def build_db(local_dir, items, progress=None):
     """items = [(song_id, path)]；返回写入/跳过的统计。"""
@@ -70,6 +148,10 @@ def build_db(local_dir, items, progress=None):
     con.execute("CREATE TABLE IF NOT EXISTS bandfeat ("
                 "song_id INTEGER PRIMARY KEY, sr INTEGER, hop INTEGER, frames INTEGER,"
                 "vmin REAL, vmax REAL, dur REAL, data BLOB)")
+    # ★ 2026-10-29：chroma 单独一张表 —— 老库没有它也能照常用 16 频带通道，
+    #   不破坏向后兼容（`build_db` 会自动把缺的那一半补上）。
+    con.execute("CREATE TABLE IF NOT EXISTS chromafeat ("
+                "song_id INTEGER PRIMARY KEY, frames INTEGER, dur REAL, data BLOB)")
     con.commit()
     wrote, skipped, failed = 0, 0, []
     for sid, p in items:
@@ -77,28 +159,42 @@ def build_db(local_dir, items, progress=None):
             if not os.path.exists(p):
                 failed.append((sid, "找不到文件"))
                 continue
-            row = con.execute("SELECT frames FROM bandfeat WHERE song_id=?", (int(sid),)).fetchone()
-            if row and row[0]:
+            r1 = con.execute("SELECT frames FROM bandfeat WHERE song_id=?", (int(sid),)).fetchone()
+            r2 = con.execute("SELECT frames FROM chromafeat WHERE song_id=?", (int(sid),)).fetchone()
+            need_band = not (r1 and r1[0])
+            need_chroma = not (r2 and r2[0])
+            if not need_band and not need_chroma:
                 skipped += 1
                 continue
             import soundfile as sf
             d, s0 = sf.read(p, dtype="float32", always_2d=True)
             x = to_mono8k(d, s0)
-            m = band_matrix(x)
-            if m.shape[0] < 40:
-                failed.append((sid, "太短"))
-                continue
-            vmin, vmax = float(m.min()), float(m.max())
-            rng = max(1e-6, vmax - vmin)
-            q = np.clip((m - vmin) / rng * 255.0, 0, 255).astype(np.uint8)
-            con.execute("INSERT OR REPLACE INTO bandfeat "
-                        "(song_id,sr,hop,frames,vmin,vmax,dur,data) VALUES (?,?,?,?,?,?,?,?)",
-                        (int(sid), SR, HOP, int(m.shape[0]), vmin, vmax,
-                         float(len(x)) / SR, sqlite3.Binary(q.tobytes())))
+            if need_band:
+                m = band_matrix(x)
+                if m.shape[0] < 40:
+                    failed.append((sid, "太短"))
+                    continue
+                vmin, vmax = float(m.min()), float(m.max())
+                rng = max(1e-6, vmax - vmin)
+                q = np.clip((m - vmin) / rng * 255.0, 0, 255).astype(np.uint8)
+                con.execute("INSERT OR REPLACE INTO bandfeat "
+                            "(song_id,sr,hop,frames,vmin,vmax,dur,data) VALUES (?,?,?,?,?,?,?,?)",
+                            (int(sid), SR, HOP, int(m.shape[0]), vmin, vmax,
+                             float(len(x)) / SR, sqlite3.Binary(q.tobytes())))
+            if need_chroma:
+                cm = chroma_matrix(x, demean=False)
+                if cm.shape[0] < 40:
+                    failed.append((sid, "chroma 太短"))
+                    continue
+                cq = np.clip(cm * CHROMA_Q, 0, 255).astype(np.uint8)
+                con.execute("INSERT OR REPLACE INTO chromafeat (song_id,frames,dur,data) "
+                            "VALUES (?,?,?,?)",
+                            (int(sid), int(cm.shape[0]), float(len(x)) / SR,
+                             sqlite3.Binary(cq.tobytes())))
             con.commit()
             wrote += 1
             if progress:
-                progress(sid, m.shape[0])
+                progress(sid, int((r1 and r1[0]) or 0) or int(x.shape[0]))
         except Exception as e:                                   # noqa: BLE001
             failed.append((sid, str(e)[:80]))
     con.close()
@@ -113,6 +209,8 @@ class BandStore:
         self.path = db_path(local_dir)
         self._cache = {}
         self._order = []
+        self._ccache = {}          # chroma 单独一套 LRU（见 get_chroma）
+        self._corder = []
         self._cap = max(1, int(cache))
         self._lock = threading.Lock()
 
@@ -149,6 +247,42 @@ class BandStore:
             self._order.append(sid)
             while len(self._order) > self._cap:
                 self._cache.pop(self._order.pop(0), None)
+        return val
+
+    def get_chroma(self, sid):
+        """返回 (chroma 矩阵 float32 [帧,12], 帧数) 或 None。
+
+        与 `get()` 分开缓存（两套特征量纲不同，混在一个 LRU 里会让缓存命中互相挤掉）。
+        """
+        sid = int(sid)
+        with self._lock:
+            if sid in self._ccache:
+                self._corder.remove(sid)
+                self._corder.append(sid)
+                return self._ccache[sid]
+        if not self.ready():
+            return None
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % self.path.replace("\\", "/"), uri=True)
+            row = con.execute("SELECT frames,data FROM chromafeat WHERE song_id=?",
+                              (sid,)).fetchone()
+            con.close()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        frames, blob = row
+        q = np.frombuffer(blob, dtype=np.uint8)
+        if q.size != frames * 12:
+            return None
+        # 存储版是"未减均值、逐帧 L2 归一化"的 chroma（v ∈ [0,1]）
+        cm = q.reshape(frames, 12).astype(np.float32) / CHROMA_Q
+        val = (cm, int(frames))
+        with self._lock:
+            self._ccache[sid] = val
+            self._corder.append(sid)
+            while len(self._corder) > self._cap:
+                self._ccache.pop(self._corder.pop(0), None)
         return val
 
 
@@ -192,4 +326,323 @@ def verify(q, ref, off_sec, rates, span=0.30, step=0.10):
             s, w = score_at(q, ref, o, r)
             if s > best[0]:
                 best = (s, w, float(r), o)
+    return best
+
+
+# ---------------------------------------------------------------- chroma 打分
+# ★ 照 KDJ `fuzzy.rs` 的做法：逐帧 12 维点积的平均（因为 chroma 逐帧已 L2 归一化，
+#   点积就是余弦相似度）。`slope` = 查询每前进 1 帧、参考前进几帧。
+#   与 `score_at()` 的 16 频带 Pearson 是**两套独立证据**：那一套看频谱纹理，
+#   这一套看音级分布；变速时两者都只轻微下降，而 landmark 票数会断崖。
+CHROMA_SLOPE_LO = 0.80
+CHROMA_SLOPE_HI = 1.25
+CHROMA_SLOPE_STEP = 0.005      # KDJ 的 91 档
+CHROMA_PHRASE = 120            # 12 秒 @ 100ms
+CHROMA_MIN_FRAMES = 30
+
+
+def chroma_slopes():
+    """0.80~1.25 步长 0.005 的斜率表（91 档），跨调用复用。"""
+    n = int(round((CHROMA_SLOPE_HI - CHROMA_SLOPE_LO) / CHROMA_SLOPE_STEP)) + 1
+    return [round(CHROMA_SLOPE_LO + i * CHROMA_SLOPE_STEP, 3) for i in range(n)]
+
+
+def chroma_score_at(q, ref, target_frame, slope, phrase=None):
+    """查询 chroma 的前 `phrase` 帧 与 参考按 slope 对齐后的平均点积。越界返回 -1。"""
+    if q is None or ref is None:
+        return -1.0
+    ph = CHROMA_PHRASE if phrase is None else int(phrase)
+    n = min(ph, q.shape[0])
+    if n < CHROMA_MIN_FRAMES or ref.shape[0] < 8:
+        return -1.0
+    idx = np.rint(np.arange(n) * float(slope)).astype(np.int64) + int(target_frame)
+    if idx[0] < 0 or idx[-1] >= ref.shape[0]:
+        return -1.0
+    # ★★★ 2026-10-29 实测修正：**两端必须用"等长窗口各自减均值"**。
+    #   查询端 `chroma_matrix()` 默认减的是"整段（可能 15 秒）"的均值，
+    #   而参考侧只减 120 帧窗口的均值 —— 窗口不等长 ⇒ 基准又错位。
+    #   实测同曲只拿到 0.44（完全同源时是 0.68）。
+    #   ⇒ 这里对**两边都重新按 n 帧**减均值 + 归一化，做到严格对称。
+    qw = q[:n]
+    qw = qw - qw.mean(axis=0, keepdims=True)
+    nrm = np.sqrt((qw ** 2).sum(axis=1, keepdims=True))
+    qw = np.divide(qw, np.maximum(nrm, 1e-8), out=np.zeros_like(qw), where=nrm > 1e-8)
+    rw = ref[idx]
+    rw = rw - rw.mean(axis=0, keepdims=True)
+    nrm = np.sqrt((rw ** 2).sum(axis=1, keepdims=True))
+    rw = np.divide(rw, np.maximum(nrm, 1e-8), out=np.zeros_like(rw), where=nrm > 1e-8)
+    return float((qw * rw).sum(axis=1).mean())
+
+
+def chroma_best(q, ref, slopes=None, target_step=4):
+    """全扫 → (最佳分数, 最佳 slope, 最佳起点帧)。`target_step` 是起点扫描步长（帧）。"""
+    if q is None or ref is None or q.shape[0] < CHROMA_MIN_FRAMES:
+        return -1.0, 1.0, 0
+    sl = chroma_slopes() if slopes is None else list(slopes)
+    best = (-2.0, 1.0, 0)
+    for slope in sl:
+        span = int(round(CHROMA_PHRASE * slope))
+        last = ref.shape[0] - span
+        if last <= 0:
+            continue
+        for t in range(0, last, max(1, int(target_step))):
+            v = chroma_score_at(q, ref, t, slope)
+            if v > best[0]:
+                best = (v, float(slope), t)
+    return best
+
+
+# ---------------------------------------------------------------- 子短语一致性
+# ★★★ 2026-10-29：这是 `unambiguous_spans` 的等价物，**不是可选项**。
+#   实测（tools/_test_chroma_falsepos.py，94 首全库）：
+#     库外曲最高 0.383 / 正向对照（它自己）只有 0.450 —— 单阈值只差 17%，分不开。
+#   根因：全库自由扫描时，重复段落/巧合能凑出很高的单点分。KDJ 的解法是把
+#   "分数"降级成"提候选"，最终判定交给**多个候选映射必须落在同一条线上**：
+#     第 i 个子短语 ↔ 参考的第 (off + i*stride*slope) 帧
+#   重复短语只会让**某一个**子短语产生多个候选，不会让所有子短语都指向同一条错线。
+CHROMA_SEG_LEN = 60        # 子短语长度（帧）= 6 秒
+CHROMA_SEG_STRIDE = 30     # 子短语间隔（帧）= 3 秒 ⇒ 相邻重叠 50%
+CHROMA_SUB_TOPK = 3        # 每个子短语保留几个候选
+CHROMA_CONSENSUS_TOL = 3   # 同一条线的容差（帧）= 0.3 秒
+CHROMA_CONSENSUS_MIN = 2   # 至少几个子短语落在同一条线上才算数
+# ★★★ 2026-10-29 实测（同一首 Hardstyle 自比自，4 个子短语）：
+#   a=0   0.258 @ slope 1.205（落在重复段落上，错的）
+#   a=30  0.963 @ slope 0.995  off=450.1  ← 对
+#   a=60  0.312 @ slope 0.955（错的）
+#   a=90  0.935 @ slope 0.995  off=450.4  ← 对
+#   ⇒ 硬性要求 3 个一致**永远凑不齐**（这首歌有一半段落是循环的）。
+#   但**对的那些段分数高达 0.94~0.96，错段只有 0.26~0.31，库外曲整体最高 0.38** ——
+#   所以正确的判据是「≥2 段一致 **且** 这些段的均分 ≥ 0.55」，而不是只数段数。
+#   这也正是 KDJ 逐段判定的价值：整体查询会把好坏段平均掉（0.45），拆开才看得见。
+CHROMA_CONSENSUS_SCORE = 0.55   # 一致组的平均分门槛（异曲 0.10~0.22，正向 0.94+）
+
+
+def chroma_topk(qsub, ref, k=3, slopes=None, target_step=4, min_score=0.02):
+    """单个子短语对参考全扫，返回 top-k `(score, slope, target)`（按分数降序）。"""
+    if qsub is None or ref is None or qsub.shape[0] < 8:
+        return []
+    sl = chroma_slopes() if slopes is None else list(slopes)
+    n = qsub.shape[0]
+    out = []
+    for slope in sl:
+        span = int(round(n * slope))
+        last = ref.shape[0] - span
+        if last <= 0:
+            continue
+        for t in range(0, last, max(1, int(target_step))):
+            v = chroma_score_at(qsub, ref, t, slope, phrase=n)
+            if v >= min_score:
+                out.append((v, float(slope), int(t)))
+    out.sort(key=lambda x: -x[0])
+    # 简单去重：位置太近的只留最高的那个，避免 top-k 全挤在同一处
+    kept = []
+    for v, sl_, t in out:
+        if any(abs(t - t2) < 8 and abs(sl_ - sl2) < 0.02 for _v2, sl2, t2 in kept):
+            continue
+        kept.append((v, sl_, t))
+        if len(kept) >= k:
+            break
+    return kept
+
+
+def chroma_consensus(q, ref, seg_len=None, stride=None, k=None, tol=None):
+    """子短语一致性判定。返回 `(slope, ref_offset_frame, support, mean_score)` 或 None。
+
+    `ref_offset_frame` = 查询第 0 帧对应的参考帧。
+    只有「≥ CHROMA_CONSENSUS_MIN 个子短语落在同一条 (slope, offset) 线上」才返回。
+    """
+    if q is None or ref is None:
+        return None
+    seg_len = CHROMA_SEG_LEN if seg_len is None else int(seg_len)
+    stride = CHROMA_SEG_STRIDE if stride is None else int(stride)
+    k = CHROMA_SUB_TOPK if k is None else int(k)
+    tol = CHROMA_CONSENSUS_TOL if tol is None else int(tol)
+    n = q.shape[0]
+    starts = list(range(0, max(1, n - seg_len + 1), max(1, stride)))
+    if len(starts) < CHROMA_CONSENSUS_MIN:
+        return None
+    cands = []
+    for a in starts:
+        for v, slope, t in chroma_topk(q[a:a + seg_len], ref, k=k):
+            # 线上的一点：off = 参考帧 - 查询帧*slope（以查询第 0 帧为基准）
+            cands.append((float(t) - a * slope, v, slope, a))
+    if not cands:
+        return None
+    # ★ 不做「按桶聚类」—— 实测会因边界把同一条线拆开：
+    #   off 桶宽 3 帧时，448/3→149、450/3→150、452/3→151，同一条真线落三个桶，
+    #   正向查询因此全部返回 None（4 个子短语一个都凑不齐）。
+    #   ⇒ 改成**以每个候选为中心做容差聚类**（O(N²)，N = 子短语数×k，很小）。
+    best = None
+    for off0, _v0, sl0, _a0 in cands:
+        group = [c for c in cands
+                 if abs(c[2] - sl0) <= 0.02 and abs(c[0] - off0) <= float(tol)]
+        per = {}
+        for off, v, slope, a in group:
+            # 同一个子短语只留贡献最高的那个，避免自己给自己刷票
+            if a not in per or v > per[a][1]:
+                per[a] = (off, v, slope)
+        subs = len(per)
+        if subs < CHROMA_CONSENSUS_MIN:
+            continue
+        off_m = float(np.mean([q[0] for q in per.values()]))
+        sl_m = float(np.mean([q[2] for q in per.values()]))
+        sc_m = float(np.mean([q[1] for q in per.values()]))
+        if sc_m < CHROMA_CONSENSUS_SCORE:
+            continue
+        if best is None or (subs, sc_m) > (best[2], best[3]):
+            best = (sl_m, off_m, subs, sc_m)
+    return best
+
+
+# ---------------------------------------------------------------- 现场接口
+# ★★★ 2026-10-29 定案（实测数据见下）：**用现有 4.5 秒窗就够，不需要长窗**。
+#   同一首 Hardstyle（真值 target=450 帧 = 45 秒），窗口长度 vs 分数：
+#     窗长    同曲1.00  同曲1.08  同曲1.20   异曲
+#     4.5s     0.978     0.837     0.797    0.183    ← 最好
+#     6.0s     0.978     0.861     0.815    0.184
+#     9.0s     0.972     0.780     0.768    0.151
+#     12.0s    0.966     0.683     0.750    0.141
+#   分离度 4.4~5.3 倍。
+#
+#   ⚠⚠ **target 必须细扫到 1 帧**：chroma 是 100ms 一帧，target 步长 4（0.4 秒）
+#      就足以让同曲分数从 0.978 掉到 0.347（Hardstyle 150BPM 半拍的内容差异）。
+#      之前所有"chroma 不行"的结论都是这个原因，不是特征的问题。
+#   ⇒ 两阶段：粗扫（步长 16 + slope 0.02）框范围 → 精扫（步长 1 + slope 0.005）。
+CHROMA_VERIFY_SCORE = 0.55      # 现场放行门槛（同曲 0.80~0.98、异曲 0.14~0.18）
+CHROMA_COARSE_STEP = 16         # 粗扫 target 步长（帧）
+CHROMA_COARSE_SLOPE = 0.02      # 粗扫 slope 步长
+CHROMA_FINE_TARGET = 20         # 精扫 target 半宽（帧）
+CHROMA_FINE_SLOPE = 0.005       # 精扫 slope 步长
+CHROMA_FINE_SLOPE_HALF = 0.02   # 精扫 slope 半宽
+# 变速必须"明显更好"才采信（防止原速时凑出 1.08，实测会发生）
+CHROMA_SLOPE_MARGIN = 0.08
+
+
+def chroma_verify(q, ref, coarse_step=None):
+    """对**单首**参考做两阶段扫描。返回 `(score, slope, target_frame)`。
+
+    这是现场唯一该调的接口：指纹先给出候选曲目（top-3），再对每首调它一次。
+    ⚠ 不要拿它去扫全库 —— 全库的粗筛交给指纹票数，chroma 只负责"确认 + 定位 + 估倍率"。
+    """
+    if q is None or ref is None:
+        return -1.0, 1.0, 0
+    n = q.shape[0]
+    if n < CHROMA_MIN_FRAMES or ref.shape[0] < n + 8:
+        return -1.0, 1.0, 0
+    step = CHROMA_COARSE_STEP if coarse_step is None else max(1, int(coarse_step))
+    # ---- 粗扫：框出候选 (slope, target) ----
+    coarse = []
+    sl = CHROMA_SLOPE_LO
+    while sl <= CHROMA_SLOPE_HI + 1e-9:
+        span = int(round(n * sl))
+        last = ref.shape[0] - span
+        if last > 0:
+            for t in range(0, last, step):
+                v = chroma_score_at(q, ref, t, sl, phrase=n)
+                if v > 0.02:
+                    coarse.append((v, sl, t))
+        sl = round(sl + CHROMA_COARSE_SLOPE, 4)
+    if not coarse:
+        return -1.0, 1.0, 0
+    coarse.sort(key=lambda x: -x[0])
+    # ---- 精扫：对前几个候选细化到 1 帧 ----
+    best = (-2.0, 1.0, 0)
+    seen = []
+    for _v, csl, ct in coarse[:4]:
+        if any(abs(ct - t0) <= CHROMA_FINE_TARGET and abs(csl - s0) <= CHROMA_FINE_SLOPE_HALF
+               for t0, s0 in seen):
+            continue
+        seen.append((ct, csl))
+        sl0 = max(CHROMA_SLOPE_LO, csl - CHROMA_FINE_SLOPE_HALF)
+        sl1 = min(CHROMA_SLOPE_HI, csl + CHROMA_FINE_SLOPE_HALF)
+        a = sl0
+        while a <= sl1 + 1e-9:
+            span = int(round(n * a))
+            lo = max(0, ct - CHROMA_FINE_TARGET)
+            hi = min(ref.shape[0] - span, ct + CHROMA_FINE_TARGET)
+            for t in range(lo, max(lo + 1, hi + 1)):
+                v = chroma_score_at(q, ref, t, a, phrase=n)
+                if v > best[0]:
+                    best = (v, float(a), int(t))
+            a = round(a + CHROMA_FINE_SLOPE, 4)
+    return best
+
+
+def chroma_verify_near(q, ref, target_hint, rate_hint=1.0,
+                       target_span=30, rate_span=None):
+    """**现场用的版本**：位置限定在已知附近，倍率**全量程扫**（不靠猜）。
+
+    为什么倍率不能靠 `rate_hint` 限范围（2026-10-29 实测）：
+      `rate_hint` 来自上一帧，而变速工况下 `_rate_est` 常年停在 1.000
+      ⇒ 若按 ±0.08 限定，范围只有 0.92~1.08，**1.20 永远扫不到**，
+      实测 1.20× 的三首歌全部退化成 0.28/0.12/0.51。
+      ⇒ 倍率改用「全量程粗扫（0.80~1.25 步长 0.02）+ 对 top-4 精扫（0.005）」，
+        位置仍由 `target_hint` 限定（这一步才是省时间的关键，也防止跳到重复段落）。
+
+    :param target_hint: 查询第 0 帧对应的参考帧（引擎给，单位 100ms 帧）
+    :param rate_hint:   仅用于「与 1.0 的边际比较」时的参考，不限制搜索范围
+    :return: `(score, slope, target_frame)`；全越界时返回 (-1, rate_hint, -1)
+    """
+    if q is None or ref is None:
+        return -1.0, float(rate_hint or 1.0), -1
+    n = q.shape[0]
+    if n < CHROMA_MIN_FRAMES or ref.shape[0] < n + 8:
+        return -1.0, float(rate_hint or 1.0), -1
+
+    def _best_at(slope, step=1):
+        span = int(round(n * slope))
+        lo = max(0, int(target_hint) - int(target_span))
+        hi = min(ref.shape[0] - span, int(target_hint) + int(target_span))
+        bb = (-2.0, float(slope), -1)
+        for t in range(lo, max(lo + 1, hi + 1), step):
+            v = chroma_score_at(q, ref, t, slope, phrase=n)
+            if v > bb[0]:
+                bb = (v, float(slope), int(t))
+        return bb
+
+    # ---- 1. 粗扫：slope 限定在「上一帧倍率 ±rate_span」，位置步长 10 帧 ----
+    # ★★ 2026-10-29 真机（`cr=1.230` 在原速播放时出现，直接造成一次位置窜动 4.27 拍/秒）：
+    #   全量程扫会让 chroma 一步跳到 1.23 —— 因为 hint 位置本身有偏差时，
+    #   「换个倍率 + 换个位置」总能凑出更高的分。而引擎的前馈会被它带跑。
+    #   ⇒ 倍率只允许**逐步爬升**：搜索范围 = 上一帧 ±0.12。
+    #     原速时范围 0.88~1.12（够不到 1.23）⇒ 不会被带跑；
+    #     真变速时两窗内就能爬到 1.20（1.00 → 1.12 → 1.20）。
+    _rs = 0.12 if rate_span is None else float(rate_span)
+    _rh = float(rate_hint or 1.0)
+    if not (CHROMA_SLOPE_LO <= _rh <= CHROMA_SLOPE_HI):
+        _rh = 1.0
+    coarse = []
+    sl = max(CHROMA_SLOPE_LO, round(_rh - _rs, 4))
+    sl_hi = min(CHROMA_SLOPE_HI, round(_rh + _rs, 4))
+    while sl <= sl_hi + 1e-9:
+        b = _best_at(sl, step=10)
+        if b[2] >= 0 and b[0] > 0.02:
+            coarse.append(b)
+        sl = round(sl + CHROMA_COARSE_SLOPE, 4)
+    if not coarse:
+        return -1.0, float(rate_hint or 1.0), -1
+    coarse.sort(key=lambda x: -x[0])
+    # ---- 2. 精扫：对 top-4 细化 slope(0.005) 与位置(1 帧) ----
+    best = (-2.0, 1.0, -1)
+    seen = []
+    for _v, csl, ct in coarse[:4]:
+        if any(abs(ct - t0) <= 12 and abs(csl - s0) <= 0.03 for t0, s0 in seen):
+            continue
+        seen.append((ct, csl))
+        a = max(CHROMA_SLOPE_LO, csl - 0.02)
+        a_hi = min(CHROMA_SLOPE_HI, csl + 0.02)
+        while a <= a_hi + 1e-9:
+            span = int(round(n * a))
+            lo = max(0, ct - 10)
+            hi = min(ref.shape[0] - span, ct + 10)
+            for t in range(lo, max(lo + 1, hi + 1)):
+                v = chroma_score_at(q, ref, t, a, phrase=n)
+                if v > best[0]:
+                    best = (v, round(float(a), 4), int(t))
+            a = round(a + CHROMA_FINE_SLOPE, 4)
+    # ---- 3. 边际要求：变速必须明显优于 slope=1.0，否则报 1.0（不猜） ----
+    if best[2] >= 0 and abs(best[1] - 1.0) > 1e-9:
+        base = _best_at(1.0, step=1)
+        if best[0] < base[0] + CHROMA_SLOPE_MARGIN:
+            return base
     return best

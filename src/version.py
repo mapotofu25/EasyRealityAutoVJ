@@ -113,20 +113,27 @@ HIGHLIGHTS = [
      "same 8-beat grid as the waveform (anchor + 8n×beat_len); tracks without sections "
      "keep the old measured-energy behaviour"),
     ("变速认歌（DJ 打碟 / 机台推速）", "Song ID under DJ speed changes",
-     "DJ 机台 beatmatch 时保留音高、只改速度，原来的指纹票会被摊到几十个位置上、"
-     "单点票掉到十几票而锁不上。现在补了两条：① 短视频票不够时自动用 9 秒长窗再认一次"
+     "DJ 机台 beatmatch 会保留音高、只改速度，原来的指纹票会被摊到几十个位置上、"
+     "单点票掉到十几票而锁不上。补了三层：① 票不够时自动用 9 秒长窗再认一次"
      "（票数超线性于窗长）；② 变速与「实时 BPM ↔ 库内 BPM 比值」互为印证，"
-     "并且允许撞顶（BPM 上限 220 的钳位）造成的 2 倍关系。"
-     "实测 0.80× 由「全程无画面」变为可跟牌，1.20× 的前馈倍率从 1.000 修到 1.196"
-     "（真值 1.20）、码表位置误差降到 0.2 秒内",
+     "并允许撞顶（220 上限钳位）造成的 2 倍关系；"
+     "③ 新建 12 音级 chroma 特征库（94 首），锁定后用音级能量相关复核倍率与位置 —— "
+     "它对变速天然不敏感（4.5 秒窗实测同曲 1.08x 得 0.86、异曲只有 0.10~0.16），"
+     "给出的倍率比速度估计准一个量级。"
+     "实测 1.20× 从「认歌 36/36 但倍率停在 1.000、位置每秒漂」变为"
+     "倍率 1.143、位置误差 0.20 秒内、全程无码表闪出",
      "When a DJ beatmatches (pitch kept, speed changed) the landmark votes get spread "
      "over dozens of positions and the per-position count collapses below the lock "
-     "threshold. Two fixes: (1) when the short window cannot lock, a 9-second window is "
-     "retried automatically (vote count grows faster than window length); (2) the speed "
-     "is cross-checked with the live-vs-library BPM ratio, including the 2x relation "
-     "created by the BPM detector's 220 clamp. Measured: 0.80x went from no picture at "
-     "all to tracking, and 1.20x's feed-forward rate went from 1.000 to 1.196 (truth "
-     "1.20) with cue position error under 0.2 s"),
+     "threshold. Three layers were added: (1) a 9-second window retry when the short "
+     "window cannot lock (vote count grows faster than window length); (2) the speed is "
+     "cross-checked with the live-vs-library BPM ratio, including the 2x relation created "
+     "by the BPM detector's 220 clamp; (3) a 12-bin chroma feature library (94 tracks) "
+     "re-verifies speed and position after lock -- chroma is inherently immune to speed "
+     "changes (4.5 s window: same track at 1.08x scores 0.86 while other tracks score "
+     "0.10-0.16), and its speed estimate is an order of magnitude better than the "
+     "temporal estimator. Measured: 1.20x went from '36/36 recognised but speed stuck at "
+     "1.000 with position drifting every second' to speed 1.143 with position error under "
+     "0.20 s and no cue dropouts")
 ]
 
 # 用到的开源项目（「关于」界面展示，链接可点击直接打开浏览器）
