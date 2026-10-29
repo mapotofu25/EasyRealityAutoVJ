@@ -1921,7 +1921,6 @@ class MusicScanThread(QThread):
                     except Exception:                                # noqa: BLE001
                         fmd5 = ""
                 r["file_md5"] = fmd5
-                # 段落分析已移除（用户反馈：不准，去掉曲库的段落分析与预览里的段落显示）
                 # ★ 节拍网格（BPM / 锚点 / 八拍乐句相位）—— 离线一次入库，演出中只查表。
                 #   复用刚解码的 sig：扫描已经为指纹读过一次盘，这里不再读第二遍。
                 if _bg is not None:
@@ -1929,6 +1928,32 @@ class MusicScanThread(QThread):
                         g = _bg.grid_from_signal(sig, sr, vdj_idx, path=p)
                         if g:
                             r["grid"] = g
+                    except Exception:
+                        pass
+                # ★★★ 2026-10-29 自动能量分段（用户要求「扫描曲库时自动识别 drop 段落」）
+                #   之前这里是"段落分析已移除"（旧版是手标模板，不准），现在换成
+                #   基于能量落差的自动分段 —— 实测 INTERNET YAMERO 四个边界全中
+                #   （误差 ≤0.1 秒，见 sections.auto_segments 的注释）。
+                #   存两套：`sections`（按八拍对齐，引擎用）+ `sections_raw`（原始边界，
+                #   编辑时切换"八拍/小节"用 —— 八拍是小节的子集，只留吸附值就细化不回去）。
+                if _bg is not None:
+                    try:
+                        import sections as _sec
+                        # ⚠ 不要在这里用 `np`：`import numpy as np` 是 1721 行
+                        #   （另一个方法内）的**局部导入**，这里拿不到 ⇒ NameError
+                        #   会被下面的 `except Exception` 吞掉、静默不生效。
+                        #   `sig` 本身就是 `np.mean(data, axis=1)` 的连续数组，直接传。
+                        _m22, _s22 = _bg.resample(sig, sr, _bg.SR_TARGET)
+                        _f2 = _bg.features(_m22, _s22)
+                        _d2 = len(_m22) / float(_s22)
+                        _seg_g = r.get("grid") or None
+                        _sg = _sec.auto_segments(_f2, dur=_d2, grid=_seg_g)
+                        _sgr = _sec.auto_segments(_f2, dur=_d2, grid=None)
+                        if _sg:
+                            r["sections"] = _sg
+                            r["sections_raw"] = _sgr
+                            r["sections_auto"] = True
+                        del _m22, _f2
                     except Exception:
                         pass
                 # ★ 歌曲封面（列表左侧那张图）：**在建库时离线取一次**入库。
@@ -1948,6 +1973,11 @@ class MusicScanThread(QThread):
                         r["grid_manual"] = _ou["grid_manual"]
                     if _ou.get("grid_flip"):
                         r["grid_flip"] = _ou["grid_flip"]
+                    # ★ 手改过的段落一律保留（`sections_auto is False` 就是手动保存过的）
+                    if _ou.get("sections_auto") is False and _ou.get("sections"):
+                        r["sections"] = _ou["sections"]
+                        r["sections_raw"] = _ou.get("sections_raw")
+                        r["sections_auto"] = False
                 return p, r, (t1 - t0), (t2 - t1), (t3 - t2)
             except Exception:
                 return p, None, 0.0, 0.0, 0.0

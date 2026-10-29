@@ -47,6 +47,15 @@ _HIT_PX = 6.0            # 命中标记线 / 播放头的像素阈值
 LABEL_H = 20             # 顶部标签带高度（分段 BPM / 八拍秒数只画在这里）
 _BAND_H = LABEL_H        # 兼容别名（历史 API 名）
 AXIS_H = 14.0            # 底部时间轴高度
+# 能量段落带（用户 2026-10-29：「标在波形图下方」）。
+# 为什么从"叠在波形上的半透明染色"改成"下方独立条带"：
+#   · 叠色只能表达「这段属于哪一档」——0.72 和 0.95 都染同一个颜色，看不出差别；
+#   · 独立条带可以用**柱高 = 平均能量**，层级一眼可比，且完全不挡读波形。
+# ⚠ 高度按"能不能读出层级"定：18px 柱区时 0.48 的段只有 8.6px、0.17 只有 3px，
+#   截图里几乎看不出高低差（第一版实拍验证）。26px 柱区下 0.17→4.4px、0.98→25px，
+#   一眼可比；再加 12px 文字行，总高 46px 仍然只占 320px 控件的 1/7。
+ENERGY_H = 46.0          # 段落带总高（26 柱 + 12 文字 + 分隔/边距）
+ENERGY_BAR_H = 26.0      # 柱区高度（能量 0~1 线性映射到 0~26px）
 MIN_SPAN_SEC = 0.5       # 最小可视跨度（秒）—— 再放大会看不清也不用
 _VIEW_MIN_SPAN = MIN_SPAN_SEC   # 兼容别名（历史 API 名）
 ZOOM_FACTOR = 0.82       # 每档滚轮缩放比例（与 ERCUE 一致）
@@ -398,7 +407,11 @@ class WaveformMarkWidget(QWidget):
         return float(LABEL_H)
 
     def _plot_bottom(self):
-        return max(float(LABEL_H) + 8.0, float(self.height()) - AXIS_H)
+        """波形区底边。**有能量段落时让出 `ENERGY_H`**（段落带画在那一段里）。"""
+        reserve = AXIS_H
+        if getattr(self, "_energy_sections", None):
+            reserve = AXIS_H + ENERGY_H
+        return max(float(LABEL_H) + 8.0, float(self.height()) - reserve)
 
     # ---------------- v2：顶部标签几何（测试据此断言「文字在带内」） ----------------
     def label_items(self):
@@ -477,16 +490,31 @@ class WaveformMarkWidget(QWidget):
         if self._wf and self._wf.get("amp"):
             self._paint_waveform(p, w, plot_top, plot_bot)
 
-        # ---- 3a) 能量段落底色带（用户 2026-10-28）----
-        #   画在波形**之上**、拍网之下：alpha 只有 26 ⇒ 像"染色"而不是"盖住"，
-        #   读波形依然清楚；顶部 3px 实色条用来一眼看到段落边界在哪。
-        #   档位配色与详情页对话框里的色块一致，避免"两处颜色对不上"。
+        # ---- 3a) 能量段落带（用户 2026-10-29：「标在波形图下方」）----
+        #   从"叠在波形上的半透明染色"改成**波形下方的独立条带**，因为它能多表达一层：
+        #     · 柱高 = 该段平均能量（0~1 线性映射到 ENERGY_BAR_H）
+        #     · 柱色 = 高/低档（高=暖橙红、低=青蓝），与详情页色块同一套
+        #     · 文字 = 段名 + 能量数值（段够宽才写，窄段自动省略，绝不重叠）
+        #     · 竖线 = 段落边界，从带顶一直拉到波形顶（一眼看出"到底切在哪一秒"）
+        #   为什么不再染色：0.72（主歌）和 0.96（drop）会染成同一个颜色，
+        #   而"这一段有多强"恰恰是要看的东西 —— 柱高才看得出层级差。
         _esec = [x for x in (getattr(self, "_energy_sections", None) or [])
                  if isinstance(x, dict)]
         if _esec and d > 0:
-            _tc = {"low": (80, 140, 220), "mid": (222, 190, 90),
-                   "high": (232, 88, 88)}
-            _ph = max(1.0, float(plot_bot) - float(plot_top))
+            _tc = {"low": (74, 132, 214), "mid": (222, 190, 90),
+                   "high": (232, 96, 76)}
+            _by0 = float(plot_bot) + 3.0
+            _by1 = _by0 + ENERGY_BAR_H
+            # 文字基线：柱区底 + 13 ⇒ 文字框 291~303，**不与柱子重叠**
+            # （第一版给 +10，文字框从 _by1-1 起，把柱脚盖住了，实拍才发现）
+            _ty = _by1 + 13.0
+            # 波形区与段落带的分隔线（不然两者糊在一起，看不出条带从哪开始）
+            p.setPen(QPen(QColor(70, 78, 92, 200), 1))
+            p.drawLine(0, int(float(plot_bot) + 1.0), int(w), int(float(plot_bot) + 1.0))
+            # 0.5 能量参考线（很淡，给"柱有多高"一个标尺）
+            p.setPen(QPen(QColor(120, 130, 145, 70), 1))
+            p.drawLine(0, int(_by0 + ENERGY_BAR_H * 0.5),
+                       int(w), int(_by0 + ENERGY_BAR_H * 0.5))
             for _s in _esec:
                 try:
                     _a0 = float(_s.get("t0") or 0.0)
@@ -501,16 +529,36 @@ class WaveformMarkWidget(QWidget):
                     continue
                 _c = _tc.get(str(_s.get("tier") or "mid"), (150, 150, 150))
                 _bw = max(1.0, _x1 - _x0)
-                # 底色 alpha 45：第一版用 26 太淡，被彩色波形（青→黄→红）完全淹没，
-                # 截图里根本看不出段落 —— 提亮到 45 才"看得见但不挡读波形"。
-                p.fillRect(QRectF(_x0, float(plot_top), _bw, _ph),
-                           QColor(_c[0], _c[1], _c[2], 45))
-                # 顶部 10px 实色标尺：段落边界一眼可见（3px 在 720p 下太细）
-                p.fillRect(QRectF(_x0, float(plot_top), _bw, 10.0),
-                           QColor(_c[0], _c[1], _c[2], 225))
-                # 边界竖线（段与段的交界画一条，比标尺更能定位"到底切在哪一秒"）
-                p.setPen(QPen(QColor(_c[0], _c[1], _c[2], 235), 2))
-                p.drawLine(int(_x0), int(plot_top), int(_x0), int(plot_bot))
+                try:
+                    _e = max(0.0, min(1.0, float(_s.get("energy") or 0.0)))
+                except (TypeError, ValueError):
+                    _e = 0.0
+                # 柱底槽（很淡，让"空段"也有范围可读）
+                p.fillRect(QRectF(_x0, _by0, _bw, ENERGY_BAR_H),
+                           QColor(_c[0], _c[1], _c[2], 26))
+                # 柱：高度 = 平均能量
+                _bh = max(2.0, ENERGY_BAR_H * _e)
+                p.fillRect(QRectF(_x0 + 0.5, _by1 - _bh, max(1.0, _bw - 1.0), _bh),
+                           QColor(_c[0], _c[1], _c[2], 215))
+                # ★ 柱顶高亮线：纯色块之间人眼分不出 14px 和 23px（第一版实拍验证：
+                #   柱高明明差 9px，看着却像一条平带）。画一条 1.5px 的亮线，
+                #   高度轮廓立刻显现 —— 这是"阶梯图"的读法。
+                p.setPen(QPen(QColor(255, 255, 255, 165), 1.5))
+                p.drawLine(QPointF(_x0 + 1.0, _by1 - _bh), QPointF(_x1 - 1.0, _by1 - _bh))
+                # 边界竖线：带顶 → 波形顶
+                p.setPen(QPen(QColor(_c[0], _c[1], _c[2], 190), 1.5))
+                p.drawLine(int(_x0), int(_by0), int(_x0), int(plot_top))
+                # 文字：段够宽才写。>92px 写「段名 0.96」，>46px 只写数值
+                if _bw >= 46.0:
+                    _nm = str(_s.get("name") or "")
+                    _txt = ("%s %.2f" % (_nm, _e)) if _bw >= 92.0 and _nm else ("%.2f" % _e)
+                    p.setPen(QColor(226, 232, 240, 235))
+                    _f = p.font()
+                    _f.setPointSizeF(7.5)
+                    p.setFont(_f)
+                    p.drawText(QRectF(_x0 + 3.0, _ty - 11.0, _bw - 5.0, 12.0),
+                               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                               _txt)
 
         # ---- 3b) 拍网（浅灰）/ 八拍头（更亮）—— 画在波形**之上**，否则会被彩色填充盖住
         bl = self._beat_len()

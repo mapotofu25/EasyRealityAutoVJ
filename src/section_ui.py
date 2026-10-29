@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
+from PySide6.QtWidgets import (QButtonGroup, QRadioButton,
+                               QAbstractItemView, QComboBox, QDialog,
                                QDialogButtonBox, QDoubleSpinBox, QHBoxLayout,
                                QHeaderView, QLabel, QMessageBox, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout)
@@ -42,6 +43,11 @@ class EnergySectionDialog(QDialog):
         self._dur = float(dur or 0.0)
         self._grid = dict(grid or {})
         self._cur = float(cur_sec or 0.0)
+        # ★★ 保留**未吸附**的原始边界：切换"八拍/小节"时必须从它重算。
+        #   ⚠ 八拍线是小节线的子集（8 拍 = 2 个小节），一旦把边界吸到八拍，
+        #     再切成小节就是原地不动 —— 实测 25.2 → 25.95（八拍）→ 25.95（小节），
+        #     用户会以为选项没生效。只有从原始值重算才能双向切换。
+        self._orig = [dict(x) for x in (sections or []) if isinstance(x, dict)]
         self._rows = S.normalize(sections or [], self._dur, self._grid or None)
         if not self._rows:
             self._rows = S.make_default(self._dur, grid=self._grid or None)
@@ -52,7 +58,8 @@ class EnergySectionDialog(QDialog):
         head = QLabel(
             "每个段落写明「目标能量」和「档位」。演出时指纹认到歌、位置一对齐，"
             "到点就按这张表**立刻**切素材池 —— 不再等实测能量爬上来。\n"
-            "边界会自动吸附到八拍头（与波形图的八拍线同一条网格）。")
+            "边界会按下方选择的粒度吸附：八拍（乐句头）或小节（4 拍）——"
+            "与波形图上那套网格是同一条。")
         head.setWordWrap(True)
         head.setStyleSheet("color:#9fb3c8;")
         root.addWidget(head)
@@ -79,12 +86,28 @@ class EnergySectionDialog(QDialog):
         self.lbl_grid.setStyleSheet("color:#7f93a8;")
         root.addWidget(self.lbl_grid)
 
+        # ★ 2026-10-29 用户要求：「吸附到八拍」和「吸附到小节」**二选一**。
+        #   用 QRadioButton 而不是两个按钮：按钮是"点一次执行一次"，
+        #   而这里要的是一个**持续生效的粒度设置** —— 之后每次改边界、加段、
+        #   恢复模板都按它吸附。QButtonGroup 保证互斥（同组只能选一个）。
+        snap_row = QHBoxLayout()
+        snap_row.addWidget(QLabel("边界吸附："))
+        self.rb_phrase = QRadioButton("八拍（乐句）")
+        self.rb_bar = QRadioButton("小节（4 拍）")
+        self.rb_phrase.setChecked(True)
+        self.snap_group = QButtonGroup(self)
+        self.snap_group.addButton(self.rb_phrase, 8)
+        self.snap_group.addButton(self.rb_bar, 4)
+        snap_row.addWidget(self.rb_phrase)
+        snap_row.addWidget(self.rb_bar)
+        snap_row.addStretch(1)
+        root.addLayout(snap_row)
+
         bar = QHBoxLayout()
         self.btn_add = QPushButton("＋ 在播放头加段")
         self.btn_del = QPushButton("删除选中段")
-        self.btn_snap = QPushButton("吸附到八拍")
         self.btn_tpl = QPushButton("恢复默认四段模板")
-        for b in (self.btn_add, self.btn_del, self.btn_snap, self.btn_tpl):
+        for b in (self.btn_add, self.btn_del, self.btn_tpl):
             bar.addWidget(b)
         bar.addStretch(1)
         root.addLayout(bar)
@@ -97,7 +120,7 @@ class EnergySectionDialog(QDialog):
 
         self.btn_add.clicked.connect(self._on_add)
         self.btn_del.clicked.connect(self._on_del)
-        self.btn_snap.clicked.connect(self._on_snap)
+        self.snap_group.buttonClicked.connect(self._on_snap_mode)
         self.btn_tpl.clicked.connect(self._on_template)
         bb.accepted.connect(self._on_ok)
         bb.rejected.connect(self.reject)
@@ -112,7 +135,9 @@ class EnergySectionDialog(QDialog):
             self._append_row(r)
         self._update_grid_hint()
         self.btn_del.setEnabled(len(self._rows) >= 2)
-        self.btn_snap.setEnabled(bool(self._grid.get("beat_len")))
+        _has_grid = bool(self._grid.get("beat_len"))
+        self.rb_phrase.setEnabled(_has_grid)
+        self.rb_bar.setEnabled(_has_grid)
 
     def _append_row(self, r):
         i = self.tbl.rowCount()
@@ -168,7 +193,7 @@ class EnergySectionDialog(QDialog):
     def _commit(self):
         """读表格 → normalize → 存回 `self._rows`（表格不自动重铺，避免打字被打断）。"""
         self._rows = S.normalize(self._read_table(), self._dur,
-                                 self._grid or None)
+                                 self._grid or None, beats=self.snap_beats())
         return self._rows
 
     def _on_cell_changed(self, *_a):
@@ -181,14 +206,15 @@ class EnergySectionDialog(QDialog):
         except (TypeError, ValueError):
             bl, a = 0.0, 0.0
         if bl > 1e-6:
-            step = bl * S.PHRASE_BEATS
+            nb = self.snap_beats()
+            step = bl * nb
             self.lbl_grid.setText(
-                "八拍网格：一发 %0.2f 秒 = 8 拍 × %.4f 秒，锚点 %.2f 秒；"
-                "波形上的八拍线就在这些位置上。曲长 %.1f 秒。"
-                % (step, bl, a, self._dur))
+                "%s：一发 %.2f 秒 = %d 拍 × %.4f 秒，锚点 %.2f 秒；"
+                "波形上的网格线就在这些位置上。曲长 %.1f 秒。"
+                % ("八拍" if nb == 8 else "小节", step, nb, bl, a, self._dur))
         else:
             self.lbl_grid.setText(
-                "这首歌还没有网格（BPM 未知）⇒ 无法吸附到八拍，边界按填的秒数原样使用。"
+                "这首歌还没有网格（BPM 未知）⇒ 无法吸附，边界按填的秒数原样使用。"
                 "曲长 %.1f 秒。" % self._dur)
 
     # ---------------- 按钮 ----------------
@@ -200,7 +226,8 @@ class EnergySectionDialog(QDialog):
                                     "播放头位置不可用（%.2f 秒）。先把播放头拖到要切的地方。" % t)
             return
         rows.append({"t0": t, "energy": 0.6, "tier": "mid", "name": ""})
-        self._rows = S.normalize(rows, self._dur, self._grid or None)
+        self._rows = S.normalize(rows, self._dur, self._grid or None,
+                                 beats=self.snap_beats())
         self._rebuild()
 
     def _on_del(self):
@@ -212,17 +239,26 @@ class EnergySectionDialog(QDialog):
             # 删首段 = 把第二段的起点拉到 0（网格必须从 0 开始）
             rows[1]["t0"] = 0.0
         rows.pop(i if i > 0 else 0)
-        self._rows = S.normalize(rows, self._dur, self._grid or None)
+        self._rows = S.normalize(rows, self._dur, self._grid or None,
+                                 beats=self.snap_beats())
         self._rebuild()
 
-    def _on_snap(self):
-        rows = self._commit()
-        bl = float(self._grid.get("beat_len") or 0.0)
-        if bl <= 1e-6:
-            QMessageBox.information(self, "吸附到八拍",
-                                    "这首歌没有网格（BPM 未知），无法吸附。")
+    def snap_beats(self):
+        """当前吸附粒度（4=小节 / 8=八拍）。"""
+        return int(self.snap_group.checkedId()) if self.snap_group.checkedId() in (4, 8) else 8
+
+    def _on_snap_mode(self, _btn=None):
+        """切换吸附粒度 ⇒ **立即**从**原始边界**按新粒度重排（不用再点按钮）。
+
+        ⚠ 用 `self._orig`（打开对话框时的未吸附值）而不是表格当前值：
+          表格里存的已经是吸附后的坐标，拿它再吸附只会往"更粗"走、回不来。
+          代价是"手改了表格再切粒度"会丢掉手改 —— 但这两个动作本来就是二选一的
+          语义（要么按网格对齐，要么手填），不会同时用。
+        """
+        if float(self._grid.get("beat_len") or 0.0) <= 1e-6:
             return
-        self._rows = S.normalize(rows, self._dur, self._grid)
+        self._rows = S.normalize([dict(x) for x in self._orig], self._dur,
+                                 self._grid, beats=self.snap_beats())
         self._rebuild()
 
     def _on_template(self):

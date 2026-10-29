@@ -694,10 +694,16 @@ class MusicDetailDialog(QDialog):
 
     # ---------------- 能量段落 ----------------
     def _energy_rows(self):
-        """当前曲目的段落表（normalize 过、已按八拍吸附）。取不到返回 []。"""
+        """当前曲目的段落表（normalize 过）。取不到返回 []。
+
+        ★★ 2026-10-29：优先读 `sections_raw`（**未吸附**的原始边界）。
+          为什么：八拍线是小节线的**子集**，一旦把边界吸到八拍，再切成"小节"
+          就是原地不动（实测 25.95 → 25.95，用户会以为选项没生效）。
+          只有保留原始值，八拍 ⇄ 小节才能双向切换。
+        """
         try:
             meta = (self.cfg["music_meta"] or {}).get(self.path) or {}
-            raw = meta.get("sections") or []
+            raw = meta.get("sections_raw") or meta.get("sections") or []
         except Exception:                                     # noqa: BLE001
             return []
         if not raw:
@@ -762,8 +768,17 @@ class MusicDetailDialog(QDialog):
                 mm[self.path] = rec
             if got:
                 rec["sections"] = [dict(x) for x in got]      # ★ 新 list ⇒ 引擎缓存按引用失效
+                # ★ 2026-10-29：同时记一份**未吸附**的原始边界，供下次编辑时切换粒度
+                #   （八拍是小节的子集，只留吸附值就再也细化不回去）。
+                rec["sections_raw"] = S.normalize(
+                    [dict(x) for x in got], self._dur_now(), None)
+                # ★ 手动保存 = 用户认过的段落 ⇒ 标记为非自动，
+                #   以后「扫描曲库 / 批量自动分段」一律不覆盖它（见 _auto_sections_apply）。
+                rec["sections_auto"] = False
             else:
                 rec.pop("sections", None)
+                rec.pop("sections_raw", None)
+                rec.pop("sections_auto", None)
             self.cfg.save()
         except Exception as e:                                # noqa: BLE001
             QMessageBox.warning(self, "能量段落", "保存失败：%s" % e)
