@@ -749,3 +749,152 @@ class FingerprintDB:
 
     def close(self):
         self.conn.close()
+
+
+def count_query_hits(conn, hashes, chunk=500):
+    """一批指纹哈希 → `{song_id: 命中的**查询哈希**个数}`。
+
+    ★★ 必须按"命中的**查询哈希**去重计数"，不能累加库里的行数：
+      同一 hash 在库里可能出现多行（同一首歌被扫过两次、合成指纹与本机指纹并存），
+      累加行数会算出 **>100%** 的假比例（2026-10-30 实测第一版就是 118.9%）。
+
+    用途（用户 2026-10-30：「我期望的是用指纹对比」）：
+      判断"码表里这首歌本机是不是也有"。`identity.fp_id` 是
+      `sha1(全部哈希)[:16]` —— **一个哈希不同签名就变**，所以只能判"完全同一个 PCM"；
+      而同一首歌的不同压制版本（只换容器/码率）签名完全不同，指纹内容却大面积重合。
+      实测（测试151.ercue × 本机 91 首）：同一文件 100.0%、同曲不同混音 11.5%、
+      无关曲目 8.7~9.1% ⇒ 用重合率判"同一首"区分度极大。
+    """
+    out = {}
+    try:
+        items = [str(h) for h in (hashes or ())]
+    except Exception:                                            # noqa: BLE001
+        return out
+    for i in range(0, len(items), max(1, int(chunk))):
+        part = items[i:i + max(1, int(chunk))]
+        if not part:
+            continue
+        ph = ",".join("?" * len(part))
+        try:
+            rows = conn.execute(
+                "SELECT hash, song_id FROM fingerprints WHERE hash IN (%s)" % ph,
+                part).fetchall()
+        except Exception:                                        # noqa: BLE001
+            continue
+        for r in rows:
+            try:
+                h, sid = str(r[0]), int(r[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            out.setdefault(sid, set()).add(h)
+    # 转成计数（set 去重是关键，见 docstring）
+    return {sid: len(s) for sid, s in out.items()}
+
+
+def purge_except(conn, keep_ids, chunk=200):
+    """删掉**不属于** `keep_ids` 的指纹行；返回 `(删掉的歌曲数, 删掉的行数)`。
+
+    ★★ 2026-10-30 现场事故的修法。用户两次强调：
+       「清除分析数据 不要清码表和曲库分析包的东西」。
+
+    为什么必须按 song_id 删、而不是删库文件：
+      `fingerprints.db` 里同时装着**三家**的指纹 ——
+        ① **本机曲库**（`song_id = int(md5(路径)[:8], 16)`）→ 清除分析数据该清的就是它；
+        ② **码表 `.ercue` 的内嵌曲**（`fp_song_id(fp_id)` 合成 id，见 `cue_fp_pack`）；
+        ③ **导入的曲库分析包**（`.eravjlib`，id 记在 `imported_meta.db`）。
+      旧实现 `os.remove(fingerprints.db)` ⇒ ②③ 一起没了。实测代价：导入包 50 首
+      （本机**没有音频文件**、只能靠指纹识别）全部失联；4 首码表曲同样；更糟的是
+      `ui_main._init_recognizer()` 在库文件不存在时**直接 return** ⇒ 连识别器都不建
+      （静默失效，一条日志都没有）。
+
+    ★★ 为什么用"重建表"而不是逐行 DELETE（2026-10-30 02:06 第二次事故）：
+      第一版写成 `DELETE FROM fingerprints WHERE song_id IN (...)`。功能对，但
+      **每删一行要维护 `idx_hash` + `idx_song` 两个索引**。现场真库 146 万行实测
+      **8153 行/秒 ⇒ 外推 198 秒**（冷盘那次直接 28 分钟），而且这段跑在 GUI
+      主线程 ⇒ 用户看到的画面就是「点清除后软件卡死（未响应）」。
+      改成本函数现在的做法：`CREATE 新表 → 只搬白名单的行 → DROP 旧表 → RENAME → 重建索引`
+      ⇒ `DROP TABLE` 是 O(页数)、不逐行改索引，同一份真库实测 **0.16 秒（快 1238 倍）**。
+      白名单通常很小（码表内嵌曲 + 导入包），要"搬"的行更少 ⇒ 天然更快。
+      基准脚本：`tools/_bench_purge.py`（用真实库副本跑，不碰用户数据）。
+
+    ⚠ 事务写法：python sqlite3 默认在每个 DDL 前**自动开事务**，直接 `BEGIN` 会报
+      `cannot start a transaction within a transaction` ⇒ 这里先 `commit()` 清掉挂起
+      事务、再切到 autocommit（`isolation_level=None`），手动 `BEGIN IMMEDIATE`。
+    """
+    keep = set()
+    for x in (keep_ids or ()):
+        try:
+            keep.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    try:
+        all_ids = [int(r[0]) for r in conn.execute(
+            "SELECT DISTINCT song_id FROM fingerprints")]
+    except Exception:                                            # noqa: BLE001
+        return 0, 0
+    victims = [x for x in all_ids if x not in keep]
+    if not victims:
+        return 0, 0
+    try:
+        total = int(conn.execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0])
+    except Exception:                                            # noqa: BLE001
+        total = 0
+
+    old_iso = getattr(conn, "isolation_level", "")
+    kept_rows = 0
+    try:
+        try:
+            conn.commit()                     # 清掉任何挂起事务（DDL 前必须）
+        except Exception:                                        # noqa: BLE001
+            pass
+        conn.isolation_level = None           # autocommit：DDL 不再自动开事务
+        conn.execute("DROP TABLE IF EXISTS keep_ids")
+        conn.execute("CREATE TEMP TABLE keep_ids (song_id INTEGER PRIMARY KEY)")
+        if keep:
+            conn.executemany("INSERT OR IGNORE INTO keep_ids (song_id) VALUES (?)",
+                             [(int(x),) for x in keep])
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # schema 与 `FingerprintDB.__init__` **逐字一致**（列顺序也一致：
+            # `INSERT` 显式写列名是本项目铁律，但"搬行"这里是 SELECT 全列，顺序必须对）
+            conn.execute("CREATE TABLE fingerprints__new ("
+                         "hash TEXT NOT NULL, song_id INTEGER NOT NULL, "
+                         "offset INTEGER NOT NULL)")
+            conn.execute("INSERT INTO fingerprints__new (hash, song_id, offset) "
+                         "SELECT hash, song_id, offset FROM fingerprints "
+                         "WHERE song_id IN (SELECT song_id FROM keep_ids)")
+            try:
+                kept_rows = int(conn.execute(
+                    "SELECT COUNT(*) FROM fingerprints__new").fetchone()[0])
+            except Exception:                                    # noqa: BLE001
+                kept_rows = 0
+            conn.execute("DROP TABLE fingerprints")
+            conn.execute("ALTER TABLE fingerprints__new RENAME TO fingerprints")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON fingerprints(hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_song ON fingerprints(song_id)")
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:                                    # noqa: BLE001
+                pass
+            raise
+    except Exception:                                            # noqa: BLE001
+        # 重建失败 ⇒ 返回 0（调用方会打日志）。**绝不退回逐行 DELETE**：
+        # 那条路要几分钟，退回等于把"卡死"重新引进来。
+        return 0, 0
+    finally:
+        try:
+            conn.isolation_level = old_iso
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            conn.execute("DROP TABLE IF EXISTS keep_ids")
+        except Exception:                                        # noqa: BLE001
+            pass
+        # DROP TABLE 会往 WAL 里写一批页，收尾截断，免得白占几十 MB
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:                                        # noqa: BLE001
+            pass
+    return len(victims), max(0, total - kept_rows)

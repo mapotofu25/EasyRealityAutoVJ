@@ -28,6 +28,14 @@ def app_base_dir():
 
 CONFIG_FILE = os.path.join(app_base_dir(), "config.json")
 
+# 两个输出的**固定默认名**（用户 2026-10-30：「两个输出名字改成固定的」）。
+# ⚠ 「本地 / 局域网」的括号说明加在**复选框标签**上（见 `ui_main.OutputPanel`），
+#   不加在名字里 —— 用户明确纠正过：「不是 是加到前面的选项上」。
+#   名字保持裸的 `EasyRealityAutoVJ`：NDI 接收端本来就会自动加「机器名 (源名)」前缀，
+#   名字里再塞中文括号只会让 OBS 里更难认。
+DEFAULT_SPOUT_NAME = "EasyRealityAutoVJ"
+DEFAULT_NDI_NAME = "EasyRealityAutoVJ"
+
 DEFAULT_HOTKEYS = {
     "toggle_run": {"key": "Space", "global": False, "enabled": True},
     "blackout": {"key": "B", "global": False, "enabled": True},
@@ -187,9 +195,14 @@ DEFAULTS = {
         "library_dir": "",            # 素材库目录：空=exe 同级/素材库；否则用此路径
         "import_strategy": "",        # 记住的导入策略：copy/move/link；空=每次询问
         "spout_enabled": False,       # Spout 输出：把画面发给本机 OBS/Resolume 等
-        "spout_name": "EasyRealityAutoVJ",
+        # ★★ 2026-10-30（用户要求）：两个输出的默认名**固定**，并各自带括号说明。
+        #   原来两个都叫 `EasyRealityAutoVJ` —— 在 OBS 的源列表里**完全分不出来**，
+        #   用户不知道该选哪个。它们的本质差异就一条：
+        #     · Spout = 本机进程间共享内存（同一台电脑才看得到）
+        #     · NDI   = 走局域网（别的电脑/手机也能收）
+        "spout_name": DEFAULT_SPOUT_NAME,
         "ndi_enabled": False,         # NDI 输出（音画同步；运行时随包自带，用户无需安装）
-        "ndi_name": "EasyRealityAutoVJ",
+        "ndi_name": DEFAULT_NDI_NAME,
         "ndi_audio": False,           # NDI 是否随画面一起发声音（默认关：怕双声/回声）
     },
     "hotkeys": DEFAULT_HOTKEYS,

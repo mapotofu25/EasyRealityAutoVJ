@@ -14,6 +14,7 @@
   └───────────────────────┴─────────────────────┴──────────────┘
   首页：三步（选音源→导素材→开始）
 """
+import hashlib
 import os
 import shutil
 import time
@@ -36,7 +37,10 @@ from PySide6.QtWidgets import (
 import i18n
 from i18n import tr, set_lang, T, Tf
 import theme
-from config import Config, CONFIG_FILE, exe_dir
+from config import (Config, CONFIG_FILE, exe_dir,
+                    DEFAULT_SPOUT_NAME, DEFAULT_NDI_NAME)
+import dups as D            # 曲库查重（纯函数，见 dups.py）
+from dup_ui import DuplicateDialog
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
                       DYNAMIC_TAGS, COVERAGE_FULL, COVERAGE_PART, COVERAGE_TAGS,
                       COVERAGE_FULL_THRESHOLD,
@@ -56,12 +60,41 @@ MEDIA_FILTER = "媒体素材 (*.mp4 *.mov *.webm *.avi *.mkv *.gif *.png *.jpg *
 MUSIC_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".aiff", ".aif", ".aac", ".ogg", ".opus", ".wma"}
 MUSIC_FILTER = "音频文件 (*.flac *.mp3 *.m4a *.wav *.aiff *.aif *.aac *.ogg *.opus *.wma);;All Files (*)"
 
+# 「清除分析数据」的确认文案 —— **提成模块级常量**，因为它是 i18n 的 key：
+#   中文原文即 key，与 `i18n_map.ZH2EN` 必须**逐字一致**，否则英文界面直接显示中文。
+#   以前这条文案内联在 `ask_clear_analysis` 里，改文案时忘了同步 i18n（实测发生过）。
+#   `tools/_test_clear_keep_external.py` 的 (f) 就是拿这个常量去查 ZH2EN。
+CLEAR_ANALYSIS_TIP = (
+    "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、曲风、自动段落。\n"
+    "以下内容一律保留：\n"
+    "  · 音乐文件与曲库列表\n"
+    "  · 手工标注（手改的 BPM / 拍锚点 / 段落）\n"
+    "  · **码表**：码表本身与它内嵌曲目的指纹（照常认歌）\n"
+    "  · **导入的曲库分析包**：曲风、节拍网格、封面、指纹"
+)
+
 # 后处理效果的配置键 → 界面中文名（配置里存的是英文 key，状态行要显示中文）
 POSTFX_CN = {
     "chromatic": "色差", "bloom": "辉光", "glitch": "故障位移", "exposure": "曝光脉冲",
     "saturation": "饱和度脉冲", "softfocus": "柔焦", "trails": "拖影", "grain": "颗粒",
     "pixelate": "像素化", "spectrum": "径向频谱", "deform": "音频反应变形",
 }
+
+
+def _local_song_id(path):
+    """本机曲目在指纹库里的 `song_id`：`int(md5(路径)[:8], 16)`。
+
+    与建库处（`MusicScanThread` 的 `song_id = int(hashlib.md5(p.encode()).hexdigest()[:8], 16)`）
+    **逐字一致** —— 口径必须只有一份，否则"该保留的"会算成别的 id（那就是漏删的根源）。
+    取不到 / 路径为空 ⇒ 返回 `None`（调用方跳过，绝不抛）。
+    """
+    try:
+        s = str(path or "")
+        if not s:
+            return None
+        return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def postfx_status_text(pi):
@@ -275,20 +308,11 @@ class SettingsPanel(QWidget):
         self.chk_beat_grid = QCheckBox("节拍网格（八拍乐句对齐）")
         self.chk_beat_grid.setToolTip("认出曲库里的歌时，用离线算好的八拍网格驱动拍位：素材切换踩在八拍乐句头，变速播放也能对齐。关掉则完全回到原来的实时拍钟。")
         gm.addWidget(self.chk_beat_grid, 3, 0, 1, 2)
-        # 八拍相位修正：离线算的 phrase 是 0/4 二选一，判错时听感上就是"差 4 拍"（差半个乐句）。
-        # 按钮只作用于**当前识别到的这首歌**，就地生效（不重建网格、不丢锁定），并写进配置。
-        self.btn_grid_flip = QPushButton("八拍相位翻转")
-        self.btn_grid_flip.setToolTip(
-            "离线网格把「两个小节里哪一个是乐句头」判反时（听感上差 4 拍）点这里。"
-            "只作用于当前正在放、且已被识别出来的那首歌，就地生效（不用重扫、不打断已对齐的拍位），"
-            "并记进配置，下次放同一首仍然生效。点一下翻转，再点一下翻回来。"
-            "怎么听：看预览里的节拍网格线，「◆」应该正好落在音乐换句的地方。")
-        self.btn_grid_flip.clicked.connect(self._flip_grid_phrase)
-        gm.addWidget(self.btn_grid_flip, 4, 0)
-        self.lbl_grid_flip = QLabel("")
-        self.lbl_grid_flip.setProperty("_i18nDynamic", True)
-        self.lbl_grid_flip.setStyleSheet("color:#7ab;")
-        gm.addWidget(self.lbl_grid_flip, 4, 1)
+        # ★ 2026-10-30 用户：「去掉这个选项」（截图指向「八拍相位翻转」）——
+        #   手动翻转是给"离线乐句相位判反"打的补丁，用户不想再靠它；
+        #   相位问题改为**在日志里量出来**（见 engine `_auto_switch_tick` 的「拍位切换」行：
+        #   栅格=8 且残差≈0 ⇒ 对齐正常；栅格=4 ⇒ 根本没进网格模式）。
+        #   ⚠ 已存的 `grid_flip` 仍然被引擎读取（老配置不会突然变调），只是不能再手动改。
         gp.addWidget(QLabel("渲染帧率"), 0, 0)
         self.render_fps = QComboBox()
         self.render_fps.addItems(["60", "30", "20"])
@@ -760,31 +784,10 @@ class SettingsPanel(QWidget):
         self.main.cfg["ui"]["sections"] = states
         self.main.cfg.save()
 
-    def _flip_grid_phrase(self):
-        """把**当前识别到的这首歌**的八拍相位翻转半个乐句（用户听出"差 4 拍"时一键修正）。
-
-        离线算的 `phrase` 只有 0 / 4 两种可能（两个小节里哪一个是乐句头），判错时听感上就是
-        "整个偏了半个乐句"。这里只翻"哪条线算乐句头"——**拍位与锁定都不动**，所以现场点一下
-        立刻生效：不用重扫、不用重开、不打断已经对齐的拍位。结果写进配置，下次放同一首仍然生效。
-        立即反馈有两个：① 本行右侧的"相位 +4/0"；② 预览里的节拍网格线 ◆ 会整条挪 4 拍。
-        """
-        snap = self.main.audio.state.snapshot()
-        ok, val = self.main.engine.flip_phrase_now(snap)
-        if not ok:
-            self.lbl_grid_flip.setText(T("没有正在识别的歌"))
-            return
-        sid = snap.get("recognized_song_id", -1)
-        p = getattr(self.main, "_grid_path_by_sid", {}).get(sid)
-        if p:
-            m = self.main.cfg["music_meta"].get(p)
-            if isinstance(m, dict):
-                # 落盘键放在 grid **同级**（不在 grid 里面）：重扫会重建 grid，写进去会被覆盖。
-                m["grid_flip"] = 1 if float(val) >= 2.0 else 0
-                try:
-                    self.main.cfg.save()
-                except Exception:
-                    pass
-        self.lbl_grid_flip.setText(Tf("相位 {}", "+4" if float(val) >= 2.0 else "0"))
+    # ★ 2026-10-30：`_flip_grid_phrase`（八拍相位翻转）随按钮一起去掉。
+    #   手动翻转治的是"离线乐句相位判反"，但用户不想再靠它；现在靠日志量（见
+    #   engine `_auto_switch_tick` 的「拍位切换」行）。引擎侧 `flip_phrase_now`
+    #   保留（老配置里的 `grid_flip` 仍然生效），只是 GUI 不再提供入口。
 
     def retranslate(self):
         pass
@@ -835,18 +838,65 @@ class OutputPanel(QWidget):
         self.screen_combo.setToolTip("选择后输出窗口会全屏到对应显示器（适合双屏演出）")
         go.addWidget(self.screen_combo, 4, 1)
         # ---- Spout / NDI 输出 ----
-        self.chk_spout = QCheckBox("Spout 输出")
-        self.chk_spout.setToolTip("把画面实时共享给本机其他程序（OBS 需装 Spout 插件后选本 Sender）")
+        # ★★ 2026-10-30（用户：「两个输出名字改成固定的 分别加本地和局域网的括号说明」）：
+        #   默认名从同一个 `EasyRealityAutoVJ` 拆成「(本地)」「(局域网)」—— 本质差异就一条：
+        #   Spout 只能被**同一台电脑**上的程序收，NDI 走**局域网**。
+        # ★★ 2026-10-30（用户：「两个输出名字改成固定的 分别加本地和局域网的括号说明」
+        #   紧接着纠正：「不是 是加到前面的选项上」）：括号说明加在**复选框标签**上。
+        self.chk_spout = QCheckBox(T("Spout 输出（本地）"))
+        self.chk_spout.setToolTip(T("**本地**输出：把画面实时共享给同一台电脑上的程序"
+                                    "（OBS 装 Spout 插件后选本 Sender；局域网里别的机器看不到）"))
         go.addWidget(self.chk_spout, 5, 0)
-        self.spout_name = QLineEdit()
-        self.spout_name.setPlaceholderText("Sender 名称（OBS 里显示的名字）")
-        go.addWidget(self.spout_name, 5, 1)
-        self.chk_ndi = QCheckBox(T("NDI 输出"))
-        self.chk_ndi.setToolTip("通过网络发送画面+声音（运行时已随软件自带，无需安装；接收端需装 NDI Runtime）")
-        go.addWidget(self.chk_ndi, 6, 0)
-        self.ndi_name = QLineEdit()
-        self.ndi_name.setPlaceholderText("NDI 源名称")
-        go.addWidget(self.ndi_name, 6, 1)
+        # ★★ 2026-10-30（用户：「看不见了 不要输入框 把名字写死」）：
+        #   输入框被右边的「本机 xxxx」挤成 `oVJ`（截图可见），而且这两个名字本来
+        #   就不该让用户改 ⇒ 换回**只读文字**（可选中复制）。
+        self.lbl_spout_name = QLabel(DEFAULT_SPOUT_NAME)
+        self.lbl_spout_name.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_spout_name.setToolTip(
+            T("固定名字。OBS 用 Spout2 Capture 插件时选它。"))
+        go.addWidget(self.lbl_spout_name, 5, 1)
+        self.chk_ndi = QCheckBox(T("NDI 输出（局域网）"))
+        self.chk_ndi.setToolTip(T("**局域网**输出：通过网线/WiFi 把画面+声音发给别的电脑、手机"
+                                  "（本机也能收）。运行时已随软件自带，接收端需装 NDI Runtime"))
+        # ★★ 2026-10-30（用户：「写死了就能写完整名字了吧」）：名字写死之后就不用担心
+        #   用户改坏 ⇒ **这里直接显示完整接收名**（`本机名 (源名)`），
+        #   OBS 里看到的是什么，界面就显示什么。
+        #   ⚠ 但真正交给 NDI 的 `cfg["output"]["ndi_name"]` 仍然是**裸源名**：
+        #     机器名由 NDI 协议层自动加，写进源名会变成 `HOST (HOST (名))`（已实测）。
+        self.lbl_ndi_name = QLabel("")
+        self.lbl_ndi_name.setWordWrap(True)
+        # ⚠ 垂直 policy 必须是 `Maximum`：`QGridLayout` 会把多余高度平均分给各行，
+        #   默认 `Preferred` 允许增长 ⇒ 名字那一格被拉到 500+ px（文本飘在中间，
+        #   实测 760px 高的面板里 label 高 526px）。`Maximum` 表示"sizeHint 就是上限"，
+        #   行变高时它只按自身文字高度占位。
+        self.lbl_ndi_name.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                       QSizePolicy.Policy.Maximum)
+        self.lbl_ndi_name.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_ndi_name.setToolTip(
+            T("OBS 的 NDI 源列表里就是这个名字。\n"
+              "前面的本机名由 NDI 自动加，源名本身不含它（否则会重复两遍）。"))
+        # ★★ 2026-10-30（用户：「和 ndi 开关一起 一行放得下就放 放不下就另起一行
+        #   因为全屏了的话那肯定是放得下的嘛」）：
+        #   ⇒ 复选框与完整名放进**同一个 QGridLayout**（一个格子一个），
+        #     再由 `_flow_ndi()` 在窗口尺寸变化时二选一：
+        #       · 放得下 → 复选框 (0,0) + 名字 (0,1) 并排一行；
+        #       · 放不下 → 名字整体挪到 (1,0) 跨两列，**另起一行**（不是硬挤成两行）。
+        #   为什么不用 QHBoxLayout：那样名字只能"折行"，窄窗口下会变成贴在右边
+        #   折成两三行的碎块（实测 360px 宽时 x=148、高 32px），既不像并排也不像另起一行。
+        self._ndi_grid = QGridLayout()
+        self._ndi_grid.setContentsMargins(0, 0, 0, 0)
+        self._ndi_grid.setHorizontalSpacing(8)
+        self._ndi_grid.setVerticalSpacing(2)
+        self._ndi_grid.addWidget(self.chk_ndi, 0, 0)
+        self._ndi_grid.addWidget(self.lbl_ndi_name, 0, 1)
+        self._ndi_grid.setColumnStretch(1, 1)
+        self._ndi_stacked = False
+        self._ndi_flow_busy = False
+        go.addLayout(self._ndi_grid, 6, 0, 1, 2)
+        # ★ 2026-10-30（用户：「把下面多余的那行文字去掉」）：完整名已经直接显示在
+        #   NDI 那一行上了，再补一行小字是重复 ⇒ 只保留 label 的 tooltip 做解释。
         # ★ 2026-10-18 用户要求：**「NDI 传输音频」这一行从界面删除**（复选框 + 提示）。
         #   NDI 音频转发后端（audio_engine 的 ndi_audio_on / ndi_out.send_audio）**原样保留**，
         #   只是不再有 UI 入口；配置文件里 ndi_audio 仍按原逻辑生效。
@@ -858,10 +908,91 @@ class OutputPanel(QWidget):
         self.chk_top.stateChanged.connect(main.set_always_top)
         self.screen_combo.currentIndexChanged.connect(main.set_output_screen)
         self.chk_spout.stateChanged.connect(main.set_spout_enabled)
-        self.spout_name.editingFinished.connect(main.set_spout_name)
         self.chk_ndi.stateChanged.connect(main.set_ndi_enabled)
-        self.ndi_name.editingFinished.connect(main.set_ndi_name)
+        self._update_ndi_full()   # NDI 完整接收名（机器名 + 源名）
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
+
+    def _update_ndi_full(self):
+        """刷新 NDI **完整接收名**提示：`<本机名> (<源名>)`。
+
+        机器名取 `%COMPUTERNAME%` —— NDI 用的就是它（实测 `tools/_probe_ndi_name.py`：
+        源名 `EasyRealityAutoVJ` ⇒ 接收端 `6N4CZTM151UPP8Y (EasyRealityAutoVJ)`）。
+        机器名取不到就只显示源名，绝不显示成 `(名)` 这种残缺串。
+
+        ⚠ 源名现在是**写死的常量**（用户 2026-10-30：「不要输入框 把名字写死」），
+          所以这里不再读输入框；名字以后要改就改 `config.DEFAULT_NDI_NAME`。
+
+        ⚠⚠ 配套删除：`MainWindow.set_spout_name` / `MainWindow.set_ndi_name` 已**故意删除**
+          （输入框没了，已无任何调用方）。`tools/_scan_removed_defs.py` 会报
+          「ui_main.py 丢失 2 个定义」—— 那是预期的，不是批量替换误删。
+        """
+        try:
+            nm = DEFAULT_NDI_NAME
+            comp = str(os.environ.get("COMPUTERNAME") or "").strip()
+            full = ("%s (%s)" % (comp, nm)) if comp else nm
+            try:
+                self.lbl_ndi_name.setText(full)      # 完整接收名（OBS 里就是它）
+            except Exception:                                    # noqa: BLE001
+                pass
+            # 名字长度变了 ⇒ 并排/另起一行要重新判一次（换了电脑机器名长度会变）
+            self._flow_ndi()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _flow_ndi(self):
+        """让 NDI 开关与完整名**自适应同一行或两行**（用户 2026-10-30 要求）。
+
+        判据只看一件事：名字单行需要的宽度（`fontMetrics`）是否放得进"复选框右侧
+        剩余的那点宽度"。放得下就并排；放不下就让名字整体挪到下一行（跨两列），
+        此时它几乎总能一行显示完 —— 比硬挤成两三行的碎块好看，也更符合"另起一行"。
+
+        滞回：从并排→堆叠的阈值是 `avail`，从堆叠→并排要 `avail-20`。
+        没有滞回的话，窗口宽度正好卡在临界点时拖动窗口会疯狂来回跳。
+        """
+        if getattr(self, "_ndi_flow_busy", False):
+            return
+        grid = getattr(self, "_ndi_grid", None)
+        if grid is None:
+            return
+        try:
+            txt = self.lbl_ndi_name.text() or ""
+            need = self.lbl_ndi_name.fontMetrics().horizontalAdvance(txt)
+            chk = max(0, self.chk_ndi.sizeHint().width())
+            # 面板宽 - 复选框 - 面板左右留白（实测 10 + 18）- 间距 8 - 安全余量 6
+            # ⚠ 那 6px 不是多余的：`horizontalAdvance` 与实际绘制可能差 1~2px（不同
+            #   字体/DPI 缩放），贴着边界时末尾字符会被裁掉。实测 380px 宽时正好卡在
+            #   "需要 212 / 可用 214"，看着就是字顶到右边缘。
+            avail = self.width() - chk - 42
+            if getattr(self, "_ndi_stacked", False):
+                want = need > (avail - 20)
+            else:
+                want = need > avail
+            if want == getattr(self, "_ndi_stacked", False):
+                return
+            self._ndi_flow_busy = True
+            try:
+                if want:
+                    # 另起一行：跨两列（第 1 行），名字自己独占一行
+                    grid.addWidget(self.lbl_ndi_name, 1, 0, 1, 2)
+                    room = self.width() - 28
+                else:
+                    grid.addWidget(self.lbl_ndi_name, 0, 1)
+                    room = avail
+                self._ndi_stacked = want
+                # ⚠ 行高自己钉死：`QGridLayout` 对 hasHeightForWidth 的 item 会退回
+                #   用 `sizeHint().height()`（实测 32px = 两行），于是并排时那一格
+                #   凭空多出一行高度、文本飘在中间。按"当前实际可用宽度"算才对。
+                hh = self.lbl_ndi_name.heightForWidth(max(40, int(room)))
+                if hh > 0:
+                    self.lbl_ndi_name.setFixedHeight(hh)
+            finally:
+                self._ndi_flow_busy = False
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._flow_ndi()
 
     def set_gate(self, running):
         """输出设置门控：显示窗口/重置大小/输出显示器需在「开始自动VJ」后才能生效"""
@@ -1846,7 +1977,9 @@ class MusicScanThread(QThread):
                 sig = np.mean(data, axis=1)
                 if _bg is None:
                     return p, None
-                return p, _bg.grid_from_signal(sig, sr, vdj_idx, path=p, dur=dur)
+                # ★ 2026-10-30 用户要求「去掉 vdj 源，完全依赖本地扫描确定 bpm」
+                return p, _bg.grid_from_signal(sig, sr, vdj_idx, path=p, dur=dur,
+                                              use_vdj=False)
             except Exception:
                 return p, None
 
@@ -1925,7 +2058,7 @@ class MusicScanThread(QThread):
                 #   复用刚解码的 sig：扫描已经为指纹读过一次盘，这里不再读第二遍。
                 if _bg is not None:
                     try:
-                        g = _bg.grid_from_signal(sig, sr, vdj_idx, path=p)
+                        g = _bg.grid_from_signal(sig, sr, vdj_idx, path=p, use_vdj=False)
                         if g:
                             r["grid"] = g
                     except Exception:
@@ -1946,9 +2079,21 @@ class MusicScanThread(QThread):
                         _m22, _s22 = _bg.resample(sig, sr, _bg.SR_TARGET)
                         _f2 = _bg.features(_m22, _s22)
                         _d2 = len(_m22) / float(_s22)
-                        _seg_g = r.get("grid") or None
+                        # ★★ 2026-10-30：用**生效网格**（`grid_manual.bpm_manual` 优先），
+                        #   否则用户手改 BPM 之后分段仍按旧的自动 BPM 算 —— Extra Pain
+                        #   手改成 200 但 `grid` 还是 99.95 ⇒ "2 个八拍"被当成 9.6 秒
+                        #   （真实 4.8）⇒ 整首只切出 2 段、边界偏一倍。
+                        _oldm = meta.get(p) or {}
+                        _seg_g = _sec.grid_from_meta({
+                            "grid": r.get("grid") or _oldm.get("grid") or {},
+                            "grid_manual": _oldm.get("grid_manual") or {},
+                        }) or None
                         _sg = _sec.auto_segments(_f2, dur=_d2, grid=_seg_g)
-                        _sgr = _sec.auto_segments(_f2, dur=_d2, grid=None)
+                        # ★ 2026-10-30：`raw` 必须**同样过乐句判据**（只是不吸附位置），
+                        #   否则段数和 `sections` 对不上 —— 详情页读 raw，用户看到的
+                        #   就是另一套分段（"怎么还是三个八拍五个八拍"）。
+                        _sgr = _sec.auto_segments(_f2, dur=_d2, grid=None,
+                                                  phrase_grid=_seg_g)
                         if _sg:
                             r["sections"] = _sg
                             r["sections_raw"] = _sgr
@@ -2256,6 +2401,42 @@ class MusicScanThread(QThread):
         except Exception as _e:                                     # noqa: BLE001
             _log("码表指纹对账失败（不影响扫描结果）：%s" % _e)
         db.close()
+
+
+class DupCheckThread(QThread):
+    """后台跑曲库查重（铁律：主线程不做耗时活）。
+
+    实测库里 98 首时：只读 meta 比对是瞬时的；只有「时长几乎一样」的少数几对
+    才会去查指纹库（`mode=ro`，不占写锁），整轮通常 < 100ms。
+    """
+
+    found = Signal(list)
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+
+    def run(self):
+        pairs = []
+        try:
+            cfg = self.main.cfg
+            meta = cfg["music_meta"] or {}
+            lib = [p for p in (cfg["music_library"] or []) if p]
+            items = [(p, meta.get(p) or {}) for p in lib
+                     if isinstance(meta.get(p), dict)]
+            db = None
+            try:
+                import cue_fp_pack as _cfp
+                db = _cfp.default_db_path()
+            except Exception:                                      # noqa: BLE001
+                db = None
+            pairs = D.scan_pairs(items, db_path=db)
+        except Exception:                                          # noqa: BLE001
+            pairs = []
+        try:
+            self.found.emit(pairs)
+        except Exception:                                          # noqa: BLE001
+            pass
 
 
 def _probe_spout_once():
@@ -3835,9 +4016,6 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         self.engine._spout_fail = False
 
-    def set_spout_name(self):
-        self.cfg["output"]["spout_name"] = self.output_panel.spout_name.text().strip() or "EasyRealityAutoVJ"
-        self.cfg.save()
         self.engine._spout = None   # 名字变了重建 sender
 
     def set_ndi_enabled(self, s):
@@ -3893,10 +4071,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def set_ndi_name(self):
-        self.cfg["output"]["ndi_name"] = self.output_panel.ndi_name.text().strip() or "EasyRealityAutoVJ"
-        self.cfg.save()
-        self.engine._ndi = None
 
     def _ndi_audio_feed(self, pcm, sr):
         """把采集到的 PCM 投递给 NDI 发送端（运行在**音频转发线程**里）。
@@ -4149,7 +4323,10 @@ class MainWindow(QMainWindow):
         except Exception:
             self.output_panel.screen_combo.setCurrentIndex(0)
         self.output_panel.chk_spout.setChecked(o.get("spout_enabled", False))
-        self.output_panel.spout_name.setText(o.get("spout_name", "EasyRealityAutoVJ"))
+        # ★ 2026-10-30（用户：「不要输入框 把名字写死」）：界面已无输入框，
+        #   这里把配置里的旧值**统一成常量**，保证 engine 实际用的名字与界面显示一致
+        #   （否则旧配置里残留的自定义名会让 OBS 里看到的和界面对不上）。
+        o["spout_name"] = DEFAULT_SPOUT_NAME
         # ⚠⚠ NDI：用配置回填 UI **必须屏蔽信号**（2026-10-01 修，现场"没声音"的直接原因）
         #   原来直接 `setChecked(ndi_enabled)` 会触发 `set_ndi_enabled()` 槽，而那个槽里会做
         #   运行时探测 ⇒ 启动时弹「NDI 不可用」/把已存值改写。这里只回填、不触发槽。
@@ -4157,7 +4334,8 @@ class MainWindow(QMainWindow):
         _w.blockSignals(True)
         _w.setChecked(bool(o.get("ndi_enabled", False)))
         _w.blockSignals(False)
-        self.output_panel.ndi_name.setText(o.get("ndi_name", "EasyRealityAutoVJ"))
+        o["ndi_name"] = DEFAULT_NDI_NAME
+        self.output_panel._update_ndi_full()
         # 信号被屏蔽了，槽不会再跑 ⇒ 这里显式同步一次采集侧的布尔量（不要在这里做运行时探测：
         # 启动时弹「NDI 不可用」会很烦；真正的探测交给 set_ndi_enabled）
         try:
@@ -4635,17 +4813,52 @@ class MainWindow(QMainWindow):
         if dlg:
             dlg.refresh()
 
+    def _scan_busy(self):
+        """是否已有扫描在进行中 —— **含"正在弹确认框"的窗口期**。
+
+        ⚠⚠ 2026-10-29 现场 bug（用户报"重扫非常慢"、CPU 60%）：**两个扫描同时在跑**。
+          `scan_time.log` 铁证 —— 两组进度交错独立递增：
+
+              23:19:08  40/98（2 线程）      23:19:22  10/98（5 线程）
+              23:19:37  50/98（2 线程）      23:19:47  20/98（5 线程）
+              23:20:11  60/98（2 线程）      23:20:18  30/98（5 线程）
+
+          而且指纹从 5.7s/首 恶化到 **40.67s/首**（两批 worker 抢 16 核）。
+          根因正是铁律 11「重入守卫必须在动 UI 之前置位」：旧代码先
+          `QMessageBox.question(...)`（**模态，但期间照常派发事件**）再赋值
+          `self._music_scan`，于是第二次点击进来时检查看到的是"还没有扫描"，
+          两道检查一起放行 ⇒ 两个 `MusicScanThread` 各自起一个线程池。
+
+        现在的判据：`_scan_pending`（点击→确认框→启动 这一整段都算忙）+ 线程在跑。
+        """
+        if getattr(self, "_scan_pending", False):
+            return True
+        sc = getattr(self, "_music_scan", None)
+        return bool(sc is not None and sc.isRunning())
+
+    def _on_music_scan_done(self, *_a):
+        """扫描线程结束（正常或异常）⇒ 放开重入守卫。"""
+        self._scan_pending = False
+
     def scan_music(self, force=False):
-        if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
+        if self._scan_busy():
             QMessageBox.information(self, T("扫描分析"), "已有扫描在进行中，请稍候。")
             return
-        if force:
-            ret = QMessageBox.question(
-                self, T("全量重扫"),
-                "全量重扫将忽略已有结果，重新分析曲库里的全部歌曲（含指纹与曲风）。\n可能耗时较长，确定继续吗？",
-                QMessageBox.Yes | QMessageBox.Cancel)
-            if ret != QMessageBox.Yes:
-                return
+        # ★ 守卫**必须在弹窗之前**置位（见 `_scan_busy` 的现场复盘）
+        self._scan_pending = True
+        try:
+            if force:
+                ret = QMessageBox.question(
+                    self, T("全量重扫"),
+                    "全量重扫将忽略已有结果，重新分析曲库里的全部歌曲（含指纹与曲风）。\n"
+                    "可能耗时较长，确定继续吗？",
+                    QMessageBox.Yes | QMessageBox.Cancel)
+                if ret != QMessageBox.Yes:
+                    self._scan_pending = False
+                    return
+        except Exception:                                          # noqa: BLE001
+            self._scan_pending = False
+            raise
         self._music_scan = MusicScanThread(self, None, force)
         dlg = getattr(self, "music_dialog", None)
         if dlg:
@@ -4657,7 +4870,67 @@ class MainWindow(QMainWindow):
                                   dlg.progress.setValue(d)))
             self._music_scan.finished.connect(
                 lambda: (dlg.progress.hide(), dlg.refresh(), self._init_recognizer()))
-        self._music_scan.start()
+        # ★ 2026-10-29 用户要求：「扫到相同音乐（名字或指纹相似）时给个弹窗，
+        #   对比选择是留着还是删掉一个」。
+        #   放在扫描**结束之后**统一查一遍，而不是扫到哪首就弹哪首 ——
+        #   扫描是并行的，逐首弹会连着炸出好几个窗口，而且那时别的歌还没入库、
+        #   时长/指纹都还取不到。扫完再查一次既完整又不打扰。
+        self._music_scan.finished.connect(
+            lambda: self.find_duplicate_music(auto=True))
+        # ★ 守卫复位挂在 finished 上：线程正常/异常结束都会 emit（见 `_scan_busy`）
+        self._music_scan.finished.connect(self._on_music_scan_done)
+        try:
+            self._music_scan.start()
+        except Exception:                                          # noqa: BLE001
+            self._scan_pending = False
+            raise
+
+    # ------------------------------------------------------------------ 查重
+    def find_duplicate_music(self, auto=False):
+        """查重：找出曲库里指向同一段音频的多份，弹窗让用户选留哪一份。
+
+        :param auto: True = 扫描结束后自动跑（没找到就不打扰用户）
+
+        ⚠ 「移除」只删曲库条目（见 `remove_music_many` 的说明），
+          **不动磁盘文件** —— 误删音频不可逆，不该藏在一次点击里。
+        """
+        t = getattr(self, "_dup_check", None)
+        if t is not None and t.isRunning():
+            return
+        self._dup_auto = bool(auto)
+        self._dup_check = DupCheckThread(self)
+        self._dup_check.found.connect(self._show_duplicate_dialogs)
+        self._dup_check.start()
+
+    def _show_duplicate_dialogs(self, pairs):
+        """把查重结果逐对弹出来让用户选（已移除的跳过）。"""
+        auto = bool(getattr(self, "_dup_auto", False))
+        pairs = list(pairs or [])
+        if not pairs:
+            if not auto:
+                QMessageBox.information(self, T("查重"), T("没有发现重复曲目。"))
+            return
+        meta = self.cfg["music_meta"] or {}
+        lib = self.cfg["music_library"] or []
+        removed = 0
+        for pr in pairs:
+            a, b = pr.get("a"), pr.get("b")
+            # 前一对可能已经把其中一份移除了 ⇒ 后面的对失效，跳过
+            if a not in lib or b not in lib:
+                continue
+            dlg = DuplicateDialog(self, pr, meta.get(a) or {}, meta.get(b) or {})
+            dlg.exec()
+            c = dlg.choice()
+            if c == "a":
+                self.remove_music(b)
+                removed += 1
+            elif c == "b":
+                self.remove_music(a)
+                removed += 1
+        if removed:
+            QMessageBox.information(
+                self, T("查重"),
+                T("已从曲库移除 {} 份重复条目（磁盘上的音频文件没有动）。").format(removed))
 
     def edit_music_genre(self, path):
         from panels import GenreEditDialog
@@ -4668,10 +4941,15 @@ class MainWindow(QMainWindow):
         """重新分析扫描单首曲目（重建指纹 + 重查曲风 + 重算节拍网格）。
 
         段落分析已移除（见 `_music_scan` 的说明），别再写「重算段落」。"""
-        if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
+        if self._scan_busy():
             QMessageBox.information(self, T("重新分析"), "已有扫描在进行中，请稍候。")
             return
-        self._music_scan = MusicScanThread(self, [path], True)
+        self._scan_pending = True      # 同 `scan_music`：守卫先置位，再动任何东西
+        try:
+            self._music_scan = MusicScanThread(self, [path], True)
+        except Exception:                                          # noqa: BLE001
+            self._scan_pending = False
+            raise
         dlg = getattr(self, "music_dialog", None)
         if dlg:
             dlg.progress.show()
@@ -4680,7 +4958,12 @@ class MainWindow(QMainWindow):
                 lambda d, t, _p: (dlg.progress.setRange(0, max(1, t)), dlg.progress.setValue(d)))
             self._music_scan.finished.connect(
                 lambda: (dlg.progress.hide(), dlg.refresh(), self._init_recognizer()))
-        self._music_scan.start()
+        self._music_scan.finished.connect(self._on_music_scan_done)
+        try:
+            self._music_scan.start()
+        except Exception:                                          # noqa: BLE001
+            self._scan_pending = False
+            raise
 
     def show_music_info(self, path):
         """曲目信息（码表行 / 导入行仍走这个轻量弹窗）。
@@ -4703,7 +4986,7 @@ class MainWindow(QMainWindow):
             return
         box = QMessageBox(self)
         box.setWindowTitle( T("清除分析数据"))
-        box.setText( T("将删除全部已建立的指纹与自动识别的曲风。\n音乐文件本身和曲库列表不会被删除。"))
+        box.setText( T(CLEAR_ANALYSIS_TIP))
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
         box.button(QMessageBox.Yes).setText( T("清除"))
         cb = QCheckBox("保留手动设置过的曲风")
@@ -4715,33 +4998,185 @@ class MainWindow(QMainWindow):
         if dlg:
             dlg.refresh()
 
+    def _analysis_keep_paths(self):
+        """清除分析数据时必须**整条保留** `music_meta` 的本机路径（码表 / 导入包覆盖的曲目）。
+
+        ★★★ 2026-10-30 04:42 第四次报障（「怎么码表还是被清了」）—— 上一次只修了一半：
+          上一版保住了**指纹**（`_analysis_keep_fp_ids`），却照旧把 `music_meta` 精简成
+          "只留 grid_manual / grid_flip"。而码表曲目的 **BPM / 节拍网格 / 自动段落**
+          就存在 `music_meta[path]` 里 ⇒ 清完这 3 首在曲库里变"无网格、未分析"、
+          码表对齐拿不到 BPM、分段表消失 ⇒ 用户看到的就是"码表又被清了"。
+          实测（清除后）：`music_meta` 91 → 3 条，3 首码表曲目**全都没有记录**，
+          而指纹其实一行没少（主库 4 首 = 码表 3 首 + 包内合成指纹 1 个）。
+
+        来源与 `_analysis_keep_fp_ids` **同一份判据**，只是返回路径而不是 song_id：
+          a) `cfg["cue"]["fp_same"]` 的**值**（`fp_id → 本机路径`，导入码表时用指纹
+             内容重合率算好并落盘，不依赖 `music_meta` 现状 —— 最可靠）；
+          b) `cue_index.covered_paths(require_file=False)` 的 key（四级判据实时反查；
+             关掉"包文件必须存在"是因为外接盘没插不等于码表被删）。
+
+        ⚠ 必须在动 `music_meta` **之前**调用：b 要用里面的 fp_id / file_md5 / 名 / 时长。
+        """
+        out = set()
+        try:
+            _cue = self.cfg["cue"] or {}
+        except Exception:                                        # noqa: BLE001
+            _cue = {}
+        try:
+            _same = _cue.get("fp_same") or {}
+            for _p in (_same.values() if isinstance(_same, dict) else []):
+                if isinstance(_p, str) and _p:
+                    out.add(_p)
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            import cue_index as _ci
+            _cov = _ci.covered_paths(self.cfg, _ci.CueIndex().load_cfg(self.cfg),
+                                     require_file=False) or {}
+            for _p in _cov:
+                if isinstance(_p, str) and _p:
+                    out.add(_p)
+        except Exception:                                        # noqa: BLE001
+            pass
+        return out
+
+    def _analysis_keep_fp_ids(self, keep_paths=None):
+        """清除分析数据时**必须保留**的指纹 `song_id`：码表内嵌曲 + 导入的曲库分析包。
+
+        这两类都**不是**本机算法扫描的产物，而是用户导入的作品
+        （用户 2026-10-30 两次强调「清除分析数据 不要清码表和曲库分析包的东西」）：
+          · 码表：`cfg["cue"]["fp_songs"][fp_id]["song_id"]`（合成 id，`fp_song_id()`）
+          · 导入包：`imported_meta.db` 里 `songs.song_id`
+        本机曲库（`song_id = int(md5(路径)[:8], 16)`）**故意不在这里** ⇒ 会被清掉
+        —— 那正是"清掉重新分析一遍"的本意。
+
+        ⚠ 都是只读操作，异常只可能让"保护名单变小"（多清一点）；所以每一段都单独
+          兜底，绝不因为读不到导入包就连码表也不保护。
+        """
+        keep = set()
+        try:
+            _fs = (self.cfg["cue"] or {}).get("fp_songs") or {}
+        except Exception:                                        # noqa: BLE001
+            _fs = {}
+        for _rec in (_fs.values() if isinstance(_fs, dict) else []):
+            try:
+                keep.add(int(_rec.get("song_id")))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        # ③ 码表 / 导入包覆盖的**本机曲目**：它们的指纹是以本机 song_id 存的
+        #   （不是 `fp_songs` 那个合成 id）⇒ 路径换算成 id 后并入白名单。
+        #   判据只有一份，见 `_analysis_keep_paths()`。
+        for _p in (keep_paths if keep_paths is not None
+                   else self._analysis_keep_paths()):
+            _sid = _local_song_id(_p)
+            if _sid is not None:
+                keep.add(_sid)
+        try:
+            import imported_lib as _il
+            from config import app_base_dir as _abd
+            _p = _il.meta_db_path(_abd())
+            if os.path.exists(_p):
+                import sqlite3 as _sq
+                _conn = _sq.connect("file:%s?mode=ro" % _p, uri=True)
+                try:
+                    for _r in _conn.execute("SELECT song_id FROM songs"):
+                        try:
+                            keep.add(int(_r[0]))
+                        except (TypeError, ValueError):
+                            continue
+                finally:
+                    _conn.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+        return keep
+
     def clear_music_analysis(self, keep_manual):
+        """清除**算法分析结果**（指纹 / 曲风 / 网格 / 段落），**保留用户产物**。
+
+        ⚠⚠ 2026-10-30 现场事故（用户：「清除分析数据 怎么把码表也清了」）：
+          旧实现直接 `self.cfg["music_meta"] = {}` —— 把 `music_meta[path]` 里的
+          **用户手工标注也一起清空了**（实测 91 条全没，其中 1 条是手改的 BPM/锚点/段落）。
+          这个字典混着两类东西：
+            · 算法产物：`grid`（BPM/网格）、自动生成的 `sections`/`sections_raw`、
+              `genres`、`cover`、`fp_id`、`file_md5`、`duration` …
+            · **用户产物**：`grid_manual`（手改 BPM / 拍锚点 / 段落）、
+              `grid_flip`（八拍相位翻转）、`sections_auto is False`（手存过的段落）
+          用户点"清除分析数据"只是想清掉算法算的，手工作品必须留着 ——
+          与扫描时的口径一致（`MusicScanThread` 的 `old_user` 快照同样是"force 重扫也保留"）。
+        """
+        # 计时：现场「点清除后卡死」（2026-10-30 02:06）就是这段慢到 3 分钟。
+        # 现在 `purge_except` 改成重建表（实测 0.16 秒 / 146 万行），但**留着这行日志**：
+        # 库规模是用户环境变量，下次变慢要能一眼看到是哪一步。
+        _t_all = time.perf_counter()
+        # ★★★ 白名单必须在**动 `music_meta` 之前**算：四级反查要用里面的
+        #   `fp_id` / `file_md5` / 名 / 时长，先精简就一条都查不到 ——
+        #   2026-10-30 04:27 第三次报障「还是把码表的清掉了」就是这个顺序错。
+        keep_paths = self._analysis_keep_paths()
+        keep = self._analysis_keep_fp_ids(keep_paths)
         meta = self.cfg["music_meta"] or {}
-        if keep_manual:
-            self.cfg["music_meta"] = {p: m for p, m in meta.items()
-                                      if (m or {}).get("source") == "manual"}
-        else:
-            self.cfg["music_meta"] = {}
+        new_meta = {}
+        for p, m in meta.items():
+            if not isinstance(m, dict):
+                continue
+            if keep_manual and m.get("source") == "manual":
+                new_meta[p] = dict(m)      # 用户勾了"保留手动曲风"：整条留着
+                continue
+            # ★★★ 2026-10-30 04:42 第四次报障的修法：码表 / 导入包**覆盖的曲目**，
+            #   `music_meta` 整条保留 —— 它们的 BPM / 网格 / 段落是码表对齐要用的，
+            #   只保指纹不保 meta，用户看到的就是"码表又被清了"（详见 `_analysis_keep_paths`）。
+            if p in keep_paths:
+                new_meta[p] = dict(m)
+                continue
+            k = {}
+            for kk in ("grid_manual", "grid_flip"):
+                if kk in m:
+                    k[kk] = m[kk]
+            if m.get("sections_auto") is False and m.get("sections"):
+                k["sections"] = m["sections"]
+                k["sections_raw"] = m.get("sections_raw")
+                k["sections_auto"] = False
+            if k:
+                new_meta[p] = k
+        self.cfg["music_meta"] = new_meta
         self.cfg.save()
-        # 指纹库：先关闭本进程连接（Windows 下文件被占用无法删除），再删库文件
+
+        # ★★ 2026-10-30 修（用户两次强调：「清除分析数据 不要清码表和曲库分析包的东西」）：
+        #   旧实现 `os.remove(fingerprints.db)` 把这个库里**另外两家**的指纹一起删了：
+        #     · 码表 `.ercue` 的内嵌曲（合成 song_id，`cue_fp_pack` 灌进来的）
+        #     · 导入的曲库分析包 `.eravjlib`（id 记在 `imported_meta.db`）
+        #   实测代价：导入包 50 首**本机没有音频文件、只能靠指纹识别** ⇒ 全部失联；
+        #   而且 `_init_recognizer()` 在库文件不存在时直接 return ⇒ 连识别器都不建。
+        #   现在保留库文件，只删本机曲库那些行（白名单已在函数开头算好，见 `keep`）。
+        n_songs = n_rows = 0
         if self._fp_db is not None:
             try:
+                import fp as _fpmod
+                n_songs, n_rows = _fpmod.purge_except(self._fp_db.conn, keep)
+            except Exception as _e:                              # noqa: BLE001
+                print("[曲库] 清除本机指纹失败：%s: %s" % (type(_e).__name__, _e))
+            try:
                 self._fp_db.close()
-            except Exception:
+            except Exception:                                    # noqa: BLE001
                 pass
         self._song_meta_by_id = {}
         self._fp_db = None
         try:
             self.audio.set_recognizer(None)
-        except Exception:
+        except Exception:                                        # noqa: BLE001
             pass
-        from config import app_base_dir
-        dbp = os.path.join(app_base_dir(), "fingerprints.db")
-        for f in (dbp, dbp + "-wal", dbp + "-shm"):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+        print("[曲库] 清除分析数据：删本机指纹 %d 首 / %d 行；保留码表+导入包 %d 首"
+              % (n_songs, n_rows, len(keep)))
+        # 立刻重建识别器：保留的码表 / 导入包指纹要**当场还能用**，不必等重启。
+        # （库文件还在 ⇒ `_init_recognizer` 会正常建库并接上白名单；它只在文件不存在时才 return。）
+        try:
+            self._init_recognizer()
+        except Exception as _e:                                  # noqa: BLE001
+            print("[曲库] 清除后重建识别器失败：%s: %s" % (type(_e).__name__, _e))
+        _dt = time.perf_counter() - _t_all
+        # 阈值 5 秒：重建表要"搬保留的行 + 重建两个索引"，259 万行的真实库实测 3.98 秒
+        # （146 万行时 1.9 秒）⇒ 按库规模正常增长，不该报"偏慢"。超过 5 秒才值得看。
+        print("[曲库] 清除分析数据完成：%.2f 秒%s"
+              % (_dt, "  ⚠ 偏慢，检查库规模/磁盘" if _dt > 5.0 else ""))
 
     def remove_music(self, path):
         """从曲库移除单首（曲库面板的右键走批量版 `remove_music_many`）。"""

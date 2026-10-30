@@ -79,6 +79,15 @@ MAX_PAYLOAD = HEADER_SIZE + RECORD_SIZE * MAX_RECORDS
 
 JSON_NAME = "cuesheet.json"      # 与 `cuesheet.JSON_NAME` 一致（这里不 import，保持零依赖）
 FP_SONGS_KEY = "fp_songs"        # cfg["cue"]["fp_songs"]：fp_id → {song_id, title, …}
+#: ★★ 2026-10-30（用户：「我期望的是用指纹对比」「一首歌它有两个版本，就只是专辑不同，
+#:   歌曲的时长啊，这些东西完全都是一样的」）：
+#: `cfg["cue"]["fp_same"]`：`fp_id → 本机曲库路径` —— 由**指纹内容重合率**判出来的
+#: "码表这首 = 本机这首"。运行期直接查表，零重活（读包+查库要 1~2 秒/首，绝不能进 tick）。
+FP_SAME_KEY = "fp_same"
+#: 判定"同一首"的指纹重合率下限。实测（测试151.ercue × 本机 91 首）：
+#: 同一文件 **100.0%** / 同曲不同混音 11.5% / 无关曲目 8.7~9.1%
+#: ⇒ 40% 离噪声 4 倍、离"全等"还能容忍 60% 的差异（换容器、换码率都不会掉这么多）。
+DEFAULT_SAME_RATIO = 0.40
 INSERT_CHUNK = 10000             # executemany 分块（控制内存峰值，也让长事务别太粗）
 DB_FILE = "fingerprints.db"
 
@@ -576,6 +585,108 @@ def migrate_fp_song_bpm(cfg) -> int:
 # ==========================================================================
 # 灌库 / 清库（同步实现；GUI 请用 start_ingest/start_drop）
 # ==========================================================================
+def match_pack_local(cfg, db, pkg_path, min_ratio=None):
+    """包内每首曲目 → 本机曲库里"**同一首**"的那条路径（按**指纹内容重合率**）。
+
+    ★★ 为什么不能只看 `fp_id`（用户 2026-10-30 两次强调）：
+       `identity.fp_id` 是 `sha1(全部指纹哈希串联)[:16]` —— **只要一个哈希不同，
+       签名就完全变**。而"同一首歌的两个版本，只是专辑不同"（换容器/换码率/重新压制）
+       在指纹层面是**大面积重合、少数哈希不同** ⇒ 签名必不相同，判不出来。
+       用户原话：「我期望的是用指纹对比」「歌曲的时长啊，这些东西完全都是一样的」。
+
+    实测（`测试151.ercue` × 本机曲库 91 首，`tools/_probe_fp_same.py`）：
+       · 同一文件                → **100.0%**
+       · 同曲不同混音（Remix）    → 11.5%
+       · 无关曲目噪声            → 8.7 ~ 9.1%
+      ⇒ 区分度极大，`DEFAULT_SAME_RATIO = 0.40` 判"同一首"既不会误判 Remix，
+        也留足空间给"同一首的不同压制版本"。
+
+    ⚠ 只统计**本机曲库里真实存在**的 `song_id`（`by_sid`），并**排除合成 id**
+      （`fp_song_id(fp_id)` 是包自己灌进去的那份，不能当"本机已有"）。
+    ⚠ 结果会写进 `cfg["cue"]["fp_same"]`（`fp_id → 本机路径`）—— 运行期
+      （`engine._cue_peer_song_ids` / `cue_index._LocalIndex`）只读它，绝不重算。
+    ⚠ 耗时：读包 + 查库 **1~2 秒/首** ⇒ 只能在导入/对账时跑，别放进 tick。
+
+    :return: `{"tracks": [{fp_id,title,path,ratio,n_query,n_hit}], "same": {fp_id: path}, "ms": float}`
+    """
+    t0 = time.perf_counter()
+    res = {"tracks": [], "same": {}, "ms": 0.0}
+    pkg = os.path.abspath(str(pkg_path or ""))
+    if not pkg or not os.path.isfile(pkg):
+        res["ms"] = (time.perf_counter() - t0) * 1000.0
+        return res
+    tracks = _read_tracks(pkg)
+    if not tracks:
+        res["ms"] = (time.perf_counter() - t0) * 1000.0
+        return res
+    # 本机曲库：song_id → 路径（与 `ui_main` 建库算法一致：md5(路径)[:8]）
+    try:
+        lib = cfg["music_library"] or []
+    except Exception:                                            # noqa: BLE001
+        lib = []
+    by_sid = {}
+    for p in lib:
+        if isinstance(p, str) and p:
+            try:
+                by_sid[int(hashlib.md5(p.encode("utf-8")).hexdigest()[:8], 16)] = p
+            except Exception:                                    # noqa: BLE001
+                continue
+    ratio_min = DEFAULT_SAME_RATIO if min_ratio is None else float(min_ratio)
+    conn, own = _conn_of(db)
+    if conn is None:
+        res["ms"] = (time.perf_counter() - t0) * 1000.0
+        return res
+    try:
+        import fp as _fpmod
+        for tr in tracks:
+            fp_id = str(tr.get("fp_id") or "")
+            item = {"fp_id": fp_id, "title": str(tr.get("title") or ""),
+                    "path": "", "ratio": 0.0, "n_query": 0, "n_hit": 0}
+            res["tracks"].append(item)
+            if not fp_id:
+                continue
+            hs = read_from_package(pkg, fp_id)
+            if not hs:
+                continue                       # 老包 / 这首没导指纹（正常情况）
+            uniq = sorted({h for h, _o in hs})
+            item["n_query"] = len(uniq)
+            if not uniq:
+                continue
+            hits = _fpmod.count_query_hits(conn, uniq)
+            synth = fp_song_id(fp_id)
+            best_sid, best_n = -1, 0
+            for sid, n in hits.items():
+                if sid == synth or sid not in by_sid:
+                    continue                   # 合成 id / 不在本机曲库 ⇒ 不算
+                if n > best_n:
+                    best_sid, best_n = sid, n
+            if best_sid >= 0:
+                item["n_hit"] = best_n
+                item["ratio"] = best_n / float(len(uniq))
+                if item["ratio"] >= ratio_min:
+                    item["path"] = by_sid[best_sid]
+                    res["same"][fp_id] = by_sid[best_sid]
+    finally:
+        if own and conn is not None:
+            try:
+                conn.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+    if res["same"]:
+        try:
+            cue = _cue_cfg(cfg)
+            same = cue.setdefault(FP_SAME_KEY, {})
+            if not isinstance(same, dict):
+                same = {}
+                cue[FP_SAME_KEY] = same
+            same.update(res["same"])
+            _save_cfg(cfg)
+        except Exception:                                        # noqa: BLE001
+            pass
+    res["ms"] = (time.perf_counter() - t0) * 1000.0
+    return res
+
+
 def ingest_sheet(cfg, db, pkg_path) -> dict:
     """把包内 `fp/<fp_id>.bin` 全部灌进指纹库，并更新 `cfg["cue"]["fp_songs"]`。
 
@@ -839,6 +950,21 @@ class _Job:
                 self.result = drop_sheet(self.cfg, self.db, self.pkg)
             else:
                 self.result = ingest_sheet(self.cfg, self.db, self.pkg)
+                # ★★ 2026-10-30（用户：「导入 时给个弹窗提示？」）：灌库之后立刻做一次
+                #   **指纹内容对账**，算出"这张码表里哪些歌本机曲库已经有"。
+                #   为什么必须在这个后台线程里：读包 + 查库 1~2 秒/首
+                #   （实测 4 首 5.8 秒），放 GUI 线程会把界面冻住。
+                #   结果写进 `result["same"]`（fp_id → 本机路径）+ `same_tracks`（明细），
+                #   由 `cue_page._fp_poll` 在主线程弹窗。
+                try:
+                    _m = match_pack_local(self.cfg, self.db, self.pkg)
+                    self.result = dict(self.result or {})
+                    self.result["same"] = _m.get("same") or {}
+                    self.result["same_tracks"] = _m.get("tracks") or []
+                except Exception as _e:                          # noqa: BLE001
+                    # 对账失败**不影响导入**（指纹已经灌完了）
+                    print("[码表] 指纹对账失败（不影响导入）：%s: %s"
+                          % (type(_e).__name__, _e))
         except Exception as e:                                   # noqa: BLE001
             self.error = "%s: %s" % (type(e).__name__, e)
         finally:

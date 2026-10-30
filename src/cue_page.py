@@ -51,6 +51,18 @@ _FRAG_CACHE: dict[str, tuple] = {}
 
 CUE_PAGE_INDEX = 3          # 第 4 个页签（0=演出台 1=素材库 2=曲库·曲风 3=码表）
 
+# 导入码表后「本机已有同一首」弹窗的**详细说明**。
+# ★ 提成模块级常量：它是 i18n 的 key，中文原文必须与 `i18n_map.ZH2EN` **逐字一致**
+#   （内联多行字符串很容易改文案时忘了同步）。测试 `_test_cue_same_song.py` 直接查它。
+SAME_SONG_DETAIL = (
+    "判定方式：指纹内容比对（不是文件名、也不是 fp_id 签名）。\n"
+    "同一首歌换专辑 / 换容器 / 重新压制后，fp_id 会完全不同，但指纹内容大面积重合。\n"
+    "\n"
+    "这些歌不会在曲库里重复出现：本机那一条会标上「码表：表名」并用颜色区分\n"
+    "（青绿 = 这张表正在演出中，灰 = 未装载）。\n"
+    "演出时画面用码表的编排；BPM / 段落仍用本机的分析结果。"
+)
+
 
 # ==========================================================================
 # 小工具
@@ -169,13 +181,51 @@ def sheet_entries(owner):
 
 
 def sheet_label(entry):
-    """列表/下拉里显示的码表名：表名 → 文件名 → 路径。"""
+    """列表 / 下拉 / 对话框标题里显示的码表名：**文件名优先** → 包内标题 → 路径。
+
+    ★★ 2026-10-30（用户：「为什么 曲库和图层的码表名字不一样 检查一下 ercue」）：
+      实测 `测试151.ercue` 的**文件名**是 `测试151.ercue`，而包内 `cuesheet.json`
+      的 `title` 是 **`测试11`**（与文件名不符，像导出时手滑）。
+      曲库那边一直用 `os.path.basename()`（`cue_index.covered_paths` /
+      `library_rows` 的 `sheet_name`），而这里原来**优先用 `title`**
+      ⇒ 同一个包在「码表页 / 图层下拉」叫「测试11」、在「曲库来源列」叫
+      「测试151.ercue」，用户根本对不上。
+
+      统一口径 = **文件名**，理由：
+        · 用户是在文件系统里管理码表的，按文件名找最快；
+        · 曲库的来源列 / 来源筛选 / 图例**已经全用文件名**（改一处比改五处稳）；
+        · `title` 是包内元数据，可能是导出工具写残的（本例就是）。
+      `title` 并没丢：`sheet_tooltip()` 把它（以及路径、曲目数）带进 tooltip。
+    """
     e = entry or {}
-    t = str(e.get("title") or "").strip()
-    if t:
-        return t
     b = os.path.basename(str(e.get("path") or "")).strip()
-    return b or str(e.get("path") or "?")
+    if b:
+        return b
+    return str(e.get("title") or "").strip() or str(e.get("path") or "?")
+
+
+def sheet_tooltip(entry):
+    """码表项的 tooltip：**包内标题**（可能和文件名不同）+ 曲目数 + 完整路径。
+
+    ★ 存在的意义就是"名字统一之后，原本的信息别丢"：文件名与 `title` 不一致时
+      （实测 `测试151.ercue` 的 title 是 `测试11`），用户能在这里看到。
+    """
+    e = entry or {}
+    p = str(e.get("path") or "")
+    t = str(e.get("title") or "").strip()
+    n = 0
+    try:
+        n = int(e.get("n_tracks", 0) or 0)
+    except (TypeError, ValueError):
+        n = 0
+    lines = [Tf("文件：{}", os.path.basename(p) or p)]
+    if t and t != os.path.basename(p):
+        lines.append(Tf("包内标题：{}", t))
+    if n:
+        lines.append(Tf("曲目：{} 首", n))
+    if p:
+        lines.append(p)
+    return "\n".join(lines)
 
 
 # ==========================================================================
@@ -897,6 +947,14 @@ class CueSheetPanel(QWidget):
             jobs = []
         if jobs:
             self._flash(" ｜ ".join(self._fp_text(j) for j in jobs))
+            # ★★ 2026-10-30（用户：「导入 时给个弹窗提示？」）：导入后告诉用户
+            #   "这张码表里哪些歌本机已经有了"（按**指纹内容重合率**判，不是文件名）。
+            #   不提示的话，用户会以为码表里的歌和曲库里的歌是两首，不敢删也不敢用。
+            for _j in jobs:
+                try:
+                    self._same_song_popup(_j)
+                except Exception as _e:                          # noqa: BLE001
+                    print("[码表] 同曲提示弹窗失败：%s: %s" % (type(_e).__name__, _e))
         try:
             left = cue_fp_pack.pending_jobs()
         except Exception:                                        # noqa: BLE001
@@ -918,6 +976,48 @@ class CueSheetPanel(QWidget):
                         _sg(getattr(self.owner, "_song_meta_by_id", {}) or {})
             except Exception:                                    # noqa: BLE001
                 pass
+
+    def _same_song_popup(self, job):
+        """导入码表后：本机曲库**已经有**的曲目，弹窗列出对应关系。
+
+        为什么要有（用户 2026-10-30：「导入 时给个弹窗提示？」）：
+          不提示的话，用户看到曲库里既有一条"本机"的、又知道码表里有同一首，
+          会以为是两份东西，要么重复导入、要么不敢删。
+
+        判据是**指纹内容重合率**（`cue_fp_pack.match_pack_local`），不是文件名：
+          实测同一文件 100%、同曲不同混音 11.5%、无关曲目 8.7~9.1%，阈值 40%。
+
+        ⚠ 只对 `ingest` 作业弹（`drop` 的 result 是 int，没有 `same`）；
+          `poll_jobs()` 取走即移除 ⇒ 每张包只会弹一次，不用额外去重。
+        """
+        if str(getattr(job, "kind", "")) != "ingest":
+            return
+        r = getattr(job, "result", None)
+        if not isinstance(r, dict):
+            return
+        same = r.get("same") or {}
+        if not same:
+            return
+        trs = [t for t in (r.get("same_tracks") or [])
+               if isinstance(t, dict) and t.get("path")]
+        if not trs:
+            return
+        name = os.path.basename(str(getattr(job, "pkg", "") or ""))
+        lines = []
+        for t in trs:
+            lines.append(Tf("　· {}　←　{}（指纹吻合 {:.0f}%）",
+                            (t.get("title") or "?")[:28],
+                            os.path.basename(str(t.get("path") or ""))[:40],
+                            float(t.get("ratio") or 0.0) * 100.0))
+        body = "\n".join(lines)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(T("导入码表"))
+        box.setText(Tf("「{}」里有 {} 首歌，本机曲库已经有同一首：", name, len(trs)))
+        box.setInformativeText(body)
+        box.setDetailedText(T(SAME_SONG_DETAIL))
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
 
     @staticmethod
     def _fp_text(job):

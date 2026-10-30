@@ -60,13 +60,39 @@ BPM_MIN, BPM_MAX = 60.0, 220.0   # 上限 220：Frenchcore/Uptempo 200~220 BPM�
 BPM_PRIOR = (110.0, 210.0)  # DJ 音乐的先验区间：半速歧义时优先取落在这里的候选
 PHRASE_MIN, PHRASE_MAX = 0.62, 1.30   # 八拍相位对比度阈值（低于此判定"证据不足"）
 
+# BPM 分析的最长时间窗（秒）。**等于"尽量全曲"**：本机曲库最长 466 秒，都不受影响。
+# ★★★ 2026-10-30 用户报「Crescent Horizon 分析成 143.6，我记得是 145」——真凶就是这里。
+#   那时默认 180 秒，而这把歌（298 秒）**前 120 秒 ≈145、后 178 秒 ≈143.5**（差 1%）。
+#   用 180 秒分析 → 143.55 得分 4.09 > 145 的 3.81 ⇒ 选了错的；
+#   用全曲 298 秒 → 145.00 得分 3.93 > 143.55 的 3.82，且 VDJ 标注正是 **144.9983**。
+#   原理：fold 的分辨力随长度线性增长 —— 1% 的差异在 180 秒上只累积 4 拍，
+#   在 298 秒上累积 7 拍，长窗才分得开。实测另外 5 首（200 / 128 / 142 / 143.55）
+#   在 180 秒与全曲下结果**完全一致**，耗时只差 <1 秒（大头是解码与特征，不是扫描）。
+#   ⚠ 别为了省时间调回 180：那会把"长曲里 1% 级别的双 BPM 歧义"重新引入。
+GRID_MAXSEC = 600.0
+
 DEFAULT_VDJ = ""           # 不硬编码路径，统一由 vdj_db_path() 自动探测
 
 # 网格算法版本：算法 / 参数变更时递增。曲库增量扫描据此判断「已有记录的网格是否过期」，
 # 只对过期 / 缺失的网格重算（见 ui_main 扫描），而不用整库全量重扫。
 #   1 = 初版（隐式，未写入 grid dict）
 #   2 = 2026-09-27：_assemble 输出显式带 grid_ver；配合增量补网格
-GRID_VER = 3          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的曲目改为 src="bt"）
+GRID_VER = 6          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的曲目改为 src="bt"）
+                      # 4 = 2026-10-30：BPM 分析长度 180 秒 → `GRID_MAXSEC`(600)。
+                      #     长曲里 1% 级别的双 BPM 歧义（Crescent Horizon 298 秒：
+                      #     前 120 秒 ≈145、后 178 秒 ≈143.5）在 180 秒窗上分不开 ⇒
+                      #     旧版本把它存成 143.55，与 VDJ 的 144.9983 不符。
+                      # 6 = 2026-10-30：**BPM 被候选级决胜改判后，anchor 不再沿用 Beat This 的**
+                      #     （`_bpm_changed_by_fit`）。用户报「偏了四拍」：Addicted 沿用 bt anchor
+                      #     得 1.801/phrase=4，纯相位估计是 0.3595/phrase=0 —— **差 3.47 拍**。
+                      #     原因：bt 的 anchor 是按它自己那套节奏假设给的，BPM 一换就不再是小节头。
+                      # 5 = 2026-10-30：新增**候选级 `tempo_fit` 决胜**（`disambiguate_by_fit`）。
+                      #     `grid_conc` 会偏袒伪峰：Addicted 2 Love (Digi-Tizio Mix) 的
+                      #     143.55 得 4.31、真值 144.40 只有 2.38 ⇒ `pick_bpm` 挑到 152；
+                      #     而 tempo_fit 给 144.40=0.786 > 143.55=0.676 > 152=0.612。
+                      #     ⚠ 必须升版本，否则存量歌永远拿不到新结果（`_need_grid` 靠它判断）。
+                      #     代价：下次「扫描分析」会把 grid_ver<5 的歌放进 `todo_grid`
+                      #     （**只算网格**，跳过指纹/联网/本地 AI）。
                       # ⚠ 每次改网格算法都要 +1：ui_main 的 `_need_grid` 靠它判断"该重算"。
 
 
@@ -175,6 +201,89 @@ def grid_conc(t, env, period, nbins=32):
 
 TEMPO_FIT_MARGIN = 0.12      # 跨段命中率领先多少个百分点才改判（0.12 = 12 点）
 TEMPO_FIT_MIN_SEG = 2        # 至少这么多段可比才敢改判（短曲退回原行为）
+
+# 「候选级」tempo_fit 决胜（`disambiguate_by_fit`）—— 门槛比上面那道**松**：
+#   跨族仲裁（Beat This vs 扫描）是两个**不相干**的节奏假设，要证据很足才敢翻（0.12）；
+#   而这里是在同一首曲子的**近邻候选**里挑，`grid_conc` 本身就会偏袒伪峰，
+#   0.12 会把正确答案挡在外面（实测 Addicted 2 Love 的真值只领先 0.11）。
+TEMPO_FIT_ALT_MARGIN = 0.08  # 候选级改判门槛（fit 领先这么多才换）
+TEMPO_FIT_ALT_STEP = 0.2     # 枚举步长（BPM）
+TEMPO_FIT_ALT_TOPN = 12      # 参与 tempo_fit 打分的候选数（按 grid_conc 取前 N）
+TEMPO_FIT_ALT_FLOOR = 0.5    # 候选的 grid_conc 至少是区间最高值的这个比例（过滤弱峰）
+TEMPO_FIT_ALT_SAME = 0.02    # 与当前值相对差小于此 ⇒ 视作同一个峰，不参与改判
+
+
+def disambiguate_by_fit(t, env, bpm, step=None, topn=None, margin=None):
+    """在 `BPM_PRIOR` 区间里重新枚举候选，用 `tempo_fit_score` 挑更可信的那个。
+
+    ★★★ 2026-10-30 用户第三次报 BPM 偏差（`Addicted 2 Love (Digi-Tizio Mix)`）：
+      界面显示 **152.0**，用户说 **144.4**（VDJ 三首分别是 144.4 / 144.4 / 144.8，用户对）。
+      实测这首曲子的 `grid_conc`（相位直方图峰均比）排名是：
+        143.55 → 4.31、129.20 → 3.29 …… **真值 144.40 只有 2.38**，连 `scan_bpm` 的
+        top-3 都进不去（那三名是 102/1.997、76/1.955、152/1.955）⇒ `pick_bpm` 只能在
+        先验区间里挑到 152。
+      但 `tempo_fit_score`（前 1/3 段拟合相位、测**所有段**的命中率）给：
+        144.40 → **0.786**（74%/76%/87%）
+        143.55 → 0.676（59%/70%/74%）
+        152.00 → 0.612（62%/56%/66%）
+      ⇒ `grid_conc` 对"周期略错"不敏感（它只看整首折叠后的峰有多尖），
+        累积漂移只有跨段才暴露 —— 这与 `tempo_fit_score` docstring 里记录的
+        `Power Generator`（147 vs 141.77）是同一个病根。
+
+    做法：区间内按 `TEMPO_FIT_ALT_STEP` 枚举 → 取 `grid_conc` 前 `topn` →
+    对每个候选算 `tempo_fit_score`，**领先 `margin` 才改判**。
+
+    ⚠ 与当前值「同族」（含 2^n：半速/双速）的候选**不参与**改判 —— 倍速是 `pick_bpm`
+      先验区间 + `octave_fix` 的职责，这里再插一手会把 200 改成 100。
+
+    实测 8 首（145 / 200 / 128 / 142 / 143.55 / 175 全部不变，只有 152 → 144.40），
+    成本 ≈0.7 秒/首（枚举 0.19s + 12 次 tempo_fit 0.5s）。返回**新 BPM**；
+    没有更好的候选 ⇒ 返回 `None`（调用方保持原值）。
+    """
+    step = TEMPO_FIT_ALT_STEP if step is None else float(step)
+    topn = TEMPO_FIT_ALT_TOPN if topn is None else int(topn)
+    margin = TEMPO_FIT_ALT_MARGIN if margin is None else float(margin)
+    try:
+        cur = float(bpm)
+    except (TypeError, ValueError):
+        return None
+    if cur <= 0 or step <= 0 or topn <= 0:
+        return None
+    try:
+        if len(t) < 32 or len(env) != len(t):
+            return None
+        e = env.astype(np.float64)
+        lo, hi = float(BPM_PRIOR[0]), float(BPM_PRIOR[1])
+        bs = np.arange(lo, hi + 1e-9, step)
+        if bs.size < 4:
+            return None
+        sc = np.array([grid_conc(t, e, 60.0 / b, 32)[0] for b in bs])
+        if not np.isfinite(sc).any() or float(sc.max()) <= 0:
+            return None
+        order = np.argsort(-sc)[:topn]
+        gmax = float(sc[order[0]])
+        if gmax <= 0:
+            return None
+        best_fit = tempo_fit_score(t, e, cur)[0]
+        best_b = None
+        for i in order:
+            b = float(bs[i])
+            if abs(b - cur) <= cur * TEMPO_FIT_ALT_SAME:
+                continue                       # 就是当前这个峰本身
+            # 同族（含 2^n）不参与：倍速由 pick_bpm/octave_fix 负责
+            p2 = _octave_norm(b, cur)
+            if abs(p2 - cur) <= cur * TEMPO_FIT_ALT_SAME:
+                continue
+            if float(sc[i]) < TEMPO_FIT_ALT_FLOOR * gmax:
+                continue                       # 弱峰不参与
+            f2, _a2, r2 = tempo_fit_score(t, e, b)
+            if len(r2) < TEMPO_FIT_MIN_SEG:
+                continue
+            if f2 - best_fit >= margin:
+                best_fit, best_b = f2, b
+        return best_b
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def tempo_fit_score(t, env, bpm, tol=0.05, nseg=3, min_beats=32):
@@ -942,16 +1051,44 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
             if (len(_ra) >= TEMPO_FIT_MIN_SEG and len(_rb) >= TEMPO_FIT_MIN_SEG
                     and (_fb - _fa) >= TEMPO_FIT_MARGIN):
                 bpm = _bt_bpm
+
+    # ★★★ 2026-10-30：**候选级 tempo_fit 决胜**（见 `disambiguate_by_fit` 的完整说明）。
+    #   为什么必须在 `bpm` 定下来之后、算 anchor 之前做：
+    #     `grid_conc` 只看"整首折叠后峰有多尖"，对"周期略错"不敏感 ——
+    #     `Addicted 2 Love (Digi-Tizio Mix)` 的伪峰 143.55 得 4.31、真值 144.40 只有 2.38，
+    #     于是 `pick_bpm` 在区间内挑到 152（1.955），实测 VDJ 三首都是 144.4/144.4/144.8。
+    #   只改 `bpm`、不动 anchor 的算法（下面 `phase_of` 会按新 period 重算相位）。
+    _bpm_changed_by_fit = False
+    if bpm > 0 and env is not None and len(env) > 32:
+        try:
+            _t_alt = (np.arange(env.shape[0]) * f["dt"]).astype(np.float64)
+            _alt = disambiguate_by_fit(_t_alt, env, bpm)
+            if _alt and abs(_alt - bpm) > 0.05:
+                bpm = float(_alt)
+                _bpm_changed_by_fit = True
+        except Exception:                                        # noqa: BLE001
+            pass
     period = 60.0 / bpm if bpm > 0 else 0.5
 
-    if anchor_hint is not None:
+    # ★★★ 2026-10-30（用户紧接着报「偏了四拍」）：**BPM 被上面改判后，
+    #   Beat This 的小节头 anchor 不能再信** —— 它是按 Beat This 自己那套节奏假设
+    #   给的相位，BPM 一换，那个"小节第 1 拍"就不再是小节头。
+    #   实测 Addicted 2 Love (Digi-Tizio Mix)：沿用 bt anchor ⇒ phrase=4、
+    #   anchor=1.8010；而按 144.4 纯相位估计（`phase_of`+`phrase_phase`）得
+    #   phrase=0、anchor=0.3595 —— **差 3.47 拍，正是用户听到的"偏四拍"**。
+    #   ⇒ 改判过 BPM 就退回纯相位估计（`phrase_phase` 的 contrast=1.264 足够高，
+    #     说明八拍头证据充分，不需要 bt 兜底）。
+    if anchor_hint is not None and not _bpm_changed_by_fit:
         # ★ 不要折叠到 [0, period)：锚点本身就是「小节第 1 拍」，
         #   折叠会丢掉这个信息，使八拍头整体平移（实测踩过）。
         base = float(anchor_hint)
         conc = 0.0
-    elif bt_used and _bt_bpm > 0 and abs(bpm - _bt_bpm) > 0.5:
+    elif (bt_used and _bt_bpm > 0 and abs(bpm - _bt_bpm) > 0.5
+          and not _bpm_changed_by_fit):
         # BPM 被扫描改掉、但 Beat This 的**拍点位置仍然可用**（它是拍位置，不随倍速变）
         # ⇒ 以它为先验挑相位，而不是完全丢掉这份信息。
+        # ⚠ 但 `_bpm_changed_by_fit` 除外：那是"连节奏假设都换掉了"，bt 的相位也跟着失效
+        #   （实测偏 3.47 拍），必须走下面的纯相位估计。
         base, conc = phase_of(f, env, period)
         try:
             _ba = float(anchor_hint) if anchor_hint is not None else 0.0
@@ -1319,31 +1456,46 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
     }
 
 
-def compute_grid(path, vdj=None, maxsec=180.0, allow_local=True, do_scan=None):
+def compute_grid(path, vdj=None, maxsec=GRID_MAXSEC, allow_local=True, do_scan=None,
+                 use_vdj=True):
     """算一首歌的网格（自己读文件）。返回 dict（失败返回 None）。
 
     `anchor` 统一表示「某个八拍头」：**八拍头 = anchor + 8n * beat_len**。
     `do_scan=None`（默认）时自动决定：**有 VDJ 数据就跳过 BPM 扫描**（省掉单首最贵的一步），
     没有才自算 —— 曲库扫描（上千首）靠这个把成本压下来。
+
+    `maxsec` 默认 `GRID_MAXSEC`（= 尽量全曲，见该常量的注释）：180 秒的分辨力
+    不足以分开长曲里 1% 级别的双 BPM（Crescent Horizon 就被这个坑成 143.55）。
+    `use_vdj=False`：完全不读 VDJ 的 BPM（2026-10-30 用户要求，见 `grid_from_signal`）。
     """
     if not path or not os.path.isfile(path):
         return None
     dur = _file_duration(path)
-    e = vdj_lookup(vdj, path, dur)
+    e = vdj_lookup(vdj, path, dur) if use_vdj else None
     mono, sr = load_mono(path, maxsec=maxsec)
     return _assemble(mono, sr, e, dur, do_scan=do_scan, allow_local=allow_local)
 
 
-def grid_from_signal(mono, sr, vdj=None, path="", maxsec=180.0, dur=None,
-                     allow_local=True, do_scan=None):
+def grid_from_signal(mono, sr, vdj=None, path="", maxsec=GRID_MAXSEC, dur=None,
+                     allow_local=True, do_scan=None, use_vdj=True):
     """从**已解码**的单声道整曲信号算网格。
 
     ★ 曲库扫描时用它：扫描已经为指纹解码过一次，这里直接复用，省掉第二次读盘
       （HDD 上这很值钱）。只取前 `maxsec` 秒做分析。
+
+    :param use_vdj: ★★ 2026-10-30 用户要求「**去掉 vdj 源，完全依赖本地扫描确定 bpm**」。
+        `False` ⇒ **完全不读 VDJ 的 BPM**：`e=None` ⇒ `_assemble` 走 `do_scan=True`
+        （强制全 BPM 扫描）、`bpm_hint=None`、`src` 标 `local`/`bt`。
+        为什么：VDJ 给的 BPM 经常是半速/倍速（实测 175→87.5、200→99.95；
+        `Sociable State` 的 145 也疑似 5:4 层级），当先验会把本地结果一起带偏；
+        更糟的是用户手改 BPM 只写进 `grid_manual.bpm_manual`，`grid.beat_len` 仍是
+        旧值 ⇒ 分段按错的拍长算 ⇒ 用户看到的"**偏差三拍**"。
     """
     if dur is None:
         dur = len(mono) / float(sr)
-    e = vdj_lookup(vdj, path, dur) if path else None
+    e = None
+    if use_vdj and path:
+        e = vdj_lookup(vdj, path, dur)
     n = min(len(mono), int(maxsec * sr))
     sig = np.ascontiguousarray(mono[:n], dtype=np.float32)
     sig, sr2 = resample(sig, sr, SR_TARGET)

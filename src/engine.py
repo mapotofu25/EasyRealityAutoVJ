@@ -71,6 +71,25 @@ _SILENT_ENDED_EVERY = 5.0    # "有帧前就 ended" 这类：每这么久记一�
 #   又没有覆盖这一类 ⇒ 无人恢复。这里给它一个兜底重建：宽限后重建解码器，且**限流**
 #   （每图层 ≥2s 一次、同素材累计 ≤3 次），到顶只记一行日志、不再重建（避免重建风暴）。
 _NOFRAME_GRACE = 2.2        # 可见 + 当前素材 + `_frames==0` 持续这么久 ⇒ 判定"解不出首帧"
+# ★★ 大素材宽限（2026-10-29 现场「无帧重建」翻案）：同样的判据对 4K / 大文件太紧。
+#   HDD 上冷打开实测 127~543ms（tools/_probe_cv2_vs_av.py：`2020.5.13.mov` 542.6ms、
+#   `搬运工 (38).mov` 126.9ms），再叠加首帧解码就很容易越过 2.2s ⇒ 被误判成"解不出
+#   首帧" ⇒ 重建解码器 ⇒ **又要把同一份数据从机械盘重新读一遍** ⇒ 越治越卡
+#   （现场 ui_stall.log：同一素材 2.2s/2.2s/2.3s 连判三次）。
+#   宽限按文件体量给：超过 150MB 的素材给 5.0s。
+_NOFRAME_GRACE_BIG = 5.0
+_NOFRAME_BIG_BYTES = 150 * 1024 * 1024
+
+# 「多层同时停帧」取证（见 `_stutter_watch`）：
+#   用户报"预览和输出都一卡一卡"时，`layer_health.log` 里只能看到某个时刻 age 变大，
+#   但**分不清**是"单层素材解不出来"还是"整个渲染/取帧都停了"——这两种的修法完全不同。
+#   这里在常态心跳里主动判定：可见且活跃的图层有 ≥2 层的帧龄超过 `_STUTTER_AGE`
+#   ⇒ 记一行到 ui_stall.log，附每层 age / frames / 素材名，下次卡了直接看这条。
+_STUTTER_AGE = 0.8
+_STUTTER_LOG_EVERY = 10.0
+
+# 掉锁后「冻结段位」多久（秒）。见 `_section_tick` 的 2026-10-30 复盘。
+_SEC_HOLD_SEC = 6.0
 _SILENT_NOFRAME_COOLDOWN = _SILENT_ACTION_MIN   # 同图层两次重建的最小间隔（≥2s/图层）
 _SILENT_NOFRAME_MAX = 3     # 同素材累计重建上限（≤3 次/素材，换素材重置）
 
@@ -815,6 +834,9 @@ class AutoVJEngine(QObject):
         self._sec_seen_path = None       # 上一次见过 path（判断"是否换歌"）
         self._sec_cache = None           # (path, sections) 缓存
         self._sec_info = {}              # 取证：状态/段索引/目标值
+        # 掉锁后「冻结段位」的计时（见 `_section_tick`）：掉锁 ≠ 音乐变了，
+        # 立刻退回实测能量会让能量档跳变 ⇒ 素材池重 roll + 强切（用户 2026-10-30 实测）。
+        self._sec_lost_t = 0.0
         self._sec_switch_n = 0           # 段落触发的切换次数（取证）
         self._sec_reset_n = 0            # 段落状态被重置的次数（换歌/无表，取证用）
         self._sec_why = ""               # 最近一次切换/重置的原因（取证用）
@@ -842,6 +864,8 @@ class AutoVJEngine(QObject):
         self._heal_last_global_t = 0.0
         # 静默冻帧兜底日志去重：key=(图层名, 原因) → 上次记录时刻（见 `_heal_silent`）
         self._silent_log_t = {}
+        # 多层同时停帧取证：上次记录时刻（见 `_stutter_watch`）
+        self._stutter_log_t = 0.0
         # 每层健康快照日志（懒创建；见 `_health_tick` / `_LayerHealthLog`）
         self._health_log = None
         self._health_next_t = 0.0
@@ -1013,6 +1037,7 @@ class AutoVJEngine(QObject):
         self._grid_coord_delta = 0.0
         self._grid_last_pos = 0.0
         self._grid_last_out = None
+        self._bar_off_sid = None          # 手动相位属于哪首歌（换歌即作废，见 _beat_pos_grid）
         self._grid_pending = None
         self._grid_seen = None
         self._grid_segkey = None       # 当前段/锚标识（分段/多锚变化时硬重锚，见 _grid_observe）
@@ -1284,7 +1309,7 @@ class AutoVJEngine(QObject):
     def _refresh_auto_layers(self, snap, force_tier=None):
         """曲风变化时（或能量跨档 force_tier 时）用 match_clips 重新挑素材池并立即切换。
 
-        force_tier: None=常规（曲风变化触发，带门控）；"low"/"high"=能量跨档重 roll，
+        force_tier: None=常规（曲风变化触发，带门控）；"low"/"mid"/"high"=能量跨档重 roll，
         跳过曲风门控，池子按动态档过滤/前置（match_clips 的 tier 参数）。"""
         genres = self._current_genres(snap)
         key = tuple(sorted(set(g.lower() for g in genres if g)))
@@ -1444,6 +1469,26 @@ class AutoVJEngine(QObject):
             sid, sec = -1, None
 
         if sid < 0 or sec is None:
+            # ★★ 2026-10-30 现场（Dust：实时 BPM 误判 219.5 → BPM 一致性否决 → 掉锁 11 秒）：
+            #   旧实现在这里**立刻**把 `_sec_energy/_sec_tier` 清成 None ⇒ 实测能量接管
+            #   （当时日志 `E=0.82 tier=mid`，而这一段的段落档位是 high）⇒ 能量档从 high
+            #   掉到 mid ⇒ `_energy_tier_switch` 重 roll 素材池 + 立刻切 ⇒ 用户看到的
+            #   **「素材强切了一下」**；等位置回来，`_apply_section_switch` 又把档位推回
+            #   high ⇒ 再切一次（一掉一认 = 两次强切）。
+            #   **掉锁 ≠ 音乐变了**：短暂丢票 / 位置过期期间冻结段位（池、素材、档位都不动）
+            #   才符合现场预期；超过 `_SEC_HOLD_SEC` 仍没回来才真退回实测能量。
+            _lose_t = float(getattr(self, "_sec_lost_t", 0.0) or 0.0)
+            if not _lose_t:
+                _lose_t = now
+                self._sec_lost_t = now
+            if (now - _lose_t) < _SEC_HOLD_SEC and self._sec_tier is not None:
+                if getattr(self, "_sec_last_state", None) != "冻结":
+                    self._sec_last_state = "冻结"
+                    self._section_log("掉锁冻结：保持段位 %.1fs（不退回实测能量，避免强切）"
+                                      % (now - _lose_t))
+                self._sec_info = {"state": "冻结", "lost": round(now - _lose_t, 2),
+                                  "tier": self._sec_tier}
+                return
             # 没认到歌 / 位置过期：**不接管**，但**不清段索引**。
             # 为什么不清：短暂丢票（HOLD_N 次内）之后位置会回来，清空会让
             # "丢一帧 → 回落实测能量 → 掉档 → 位置回来再升档"抖一次，现场看得见。
@@ -1485,6 +1530,7 @@ class AutoVJEngine(QObject):
             self._sec_why = "song-change"
 
         self._sec_list = secs
+        self._sec_lost_t = 0.0          # 位置回来了 ⇒ 掉锁计时复位（见掉锁冻结分支）
         i, cur = sections.section_at(secs, sec)
         self._sec_idx = i
         self._sec_tier = cur["tier"]
@@ -1502,6 +1548,20 @@ class AutoVJEngine(QObject):
             self._sec_applied_idx = i
             if self._sec_why not in ("no-table", "song-change"):
                 self._sec_why = "seg"
+            # ★ 2026-10-30 用户报「素材切换比听起来慢了一拍」：把**迟到量**落日志
+            #   （切的那一刻实际位置 − 段落边界）。>0.2s 是肉眼能看出的"慢"，
+            #   换算成拍数（÷ beat_len）就能直接读"慢了几拍"。
+            #   `cue_health.log` 的时间戳只到秒，靠它测不出亚秒偏差，所以必须有这个数。
+            try:
+                _late = float(sec) - float(cur.get("t0", 0.0) or 0.0)
+                _bl = float(getattr(trk, "beat_len", 0.0) or 0.0)
+                self._sec_late = _late
+                self._section_log(
+                    "段迟到 %.2fs%s（%s @%.2f）"
+                    % (_late, ("=%.2f 拍" % (_late / _bl)) if _bl > 1e-6 else "",
+                       cur.get("name", "?"), float(sec)))
+            except Exception:                                     # noqa: BLE001
+                pass
             self._apply_section_switch(snap, cur)
 
     def _apply_section_switch(self, snap, cur):
@@ -1521,10 +1581,9 @@ class AutoVJEngine(QObject):
             return                        # 没点「开始」：只记状态，不动画面
         tier = cur.get("tier") or "mid"
         tms = cur.get("trans_ms", None)
-        # ① 重 roll 素材池（mid 不强制过滤，与 _energy_tier_switch 同口径）
+        # ① 重 roll 素材池（★ 2026-10-30 起 mid 也按档位过滤 —— 用户要求中动态也强制换池）
         try:
-            self._refresh_auto_layers(
-                snap, force_tier=(tier if tier in ("low", "high") else None))
+            self._refresh_auto_layers(snap, force_tier=tier)
         except Exception:                                     # noqa: BLE001
             pass
         # ② 把档位状态机直接推到目标档，避免下一帧 _energy_tier_switch 又按实测能量改回去
@@ -1561,7 +1620,7 @@ class AutoVJEngine(QObject):
             % (self._sec_switch_n, (cur.get("name") or "-"), tier,
                float(cur.get("energy") or 0.0), float(_sec),
                self._sec_idx + 1, len(self._sec_list or [None]),
-               tier if tier in ("low", "high") else "不强制", _n_sw,
+               tier, _n_sw,
                getattr(_trk, "song_id", "?"), getattr(self, "_sec_reset_n", 0),
                getattr(self, "_sec_why", "?")))
 
@@ -1582,16 +1641,19 @@ class AutoVJEngine(QObject):
         # 上一档，低动态池一辈子 roll 不出来（用户反馈：能量为 0 时不 roll 低动态池）。
         # 本方法只在新档位稳定 2 秒后触发一次（滞回 + 稳定期），所以最多换一次池，不会 churn。
         # 滞回式三段判定（防阈值附近频繁横跳 → 素材池切换"太灵敏"）：
-        # 三段划分 0~0.5 低 / 0.5~0.65 中 / 0.65+ 高，但进出阈值不对称，留出滞回带：
-        #   进 high 要 >=0.70，退回 mid 要 <0.58；进 low 要 <0.45，退回 mid 要 >0.55。
-        # 能量在 0.5/0.65 附近小幅波动时不会反复跨档（之前纯三段一刀切会来回切池子）。
+        # ★★ 2026-10-30 用户：「除了高动态低动态 再把中动态也加进来 0.4到0.8」「高动态提到 0.8」
+        #   ⇒ 三段边界改成 0.40 / 0.80（和 `sections.TIER_LO/TIER_HI`、`match_clips` 同一套）。
+        # ★★ 2026-10-30 晚（`Rolling Contact`）：「中能量改回 0.4 0.75」⇒ 高门槛 0.80 → 0.75。
+        #   进出阈值仍不对称，留 0.06 的滞回带（进档按用户给的 0.40/0.75 原值）：
+        #     进 high 要 >=0.75，退回 mid 要 <0.69；进 low 要 <0.40，退回 mid 要 >0.46。
+        #   能量在 0.4/0.75 附近小幅波动时不会反复跨档（纯一刀切会来回切池子）。
         cur = self._last_energy_tier
         if cur == "high":
-            tier = "mid" if E < 0.58 else "high"
+            tier = "mid" if E < 0.69 else "high"
         elif cur == "low":
-            tier = "mid" if E > 0.55 else "low"
+            tier = "mid" if E > 0.46 else "low"
         else:  # mid
-            tier = "high" if E >= 0.70 else ("low" if E < 0.45 else "mid")
+            tier = "high" if E >= 0.75 else ("low" if E < 0.40 else "mid")
         if tier == self._last_energy_tier:
             self._tier_since = None
             return
@@ -1608,8 +1670,9 @@ class AutoVJEngine(QObject):
         self._next_due = None
         # 自动图层：跨档即重新 roll 一批符合新动态档的素材池（match_clips tier 过滤 +
         # 立即切换），而不是在旧池子里挑——否则池里大部分不符合新档，几个素材来回切
-        if tier in ("low", "high"):
-            self._refresh_auto_layers(snap, force_tier=tier)
+        # ★ 2026-10-30 用户：「中动态 0.4到0.8 稳定了就强制切素材池，和之前一样逻辑」
+        #   ⇒ mid 也重 roll（以前只有 low/high 才 roll，中能量段一直在旧池子里挑）。
+        self._refresh_auto_layers(snap, force_tier=tier)
         # 手动图层：在现有池里按动态档挑一个
         for lay in self.layers:
             if lay.fixed >= 0 or not lay.clips or self.locked:
@@ -1765,12 +1828,21 @@ class AutoVJEngine(QObject):
             #   只遍历缓存 ⇒ 这样的 `lay.player` **永远不被置为活跃 ⇒ 永不解码 ⇒ 画面
             #   冻在最后一帧**；而看门狗又跳过非活跃播放器 ⇒ **零日志的"静默冻帧"**。
             #   这是用户实测"播放中仍卡在某一帧、且 ui_stall.log 一条都没有"的根因。
+            # ★★ 不可见图层**不解码**：旧写法 `active` 只看"是不是当前播放器"，与
+            #   `visible` 无关 ⇒ 用户关掉的图层仍满速解码。现场 `layer_health.log`
+            #   可见：`L7 图层 5 vis=0 … frames=528` 一路涨到 1302。
+            #   代价是实打实的帧预算：软解一路 1080p DXV ≈ 12ms/帧、4K ≈ 24ms/帧
+            #   （tools/_probe_4k.py 实测），多路并发时 30fps 的 33ms 预算直接爆掉，
+            #   而且每路都在从素材盘取数据（Y: 是机械盘，见 tools/_probe_disk.py）。
+            #   过渡中的图层仍要解码（淡入需要新画面），所以 `trans_active` 也算可见。
+            vis_now = (bool(getattr(lay, "visible", True))
+                       or bool(getattr(lay, "trans_active", False)))
             seen = set()
             for p in list(lay.cache.values()) + [lay.player, lay.prev_player]:
                 if p is None or id(p) in seen:
                     continue
                 seen.add(id(p))
-                active = p is lay.player or p is lay.prev_player
+                active = (p is lay.player or p is lay.prev_player) and vis_now
                 # 静音时暂停：保持当前画面不动（解码线程挂起，最后一帧仍在显示）
                 # 仅在 VJ 运行中生效；停止时预览要保持实时，不能挂起
                 if active and lay.pause_silent and silent_now and p is lay.player and self.running:
@@ -1924,8 +1996,25 @@ class AutoVJEngine(QObject):
             _output_health_write("%s 发送恢复（中断 %.1fs）" % (ch, dur))
 
     def _spout_send(self):
-        """Spout 输出：CPU 共享内存路径把画布帧发给本机其他程序（OBS/Resolume 等）。
-        懒加载；失败走**退避重试**（不再永久停，见 `_output_fail`；未装 SpoutGL 时静默）。"""
+        """Spout 输出：**渲染线程只拷贝入队**，native `sendImage` 在专用线程提交。
+
+        ⚠⚠⚠ 2026-10-29 现场（用户报"预览和输出都一卡一卡，不是帧数低那种卡"）：
+          旧实现在本方法里**同步**调 `s.sendImage(buf, w, h, ...)`，而它跑在
+          `_tick_locked`（渲染线程）上。实测（tools/_probe_spout.py）：
+
+              720p   中位 1.01ms  p95 1.44ms  **max 14327ms**
+              1080p  中位 2.04ms  p95 2.77ms  **max   217ms**
+
+          ⇒ 偶发一次就把整个 tick 停住十几秒：**预览面板和输出窗口同时冻**，而 GUI
+          主线程不受影响（所以 `ui_stall.log` 一条都没有、`layer_health.log` 里却是
+          好几层 age 一起飙）。用户对照"OBS 的 Spout/NDI 输出不卡"正好印证：问题不在
+          Spout 本身，而在同步调用。NDI 那条路 2026-10-08 已经改成同款异步（见
+          `ndi_out.send_video`），Spout 这里一直漏着。
+
+          现在：渲染线程只 `bytearray` 拷贝一帧（720p 实测 1.7ms / max 2.8ms）再入队，
+          发送线程慢就丢旧帧。发送线程的异常由 `last_error()` 回传，仍走既有退避重试
+          （`_output_fail`），绝不永久停。
+        """
         # ★ 2026-09-27 修（用户报：**没开始 VJ 时 NDI 也在输出**；Spout 同理，同一个坑）：
         #   没点「开始」一律**不喂帧** —— 与「输出设置」既有门控语义一致
         #   （显示输出窗口 / 重置窗口大小 / 输出显示器本来就要先开始）。
@@ -1945,29 +2034,30 @@ class AutoVJEngine(QObject):
         elif now < self._spout_retry_at:
             return                      # 退避窗口内：这一帧不尝试
         try:
+            import spout_out
             if self._spout is None:
-                from SpoutGL import SpoutSender
-                from SpoutGL.enums import GL_BGRA_EXT
-                s = SpoutSender()
-                s.setSenderName(oc.get("spout_name") or "EasyRealityAutoVJ")
-                s.createOpenGL()
-                self._spout = (s, GL_BGRA_EXT)
-            import numpy as _np
-            s, glfmt = self._spout
+                self._spout = spout_out.SpoutOut(oc.get("spout_name")
+                                                 or "EasyRealityAutoVJ")
             w, h = self.canvas.width(), self.canvas.height()
             bpl = self.canvas.bytesPerLine()
-            buf = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
             # ★ 参数顺序是 (buffer, width, height, …)：之前误写成 (buf, h, w, …) ⇒ 发送端宣告
-            #   尺寸转置（1920×1080 → 1080×1920），画面错乱且不报错。此处为 (w, h)，勿再写反。
+            #   尺寸转置（1920×1080 → 1080×1920），画面错乱且不报错。`send()` 里是 (w, h)。
             # ★★ 2026-10-28（用户实测：OBS 里 Spout 画面上下颠倒）：
-            #   第 5 个参数 `bInvert` 必须为 **False**。
-            #   依据：`self.canvas` 是 QImage（**行序自上而下**），同一份画布走 NDI 是正的、
-            #   界面的「输出预览」也是正的 ⇒ 数据本来就是 top-down；Spout 再翻一次就成了倒像。
-            #   （OBS 的 Spout2 捕获没有翻转选项，所以这一层必须给对。）
-            s.sendImage(buf, w, h, glfmt, False, 0)
+            #   第 5 个参数 `bInvert` 必须为 **False**（画布本就是 top-down，见 SpoutOut）。
+            self._spout.send(self.canvas.bits(), w, h, bpl)
         except Exception as e:                                     # noqa: BLE001
             # ⚠ 失败时**保留已有 `self._spout`**、不丢成 None 重建：源名反复消失/出现更难恢复
             self._output_fail("Spout", now, e)
+            return
+        # 发送线程里的异常（native 层/GL 上下文）在这里回传，交给同一套退避逻辑
+        err = None
+        try:
+            err = self._spout.last_error()
+        except Exception:                                          # noqa: BLE001
+            err = None
+        if err:
+            self._output_fail("Spout", now, RuntimeError(err.strip().splitlines()[-1]
+                                                         if err.strip() else err))
             return
         self._output_ok("Spout", now)
 
@@ -2231,6 +2321,11 @@ class AutoVJEngine(QObject):
             prev_out = getattr(self, "_grid_last_out", None)
             if prev_out is not None:
                 self._grid_coord_delta = prev_out - raw
+            # ★ 2026-10-30：手动相位绑在**旧坐标系**上，坐标系一换它就是错值
+            #   （切换点会整体偏 delta 那么多拍 —— 用户听到的"差 4 拍"就是这么来的）。
+            if getattr(self, "_bar_off_user", None) is not None:
+                self._bar_off_user = None
+                self._next_due = None
         delta = getattr(self, "_grid_coord_delta", 0.0)
         out = raw + delta if delta else raw
         self._grid_last_out = out
@@ -2259,6 +2354,17 @@ class AutoVJEngine(QObject):
           R3：时钟刚发生 >jump_max（>32 拍）的硬重锚时，`hint_hold()`>0 —— 有界暂停发布
           （开环复核），避免"连续 2 个强错窗重锚到错坐标后 hint 又把它锁住"。"""
         _grid, bl, anchor, off, r, sid = gs
+        # ★★ 2026-10-30（用户报「好几首歌切素材和八拍线差四拍」）：**换歌就作废手动相位**。
+        #   `_bar_off_user`（按「下一素材」时定的相位）原来只在"连续静音 3 秒"后清掉，
+        #   而 DJ 接歌混播根本没有 3 秒静音 ⇒ 一首歌里按过的那一下会**跟着后面每一首**
+        #   继续生效，后面的歌就整体偏掉（偏多少取决于当时按在第几拍，常听到的就是差 4 拍）。
+        #   用户按它的语义本来就是"这一首从现在开始按我的拍走"，换歌必须回到网格给的八拍头。
+        if getattr(self, "_bar_off_sid", None) != sid:
+            self._bar_off_sid = sid
+            if getattr(self, "_bar_off_user", None) is not None:
+                self._bar_off_user = None
+                self._next_due = None
+                self._section_log("换歌 ⇒ 作废手动相位（回到八拍头）sid=%s" % sid)
         now = time.perf_counter()
         clock = self._grid_clock
         pos = clock.pos(now)
@@ -2601,6 +2707,29 @@ class AutoVJEngine(QObject):
         if pos >= due:
             self.switch_pos = due
             self._next_due = None   # 切换后按最新模式/间隔重新安排下一次
+            # ★★ 2026-10-30 用户报「好几首歌切素材和八拍线差四拍」：把**每次按拍切换**
+            #   的对齐残差记进 `cue_health.log`（每 ≥10 秒一条，避免渲染线程做 I/O 抖动）。
+            #   判读：
+            #     栅格=8 残差≈0      ⇒ 对齐正常（切在八拍头上）；
+            #     栅格=8 残差≈±4     ⇒ 相位差半句（离线 `phrase` 判反 / 存在 grid_flip）；
+            #     栅格=4             ⇒ **根本没进网格模式**（没认出歌 / 票数不够没锁定
+            #                          / 这首歌没网格）⇒ 切在小节线上，听感正是"差 4 拍"。
+            #   三种情况以前只能靠耳朵猜，现在一行字就能分清。
+            try:
+                _now = time.perf_counter()
+                if _now - float(getattr(self, "_bt_log_t", 0.0)) >= 10.0:
+                    self._bt_log_t = _now
+                    _w = float(self._align_width(snap))
+                    _off = float(self._bar_off(snap))
+                    _res = (pos - _off) % _w
+                    if _res > _w / 2.0:
+                        _res -= _w
+                    self._section_log(
+                        "拍位切换 栅格=%d拍 残差=%+.2f拍 模式=%s sid=%s"
+                        % (int(round(_w)), _res, self.mode,
+                           snap.get("recognized_song_id", -1)))
+            except Exception:                                     # noqa: BLE001
+                pass
             meta = MODE_META[self.mode]
             # 过渡时长：区间内微调（高能/快切时更短）
             TR = max(-1.0, min(1.0, snap["energy_trend"]))
@@ -2640,9 +2769,9 @@ class AutoVJEngine(QObject):
                 # 未标动态：不分类（低能量不选）
             # ★ 用目标能量判偏好：否则段落选了 drop、候选却还按实测低能量挑低动态素材
             _E_sel = self._energy_for_switch(snap)
-            if _E_sel >= 0.65 and hi:
+            if _E_sel >= 0.80 and hi:
                 prefer = hi                    # 高潮段：优先高动态/频闪
-            elif _E_sel < 0.50:
+            elif _E_sel < 0.40:
                 # 缓和段：只低动态；低动态被 cooldown/recent 过滤完→中动态兜底（少选）；
                 # 无低/中动态→避开高动态/频闪（未标动态做最后手段）。绝不选未标/高动态/频闪优先。
                 if lo:
@@ -2656,8 +2785,11 @@ class AutoVJEngine(QObject):
                     prefer = [i for i in idxs if i not in avoid]
                     fallback = None
             else:
-                # 中能量（0.5~0.65）：排除频闪（高动态仍可参与），频闪只在高潮段出现
-                prefer = [i for i in idxs if i not in flash]
+                # ★ 2026-10-30 用户：「再把中动态也加进来 0.4到0.8」——
+                #   中能量段**优先中动态素材**，没有中动态才退回"排除频闪"的全池。
+                #   频闪仍只在高潮段（≥0.80）出现。
+                prefer = ([i for i in mid if i not in flash]
+                          or [i for i in idxs if i not in flash])
         cands = prefer or idxs
         cands = [i for i in cands if i != lay.cur
                  and (lay.clips[i].path not in lay.recent or now - lay.last_switch_t > cooldown)]
@@ -2961,7 +3093,17 @@ class AutoVJEngine(QObject):
             if not since:
                 lay._silent_noframe_since = now
                 return
-            if now - since <= _NOFRAME_GRACE:
+            # ★ 宽限按素材体量自适应：大素材冷打开 + 首帧本来就慢，用 2.2s 会误判
+            #   ⇒ 重建 ⇒ 重新读盘 ⇒ 更卡（见 `_NOFRAME_GRACE_BIG` 注释）。
+            _gp = getattr(lay.clips[lay.cur], "path", "") if lay.clips else ""
+            if getattr(lay, "_silent_grace_path", None) != _gp:
+                lay._silent_grace_path = _gp
+                try:
+                    _big = os.path.getsize(_gp) > _NOFRAME_BIG_BYTES
+                except OSError:
+                    _big = False
+                lay._silent_grace = _NOFRAME_GRACE_BIG if _big else _NOFRAME_GRACE
+            if now - since <= float(getattr(lay, "_silent_grace", _NOFRAME_GRACE)):
                 return
             clip = lay.clips[lay.cur]
             path = getattr(clip, "path", "")
@@ -3011,6 +3153,7 @@ class AutoVJEngine(QObject):
         # ---- 3) 有播放器但长期不活跃（活跃标记漏掉了它）⇒ 补进缓存 + 激活，**不重建** ----
         if not getattr(p, "_active", False):
             # `pause_silent` 的"静音挂起"是**有意**不活跃，绝不能强激活它
+            # （不可见图层在上面 `visible` 早返回时就已经放过了，这里不用再判）。
             if getattr(lay, "pause_silent", False):
                 return
             since = getattr(lay, "_silent_inactive_since", 0.0)
@@ -3124,6 +3267,52 @@ class AutoVJEngine(QObject):
             log.write("[%s] %s" % (time.strftime("%H:%M:%S"), self._health_snapshot(now)))
         except Exception:                                          # noqa: BLE001
             pass
+        try:
+            self._stutter_watch(now)
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _stutter_watch(self, now):
+        """多层同时停帧 ⇒ 记一行（判定见 `_STUTTER_AGE` 常量注释）。
+
+        只统计**可见且活跃**的层：不可见图层有意不解码（`_tick_locked`），
+        它的帧龄天然会涨，算进来就会天天误报。
+        """
+        if now - getattr(self, "_stutter_log_t", 0.0) < _STUTTER_LOG_EVERY:
+            return
+        hits = []
+        for lay in self.layers:
+            if not (bool(getattr(lay, "visible", True))
+                    or bool(getattr(lay, "trans_active", False))):
+                continue
+            p = getattr(lay, "player", None)
+            if p is None or not hasattr(p, "_last_t"):
+                continue
+            if not getattr(p, "_active", False):
+                continue
+            last = float(getattr(p, "_last_t", 0.0) or 0.0)
+            if not last:
+                continue
+            age = now - last
+            if age < _STUTTER_AGE:
+                continue
+            nm = ""
+            try:
+                nm = os.path.basename(getattr(lay.clips[lay.cur], "path", ""))
+            except Exception:                                      # noqa: BLE001
+                nm = ""
+            hits.append("「%s」age=%.2fs frames=%d %s"
+                        % (getattr(lay, "name", "?"), age,
+                           int(getattr(p, "_frames", 0) or 0), nm))
+        if len(hits) < 2:
+            return
+        self._stutter_log_t = now
+        try:
+            import stallwatch
+            stallwatch.log_line("!! 多层同时停帧（%d 层）：%s"
+                                % (len(hits), " | ".join(hits)))
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _gpu_token(self):
         """返回 `gpu=` 用的记号（'1' / '0' / '?'），并在**状态变化**时写一条醒目日志。
@@ -3190,7 +3379,11 @@ class AutoVJEngine(QObject):
                             % (i, name, vis, cur, nclips, in_cache))
                 continue
             last = float(getattr(p, "_last_t", 0.0) or 0.0)
-            age = ("%.2f" % (now - last)) if last else "-"
+            # ★ 不可见图层现在**有意**不解码（见 `_tick_locked` 活跃标记），它的
+            #   `age` 会一直涨 —— 那是挂起、不是卡帧。不区分的话以后一看日志就会
+            #   把"用户关掉的图层"误判成冻帧（本文件已经被这类误读坑过多次）。
+            _susp = (not vis) and (not getattr(p, "_active", False))
+            age = "-" if _susp else (("%.2f" % (now - last)) if last else "-")
             segs.append("L%d %s vis=%d cur=%d/%d p=id%d incache=%d active=%d frames=%d age=%s ended=%d"
                         % (i, name, vis, cur, nclips, id(p), in_cache,
                            1 if getattr(p, "_active", False) else 0,
@@ -3714,6 +3907,15 @@ class AutoVJEngine(QObject):
     def _cue_peer_song_ids(self, tr):
         """本机曲库里**同一首音乐**的其它 `song_id`（判据与认歌同级，按可靠性从高到低）。
 
+        ★ **0 级（最高优先）：`cfg["cue"]["fp_same"]`** —— 导入码表时用**指纹内容
+          重合率**判出来的"码表这首 = 本机这首"（`cue_fp_pack.match_pack_local`）。
+          为什么必须放在 `fp_id` 之前（用户 2026-10-30 两次强调）：
+            `identity.fp_id` 是 `sha1(全部哈希串联)[:16]`，**一个哈希不同签名就变**，
+            只能判"完全同一个 PCM"；而"同一首歌的两个版本，只是专辑不同"在指纹层面
+            是**大面积重合、少数哈希不同** ⇒ 签名必不相同、四级链全都判不出来。
+            实测：同一文件 100% / 同曲不同混音 11.5% / 无关曲目 8.7~9.1%。
+          这一步**只读 cfg**（导入时算好落盘），运行期零重活。
+
         ① `fp_id` 相等（同一段音频的指纹签名 —— 换容器/改名仍命中）
         ② `file_md5` 相等（同一文件字节）
         ③ `meta_id` 相等（名+艺人+时长取整 2 秒；两边缺失时现算，与 `Identity.meta_key` 同式子）
@@ -3724,13 +3926,28 @@ class AutoVJEngine(QObject):
         idn = getattr(tr, "identity", None)
         if idn is None:
             return set()
+        out = set()
+        fp_id = str(getattr(idn, "fp_id", "") or "").strip()
+        # ---- 0 级：导入时的指纹内容对账（最优判据，见 docstring）----
+        try:
+            _same = (self.cfg["cue"] or {}).get("fp_same") or {}
+        except Exception:                                        # noqa: BLE001
+            _same = {}
+        if fp_id and isinstance(_same, dict):
+            _p = str(_same.get(fp_id) or "")
+            if _p:
+                try:
+                    _sid = self._cue_song_id_of(_p)
+                    if _sid >= 0:
+                        out.add(int(_sid))
+                except Exception:                                # noqa: BLE001
+                    pass
         try:
             meta = self.cfg["music_meta"] or {}
         except Exception:                                        # noqa: BLE001
-            return set()
+            meta = {}
         if not isinstance(meta, dict) or not meta:
-            return set()
-        fp_id = str(getattr(idn, "fp_id", "") or "").strip()
+            return out                       # 曲库为空也要把 0 级结果带回去
         fmd5 = str(getattr(idn, "file_md5", "") or "").strip().lower()
         mid = str(getattr(idn, "meta_id", "") or "").strip()
         title = str(getattr(idn, "title", "") or "")
@@ -3746,7 +3963,6 @@ class AutoVJEngine(QObject):
         except Exception:                                        # noqa: BLE001
             _cs, norm = None, None
             want_nt = want_na = ""
-        out = set()
         for p, rec in meta.items():
             if not isinstance(rec, dict):
                 continue
@@ -4146,81 +4362,58 @@ class AutoVJEngine(QObject):
         return self._cue_rt is not None
 
     def _cue_auto_bind(self, path, query):
-        """自动选表 + 装表（换表）；没有候选 ⇒ **卸表**（明确策略，不静默保留错表）。"""
-        hits = self.cue_sheets_for_track(**query)
-        if not hits:
-            if self._cue_auto_sheet:
-                self.clear_cue_sheet(silent=True)
-                self._cue_auto_sheet = ""
-            return False
+        """**只跟随已装载的那张码表**（用户 2026-10-30：「灰掉的不会应用到演出的扫描对齐中」）。
+
+        规则（与旧版的差别在第 3 条，这是本次改动的全部意义）：
+          1. 已装载表 + 曲目属于它     → 只重建运行时（`_cue_rebind_track`，不关解码器）
+          2. 已装载表 + 曲目不属于它   → **停用编排**（`_cue_unbind_track`），**不换表**
+          3. **没装载任何表**          → **不自动装**（旧版会遍历全库挑一张装上）
+          4. 不再写 `cfg["cue"]["prefer"]`：没有"自动挑表"这一步了
+             （`choose_sheet()` 仍供码表页的手动多选使用）
+
+        为什么必须改：旧版第一行是 `hits = self.cue_sheets_for_track(**query)` ——
+        **全库遍历所有码表**，命中就 `set_cue_sheet()`。曲库里躺 5 张表的歌时，
+        放一首只属于"灰表"的歌，那张表会被自动装上并接管画面 ⇒ 演出中随时可能
+        被别的表抢走对齐，现场不可控（用户原话见上）。
+
+        ⚠ 代价（用户已知并接受）：忘记在码表页装载/绑定曲目时，放歌**没有码表编排
+          画面**，走普通能量驱动的自动切换。码表页「装载 / 绑定曲目」是唯一表来源。
+        """
+        if getattr(self, "_cue_sheet", None) is None:
+            return False                       # 3. 没表 ⇒ 不自动装（严格隔离）
+        _same, _tr = self._cue_match_track_local(query)
+        if _same:
+            return True                        # 1a. 表与曲目都对 ⇒ 什么都不做
+        if _tr is not None:
+            return self._cue_rebind_track(_tr)  # 1b. 同一张表内换曲目
+        # 2. 这首歌不属于当前表 ⇒ 停用编排，绝不拿上一首的去对这首
+        self._cue_unbind_track()
+        return False
+
+    def _cue_unbind_track(self):
+        """停用当前**曲目**的编排（**不卸表**）：表还挂着，等下一首属于它的歌。
+
+        为什么单独一个方法：`clear_cue_sheet()` 会把该图层的码表解码器全关掉
+        （下次重开要 70~690ms 首帧黑），而"这首不在本表里"只是暂时没词，
+        表本身还是演出中的那张 ⇒ 只清曲目运行时，不动表与素材。
+
+        清的全是**曲目级**状态，与 `_cue_rebind_track()` 的复位项对齐（铁律 11：
+        新增状态必须有 ≥2 处独立复位 —— 这里与 `set/clear_cue_sheet`、`__init__` 三处）。
+        """
         try:
-            prefer = {}
-            cur = self.cfg["cue"] if isinstance(self.cfg, dict) else None
-            if isinstance(cur, dict):
-                prefer = cur.get("prefer") or {}
+            self._cue_track = None
+            self._cue_bound_cache = None
+            self._cue_rt = None
+            self._cue_bad_song_n = 0
+            self._cue_bad_song_t = 0.0
         except Exception:                                        # noqa: BLE001
-            prefer = {}
-        meta_id = ""
+            pass
         try:
-            meta_id = str(query.get("file_md5") or query.get("fp_id") or query.get("title") or "")
+            if getattr(self, "_cue_policy", None) is not None:
+                self._cue_policy.reset()
         except Exception:                                        # noqa: BLE001
-            meta_id = ""
-        pick = choose_sheet(hits, prefer=prefer, track_meta_id=meta_id)
-        if pick is None:
-            return False
-        want = str(pick.get("path") or "")
-        if want and want == self._cue_auto_sheet:
-            # ★★★ 2026-10-17（用户："Nimbus 能识别但是 era 里没有码表编排的画面"）：
-            #   旧写法只要**包路径没变**就直接 `return True` —— 于是一张包里有多首曲目时，
-            #   换歌**永远不会重绑曲目**，一直用上一首的编排：
-            #     · 现场日志 `sid=216601071`（Nimbus）却 `track=揽月 rt=1 items=10`；
-            #     · 然后"认错歌护栏"发现 sid 不属于揽月 ⇒ `pb=None` ⇒ **一幅画面都不出**。
-            #   ⇒ 必须再比一次**曲目**：包相同但曲目不同 ⇒ 只重建运行时（不关解码器）。
-            if self._cue_sheet is not None and self._cue_track is not None:
-                _same, _tr = self._cue_match_track_local(query)
-                if _same:
-                    return True                 # 表与曲目都对 ⇒ 什么都不做
-                if _tr is not None:
-                    ok = self._cue_rebind_track(_tr)
-                    self._cue_auto_sheet = want if ok else ""
-                    return ok
-            # 表在但曲目认不出来 / 没有表对象 ⇒ 落到下面走完整重装（最稳妥）
-        try:
-            import cuesheet
-            media_dir = ""
-            try:
-                media_dir = str((self.cfg["cue"] or {}).get("media_dir") or "")
-            except Exception:                                    # noqa: BLE001
-                media_dir = ""
-            sheet, info = cuesheet.load(want, media_dir=media_dir or None)
-            tr, _lvl = sheet.match_track(title=query.get("title", ""),
-                                         artist=query.get("artist", ""),
-                                         duration_sec=float(query.get("duration_sec", 0.0) or 0.0),
-                                         fp_id=query.get("fp_id", ""),
-                                         file_name=query.get("file_name", ""),
-                                         file_md5=query.get("file_md5", ""))
-            layer = next((l for l in self.layers if getattr(l, "is_cuesheet", False)), None)
-            # ★ `tr`（`match_track()` 认出来的那一条）随装表一起记到引擎上（`_cue_track`），
-            #   `_cue_beat_len_for()` 优先用它算拍长 —— 码表里的 `file_name` 与本机文件名
-            #   不一致（改名/换目录）时也能拿到正确 bpm，不再退回 `music_meta` 的兜底值。
-            ok = self.set_cue_sheet(sheet, media_paths=info.get("present_media") or {},
-                                    track=tr, layer=layer,
-                                    sheet_id=os.path.basename(want))
-        except Exception as e:                                    # noqa: BLE001
-            self._cue_health("自动装表失败：%s: %s" % (type(e).__name__, e))
-            return False
-        self._cue_auto_sheet = want if ok else ""
-        if ok:
-            # 记住"这首歌用这张表"（同级多张时下次直接用它）
-            try:
-                cur = self.cfg["cue"]
-                pref = cur.setdefault("prefer", {}) if isinstance(cur, dict) else None
-                if isinstance(pref, dict) and meta_id:
-                    pref[meta_id] = want
-                    self.cfg.save()
-            except Exception:                                    # noqa: BLE001
-                pass
-        return ok
+            pass
+        return True
 
     def _cue_auto_position(self):
         """低频轮询指纹识别结果 → 拍位（**0.2s 一次，绝不进 `_compose`**）。
@@ -5782,7 +5975,7 @@ class AutoVJEngine(QObject):
             self._health_log = None
         if self._spout is not None:
             try:
-                self._spout[0].releaseSender()
+                self._spout.close()      # 见 spout_out.SpoutOut：sender 归发送线程所有
             except Exception:
                 pass
             self._spout = None

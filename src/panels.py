@@ -40,6 +40,11 @@ COVER_ICON = 64         # 曲库列表每行左侧的歌曲封面边长默认值
 #   （与码表 UI 的主色一致）。蓝 `#7aa2f7` 已被「导入曲库分析包」占用、
 #   红 `#e06666` 已被「文件缺失」占用 —— 三者语义必须能一眼分开。
 CUE_ROW_COLOR = "#4ec9b0"
+# ★ 2026-10-30（用户要求）：**只有正在演出中使用的码表**（引擎当前装载的那张）
+#   才用青绿；其他码表的曲目一律**灰色** —— 否则曲库里躺着七八张表的歌，
+#   看着像"它们都在参与演出"，现场会误判。
+#   灰不能太暗（要能读），也不能抢色（要明显退到背景）：取中间偏暗的中性灰。
+CUE_ROW_DIM_COLOR = "#6b6b6b"
 # 封面尺寸档位（右键「封面大小」里选）。⚠ 值要在下面的 COVER_SIZES 里唯一，
 #   因为它同时是配置里存的值 —— 改档位就是要让老的配置能对上（对不上回退默认）。
 COVER_SIZES = [("小", 40), ("中", 64), ("大", 96), ("特大", 128)]
@@ -986,6 +991,11 @@ class MusicLibraryDialog(I18nDialog):
         b_rescan.setToolTip("忽略已有结果，重新分析全部")
         b_clear = QPushButton("清除分析数据")
         b_clear.setToolTip("删除全部指纹与自动识别的曲风（可选保留手动设置）")
+        # ★ 2026-10-29：查重入口。同一段音频在库里放两份会把认歌的票劈成两半
+        #   （症状：有时认得出有时认不出），这里给一个主动清理的入口。
+        b_dup = QPushButton(T("查重"))
+        b_dup.setToolTip(T("找出曲库里重复的同一首歌（同一段音频放两份会让认歌变差）"))
+        b_dup.clicked.connect(lambda: self.main.find_duplicate_music())
         b_dir.clicked.connect(self.main.import_music_dir)
         b_file.clicked.connect(self.main.import_music_files)
         self.btn_scan.clicked.connect(lambda: self.main.scan_music(force=False))
@@ -996,6 +1006,7 @@ class MusicLibraryDialog(I18nDialog):
         row.addWidget(self.btn_scan)
         row.addWidget(b_rescan)
         row.addWidget(b_clear)
+        row.addWidget(b_dup)
         row.addStretch(1)
         lay.addLayout(row)
 
@@ -1277,6 +1288,24 @@ class MusicLibraryPanel(QWidget):
         hint.setWordWrap(True)
         hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
         lv.addWidget(hint)
+        # ★★ 2026-10-30（用户要求「增加文字，文字提示」）：曲库行现在有 4 种颜色语义，
+        #   不写图例只能靠猜 —— 尤其新加的「绿=演出中的码表 / 灰=其他码表」这一对，
+        #   两者**都是码表**，差别只在"有没有装载在图层里"，必须说清楚。
+        self.lbl_cue_legend = QLabel(
+            '<span style="color:%s">●</span> 演出中的码表　'
+            '<span style="color:%s">●</span> 其他码表　'
+            '<span style="color:#7aa2f7">●</span> 导入分析包　'
+            '<span style="color:#e06666">●</span> 文件缺失'
+            % (CUE_ROW_COLOR, CUE_ROW_DIM_COLOR))
+        self.lbl_cue_legend.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_cue_legend.setWordWrap(True)
+        self.lbl_cue_legend.setStyleSheet("font-size:11px;")
+        self.lbl_cue_legend.setToolTip(T(
+            "码表曲目的颜色只表示「是否正在参与演出」：\n"
+            "· 青绿 = 该表已装载（绑定到图层），演出中会跟着它切素材 / 换位置\n"
+            "· 灰　 = 该表只在曲库里参考，当前没装载，不影响演出\n"
+            "「来源」列会写明表名，并标「演出中」或「未装载」。"))
+        lv.addWidget(self.lbl_cue_legend)
         lv.addStretch(1)
         self.lbl_filter = QLabel("")
         self.lbl_filter.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
@@ -1482,6 +1511,16 @@ class MusicLibraryPanel(QWidget):
             #     ⇒ 不要在这里补"级联删除"：`music_library` 是用户曲库唯一真源，
             #       级联删错删的是用户本机的真歌。详见 cue_index.library_rows()。
             cue_lib = self._cue_lib_rows()
+            # ★ 2026-10-30（用户「怎么来源里没有码表的选项了」）：还要拿"码表里有、
+            #   本机也有"的那些（`covered_paths`）。它们**不新建行**（同一首歌不列两遍），
+            #   但「来源」列要标出码表名、「来源」下拉里也要能筛出来。
+            #   此前这套可见性**完全依赖 `music_meta` 残缺**：清空时 4 首都判"未覆盖"
+            #   ⇒ 派生行冒出来 ⇒ 下拉里有码表选项；恢复后派生行归零 ⇒ 选项消失，
+            #   用户以为码表数据又丢了。数据一直在，只是没有入口可看。
+            cue_cov = self._cue_covered()
+            # ★ 2026-10-30（用户要求）：只有**正在演出中使用的**那张码表上青绿，
+            #   其他表的曲目灰显。`cue_act` 是"在用表"的曲目身份集合。
+            cue_act = self._active_cue_ids()
             view_meta = meta
             if imp_lib or cue_lib:
                 view_meta = dict(meta)
@@ -1509,7 +1548,7 @@ class MusicLibraryPanel(QWidget):
                 lib = lib + list(imp_lib) + list(cue_lib)
             # ★ 来源下拉在**过滤前**重建（用户可能刚导入新包 / 刚加码表 ⇒ 选项要实时更新）；
             #   程序化重填内部 blockSignals，绝不触发 cascade refresh。
-            self._refresh_source_combo(imp_lib, cue_lib)
+            self._refresh_source_combo(imp_lib, cue_lib, cue_cov)
             src_key = self.cb_src.currentData(Qt.UserRole) or "__all__"
             bpm_b = self.BPM_FILTERS[self.cb_bpm.currentIndex()][1]
             dur_b = self.DUR_FILTERS[self.cb_dur.currentIndex()][1]
@@ -1518,8 +1557,8 @@ class MusicLibraryPanel(QWidget):
             for p in lib:
                 imp = p in imp_lib
                 cue = p in cue_lib
-                # ★ 来源筛选（②）：全部 / 仅本机 / 某导入包 / 仅码表 / 某张码表
-                if not self._src_ok(p, imp, imp_lib, src_key, cue, cue_lib):
+                # ★ 来源筛选（②）：全部 / 仅本机 / 某导入包 / 码表内曲目 / 某张码表
+                if not self._src_ok(p, imp, imp_lib, src_key, cue, cue_lib, cue_cov):
                     continue
                 bpm, dur, exists = self._info(view_meta, p)
                 if not self._in_bucket(bpm, bpm_b):
@@ -1553,15 +1592,23 @@ class MusicLibraryPanel(QWidget):
                     m = view_meta.get(p) or {}
                     imp = bool(m.get("_imported"))
                     cue = bool(m.get("_cue"))
+                    # ★ 2026-10-30：本机也有、但属于某张码表的那一行（不新建行的那些）。
+                    #   提到这里取，是因为**颜色也要用**（原来只在下面的 else 分支里取，
+                    #   结果"本机已有的码表歌"完全不上色，用户看不出它来自码表）。
+                    _cv = None if (imp or cue) else (
+                        (cue_cov or {}).get(p) if cue_cov else None)
+                    # 是否属于**正在演出中使用的**那张表（其他表灰显）
+                    _act = self._cue_row_active(m if cue else _cv, cue_act)
                     genres = "、".join(m.get("genres") or []) or T("未分析")
                     src = m.get("source") or ""
                     bits = []
-                    if bpm:
-                        bits.append("BPM %.0f" % bpm)
-                    else:
+                    # ★★ 2026-10-30（用户：「来源不要显示 bpm 和时长」）：
+                    #   BPM / 时长**各自已经有独立列**，来源列再拼一遍只是把列撑长、
+                    #   把真正有用的标记（未入库 / 指纹 / 文件缺失）挤到看不见。
+                    #   「无网格」**保留** —— 它是"缺数据"的状态提示，不是数值复述
+                    #   （左侧筛选里也有同名项，用户要靠它找需要补扫的歌）。
+                    if not bpm:
                         bits.append(T("无网格"))
-                    if dur:
-                        bits.append("%d:%02d" % (int(dur) // 60, int(dur) % 60))
                     if imp:
                         name = (m.get("title") or m.get("file_name")
                                 or ("#%s" % m.get("song_id")))
@@ -1579,6 +1626,7 @@ class MusicLibraryPanel(QWidget):
                         disp = "🀄 " + (disp or T("未命名"))
                         src = Tf("码表：{}", m.get("sheet")
                                  or os.path.basename(str(m.get("sheet_path") or "")))
+                        src += " · " + (T("演出中") if _act else T("未装载"))
                         bits.append(T("未入库"))
                         fp = str(m.get("fp_id") or "")
                         if fp:
@@ -1592,6 +1640,14 @@ class MusicLibraryPanel(QWidget):
                         disp = os.path.basename(p)
                         if not exists:
                             bits.append(T("文件缺失"))
+                        # ★ 本机也有、但它同时在某张码表里 ⇒ 「来源」标出码表名。
+                        #   为什么要替换 `source`（通常是 localai）而不是并列：
+                        #   「来源」列就一个词的位置，用户问的是"这首歌从哪来"，
+                        #   码表这条信息比"曲风是谁猜的"有用得多；曲风来源在曲风列里有。
+                        #   （`_cv` 已在上面的循环头取过一次，这里不再重复取。）
+                        if _cv:
+                            src = Tf("码表：{}", _cv.get("sheet_name") or "")
+                            src += " · " + (T("演出中") if _act else T("未装载"))
                     # ★★ 2026-10-28：一行拆成 5 列（原来是一串拼接文本）。
                     #   `bits`（未入库/指纹/文件缺失）并进「来源」列，避免列太多。
                     _src_txt = src or ""
@@ -1604,7 +1660,25 @@ class MusicLibraryPanel(QWidget):
                     it = QTableWidgetItem(
                         cover_icon_for(m, p, self.cover_size, need_cover), disp)
                     it.setData(Qt.UserRole, p)
-                    it.setToolTip(disp)
+                    # ★ 2026-10-30（用户要求「增加文字，文字提示」）：
+                    #   码表行给**整行 tooltip**，把"这张表到底在不在演出里"讲明白。
+                    #   只靠颜色不够 —— 绿和灰都是码表，现场没空分辨色差。
+                    _cvrow = m if cue else _cv
+                    if _cvrow:
+                        _sn = str(_cvrow.get("sheet_name") or os.path.basename(
+                            str(_cvrow.get("sheet_path") or "")))
+                        if _act:
+                            it.setToolTip("%s\n\n%s\n%s" % (
+                                disp,
+                                Tf("来自码表「{}」——正在演出中使用", _sn),
+                                T("该表已装载在图层里：切歌、换位置、素材切换都跟着它。")))
+                        else:
+                            it.setToolTip("%s\n\n%s\n%s" % (
+                                disp,
+                                Tf("来自码表「{}」——当前未装载", _sn),
+                                T("只作为曲库参考，不参与演出切换。")))
+                    else:
+                        it.setToolTip(disp)
                     # ★ 复选框（①）：默认未勾选；按重建前的勾选键恢复勾选
                     it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     it.setCheckState(
@@ -1613,9 +1687,14 @@ class MusicLibraryPanel(QWidget):
                     if imp:
                         # 来自导入包：用**蓝**区分（红色是"文件缺失"，别混用语义）
                         it.setForeground(QColor("#7aa2f7"))
-                    elif cue:
-                        # 来自码表：用**青绿**区分（蓝=导入包、红=文件缺失，各占一种）
-                        it.setForeground(QColor(CUE_ROW_COLOR))
+                    elif cue or _cv:
+                        # ★★ 2026-10-30（用户要求）：码表的曲目**分两档**
+                        #   · 属于正在演出中使用的码表 ⇒ 青绿（醒目，要能一眼找到）
+                        #   · 其他码表                    ⇒ 灰（存在但"不参与演出"）
+                        #   为什么必须分：曲库里躺着好几张表的歌，如果全青绿，
+                        #   现场会误判"这些都在跟着演出切"。
+                        it.setForeground(QColor(
+                            CUE_ROW_COLOR if _act else CUE_ROW_DIM_COLOR))
                     elif not exists:
                         it.setForeground(QColor("#e06666"))
                     self.list.setItem(_row, 0, it)
@@ -1637,11 +1716,15 @@ class MusicLibraryPanel(QWidget):
             # 底部统计：勾选数由 _update_lbl 追加（勾选变化时不必整表重建）
             self._stat = {"lib": len(lib), "done": done,
                           "rows": len(rows), "imp": len(imp_lib),
-                          "cue": len(cue_lib)}
+                          # 码表内曲目总数 = 未入库派生行 + 本机已有那些
+                          "cue": len(cue_lib) + len(cue_cov)}
             self._update_lbl()
             self._fit_cols()
             self.lbl_filter.setText(Tf("筛选后 {} / {} 首", len(rows), len(lib)))
             # 缺封面 ⇒ 起一次后台补图，补完再刷一遍（不阻塞、不重复起）
+            # ★ 记下"这一次渲染用的在用表身份集合"，供 `showEvent` 比对
+            #   （见那边的说明：切回曲库页时只在它变了才重建）。
+            self._act_snap = cue_act
             self._start_cover_backfill(need_cover)
         except Exception:                                          # noqa: BLE001
             pass
@@ -1762,14 +1845,20 @@ class MusicLibraryPanel(QWidget):
         self.lbl.setText(lbl)
 
     # ---------------- 来源筛选（用户要求②）----------------
-    def _refresh_source_combo(self, imp_lib, cue_lib=None):
-        """重建「来源」下拉：全部 / 仅本机 / <包名>… / 仅码表 / <码表名>…
+    def _refresh_source_combo(self, imp_lib, cue_lib=None, cue_cov=None):
+        """重建「来源」下拉：全部 / 仅本机 / <包名>… / 码表内曲目（N 首）/ <码表名>…
 
         选项值（`Qt.UserRole` 数据）用**稳定键**而非显示文本：
           `"__all__"` / `"__local__"` / `"pack:<包名>"`（包名可为空串=早期导入）/
-          `"__cue__"`（仅码表派生行）/ `"cue:<码表**绝对路径**>"`。
+          `"__cue__"`（仅码表派生行）/ `"__cue_any__"`（码表内曲目，**含本机已有**）/
+          `"cue:<码表**绝对路径**>"`。
         这样切换语言后文本变了也不会选错；包名/表名是**用户数据**，不走词表翻译
-        （只 `i18n_retranslate` 会把固定的「全部/仅本机/早期导入/仅码表」翻成当前语言）。
+        （只 `i18n_retranslate` 会把固定的「全部/仅本机/早期导入」翻成当前语言）。
+
+        ★ 2026-10-30：`sheets` 现在**同时**从 `cue_cov` 收集。原因——码表曲目可能
+          全部被本机曲库覆盖（`music_meta` 完整的正常状态），那时 `cue_lib` 是空的，
+          下拉里就一个码表选项都没有，用户以为码表没了。码表本身是"用户导入的东西"，
+          它的入口**不该随本机分析数据的状态出现/消失**。
 
         ⚠ 表名会重名（两张表同名、或同名不同目录）⇒ **稳定键用绝对路径**，
           显示文本才用 basename。
@@ -1779,6 +1868,7 @@ class MusicLibraryPanel(QWidget):
         """
         cb = self.cb_src
         cue_lib = cue_lib or {}
+        cue_cov = cue_cov or {}
         try:
             cur = cb.currentData(Qt.UserRole)
         except Exception:                                          # noqa: BLE001
@@ -1789,7 +1879,7 @@ class MusicLibraryPanel(QWidget):
         has_early = "" in packs
         # 收集码表（绝对路径 → 显示用表名）；按表名排序，用户好在列表里找
         sheets = {}
-        for r in cue_lib.values():
+        for r in list(cue_lib.values()) + list(cue_cov.values()):
             sp = str(r.get("sheet_path") or "")
             if sp:
                 sheets[sp] = str(r.get("sheet_name") or "") or os.path.basename(sp)
@@ -1803,7 +1893,11 @@ class MusicLibraryPanel(QWidget):
             if has_early:
                 cb.addItem("早期导入", "pack:")
             if sheets:
-                cb.addItem("仅码表 · 未入库", "__cue__")
+                # 「码表内曲目」= 派生行 + 本机已有的那些（后者才是常态）
+                cb.addItem(Tf("码表内曲目（{} 首）", len(cue_lib) + len(cue_cov)),
+                           "__cue_any__")
+                if cue_lib:
+                    cb.addItem("仅码表 · 未入库", "__cue__")
                 for sp, sn in sorted(sheets.items(), key=lambda kv: kv[1].lower()):
                     cb.addItem(sn, "cue:" + sp)
             # 按稳定键恢复之前的选择；找不到（如那个包/那张表刚被删）就回「全部」
@@ -1818,19 +1912,27 @@ class MusicLibraryPanel(QWidget):
             pass
 
     @staticmethod
-    def _src_ok(path, imp, imp_lib, key, cue=False, cue_lib=None):
+    def _src_ok(path, imp, imp_lib, key, cue=False, cue_lib=None, cue_cov=None):
         """来源筛选判据：`全部` → 恒真；`仅本机` → 排除导入包与码表派生行；
-        `pack:X` → 只要该包；`__cue__` → 只要码表派生行；`cue:<表路径>` → 只要该表。"""
+        `pack:X` → 只要该包；`__cue__` → 只要码表派生行；
+        `__cue_any__` → 只要**码表内曲目**（含本机已有那些）；
+        `cue:<表路径>` → 只要该表的曲目（同样含本机已有那些）。"""
         if key in (None, "", "__all__"):
             return True
         if key == "__local__":
             return not imp and not cue
+        cov = (cue_cov or {}).get(path) or {}
         if key == "__cue__":
             return bool(cue)
+        if key == "__cue_any__":
+            return bool(cue) or bool(cov)
         if isinstance(key, str) and key.startswith("cue:"):
-            if not cue:
+            want = key[4:]
+            if not (cue or cov):
                 return False
-            return (cue_lib or {}).get(path, {}).get("sheet_path", "") == key[4:]
+            sp = ((cue_lib or {}).get(path) or {}).get("sheet_path", "") if cue \
+                else str(cov.get("sheet_path") or "")
+            return sp == want
         if isinstance(key, str) and key.startswith("pack:"):
             if not imp:
                 return False
@@ -1872,6 +1974,73 @@ class MusicLibraryPanel(QWidget):
         except Exception:                                          # noqa: BLE001
             return {}
 
+    def _active_cue_ids(self):
+        """**正在演出中使用的码表**里所有曲目的身份（`fp_id`/`file_md5`/`meta_id`）。
+
+        判据：`engine._cue_sheet` —— 码表页「装载 / 绑定曲目」时由
+        `engine.set_cue_sheet()` 设的那个 `CueSheet` 对象。它是**此刻唯一**
+        参与演出的表；曲库里其他表的歌只是参考 ⇒ 灰显（用户 2026-10-30 要求）。
+
+        ⚠ 为什么用"曲目身份"而不是"表路径"判定：
+          `cuesheet.CueSheet` 是纯内容 dataclass，**没有 path 字段**
+          （路径只存在于 `CueIndex` 的索引条目里，装载时没回填到对象上）。
+          身份判定同样精确到"哪几行属于在用表"，而且不用改 `set_cue_sheet()`
+          的签名（它有 8 处调用，改签名要全线回归）。
+        ⚠ 返回空集 = 当前没装载任何码表 ⇒ 所有码表行都灰。
+          这是**正确语义**：没装表就没有"演出中的码表"。
+        ⚠ 一律 `.lower()` 归一：`identity.file_md5` 可能大写（不同工具产物），
+          而 `music_meta.file_md5` 经 `_as_md5()` 统一小写。
+        """
+        ids = set()
+        try:
+            sheet = getattr(self.main.engine, "_cue_sheet", None)
+        except Exception:                                        # noqa: BLE001
+            sheet = None
+        for t in (getattr(sheet, "tracks", None) or []):
+            idn = getattr(t, "identity", None)
+            if idn is None:
+                continue
+            for v in (getattr(idn, "fp_id", ""),
+                      getattr(idn, "file_md5", ""),
+                      getattr(idn, "meta_id", "")):
+                s = str(v or "").strip().lower()
+                if s:
+                    ids.add(s)
+        return ids
+
+    @staticmethod
+    def _cue_row_active(row, active_ids):
+        """这一行（码表派生行 / 本机覆盖行）是否属于**正在使用**的那张码表。"""
+        if not active_ids or not isinstance(row, dict):
+            return False
+        for k in ("fp_id", "file_md5", "meta_id"):
+            v = str(row.get(k) or "").strip().lower()
+            if v and v in active_ids:
+                return True
+        return False
+
+    def _cue_covered(self):
+        """码表曲目里**本机曲库也有**的那些：`{本机路径: 行数据}`。
+
+        与 `_cue_lib_rows()` 互补且**互斥**（两边判据都在
+        `cue_index._LocalIndex.find()`，不会同一首歌既"未覆盖"又"已覆盖"）：
+          · `_cue_lib_rows()` → 新建行（青绿色，标"未入库 + 指纹"）
+          · 本函数            → 不新建行，只让「来源」列显示码表名、并能被筛选
+
+        为什么需要（用户 2026-10-30「怎么来源里没有码表的选项了」）：正常状态下
+        码表曲目本机都有 ⇒ 派生行为 0 ⇒ 码表在曲库面板上"看不见了"。数据没丢，
+        缺的是入口。
+
+        ⚠ 每次 `refresh()` 现算，但很便宜：`load_cfg` 纯内存 + 每张表一次 `isfile`。
+        ⚠ 异常 ⇒ `{}`：曲库面板绝不能因为码表问题变空列表。
+        """
+        try:
+            import cue_index as _CI
+            idx = _CI.CueIndex().load_cfg(self.main.cfg)
+            return _CI.covered_paths(self.main.cfg, idx)
+        except Exception:                                          # noqa: BLE001
+            return {}
+
     def _start_cover_backfill(self, paths):
         """后台补封面（串行、可中断）。⚠ 已经在跑就不重复起。"""
         try:
@@ -1893,6 +2062,33 @@ class MusicLibraryPanel(QWidget):
             if n > 0:
                 self.refresh()
         except Exception:                                          # noqa: BLE001
+            pass
+
+    def showEvent(self, ev):
+        """切回曲库页时，**若"演出中的码表"变了**就重建列表。
+
+        ★★ 2026-10-30（用户：「加上了怎么曲库还是灰的」）：
+          码表曲目的青绿/灰是由 `_active_cue_ids()`（引擎当前装载的那张表）决定的，
+          但它**只在 `refresh()` 里读一次**。用户在码表页把表装载/卸载之后切回曲库，
+          列表还是上一次的渲染 ⇒ 明明是"演出中"的表，歌却还是灰的，看着像没生效。
+          现场日志对得上：`cue_health` 里 `sheet=1`（表确实装上了）而曲库仍旧灰。
+
+        ⚠ **不能无条件 refresh**：它会 `clearContents()` 整表重建，滚动位置、键盘焦点、
+          多选状态全丢 —— 用户只是切个页签，列表跳回顶部会很烦。
+          所以只在"在用表身份集合"真的变了才重建（比对 `refresh()` 时留的快照）。
+        """
+        super().showEvent(ev)
+        try:
+            cur = self._active_cue_ids()
+        except Exception:                                        # noqa: BLE001
+            return
+        prev = getattr(self, "_act_snap", None)
+        if prev is not None and prev == cur:
+            return
+        self._act_snap = cur
+        try:
+            self.refresh()
+        except Exception:                                        # noqa: BLE001
             pass
 
     def closeEvent(self, ev):
@@ -3111,6 +3307,13 @@ class LayerStackPanel(QWidget):
                 label = (label_fn(e) if label_fn is not None
                          else (os.path.basename(p) or p))
                 cmb.addItem(label, p)
+                # ★ 2026-10-30：名字统一成**文件名**后，包内标题（可能与文件名不同，
+                #   实测 `测试151.ercue` 的 title 是 `测试11`）放进 tooltip，信息不丢。
+                try:
+                    cmb.setItemData(cmb.count() - 1,
+                                    cue_page.sheet_tooltip(e), Qt.ToolTipRole)
+                except Exception:                                # noqa: BLE001
+                    cmb.setItemData(cmb.count() - 1, p, Qt.ToolTipRole)
                 if cur and (cur == os.path.basename(p) or cur == label or cur == p):
                     sel = cmb.count() - 1
                     found = True
@@ -3119,8 +3322,10 @@ class LayerStackPanel(QWidget):
             if cur and not found:
                 # ⚠ 表名兜底链：去扩展名 → 原文件名 → 原字符串 →「（已绑定的码表）」
                 #   **绝不允许下拉出现空文本**（空文本会被读成"没绑"，与「（无码表）」混淆）
-                label = (os.path.splitext(os.path.basename(cur))[0]
-                         or os.path.basename(cur) or cur or "").strip()
+                # ★ 与索引里的项保持**同一口径**：完整文件名（含扩展名）。
+                #   原来这里去掉了扩展名（"测试151"），而列表里是"测试151.ercue"
+                #   ⇒ 同一张表在"已绑定但索引缺失"时又显示成第三个名字。
+                label = (os.path.basename(cur) or cur or "").strip()
                 cmb.addItem(label or T("（已绑定的码表）"), "__bound__")
                 sel = cmb.count() - 1
             cmb.addItem(T("导入新码表…"), "__import__")

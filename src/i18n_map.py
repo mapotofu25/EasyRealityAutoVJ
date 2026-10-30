@@ -234,6 +234,39 @@ ZH2EN = {
     "选择后输出窗口会全屏到对应显示器（适合双屏演出）":
         "The output window will go fullscreen on the selected display (for dual-screen shows)",
     "Spout 输出": "Spout Output",
+    # ★ 2026-10-30：复选框标签带用途说明（全角括号，中文排版更规整）。
+    #   「本地」= 只有同一台电脑上的程序能收；「局域网」= 通过网络发给别的设备。
+    "Spout 输出（本地）": "Spout Output (Local)",
+    "NDI 输出（局域网）": "NDI Output (LAN)",
+    "**本地**输出：把画面实时共享给同一台电脑上的程序（OBS 装 Spout 插件后选本 Sender；局域网里别的机器看不到）":
+        "**Local** output: shares frames with programs on THIS computer only "
+        "(in OBS pick this sender with the Spout plugin; other machines on the LAN cannot see it)",
+    "**局域网**输出：通过网线/WiFi 把画面+声音发给别的电脑、手机（本机也能收）。运行时已随软件自带，接收端需装 NDI Runtime":
+        "**LAN** output: sends video+audio over the network to other computers/phones "
+        "(this machine can receive it too). Runtime is bundled; the receiver needs NDI Runtime",
+    "本机共享名（默认 {}）": "Local sender name (default {})",
+    "局域网源名（默认 {}）": "LAN source name (default {})",
+    "OBS 里选/填这个完整名：{}": "Pick / type this full name in OBS: {}",
+    "本机 {}": "This PC {}",
+    "OBS 的 NDI 源列表里找上面这个名字。本机名由 NDI 自动加，源名本身不含它。":
+        "Look for the name above in OBS's NDI source list. The machine name is added "
+        "by NDI; the source name itself does not contain it.",
+    "OBS 的 NDI 源列表里就是这个名字。\n"
+    "前面的本机名由 NDI 自动加，源名本身不含它（否则会重复两遍）。":
+        "This is exactly what OBS's NDI source list shows.\nThe machine-name prefix is "
+        "added by NDI; the source name does not contain it (otherwise it repeats).",
+    "实测：源名 `EasyRealityAutoVJ` ⇒ 接收端 `本机名 (EasyRealityAutoVJ)`。\n"
+    "所以源名里绝不能再写本机名，否则会变成「本机名 (本机名 (源名))」。":
+        "Measured: source name `EasyRealityAutoVJ` ⇒ receivers see "
+        "`<machine> (EasyRealityAutoVJ)`.\nNever put the machine name in the source name, "
+        "or you get `<machine> (<machine> (name))`.",
+    "本机电脑名：NDI 接收端会把它显示在源名前面":
+        "Machine name: NDI shows it in front of the source name",
+    "NDI 接收端显示的名字固定是「机器名 (源名)」，机器名由 NDI 自动加。\n"
+    "所以上面的源名里不要再写机器名，否则会变成「机器名 (机器名 (源名))」。":
+        "NDI always shows “<machine name> (<source name>)”; the machine name is added "
+        "automatically by NDI.\nDo NOT repeat it in the source name, or you get "
+        "“machine (machine (name))”.",
     "把画面实时共享给本机其他程序（OBS 需装 Spout 插件后选本 Sender）":
         "Share frames to other local apps in real time (install the Spout plugin in OBS, then pick this Sender)",
     "Sender 名称（OBS 里显示的名字）": "Sender Name (shown in OBS)",
@@ -499,9 +532,21 @@ ZH2EN = {
     # ==================== 占位符模板（供 i18n.Tf 使用）====================
     "已有扫描在进行中，请稍候。": "A scan is already running, please wait.",
     "扫描正在进行中，请稍后再清除。": "A scan is running, please try again later.",
-    "将删除全部已建立的指纹与自动识别的曲风。\n音乐文件本身和曲库列表不会被删除。":
-        "This deletes all fingerprints and auto-detected genres.\n"
-        "Music files and the library list are kept.",
+    # ★ 2026-10-30：文案随「清除分析数据」的语义一起改（只清本机算法产物，
+    #   码表与导入的曲库分析包一律保留）。中文原文是 key，必须与 ui_main 逐字一致。
+    "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、曲风、自动段落。\n"
+    "以下内容一律保留：\n"
+    "  · 音乐文件与曲库列表\n"
+    "  · 手工标注（手改的 BPM / 拍锚点 / 段落）\n"
+    "  · **码表**：码表本身与它内嵌曲目的指纹（照常认歌）\n"
+    "  · **导入的曲库分析包**：曲风、节拍网格、封面、指纹":
+        "This clears **this machine's auto-analysis**: fingerprints, BPM, beat grid, "
+        "genres, auto sections.\n"
+        "These are always kept:\n"
+        "  · Music files and the library list\n"
+        "  · Manual edits (hand-set BPM / beat anchors / sections)\n"
+        "  · **Cue sheets**: the sheet itself and its embedded tracks' fingerprints\n"
+        "  · **Imported library packages**: genres, beat grid, covers, fingerprints",
     "保留手动设置过的曲风": "Keep manually set genres",
     "以下 {} 个素材已在素材库中：": "The following {} clip(s) are already in the library:",
     "确定从素材库移除「{}」吗？\n（图层中的该素材会一并移除，标签与摆位也会清除）":
@@ -1019,6 +1064,44 @@ ZH2EN = {
     # ==================== 曲库里「码表带来的曲目」（2026-10-17）====================
     # 派生行（青绿）：只列本机曲库没覆盖的码表曲目，跟随码表存在/消失。
     "仅码表 · 未入库": "Cue sheets only · Not in library",
+    # ★ 2026-10-30：码表曲目**本机也有**时的入口（此前只有"未入库"那批，
+    #   一旦本机分析数据完整，码表在曲库面板上就"消失"了）。
+    "码表内曲目（{} 首）": "Cue-sheet tracks ({})",
+    # ★ 2026-10-30：码表行分"演出中 / 未装载"两档（绿 / 灰）+ 图例与 tooltip。
+    "演出中": "In show",
+    "未装载": "Not loaded",
+    "来自码表「{}」——正在演出中使用": "From cue sheet “{}” — in use in the show",
+    "该表已装载在图层里：切歌、换位置、素材切换都跟着它。":
+        "This sheet is loaded: track changes, position and clip switches follow it.",
+    "来自码表「{}」——当前未装载": "From cue sheet “{}” — not loaded",
+    "只作为曲库参考，不参与演出切换。":
+        "Reference only; it does not drive the show.",
+    "码表曲目的颜色只表示「是否正在参与演出」：\n"
+    "· 青绿 = 该表已装载（绑定到图层），演出中会跟着它切素材 / 换位置\n"
+    "· 灰　 = 该表只在曲库里参考，当前没装载，不影响演出\n"
+    "「来源」列会写明表名，并标「演出中」或「未装载」。":
+        "Colours on cue-sheet rows only mean “is it driving the show?”\n"
+        "· Teal = the sheet is loaded (bound to a layer); the show follows it\n"
+        "· Grey = reference only, not loaded, does not affect the show\n"
+        "The Source column shows the sheet name plus In show / Not loaded.",
+    # ★ 2026-10-30：导入码表后「本机已有同一首」的弹窗（按**指纹内容重合率**判定）。
+    "「{}」里有 {} 首歌，本机曲库已经有同一首：":
+        "“{}” contains {} track(s) you already have in this library:",
+    "　· {}　←　{}（指纹吻合 {:.0f}%）": "　· {}　←　{} (fingerprint match {:.0f}%)",
+    # ⚠ key 必须与 `cue_page.SAME_SONG_DETAIL` **逐字一致**（测试会校验）
+    "判定方式：指纹内容比对（不是文件名、也不是 fp_id 签名）。\n"
+    "同一首歌换专辑 / 换容器 / 重新压制后，fp_id 会完全不同，但指纹内容大面积重合。\n"
+    "\n"
+    "这些歌不会在曲库里重复出现：本机那一条会标上「码表：表名」并用颜色区分\n"
+    "（青绿 = 这张表正在演出中，灰 = 未装载）。\n"
+    "演出时画面用码表的编排；BPM / 段落仍用本机的分析结果。":
+        "How this is decided: fingerprint content overlap (not file name, not the fp_id signature).\n"
+        "Re-releasing the same song on another album / container / bitrate changes the fp_id, "
+        "but the fingerprints still overlap heavily.\n"
+        "\n"
+        "These tracks are NOT duplicated in the library: the local row is tagged "
+        "“Cue sheet: <name>” and colour-coded (teal = that sheet is in the show, grey = not loaded).\n"
+        "The show uses the cue sheet's arrangement; BPM / sections still come from local analysis.",
     "码表：{}": "Cue sheet: {}",
     "未入库": "Not in library",
     "未命名": "Untitled",
@@ -1122,6 +1205,36 @@ ZH2EN = {
     "自动模式按当前曲风挑效果；强度 = 全局强度（上限六成）× 能量。\n能量 0.15 以下休眠、0.70 以上满额 —— 缓拍几乎无效果，高潮最明显。":
         "Auto mode picks effects by genre; strength = global strength (capped at 60%) × energy.\n"
         "Sleeps below 0.15 energy, full above 0.70 — almost nothing in calm parts, strongest at the drop.",
+
+    # ---- 曲库查重（2026-10-29）----
+    '发现重复曲目': 'Duplicate tracks found',
+    '项目': 'Item',
+    '文件 A': 'File A',
+    '文件 B': 'File B',
+    '标题': 'Title',
+    '作者': 'Artist',
+    '格式 / 大小': 'Format / Size',
+    '有码表': 'Cue sheet',
+    '完整路径': 'Full path',
+    '是': 'Yes',
+    '否': 'No',
+    '都保留': 'Keep both',
+    '稍后决定': 'Decide later',
+    '查重': 'Find duplicates',
+    '没有发现重复曲目。': 'No duplicate tracks found.',
+    '指纹重合 {}%（名字不同，但确认是同一段音频）': 'Fingerprint overlap {}% (different names, same audio)',
+    '标题相似度 {}%，时长相差 {} 秒': 'Title similarity {}%, duration differs by {} s',
+    '同一段音频在曲库里放两份，认歌的票会被劈成两半 —— 表现是「有时认得出、有时认不出」。建议只留一份。': "Two copies of the same audio split the recognition votes in half -- the symptom is 'sometimes it recognises, sometimes it doesn't'. Keep just one.",
+    '建议保留 A —— 它有码表。': 'Suggestion: keep A -- it has a cue sheet.',
+    '建议保留 B —— 它有码表。': 'Suggestion: keep B -- it has a cue sheet.',
+    '建议保留 {} —— 文件更大，通常是无损那份。': 'Suggestion: keep {} -- larger file, usually the lossless one.',
+    '保留 A，移除 B': 'Keep A, remove B',
+    '保留 B，移除 A': 'Keep B, remove A',
+    '移除只删曲库条目，不会删除磁盘上的音频文件。': 'Removing only deletes the library entry; audio files on disk are untouched.',
+    '已从曲库移除 {} 份重复条目（磁盘上的音频文件没有动）。': 'Removed {} duplicate entries from the library (audio files on disk untouched).',
+    '找出曲库里重复的同一首歌（同一段音频放两份会让认歌变差）': 'Find duplicate tracks in the library (two copies of the same audio hurt recognition)',
+
+    '请保留你平时播放的那一份 —— 另一份只是重复入库。': 'Keep the copy you actually play -- the other one is just a duplicate import.',
 }
 
 

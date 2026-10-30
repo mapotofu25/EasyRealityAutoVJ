@@ -58,6 +58,10 @@ cmd = [
     # ★ 应用图标定位（main.py 在 try 里惰性 `import appicon`，静态分析可能漏 ⇒ 显式给出）
     "--hidden-import", "appicon",
     "--hidden-import", "ndi_out",
+    # ★ Spout 发送（2026-10-29 新增）：engine 里是 `import spout_out` 的**运行时**导入
+    #   （和 ndi_out 一样包在 try 里），PyInstaller 静态分析扫不到 ⇒ 必须显式列出，
+    #   否则包里 `import spout_out` 必失败 ⇒ Spout 输出整条静默失效（只剩退避日志）。
+    "--hidden-import", "spout_out",
     "--hidden-import", "dxvnative",
     "--hidden-import", "asio_engine",
     "--hidden-import", "wasapi_capture",

@@ -65,8 +65,10 @@ class EnergySectionDialog(QDialog):
         root.addWidget(head)
 
         self.tbl = QTableWidget(0, 5, self)
+        # ★ 2026-10-30 用户要求：「能量 改成该段平均能量」「依据输入的能量数值自动确定挡位」
+        #   ⇒ 表头直接写清楚：能量是**该段平均**，档位是**自动**算的（不再手动选）。
         self.tbl.setHorizontalHeaderLabels(
-            ["起点 (秒)", "终点 (秒)", "档位", "能量 0~1", "名称"])
+            ["起点 (秒)", "终点 (秒)", "档位（自动）", "该段平均能量", "名称"])
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -149,13 +151,15 @@ class EnergySectionDialog(QDialog):
         it1.setFlags(it1.flags() & ~Qt.ItemFlag.ItemIsEditable)   # 终点由下一段起点决定
         it1.setForeground(Qt.GlobalColor.gray)
         self.tbl.setItem(i, 1, it1)
-        cb = QComboBox()
-        for t in TIER_ORDER:
-            cb.addItem(TIER_LABEL[t], t)
-        tier = str(r.get("tier") or "mid")
-        cb.setCurrentIndex(TIER_ORDER.index(tier) if tier in TIER_ORDER else 1)
-        cb.currentIndexChanged.connect(self._on_cell_changed)
-        self.tbl.setCellWidget(i, 2, cb)
+        # ★★ 2026-10-30 用户要求「依据输入的能量数值自动确定挡位」「去掉手动改挡位」
+        #   ⇒ 档位列改成**只读显示**，值由能量列算出（同 `sections.tier_from_energy`）。
+        #   为什么：档位本来就是能量的函数，两处各写一份会打架（用户把能量改成 0.9
+        #   而档位还挂着手选的 low ⇒ 演出时按 low 换池，与看到的数字对不上）。
+        _e0 = float(r.get("energy") or 0.0)
+        it_tier = QTableWidgetItem(TIER_LABEL.get(S.tier_from_energy(_e0), ""))
+        it_tier.setFlags(it_tier.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        it_tier.setForeground(Qt.GlobalColor.gray)
+        self.tbl.setItem(i, 2, it_tier)
         sp = QDoubleSpinBox()
         sp.setRange(0.0, 1.0)
         sp.setSingleStep(0.05)
@@ -176,8 +180,9 @@ class EnergySectionDialog(QDialog):
                 t0 = 0.0
             cb = self.tbl.cellWidget(i, 2)
             sp = self.tbl.cellWidget(i, 3)
-            tier = cb.currentData() if isinstance(cb, QComboBox) else "mid"
             energy = sp.value() if isinstance(sp, QDoubleSpinBox) else 0.5
+            # ★ 2026-10-30：档位一律由能量算（不再读手动下拉，也没有下拉了）
+            tier = S.tier_from_energy(float(energy))
             it4 = self.tbl.item(i, 4)
             rec = {"t0": t0, "energy": float(energy),
                    "tier": str(tier or "mid"),
@@ -197,7 +202,26 @@ class EnergySectionDialog(QDialog):
         return self._rows
 
     def _on_cell_changed(self, *_a):
+        self._refresh_tier_col()      # 能量改了 ⇒ 档位列跟着变（档位不再手动选）
         self._commit()
+
+    def _refresh_tier_col(self):
+        """按能量列重算"档位"列（只读显示，见 `_append_row` 的说明）。"""
+        for i in range(self.tbl.rowCount()):
+            sp = self.tbl.cellWidget(i, 3)
+            try:
+                e = float(sp.value()) if isinstance(sp, QDoubleSpinBox) else 0.5
+            except (TypeError, ValueError):
+                e = 0.5
+            it = self.tbl.item(i, 2)
+            if it is None:
+                it = QTableWidgetItem()
+                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                it.setForeground(Qt.GlobalColor.gray)
+                self.tbl.setItem(i, 2, it)
+            want = TIER_LABEL.get(S.tier_from_energy(e), "")
+            if it.text() != want:
+                it.setText(want)
 
     def _update_grid_hint(self):
         try:

@@ -112,6 +112,36 @@ HIGHLIGHTS = [
      "boundaries, clip switching, effect switching and colour rotation all snap to the "
      "same 8-beat grid as the waveform (anchor + 8n×beat_len); tracks without sections "
      "keep the old measured-energy behaviour"),
+    ("曲库查重（扫到重复会弹窗让你选）", "Duplicate detection with a side-by-side dialog",
+     "同一段音频在曲库里放两份，认歌的票会被劈成两半 —— 表现是「有时认得出、有时认不出」，"
+     "而且引擎会在两份之间来回跳。现在扫描结束后会自动查一遍（曲库面板也有「查重」按钮），"
+     "把疑似重复的两份并排列出来：文件名、标题、作者、时长、格式大小、BPM，"
+     "由你选保留哪一份。「移除」只删曲库条目，不会删除磁盘上的音频文件。"
+     "判据是「标题相似 + 时长接近」或「指纹重合」两条通道，"
+     "并专门排除 remix / VIP / extended 这类不同版本",
+     "Two copies of the same audio split recognition votes in half (the symptom is "
+     "'sometimes it recognises, sometimes it doesn't'), and the engine flip-flops between "
+     "them. After a scan the library is checked automatically (there is also a "
+     "'Find duplicates' button): suspected pairs are listed side by side with file name, "
+     "title, artist, duration, format/size and BPM, and you choose which one to keep. "
+     "'Remove' only deletes the library entry -- audio files on disk are untouched. "
+     "Detection has two paths (similar title + close duration, or fingerprint overlap) and "
+     "explicitly excludes different versions such as remix / VIP / extended"),
+    ("曲库查重（扫到重复会弹窗让你选）", "Duplicate detection with a side-by-side dialog",
+     "同一段音频在曲库里放两份，认歌的票会被劈成两半 —— 表现是「有时认得出、有时认不出」，"
+     "而且引擎会在两份之间来回跳。现在扫描结束后会自动查一遍（曲库面板也有「查重」按钮），"
+     "把疑似重复的两份并排列出来：文件名、标题、作者、时长、格式大小、BPM，"
+     "由你选保留哪一份。「移除」只删曲库条目，不会删除磁盘上的音频文件。"
+     "判据是「标题相似 + 时长接近」或「指纹重合」两条通道，"
+     "并专门排除 remix / VIP / extended 这类不同版本",
+     "Two copies of the same audio split recognition votes in half (the symptom is "
+     "'sometimes it recognises, sometimes it doesn't'), and the engine flip-flops between "
+     "them. After a scan the library is checked automatically (there is also a "
+     "'Find duplicates' button): suspected pairs are listed side by side with file name, "
+     "title, artist, duration, format/size and BPM, and you choose which one to keep. "
+     "'Remove' only deletes the library entry -- audio files on disk are untouched. "
+     "Detection has two paths (similar title + close duration, or fingerprint overlap) and "
+     "explicitly excludes different versions such as remix / VIP / extended"),
     ("认歌校验（得分 / 最弱窗 / 领先）", "Match verification: score / weakest / lead",
      "照 KDJ 作者公开的判据把认歌的「确认」从一条门槛改成三条：得分（平均）、"
      "最弱窗（把查询窗分三段，取最低的一段）、领先（得分减去别的位置的次高分）。"

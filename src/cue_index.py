@@ -366,63 +366,95 @@ class _LocalIndex:
     这里把本机曲库压成集合/字典 ⇒ 每条 track 只做 O(1) 查表。
     """
 
-    __slots__ = ("fp", "md5", "meta", "names")
+    __slots__ = ("fp", "md5", "meta", "names", "same")
 
     def __init__(self):
-        self.fp = set()            # {fp_id}
-        self.md5 = set()           # {32 hex 文件内容 md5}
-        self.meta = set()          # {meta_id}（只收"有名或艺人"的，与判定口径一致）
-        self.names = {}            # (归一化艺人, 归一化曲名) -> [时长秒 | None]
+        # ★ 2026-10-30：四个容器都**存"本机路径"**（原来只存值/集合）。
+        #   为什么：用户看到「来源」下拉里没有码表了，其实是因为 `music_meta` 恢复后
+        #   4 首码表曲目全被本机覆盖 ⇒ `library_rows()` 的派生行为 0。功能没问题，
+        #   但**界面上再也看不出哪首歌来自码表**。要补回可见性就得反查
+        #   "这条码表曲目 ↔ 本机哪条 music_meta"，所以这里顺手把 path 记下来，
+        #   `find()` 直接返回它 —— 判据仍然只有 `find()` 一份（`covers()` 调它）。
+        self.fp = {}               # {fp_id: 本机路径}
+        self.md5 = {}              # {32 hex 文件内容 md5: 本机路径}
+        self.meta = {}             # {meta_id: 本机路径}（只收"有名或艺人"的，与判定口径一致）
+        self.names = {}            # (归一化艺人, 归一化曲名) -> [(时长秒 | None, 路径)]
+        # ★★ 0 级：`cfg["cue"]["fp_same"]`（`fp_id → 本机路径`）—— 由
+        #   `cue_fp_pack.match_pack_local()` 在导入时用**指纹内容重合率**算出来的。
+        #   为什么它必须排在 `fp_id` 相等之前（用户 2026-10-30：「我期望的是用指纹对比」
+        #   「一首歌它有两个版本，就只是专辑不同，歌曲的时长啊，这些东西完全都是一样的」）：
+        #     `fp_id = sha1(全部哈希)[:16]`，**一个哈希不同签名就变** ⇒ 判不了"同一首的
+        #     不同压制版本"。实测同一文件 100% / 同曲不同混音 11.5% / 噪声 8.7~9.1%。
+        #   ⚠ 由调用方注入（`library_rows` / `covered_paths`），`add()` 不填。
+        self.same = {}
 
-    def add(self, rec):
-        """把一首本机曲目（`cfg["music_meta"][路径]`）并进索引。"""
+    def add(self, rec, path=""):
+        """把一首本机曲目（`cfg["music_meta"][路径]`）并进索引。
+
+        `path` 只用于 `find()` 反查（`_covered()` 这种"只问有没有"的场景可以不传）。
+        """
         if not isinstance(rec, dict):
             return self
+        p = str(path or "")
         fp = str(rec.get("fp_id") or "")
         if fp:
-            self.fp.add(fp)
+            self.fp.setdefault(fp, p)
         m = _as_md5(rec.get("file_md5"))
         if m:
-            self.md5.add(m)
+            self.md5.setdefault(m, p)
         r_title = str(rec.get("title") or "")
         r_artist = str(rec.get("artist") or "")
         if r_title or r_artist:
             mid = str(rec.get("meta_id") or "") or _meta_key(
                 r_title, r_artist, _local_dur(rec))
             if mid:
-                self.meta.add(mid)
+                self.meta.setdefault(mid, p)
         key = (_norm(r_artist), _norm(r_title))
-        self.names.setdefault(key, []).append(_local_dur(rec))
+        self.names.setdefault(key, []).append((_local_dur(rec), p))
         return self
 
-    def covers(self, track):
-        """这条码表曲目是否已被本机曲库覆盖（四级链，见 `_covered()`）。"""
+    def find(self, track):
+        """这条码表曲目被本机曲库覆盖时，返回**那条本机记录的路径**；否则 `None`。
+
+        四级链顺序与可靠性同 `_covered()`：`fp_id` → `file_md5` → `meta_id` →
+        名+艺人+时长差≤2s。**判据只在这里一份**，`covers()` 直接调它。
+        """
         if not isinstance(track, dict):
-            return False
+            return None
+        # ---- 0 级：导入时的指纹内容对账（`fp_id → 本机路径`，见 `__init__` 的说明）----
+        fp0 = str(track.get("fp_id") or "")
+        if fp0 and self.same:
+            p0 = str(self.same.get(fp0) or "")
+            if p0:
+                return p0
         # ① 指纹签名
         fp = str(track.get("fp_id") or "")
         if fp and fp in self.fp:
-            return True
+            return self.fp[fp]
         # ② 文件内容 md5（`song_id` 进不来，见 `_as_md5()`）
         m = _as_md5(track.get("file_md5"))
         if m and m in self.md5:
-            return True
+            return self.md5[m]
         title = str(track.get("title") or "")
         artist = str(track.get("artist") or "")
         if not (title or artist):
-            return False
+            return None
         # ③ meta_id（码表侧缺失时用 title/artist/时长现算）
         mid = str(track.get("meta_id") or "") or _meta_key(
             title, artist, track.get("duration_sec"))
         if mid and mid in self.meta:
-            return True
+            return self.meta[mid]
         # ④ 名 + 艺人 + 时长差 ≤2 秒
         d1 = _dur(track.get("duration_sec"))
         if d1 is not None:
-            for d2 in self.names.get((_norm(artist), _norm(title)), ()):
+            for d2, p in self.names.get((_norm(artist), _norm(title)), ()):
                 if d2 is not None and abs(d1 - d2) <= 2.0:
-                    return True
-        return False
+                    return p
+        return None
+
+    def covers(self, track):
+        """这条码表曲目是否已被本机曲库覆盖（四级链，见 `_covered()`）。"""
+        return self.find(track) is not None
 
 
 def _track_key(track):
@@ -475,7 +507,14 @@ def library_rows(cfg, index=None):
         mm = {}
     if isinstance(mm, dict):
         for _path, rec in mm.items():
-            local.add(rec)
+            local.add(rec, _path)
+    # ★ 0 级：导入码表时用**指纹内容重合率**算好的对账表（`fp_id → 本机路径`）。
+    #   `fp_id` 相等只能判"完全同一个 PCM"，判不了"同一首的不同压制版本"（用户 2026-10-30）。
+    try:
+        _sm = (cfg["cue"] or {}).get("fp_same") or {}
+    except Exception:                                            # noqa: BLE001
+        _sm = {}
+    local.same = dict(_sm) if isinstance(_sm, dict) else {}
 
     for e in entries:
         if not isinstance(e, dict):
@@ -520,4 +559,83 @@ def library_rows(cfg, index=None):
                 "file_name": str(track.get("file_name") or ""),
                 "track_key": tkey,
             })
+    return out
+
+
+def covered_paths(cfg, index=None, require_file=True):
+    """码表曲目 → **已被本机曲库覆盖**的那条路径：`{本机路径: 行数据}`。
+
+    与 `library_rows()` 严格互补，判据**同一份**（都走 `_LocalIndex.find()`）：
+      · `library_rows()`  = 码表有、本机**没有** ⇒ 新建一行（派生行，青绿色）
+      · `covered_paths()` = 码表有、本机**也有** ⇒ 不新建行，只标记「来自哪张码表」
+
+    为什么需要它（用户 2026-10-30「怎么来源里没有码表的选项了」）：
+      `music_meta` 被误清空时，4 首码表曲目全判"未覆盖" ⇒ 派生行冒出来 ⇒
+      「来源」下拉里出现了码表选项；恢复 `music_meta` 后派生行归零，选项自然消失。
+      **那是正确行为**（同一首歌不该列两遍），但用户会以为码表数据又丢了。
+      补这个反查，就能在"不重复列"的前提下保住可见性。
+
+    返回项：`{sheet_path, sheet_name, title, artist, bpm, fp_id}`。
+    """
+    out = {}
+    try:
+        entries = list(getattr(index, "entries", None) or [])
+    except Exception:                                            # noqa: BLE001
+        entries = []
+    if not entries:
+        return out
+    local = _LocalIndex()
+    try:
+        mm = cfg["music_meta"] or {}
+    except Exception:                                            # noqa: BLE001
+        mm = {}
+    if isinstance(mm, dict):
+        for _path, rec in mm.items():
+            local.add(rec, _path)
+    # ★ 0 级：导入码表时用**指纹内容重合率**算好的对账表（`fp_id → 本机路径`）。
+    #   `fp_id` 相等只能判"完全同一个 PCM"，判不了"同一首的不同压制版本"（用户 2026-10-30）。
+    try:
+        _sm = (cfg["cue"] or {}).get("fp_same") or {}
+    except Exception:                                            # noqa: BLE001
+        _sm = {}
+    local.same = dict(_sm) if isinstance(_sm, dict) else {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        pkg = str(e.get("path") or "")
+        # 包文件不在 ⇒ 这张表等于没了 ⇒ 它的覆盖关系也一起消失（与 library_rows 一致）
+        # ⚠ `require_file=False`：**清除分析数据算白名单**时必须关掉这条检查。
+        #   理由：外接盘（U 盘/移动硬盘）没插时包不可达，但码表并没被删除；
+        #   此时若按"表不存在"处理，就会把它的本机指纹一起清掉 ⇒ 插回盘也认不出。
+        #   文件可达性只影响"界面上要不要显示"，不影响"数据该不该保护"。
+        if not pkg:
+            continue
+        if require_file:
+            try:
+                if not os.path.isfile(pkg):
+                    continue
+            except Exception:                                    # noqa: BLE001
+                continue
+        sheet_abs = os.path.abspath(pkg)
+        sheet_name = os.path.basename(sheet_abs)
+        for track in (e.get("tracks") or []):
+            if not isinstance(track, dict):
+                continue
+            p = local.find(track)
+            if not p or p in out:
+                continue                 # 同一首本机歌被多张表覆盖 ⇒ 记先到的那张
+            out[p] = {
+                "sheet_path": sheet_abs,
+                "sheet_name": sheet_name,
+                "title": str(track.get("title") or ""),
+                "artist": str(track.get("artist") or ""),
+                "bpm": _dur(track.get("bpm")) or 0.0,
+                "fp_id": str(track.get("fp_id") or ""),
+                # ★ 2026-10-30（用户要求"只有演出中在用的码表才上色，其他灰色"）：
+                #   判定"这行是不是正在用的那张表"用**曲目身份**而不是表路径 ——
+                #   `cuesheet.CueSheet` 这个 dataclass 里**没有 path 字段**（它只装内容），
+                #   而 `engine._cue_sheet` 拿到的就是它。身份字段与 `library_rows()` 一致。
+                "file_md5": _as_md5(track.get("file_md5")),
+                "meta_id": str(track.get("meta_id") or ""),
+            }
     return out

@@ -171,8 +171,14 @@ def match_clips(genre_tags, energy, library, role="bg", n=6, tier=None):
     energy: 0..1 能量（高能量偏动态素材）
     library: {path: MediaItem}
     role: 图层角色 "fg" / "bg"
-    tier: None / "low" / "high"——能量跨档时 roll 一批符合动态档的素材池：
-          low = 排除高动态+频闪（不足时才回退全池）；high = 高动态/频闪前置，全池随后。
+    tier: None / "low" / "mid" / "high"——能量跨档时 roll 一批符合动态档的素材池：
+          low = 排除高动态+频闪（不足时才回退全池）；mid = 中动态前置、排除频闪；
+          high = 高动态/频闪前置，全池随后。
+          ★ 2026-10-30 用户：「除了高动态低动态 再把中动态也加进来 0.4到0.8」「高动态提到 0.8」
+          ★ 2026-10-30 晚：「中能量改回 0.4 0.75」⇒ 高门槛 0.80 → **0.75**。
+            ⇒ 这里的能量门槛一律 0.40 / 0.75（与 `sections.TIER_LO/TIER_HI`、
+            `engine._energy_tier_switch` 同一套，差一个数值就会出现"界面写中段、
+            引擎按高动态换池"）。
     """
     target = genre_to_visual(genre_tags)
     # 候选：角色匹配且未被排除的素材（排除=logo 等固定素材，不参与自动匹配）
@@ -188,16 +194,22 @@ def match_clips(genre_tags, energy, library, role="bg", n=6, tier=None):
         if s > 0:
             is_hi = DYNAMIC_HIGH in tags or DYNAMIC_FLICKER in tags
             is_lo = DYNAMIC_LOW in tags
-            if energy >= 0.65:
+            if energy >= 0.75:
                 if is_hi:
                     s += 1.5                        # 高潮段偏好高动态/频闪
                 elif is_lo:
                     s -= 1.0                        # 高潮段避开太静的素材
-            elif energy < 0.50:
+            elif energy < 0.40:
                 if is_hi:
                     s -= 3.0                        # 缓和段强避开高动态/频闪（治"还闪"）
                 elif is_lo:
                     s += 1.0                        # 缓和段偏好低动态
+            else:
+                # 中能量段（0.40~0.75）：偏中动态，避开频闪与"太静"
+                if DYNAMIC_MID in tags:
+                    s += 0.8
+                elif is_hi:
+                    s -= 0.6
             scored.append((s, m))
 
     scored.sort(key=lambda x: -x[0])
@@ -205,7 +217,7 @@ def match_clips(genre_tags, energy, library, role="bg", n=6, tier=None):
 
     # 兜底 1：无精确命中 → 按能量从该角色挑（颜色/动态启发）
     if not picked:
-        fallback = FALLBACK_HIGH if energy >= 0.5 else FALLBACK_LOW
+        fallback = FALLBACK_HIGH if energy >= 0.40 else FALLBACK_LOW
         scored2 = [(len(set(m.all_tags()) & fallback), m) for m in cands]
         scored2.sort(key=lambda x: -x[0])
         best = scored2[0][0] if scored2 else 0
@@ -215,10 +227,10 @@ def match_clips(genre_tags, energy, library, role="bg", n=6, tier=None):
     if not picked:
         picked = cands
 
-    # 低能量（<0.5）：动态档优先于曲风匹配。选材顺序：
+    # 低能量（<0.40）：动态档优先于曲风匹配。选材顺序：
     #   1) 曲风匹配的低动态（随机）→ 2) 其他低动态（随机，不满足曲风也优先于中动态）
     #   → 3) 中动态兜底（随机，尽量少选）。未标动态/高动态/频闪一律不选。
-    if energy < 0.50:
+    if energy < 0.40:
         lo_m = [m for m in cands
                 if DYNAMIC_LOW in set(m.all_tags()) and set(m.all_tags()) & target]
         lo_o = [m for m in cands
@@ -241,13 +253,26 @@ def match_clips(genre_tags, energy, library, role="bg", n=6, tier=None):
             picked = hi + rest
         else:
             random.shuffle(picked)
+    elif tier == "mid":
+        # ★ 2026-10-30：中动态档 —— 中动态前置，其余（未标/低动态）随后；
+        #   高动态/频闪不进中档池（除非全库只有它们，那时 `mid` 为空、退回随机）
+        mid = [m for m in picked if DYNAMIC_MID in set(m.all_tags())]
+        rest = [m for m in picked
+                if DYNAMIC_MID not in set(m.all_tags())
+                and not ({DYNAMIC_HIGH, DYNAMIC_FLICKER} & set(m.all_tags()))]
+        if mid:
+            random.shuffle(mid)
+            random.shuffle(rest)
+            picked = mid + rest
+        else:
+            random.shuffle(picked)
     else:
-        # 曲风刷新（无档位，能量 ≥0.5）：也随机，避免每次刷曲风都抽同一个
+        # 曲风刷新（无档位，能量 ≥0.40）：也随机，避免每次刷曲风都抽同一个
         random.shuffle(picked)
 
-    # 频闪只在能量高(>=0.65)放行；中低能量一律从池里剔除（用户：低中不要频闪）。
+    # 频闪只在能量高(>=0.75)放行；中低能量一律从池里剔除（用户：低中不要频闪）。
     # 无论曲风刷新还是跨档重 roll，中低能量时池子都不该出现频闪素材。
-    if energy < 0.65:
+    if energy < 0.75:
         no_flash = [m for m in picked if DYNAMIC_FLICKER not in set(m.all_tags())]
         picked = no_flash or picked
 

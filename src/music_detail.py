@@ -23,10 +23,10 @@ import os
 import sys
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox,
+from PySide6.QtWidgets import (QDialog, QDoubleSpinBox,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog,
                                QLabel, QMenu, QMessageBox, QPushButton,
-                               QRadioButton, QVBoxLayout, QWidget)
+                               QVBoxLayout)
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
@@ -207,24 +207,20 @@ class MusicDetailDialog(QDialog):
         self.lbl_pos.setMinimumWidth(150)
         bar.addWidget(self.lbl_pos)
         bar.addStretch(1)
-        # ★★ 2026-10-29 用户要求：原来是一个「吸附到拍」复选框，现在改成
-        #   「吸附到拍 / 吸附到小节」**二选一**（互斥单选，必须选一个）。
-        #   用 QRadioButton + QButtonGroup：同组自动互斥，不需要自己管状态。
-        snap_box = QWidget()
-        snap_lay = QHBoxLayout(snap_box)
-        snap_lay.setContentsMargins(0, 0, 0, 0)
-        snap_lay.setSpacing(8)
-        snap_lay.addWidget(QLabel("吸附："))
-        self.rb_snap_beat = QRadioButton("拍")
-        self.rb_snap_bar = QRadioButton("小节")
-        self.rb_snap_beat.setChecked(True)
-        self.snap_grp = QButtonGroup(self)
-        self.snap_grp.addButton(self.rb_snap_beat, 1)
-        self.snap_grp.addButton(self.rb_snap_bar, 4)
-        snap_lay.addWidget(self.rb_snap_beat)
-        snap_lay.addWidget(self.rb_snap_bar)
-        self.snap_grp.buttonClicked.connect(self._on_snap_granularity)
-        bar.addWidget(snap_box)
+        # ★ 2026-10-30 用户：「把这个吸附先去掉吧 我没搞明白有什么用」+「（重新分段）
+        #   放到原来吸附的位置」。⇒ 原来「吸附：拍 / 小节」的位置现在放
+        #   「按 BPM 重新分段」按钮。
+        #   为什么吸附可以删：它只影响**手动**拖段落/锚点的落点，自动分段和播放光标
+        #   都不受它影响（用户一直以为跟光标有关）；而波形控件的默认吸附粒度本来就是
+        #   1 拍（`waveform_mark._snap_beats=1`），删掉 UI 后手动编辑的行为与原来
+        #   "拍"选中时**完全一致**。
+        self.btn_resec = QPushButton("按 BPM 重新分段")
+        self.btn_resec.setToolTip(
+            "用上面 BPM 框里的值重算**能量段落**（前奏/中段/drop/尾奏）。\n"
+            "只重算这一首，不重扫曲库；会同时把这个 BPM 记为手动值。\n"
+            "自动 BPM 差半拍、或半速/倍速判错导致分段碎掉时点它。")
+        self.btn_resec.clicked.connect(lambda: self._resegment_by_bpm(ask=True))
+        bar.addWidget(self.btn_resec)
         v.addLayout(bar)
 
         # ★ 2026-10-28：右侧「八拍起点 / BPM 分段」整块去掉 —— 波形占满宽度；
@@ -641,26 +637,6 @@ class MusicDetailDialog(QDialog):
         else:
             self.lbl_pos.setText("无法播放：%s" % (p.error or "未知原因"))
 
-    def _on_snap_granularity(self, _btn=None):
-        """「吸附到拍 / 吸附到小节」二选一 ⇒ 立刻把粒度推给波形控件。
-
-        `QButtonGroup` 的 id 就是拍数（1 = 拍 / 4 = 小节），直接用，不再判断按钮对象。
-        """
-        try:
-            n = int(self.snap_grp.checkedId())
-        except (TypeError, ValueError):
-            n = 1
-        self.wave.set_snap_beats(4 if n == 4 else 1)
-        self._refresh_snap_hint()
-
-    def _refresh_snap_hint(self):
-        """位置标签后面挂一句当前吸附粒度（用户看不出"现在到底吸在哪"时能自查）。"""
-        try:
-            n = self.wave.snap_beats()
-        except Exception:                                         # noqa: BLE001
-            n = 1
-        self._snap_hint = (" · 吸附到%s" % ("小节" if n == 4 else "拍"))
-
     def _on_play_toggle(self):
         """一个键管播放/暂停（用户 2026-10-28 要求三键合一）。"""
         p = self._player
@@ -738,9 +714,23 @@ class MusicDetailDialog(QDialog):
         """
         try:
             meta = (self.cfg["music_meta"] or {}).get(self.path) or {}
-            raw = meta.get("sections_raw") or meta.get("sections") or []
         except Exception:                                     # noqa: BLE001
             return []
+        # ★★ 2026-10-30 用户第二次反馈（截图「怎么还是三个八拍五个八拍」）：
+        #   **自动生成**的段落（`sections_auto` 不是 False）直接用库里存好的
+        #   `sections` —— 它是扫描时**经过乐句量化**的（边界落在 2 个八拍网格上：
+        #   0/16.00/76.01/136.01/151.01/196.01/271.02）。
+        #   为什么不能再过一遍吸附：`sections_raw` 是"未吸附的原始边界"
+        #   （13.61/75.79/136.72…），按八拍重吸附又回到 12.25 —— 还是 3 个八拍，
+        #   用户看到的正是这个。而且界面上「吸附：拍/小节」是**手动编辑**时的工具，
+        #   不该影响自动结果的显示（截图里选的是"拍"，一按粒度判断就会走 raw）。
+        #   raw 只在**手动编辑过**（`sections_auto is False`）时才用 —— 那时需要更细的
+        #   原始值才能实现"八拍 ⇄ 小节"双向切换。
+        if meta.get("sections_auto", True) is not False:
+            sec = meta.get("sections") or []
+            if sec:
+                return S.normalize(sec, self._dur_now(), None)
+        raw = meta.get("sections_raw") or meta.get("sections") or []
         if not raw:
             return []
         return S.normalize(raw, self._dur_now(), self._grid_for_snap() or None)
@@ -777,6 +767,120 @@ class MusicDetailDialog(QDialog):
         except (TypeError, ValueError):
             a = 0.0
         return {"anchor": a, "beat_len": bl}
+
+    def _resegment_by_bpm(self, ask=False):
+        """用**当前 BPM 框里的值**重算这一首的能量段落，并落盘。
+
+        ★ 2026-10-30 用户：「增加一个依据当前 bpm 重新分段的选项」。
+          为什么需要：自动 BPM 差半拍、或者半速/倍速判错时，能量分段是按
+          "2 个八拍 = 16 拍"切块的 ⇒ 整块错位，一首歌会被切成 0.88/0.94/0.16
+          这种碎段（现场 `Bunsen Burner` 就是这样）。手改 BPM 之后必须能
+          **立刻**按新 BPM 重切这一首，而不是等一次全库扫描（那要几分钟）。
+
+        口径与生产扫描**逐字一致**（`ui_main._one`）：全曲 `sf.read` → 重采样 →
+        `beatgrid.features` → `sections.auto_segments(grid=生效网格)`，再算一份
+        `sections_raw`（`grid=None, phrase_grid=生效网格`）。
+
+        写盘：`sections` / `sections_raw` / `sections_auto=True`，并把当前 BPM
+        记为 `grid_manual.bpm_manual`（用户就是在断言这个 BPM；不记的话下次
+        「扫描分析」又会按自动 BPM 重切，白改）。
+        """
+        try:
+            bpm = float(self.spin_bpm.value() or 0.0)
+        except (TypeError, ValueError):
+            bpm = 0.0
+        if bpm <= 0:
+            QMessageBox.information(self, "重新分段", "BPM 无效（必须 > 0）。")
+            return False
+        if ask:
+            ret = QMessageBox.question(
+                self, "按 BPM 重新分段",
+                "按当前 BPM %.1f 重新计算这首歌的能量段落（前奏/中段/drop/尾奏）？\n\n"
+                "· 只重算这一首，不重扫曲库\n"
+                "· 这个 BPM 会一并记为手动值\n"
+                "· 手动编辑过的段落会被覆盖" % bpm,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ret != QMessageBox.StandardButton.Yes:
+                return False
+        from PySide6.QtWidgets import QApplication
+        import numpy as np
+        try:
+            anchor = float((self._grid or {}).get("anchor") or 0.0)
+        except (TypeError, ValueError):
+            anchor = 0.0
+        grid = {"anchor": anchor, "beat_len": round(60.0 / bpm, 6), "bpm": bpm}
+
+        self._shutdown_audio()                 # 重算要独占读文件（试听可能正开着）
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.lbl_pos.setText("正在按 %.1f BPM 重新分段…" % bpm)
+            QApplication.processEvents()
+            import beatgrid as _bg
+            import soundfile as sf
+            data, sr = sf.read(self.path, dtype="float32", always_2d=True)
+            sig = np.mean(data, axis=1)
+            del data
+            m2, s2 = _bg.resample(sig, sr, _bg.SR_TARGET)
+            del sig
+            f = _bg.features(m2, s2)
+            dur = len(m2) / float(s2)
+            got = S.auto_segments(f, dur=dur, grid=grid)
+            raw = S.auto_segments(f, dur=dur, grid=None, phrase_grid=grid)
+            del m2, f
+        except Exception as e:                                    # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "重新分段", "重算失败：%s" % e)
+            self.lbl_pos.setText("重新分段失败")
+            return False
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:                                     # noqa: BLE001
+                pass
+        if not got:
+            QMessageBox.information(self, "重新分段", "这首算不出段落（特征不足）。")
+            return False
+
+        # ---- 落盘：sections + 手动 BPM（新 list ⇒ 引擎按引用失效自动重算）----
+        try:
+            mm = self.cfg["music_meta"]
+            rec = mm.get(self.path)
+            if not isinstance(rec, dict):
+                rec = {}
+                mm[self.path] = rec
+            gm = rec.get("grid_manual")
+            gm = dict(gm) if isinstance(gm, dict) else {}
+            gm["bpm_manual"] = float(bpm)
+            rec["grid_manual"] = gm
+            rec["sections"] = [dict(x) for x in got]
+            rec["sections_raw"] = [dict(x) for x in raw]
+            rec["sections_auto"] = True
+            self.cfg.save()
+        except Exception as e:                                    # noqa: BLE001
+            QMessageBox.warning(self, "重新分段", "写盘失败：%s" % e)
+            return False
+
+        # ---- 刷新界面（网格 + 色带 + 列表）----
+        self._meta = rec
+        self._manual = gm
+        try:
+            import beatgrid as _bg2
+            self._grid = _bg2.effective_grid(rec.get("grid") or {}, gm)
+        except Exception:                                         # noqa: BLE001
+            self._grid = dict(grid)
+        for fn in (lambda: self.wave.set_grid(self._grid),
+                   lambda: self.wave.set_energy_sections(self._energy_rows()),
+                   self._refresh_lists):
+            try:
+                fn()
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._dirty = False                    # 已经落盘了，别再弹"有未保存的修改"
+        self._update_title()
+        n_hi = sum(1 for x in got if x.get("tier") == "high")
+        self.lbl_pos.setText("%.1f BPM · %d 段（drop %d）" % (bpm, len(got), n_hi))
+        return True
 
     def _edit_energy_sections(self, sec):
         """打开编辑框；确定后写回 `music_meta[path]["sections"]` 并落盘。
