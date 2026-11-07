@@ -12,14 +12,24 @@ DXV 素材 · GPU 解码 · 局域网音频传输。
 > Keywords: auto VJ, live VJ software, music visualizer, VirtualDJ, OBS, NDI, Spout,
 > audio fingerprinting, beat grid, realtime BPM analysis.
 
-## 配套的 3 个软件（都在 Releases 里）
+## 配套的 4 个软件（都在 Releases 里）
 
 | 软件 | 跑在哪台机器 | 用途 |
 |---|---|---|
 | **EasyRealityAutoVJ.exe** | 演出机（B 机） | 主程序：音乐分析 → 自动切素材 → 输出给 OBS |
-| **EasyReality_音频发送端.exe** | 放歌机（A 机） | 把 A 机的系统声音实时发给 B 机（配合「局域网音频」音源） |
+| **EasyRealityCue.exe** | 编排机（DJ 机也行） | **码表编排**：逐首编好「第几拍放哪个素材、什么转场」，导出 `.ercue` 给演出机放 |
 | **ERLIB曲库分析.exe** | DJ 机 | 扫曲库、导出 `.eravjlib` 曲库包（带封面 / 指纹 / 节拍网格 / 能量段落），给演出机做「认歌」用 |
-| **NDI接收自检.exe** | 任一台 | 排查用：确认能不能收到 NDI 画面，连上后存一张截图 |
+| **EasyReality 音频发送端.exe** | 放歌机（A 机） | 把 A 机的系统声音实时发给 B 机（配合「局域网音频」音源） |
+
+> 外加一个**排查小工具** `NDI接收自检.exe`（任一台机器）：确认能不能收到 NDI 画面，连上后存一张截图。
+
+**Releases 里只有三个附件**：主程序一个包、EasyRealityCue 一个包、
+剩下的（ERLIB + 音频发送端 + NDI接收自检 + 音源诊断 + 各自说明）合成一个 **`工具集`** 包 ——
+和 RC1 起的老习惯一致，别去找单个 exe。
+
+**四者怎么配合**：ERLIB 先把曲库扫成包 → EasyRealityCue 拿这个包逐首编码表（`.ercue`）→
+演出机加载码表和素材，靠指纹认出 DJ 正在放的歌，**按码表精确到拍**地切素材；
+如果 B 机没有歌文件，就用音频发送端把 A 机的声音实时送过来。
 
 > **演出机不需要有歌文件** —— 靠指纹就能认出 DJ 那边正在放的是哪首。
 
