@@ -26,6 +26,8 @@ import build_version          # noqa: E402
 
 DIST = os.path.join(ROOT, os.environ.get("AUTOVJ_DIST", "dist"), "EasyRealityAutoVJ")
 MANUALS = ["使用说明.txt", "使用说明_EN.txt"]
+# 许可与第三方署名：随二进制一起分发（MIT 要求附许可全文；NOTICE 是第三方署名）
+LEGAL = ["LICENSE", "NOTICE.md"]
 # 「更新内容.txt / _EN.txt」只放在项目根，**不打进压缩包**（用户 2026-09-23 要求）
 
 
@@ -148,11 +150,19 @@ def main():
         src = os.path.join(ROOT, m)
         if os.path.exists(src):
             shutil.copy(src, os.path.join(DIST, m))
+    # ★ 2026-11-08：**许可与署名必须随二进制一起分发** —— MIT 要求附许可全文，
+    #   NOTICE.md 里是第三方署名（VJVision / KVJ-KDJ / Genre Police AutoVJ / Beat This!）。
+    #   以前包里只有两份使用说明，用户拿到的 exe 找不到任何许可信息。
+    for m in LEGAL:
+        src = os.path.join(ROOT, m)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(DIST, m))
     # 旧版只有中文说明，dist 里可能残留 → 不在本次清单里的说明文件一并进包（顶层）
-    # 注意：只认「使用说明*」，其它 txt（更新内容等）一律不进包
+    # 注意：只认「使用说明*」+ 许可文件，其它 txt（更新内容等）一律不进包
     top_files = [f for f in os.listdir(DIST)
-                 if os.path.isfile(os.path.join(DIST, f)) and f.lower().endswith(".txt")
-                 and "使用说明" in f]
+                 if os.path.isfile(os.path.join(DIST, f))
+                 and ((f.lower().endswith(".txt") and "使用说明" in f)
+                      or f in LEGAL)]
 
     n = 0
     skipped = 0
