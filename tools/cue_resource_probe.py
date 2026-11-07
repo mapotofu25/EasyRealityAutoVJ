@@ -40,8 +40,17 @@ from cue_seek_policy import CueSeekPolicy                        # noqa: E402
 
 # 真实素材目录不写死在仓库里（会暴露本机目录结构）——用环境变量指过来
 _VIDEO_ROOT = os.environ.get("ERAVJ_PV_ROOT", "")
-REAL_VIDEO = (os.path.join(_VIDEO_ROOT, "东方·临时结界 夏夜星律 宣传PV.mp4")
-              if _VIDEO_ROOT else "")
+def _first_mp4(root):
+    """目录里找一个 .mp4（不写死文件名 —— 仓库里不该出现作者自己的素材名）。"""
+    if not root or not os.path.isdir(root):
+        return ""
+    for _n in sorted(os.listdir(root)):
+        if _n.lower().endswith(".mp4"):
+            return os.path.join(root, _n)
+    return ""
+
+
+REAL_VIDEO = _first_mp4(_VIDEO_ROOT)
 W, H = 960, 540
 BPM, BL = 120.0, 0.5
 

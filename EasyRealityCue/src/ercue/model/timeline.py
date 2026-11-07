@@ -411,7 +411,7 @@ class CueRuntime:
                 #     · AutoVJ `src/engine.py:359`  注释原文：`self.speed = 1.0  # 图层播放速度倍率`
                 #     · AutoVJ `src/audio_engine.py:116` 原文：`与引擎里 speed（输出端 VJ 素材倍速）完全是两回事`
                 #     · AutoVJ `src/ui_main.py:4496` 菜单名：`播放速度`
-                #   旧运行时 `AutoVJ_码表备份_20260930/src/cuesheet_runtime.py:174` 写的是
+                #   旧运行时 `<项目根>/src/cuesheet_runtime.py:174` 写的是
                 #   `(dt_beats * bl) / spd`（**除法 = 慢放**），与它自己的播放器语义相反 ——
                 #   结果是"编辑器预览的变速方向与现场演出相反"，是旧实现的**真实缺陷**。
                 #   ⇒ 本项目一律 `× speed`；任何"改回 `/ speed` 与旧实现对齐"的改动都是错的。
