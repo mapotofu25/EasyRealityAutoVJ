@@ -3,7 +3,7 @@
 
 跑法（无头）：
     set QT_QPA_PLATFORM=offscreen
-    P:\\AutoVJ\\venv\\Scripts\\python.exe  P:\\EasyRealityCue\\tests\\test_compositor.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe  <项目根>\\tests\\test_compositor.py
 
 覆盖（对应验收标准）：
   · 7 种混合的**真实像素值**（normal/add/screen/multiply/lighten/darken + subtract 逐像素）

@@ -3,7 +3,7 @@
 
 跑法（无头）：
     set QT_QPA_PLATFORM=offscreen
-    P:\\AutoVJ\\venv\\Scripts\\python.exe  P:\\EasyRealityCue\\tests\\test_ui_smoke.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe  <项目根>\\tests\\test_ui_smoke.py
 
 覆盖（对应任务书验收标准）：
   1. 建 QApplication + 主窗口（offscreen）**不崩**

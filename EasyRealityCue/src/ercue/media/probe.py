@@ -14,7 +14,7 @@
    DXV 的解码器**一律**输出 `rgba` / `yuva420p`，但其中绝大多数素材（DXT1）的 alpha
    通道其实是**全 255（完全不透明）**。只用 `pix_fmt` 判断，会把整个 DXV 素材库都当成
    带 alpha，导致缩略图/预览白白走"带 alpha"这条更贵的通路，并且画面语义也是错的。
-   实测本机 `Y:\\EasyRealityAutoVJ\\素材库` 的 279 个 `.mov`：
+   实测本机 `<素材库>` 的 279 个 `.mov`：
        仅看 pix_fmt 会判为带 alpha = 247
        实解帧验证后真带 alpha   =  18
    所以本模块的 alpha 判定是**两层**（复刻 `media_manager.py:871 _av_probe_alpha`）：

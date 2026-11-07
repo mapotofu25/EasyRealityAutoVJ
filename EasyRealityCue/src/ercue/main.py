@@ -2,7 +2,7 @@
 """EasyRealityCue 入口（**单窗口，无 embedded 双模式**，架构方案 §3.1）。
 
 跑法：
-    P:\\AutoVJ\\venv\\Scripts\\python.exe  P:\\EasyRealityCue\\src\\ercue\\main.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe  <项目根>\\src\\ercue\\main.py
 
 无头环境（自测 / CI）：
     set QT_QPA_PLATFORM=offscreen

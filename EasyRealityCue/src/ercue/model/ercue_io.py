@@ -561,7 +561,9 @@ SPEC_SAMPLE_JSON = {
     ],
 }
 
-_OLD_SRC = r"P:\AutoVJ_码表备份_20260930\src"
+#> 旧实现源码目录**不写死在仓库里**（会暴露本机目录结构）：设 `ERAVJ_OLD_SRC` 才做旧实现比对，
+#> 不设就自动降级为 json 逐字段比对（`_load_old_impl()` 里判空）。
+_OLD_SRC = os.environ.get("ERAVJ_OLD_SRC", "")
 
 
 def _load_old_impl():

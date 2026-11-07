@@ -2,7 +2,7 @@
 """认歌身份测试：**文件 md5（最高优先级）** + 指纹签名 + 兼容性。
 
 跑法（无头）：
-    P:\\ERAVJ\\EasyRealityCue\\venv\\Scripts\\python.exe  tests\\test_identity_match.py
+    <工作区>\EasyRealityCue\\venv\\Scripts\\python.exe  tests\\test_identity_match.py
 
 覆盖（对应任务书验收）：
   1. `fp_core.file_md5` 分块读 == 一次性读；坏路径返回 ""（绝不抛）

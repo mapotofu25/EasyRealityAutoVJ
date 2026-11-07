@@ -2,7 +2,7 @@
 """M2 · 时间轴解释器测试（**零 Qt**）。
 
 跑法：
-    P:\\AutoVJ\\venv\\Scripts\\python.exe  P:\\EasyRealityCue\\tests\\test_timeline.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe  <项目根>\\tests\\test_timeline.py
 
 覆盖（对应验收标准）：
   · ★ 逐帧单调推进：过渡按预期发生（E4，规格书 §6.14 测试陷阱原文）

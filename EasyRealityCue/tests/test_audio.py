@@ -2,7 +2,7 @@
 """M4 · 音频走带测试（`ercue.audio.player`）。
 
 跑法：
-    P:\\AutoVJ\\venv\\Scripts\\python.exe  P:\\EasyRealityCue\\tests\\test_audio.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe  <项目根>\\tests\\test_audio.py
 
 覆盖（对应任务书验收标准 + 架构方案 §4-A5/A6 逐条）：
   1. **解码**：自造 wav / mp3 → `samplerate == 48000`（重采样统一）、`channels == 2`、

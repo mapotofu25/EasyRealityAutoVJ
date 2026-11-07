@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """★ BPM 自动识别核心（零 Qt，纯 numpy/stdlib）—— **逐字移植自 `AutoVJ/src/beatgrid.py`**。
 
-⚠⚠ **与 `P:\\ERAVJ\\AutoVJ\\src\\beatgrid.py` 逐字一致：改一端必须改另一端。**
+⚠⚠ **与 `<工作区>\\AutoVJ\\src\\beatgrid.py` 逐字一致：改一端必须改另一端。**
   两端的 BPM 必须给出**同一个数**：编排端算出来写进 `.ercue` 的 `identity.bpm` 会决定
   码表里 `at_beats → 秒` 的换算，演出端又按自己的 BPM 把拍换算成秒去走画面；
   只要两边差零点几，预览与现场就会越走越偏。所以这里**不"另写一个更好的"**，

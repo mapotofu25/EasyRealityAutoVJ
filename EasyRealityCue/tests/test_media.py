@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """M1 素材层专项验证（可复跑）。
 
-    P:\\AutoVJ\\venv\\Scripts\\python.exe tests\\test_media.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe tests\\test_media.py
 
 覆盖（对照 M1 验收标准）：
   1. 探测：视频 + 图片，duration/fps/尺寸合理
@@ -139,8 +139,8 @@ def _real_media_root():
                 cands.append(p.rstrip("\\/"))
     except Exception:                                               # noqa: BLE001
         pass
-    cands += [r"Y:\EasyRealityAutoVJ\素材库", r"Y:\EasyRealityAutoVJ\码表素材",
-              r"P:\AutoVJ\dist\AutoVJ\素材库"]
+    cands += [r"<素材库>", r"<码表素材>",
+              r"<AutoVJ项目根>\dist\AutoVJ\素材库"]
     for c in cands:
         if c and os.path.isdir(c):
             return c

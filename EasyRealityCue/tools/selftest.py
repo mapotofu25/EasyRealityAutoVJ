@@ -2,7 +2,7 @@
 """EasyRealityCue 一键自检（M0）。
 
 跑法（Windows，用参考项目的 venv 里已有的解释器即可）：
-    P:\\AutoVJ\\venv\\Scripts\\python.exe  P:\\EasyRealityCue\\tools\\selftest.py
+    <AutoVJ项目根>\\venv\\Scripts\\python.exe  <项目根>\\tools\\selftest.py
 
 覆盖：
   · units     单位换算往返 + 退化（bpm<=0 → 1 拍 = 1 秒）+ 吸附步长 + 时间码
