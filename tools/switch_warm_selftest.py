@@ -25,7 +25,9 @@ import media_manager as mm  # noqa: E402
 from audio_engine import AudioState  # noqa: E402
 from engine import AutoVJEngine, Layer  # noqa: E402
 
-LIB = r"Y:\EasyRealityAutoVJ\素材库"
+# 素材目录不写死在仓库里（会暴露本机目录结构）——环境变量优先，否则取项目根旁边的 `素材库`
+LIB = os.environ.get("ERAVJ_LIB") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "素材库")
 out = []
 
 
@@ -36,6 +38,8 @@ def w(s=""):
 
 def big_clips(n=4):
     fs = []
+    if not os.path.isdir(LIB):
+        return fs
     for f in sorted(os.listdir(LIB)):
         p = os.path.join(LIB, f)
         if os.path.isfile(p) and f.lower().endswith((".mov", ".mp4", ".mkv", ".avi")):
@@ -61,6 +65,9 @@ def main():
     eng.set_canvas_size(1280, 720)
     lay = Layer("测试层")
     paths = big_clips(4)
+    if not paths:
+        w("跳过：素材目录不存在（可用 ERAVJ_LIB 指定）：%s" % LIB)
+        return 0
     lay.clips = [mm.MediaItem(p) for p in paths]
     for c in lay.clips:
         c._has_alpha = False          # 强制走 OpenCV 路径，比较同一类解码器
@@ -128,7 +135,7 @@ def main():
             p.close()
         except Exception:
             pass
-    # 报告写到项目根（旧硬编码 P:\AutoVJ 已随迁移失效）
+    # 报告写到项目根（旧硬编码 <项目根> 已随迁移失效）
     _root = os.path.dirname(HERE)
     open(os.path.join(_root, "_switch_warm_selftest.txt"), "w",
          encoding="utf-8").write("\n".join(out))

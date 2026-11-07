@@ -47,7 +47,7 @@ def _default_log():
 def _dist_pids():
     """列出 **exe 路径就在 `dist/` 下** 的 EasyRealityAutoVJ 进程 PID。
 
-    ⚠ 只认 dist 里那份 —— 用户自己那份装在别的目录（例如 `Y:\\EasyRealityAutoVJ\\`），
+    ⚠ 只认 dist 里那份 —— 用户自己那份装在别的目录（例如 `<安装目录>\\`），
       **绝不能误杀**，所以必须按「可执行文件路径」判断，不能只按进程名。
     """
     import ctypes

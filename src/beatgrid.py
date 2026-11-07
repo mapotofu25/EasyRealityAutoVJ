@@ -38,16 +38,40 @@ import numpy as np
 # 常量
 # --------------------------------------------------------------------------
 SR_TARGET = 22050          # 分析用采样率（节拍信息都在 20Hz~10kHz，够了；比 44.1k 省一半）
-HOP = 1024                 # STFT 步长（22050 下 ≈ 46 ms）
+HOP = 512                  # STFT 步长（22050 下 ≈ 23 ms）
+# ★★★ 2026-11-01（用户：「(07) [Amane Oikawa] Distorted Dimension.flac 这首实际是 200bpm」，
+#   曲库里存的是 132.7）：**BPM 扫描的时间分辨率不够**。
+#   原来是 1024（46ms/帧）⇒ 200 BPM（300ms/拍）只有 **6.5 帧/拍**，而 `grid_conc` 要把
+#   相位折叠到 32 个格子（每格 9.4ms）⇒ 6.5 个点摊在 32 格里，大部分格子是空的，
+#   集中度被"哪几格恰好落到帧"决定，与真实节拍强度脱钩：
+#     实测这首 —— 132.65 得 2.519（= 200×2/3 的伪峰）、真值 200 只有 **1.773**
+#     ⇒ 连 `scan_bpm` 的候选前三都进不去，`pick_bpm` 只能挑伪峰。
+#   减半到 512（23ms/帧，12.9 帧/拍）后同一首直接扫出 **198.75**（第一名 3.499）。
+#   全库 A/B（54 首带 VDJ 参照，`tools/_ab_bpm_hop.py`）：
+#     完全一致 50/54 (93%) → **52/54 (96%)**，同族 51/54 → **53/54**，
+#     变化的 5 首里 4 首变准（161.5→160、136→170 ×2、143.55→143）、1 首仍错、**零退化**。
+#   代价：`features` 耗时 ×2（0.34 → 0.65 s/首）。曲库扫描是后台任务，可接受。
+#   ⚠ `SEG_HOP=256` 是**分段检测**自己的高帧率（它的注释早就写着"默认 HOP=1024 时每拍
+#     只有 ~7 帧，不够"），与本常量独立，不用改。
+HOP_OLD = 1024             # 仅留档：旧值（46ms/帧），排查老曲库结果时对照用
 WIN = 2048                 # STFT 窗长（≈ 93 ms）
 
 F_LOW = (30.0, 200.0)      # kick / 低音
 F_MID = (200.0, 2000.0)    # 人声 / 主奏
 F_HIGH = (2000.0, 9000.0)  # hihat
 
+#: 上报能量的「密度因子」用的 8 个对数频段（Hz）。
+#  ★★★ 2026-11-06（用户：「Drop 1 怎么能有 0.8 呢？它听起来非常缓和」）：
+#    光看总电平分不出「满编排的 drop」和「稀疏的 drop」—— 两者 RMS 只差 3 dB 很正常。
+#    实测 `Erebos` drop1：总电平只比 drop4 低 3.3 dB，但**频段间有 26 dB 的空洞**
+#    （40~80Hz 掉到 −25.8 dB、5~11kHz 掉到 −12.9 dB），听感上就是"薄、缓"。
+#    所以另算一套 8 频段能量，供 `sections` 求「空洞深度」用（见 `_density_penalty`）。
+BAND_EDGES = ((40.0, 80.0), (80.0, 160.0), (160.0, 320.0), (320.0, 640.0),
+              (640.0, 1280.0), (1280.0, 2560.0), (2560.0, 5120.0), (5120.0, 11025.0))
+
 BPM_MIN, BPM_MAX = 60.0, 220.0   # 上限 220：Frenchcore/Uptempo 200~220 BPM（2026-10-27 高 BPM 支持）
 # ★★ 2026-10-29：上界 190 → **210**。
-#   实测（76 首带 VDJ 参照：老曲库 59 首 + `W://qq//新建文件夹` 17 首）：
+#   实测（76 首带 VDJ 参照：老曲库 59 首 + `<曲库目录>/新建文件夹` 17 首）：
 #     190 ⇒ 老曲库 51/59、新目录 8/17，合计 59/76
 #     210 ⇒ 老曲库 51/59、新目录 13/17，合计 64/76   ← 老曲库**一首都没退化**
 #   原因：东方同人 / Hardcore / Frenchcore 的主体在 200~210，旧上界把它们整族
@@ -77,7 +101,7 @@ DEFAULT_VDJ = ""           # 不硬编码路径，统一由 vdj_db_path() 自动
 # 只对过期 / 缺失的网格重算（见 ui_main 扫描），而不用整库全量重扫。
 #   1 = 初版（隐式，未写入 grid dict）
 #   2 = 2026-09-27：_assemble 输出显式带 grid_ver；配合增量补网格
-GRID_VER = 6          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的曲目改为 src="bt"）
+GRID_VER = 7          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的曲目改为 src="bt"）
                       # 4 = 2026-10-30：BPM 分析长度 180 秒 → `GRID_MAXSEC`(600)。
                       #     长曲里 1% 级别的双 BPM 歧义（Crescent Horizon 298 秒：
                       #     前 120 秒 ≈145、后 178 秒 ≈143.5）在 180 秒窗上分不开 ⇒
@@ -93,6 +117,12 @@ GRID_VER = 6          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的
                       #     ⚠ 必须升版本，否则存量歌永远拿不到新结果（`_need_grid` 靠它判断）。
                       #     代价：下次「扫描分析」会把 grid_ver<5 的歌放进 `todo_grid`
                       #     （**只算网格**，跳过指纹/联网/本地 AI）。
+                      # 7 = 2026-11-01：**STFT 步长 1024 → 512**（见 `HOP` 的长注释）。
+                      #     200 BPM 每拍从 6.5 帧变 12.9 帧 ⇒ 高档 hardcore 的 2/3 伪峰
+                      #     （200→132.65）消失；全库 54 首带参照：93% → 96%，零退化。
+                      #     ⚠ 必须升版本，否则存量歌永远拿不到新 BPM（`_need_grid` 靠它判断）。
+                      #     代价：下次「扫描分析」把 grid_ver<7 的歌放进 `todo_grid`
+                      #     （**只算网格**，~1.5s/首，不重跑指纹）。
                       # ⚠ 每次改网格算法都要 +1：ui_main 的 `_need_grid` 靠它判断"该重算"。
 
 
@@ -106,7 +136,7 @@ def resample(mono, sr0, sr_target=SR_TARGET):
     n_out = int(len(mono) * sr_target / sr0)
     if n_out <= 1:
         return mono, sr0
-    # ★★ 2026-10-29 真机抓到（W:\qq\新建文件夹\11 緋魔殞罪 466 秒 FLAC 直接崩）：
+    # ★★ 2026-10-29 真机抓到（<曲库目录>\新建文件夹\11 緋魔殞罪 466 秒 FLAC 直接崩）：
     #   `idx` 原来 `.astype(np.float32)`，而 float32 在 2^24(16777216) 以上最小间隔是 **2**，
     #   最后一个采样点 22367999 被舍入成 **22368000** ⇒ `i0` 越界 1 个 ⇒ IndexError。
     #   触发条件：48kHz 下长度 > ≈350 秒（= 16777216/48000），短曲永远测不出来。
@@ -157,6 +187,17 @@ def features(mono, sr, hop=HOP, win=WIN):
         "Emid": (S[:, m_mid] ** 2).sum(1),
         "Ehigh": (S[:, m_high] ** 2).sum(1),
     }
+    # ★ 8 频段能量（只给 `sections` 算密度因子用；见 `BAND_EDGES` 的注释）。
+    #   ⚠ 这里必须**逐段累加**，不能一次性 `np.stack([(S[:, m]**2).mean(1) ...])` ——
+    #     那会给每个频段各开一份 (nf × bins) 的临时数组，长曲子上峰值内存翻几倍。
+    eb = np.empty((nf, len(BAND_EDGES)), np.float32)
+    for _k, (_a, _b) in enumerate(BAND_EDGES):
+        _m = (freqs >= _a) & (freqs < _b)
+        if _m.sum() < 2:                      # 频段太窄（极短窗）⇒ 取最近的一个 bin
+            _m = np.zeros(freqs.size, dtype=bool)
+            _m[np.argmin(np.abs(freqs - (_a + _b) * 0.5))] = True
+        eb[:, _k] = (S[:, _m] ** 2).mean(axis=1)
+    out["Eband"] = eb
     L = np.log1p(S * 8.0)
     d = np.diff(L, axis=0, prepend=L[:1, :])
     dn = np.maximum(d, 0.0)
@@ -206,9 +247,20 @@ TEMPO_FIT_MIN_SEG = 2        # 至少这么多段可比才敢改判（短曲退�
 #   跨族仲裁（Beat This vs 扫描）是两个**不相干**的节奏假设，要证据很足才敢翻（0.12）；
 #   而这里是在同一首曲子的**近邻候选**里挑，`grid_conc` 本身就会偏袒伪峰，
 #   0.12 会把正确答案挡在外面（实测 Addicted 2 Love 的真值只领先 0.11）。
-TEMPO_FIT_ALT_MARGIN = 0.08  # 候选级改判门槛（fit 领先这么多才换）
+# ★★ 2026-11-01（HOP 1024→512 之后重标定）：门槛 0.08 → **0.04**，候选数 12 → **24**。
+#   为什么必须一起改：HOP 减半让"真值族"的 `grid_conc` 排名上来了，但 `scan_bpm` 的
+#   top-3 仍是老样子（细扫只围绕粗扫前三名），所以 `pick_bpm` 照样给伪峰；
+#   能救回来的只有这里——而实测 `Addicted 2 Love (radio_edit)`：
+#     `grid_conc` 第一名 **144.80(2.482)**（=真值族）、pick 给 152.00，
+#     但 fit(144.80) 只比 fit(152) 高 **0.063** ⇒ 被 0.08 挡住 ⇒ 存成 152（错 5.1%）。
+#   全库扫描（54 首带 VDJ 参照，`tools/_sweep_bpm_margin.py`）：
+#     margin 0.08 / topn 12  ⇒ 完全一致 52/54 (96%)、同族 53/54 (98%)
+#     margin 0.04 / topn 24  ⇒ 完全一致 **53/54 (98%)**、同族 **54/54 (100%)**  ← 采用
+#   同时把 `Bottom -outro-`（topn=12 时 136、错）救到 170（VDJ 169.01）。
+#   ⚠ topn 24 的代价：多 12 次 `tempo_fit_score`（≈+0.5s/首），只有扫库时付。
+TEMPO_FIT_ALT_MARGIN = 0.04  # 候选级改判门槛（fit 领先这么多才换）
 TEMPO_FIT_ALT_STEP = 0.2     # 枚举步长（BPM）
-TEMPO_FIT_ALT_TOPN = 12      # 参与 tempo_fit 打分的候选数（按 grid_conc 取前 N）
+TEMPO_FIT_ALT_TOPN = 24      # 参与 tempo_fit 打分的候选数（按 grid_conc 取前 N）
 TEMPO_FIT_ALT_FLOOR = 0.5    # 候选的 grid_conc 至少是区间最高值的这个比例（过滤弱峰）
 TEMPO_FIT_ALT_SAME = 0.02    # 与当前值相对差小于此 ⇒ 视作同一个峰，不参与改判
 
@@ -762,6 +814,10 @@ def phrase_scores(bf, ks, nbeat=8, w=None):
     return s / (tot if tot > 0 else 1.0)
 
 
+#: 全 8 槽搜索时，"胜出槽"要比 0/4 里较好的那个强多少倍才采纳（见 `phrase_phase`）
+PHRASE_ALL_MIN = 1.30
+
+
 def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
     """在给定锚点（**视作干净的第 1 拍**）下，定「哪一个八拍头才是乐句头」。
 
@@ -787,9 +843,29 @@ def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
     bf = per_beat_feats(f, beats)
     sc = phrase_scores(bf, ks % nbeat, nbeat=nbeat)
     s0, s4 = float(sc[0]), float(sc[4])
-    phrase = 0 if s0 >= s4 else 4
-    hi, lo = max(s0, s4), min(s0, s4)
-    contrast = (hi / lo) if lo > 1e-9 else 99.0
+    # ★★★ 2026-11-06（用户：「这个位置也错了一拍 —— 你这个八拍切分它偏了一拍」）：
+    #   **原来只在 {0, 4} 里二选一**，等于假设"底层拍的锚点必然是小节头或半小节头"。
+    #   实测 `Erebos`：八个槽的得分是
+    #     0: 0.146  1: 0.104  2: 0.065  3: 0.114  4: 0.149  5: 0.135  6: 0.000  **7: 0.287**
+    #   真正的八拍头在**槽 7**（是槽 0 的 1.97 倍、槽 4 的 1.93 倍），而旧代码只能
+    #   在 0/4 里挑（contrast 1.02 = 抛硬币），结果整首小节线偏了 3 拍，
+    #   用户听到的就是"八拍切分偏了一拍"（相对最近的强拍）。
+    #   ⇒ 放开到**全 8 槽搜索**，但要求"胜出槽明显强于 0/4 里较好的那个"才移
+    #     （`PHRASE_ALL_MIN` = 1.30 倍），否则保持原来的 0/4 二选一，
+    #     避免在证据不足时把本来正确的网格推走。
+    _best = int(np.argmax(sc))
+    _base_best = 0 if s0 >= s4 else 4
+    if _best != _base_best and _base_best not in (0, 4):
+        _base_best = 0
+    if _best not in (0, 4):
+        _ref = max(s0, s4)
+        if float(sc[_best]) < _ref * PHRASE_ALL_MIN:
+            _best = _base_best
+    phrase = int(_best)
+    _cur = float(sc[phrase])
+    _other = sorted((float(x) for x in sc), reverse=True)
+    _second = _other[1] if len(_other) > 1 else 0.0
+    contrast = (_cur / _second) if _second > 1e-9 else 99.0
     return phrase, contrast, [float(x) for x in sc]
 
 
@@ -805,6 +881,20 @@ def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
 # 判据：真拍上每一拍都有 kick；被估成 2× 时，**奇数拍槽会明显空**
 #   （实测两类样本的 odd/even 比：真值 ≈0.8~1.0，2× 错 ≈0.2~0.4）。
 OCT_BALANCE_MIN = 0.55   # odd/even 低于此 ⇒ 认为当前 bpm 是 2×，取一半
+# ★★ 2026-10-30（用户 `9 無邪気弾 ~ Out of Innocence`「这首是 220」）：
+#   `pick_bpm` 的 `BPM_PRIOR` 上限是 210 ⇒ 真实的 220 被先验排除，只能拿到半速 110；
+#   而 `octave_fix` 只会**往下纠**（奇数拍空才减半），纠不了往上。
+#   ⇒ 补一条「半速检测」：把 2× 当候选，同时看**候选峰值**和**拍槽比**。
+OCT_SLOW_RATIO = 0.95    # 2× 候选的 scan 得分要达到 1× 的这个比例（打平或更高）
+OCT_SLOW_BALANCE = 0.80  # 2× 网格上低频拍槽的 odd/even 下限（两拍都有 kick）
+OCT_SLOW_HI = 260.0      # 翻倍后的上限（再高已不是 DJ 曲的常规范围）
+# ★★ 2026-10-30（用户「我扫了三遍还是 172.3」）：**整数吸附**。
+#   生产路径先把整曲重采样到 22050 再算特征，`scan_bpm` 的细扫步长有限
+#   ⇒ 真实的 172.0 会被折成 172.3。0.3 BPM 摊到 200 秒里累积 ≈1 拍偏差，
+#   用户听到的就是"后半段卡点漂了"。而跨段命中率能明确分出高下：
+#   实测 `9 無邪気弾` 172.3 fit=0.620 / 172.0 fit=0.674。
+INT_SNAP_TOL = 0.40      # 小数部分离整数多近才值得试（0.40 = 差不到半拍/分钟）
+INT_SNAP_GAIN = 0.02     # 整数版命中率要高出这么多才采纳（防"本来就不是整数"）
 OCT_LO, OCT_HI = 60.0, 220.0
 VOTE_WINDOWS = 3         # 多窗投票的窗口数
 VOTE_WIN_SEC = 60.0      # 每窗秒数
@@ -866,6 +956,86 @@ def octave_fix(f, env, bpm, anchor):
         return bpm
     except Exception:                                            # noqa: BLE001
         return bpm
+
+
+def octave_fix_slow(f, env_low, bpm, anchor, peaks):
+    """若当前 `bpm` 是「半速」（真实 = 2×），返回 `bpm*2`；否则原样返回。
+
+    ★ 2026-10-30 用户 `9 無邪気弾 ~ Out of Innocence`：「这首是 220」，软件给 110。
+      链路是：`scan_bpm` 折出 220(3.03) / 110(3.03) 打平 → `pick_bpm` 的
+      `BPM_PRIOR=[110,210]` 把 220 排除（上限）→ 取 110 → Beat This 也给 110 当提示
+      → `octave_fix` 只会往下纠（half=55 < OCT_LO，直接返回）⇒ 永远卡在 110。
+
+    三重判据（缺一不可，宁可漏判也不能误翻）：
+      ① 候选峰值里**真的有** 2× 那一档得分（是 `scan_bpm` 折叠出来的，不是硬算的）；
+      ② 它 ≥ 1× 得分的 `OCT_SLOW_RATIO`（半速歌里 2× 往往**反而更高**）；
+      ③ 用**低频** onset 在 2× 网格上采拍槽，odd/even ≥ `OCT_SLOW_BALANCE`。
+
+    ⚠ ③ 不能用 mix / 单靠它：hi-hat 常铺在 8 分音符上，`Raccoon Memes`(128) 的
+      2× 拍槽比是 0.775、`Mr.Mamizou`(129.2) 是 1.339 —— 都比这首真半速的 0.914 还高。
+      所以「候选峰值打平」才是主判据，拍槽比只是把"碰巧有 2× 候选"的假阳性按住。
+    """
+    try:
+        bpm = float(bpm)
+        if bpm <= 0:
+            return bpm
+        dbl = bpm * 2.0
+        if dbl > OCT_SLOW_HI:
+            return bpm
+        # ① 候选里找 2×（容差 2%：`fine_bpms` 的浮点累加会差一点点）
+        s1 = s2 = 0.0
+        for b, sc in (peaks or []):
+            try:
+                b, sc = float(b), float(sc)
+            except (TypeError, ValueError):
+                continue
+            if abs(b - bpm) <= 0.02 * bpm and sc > s1:
+                s1 = sc
+            if abs(b - dbl) <= 0.02 * dbl and sc > s2:
+                s2 = sc
+        if s2 <= 0.0 or s1 <= 0.0:
+            return bpm                      # 候选里没有 2× ⇒ 不猜
+        if s2 < s1 * OCT_SLOW_RATIO:
+            return bpm                      # 2× 明显更弱 ⇒ 当前就是对的
+        # ③ 拍槽比：2× 网格上是不是每拍都有低频击打
+        even, odd = beat_slot_energy(f, env_low, dbl, anchor)
+        if even <= 1e-9:
+            return bpm
+        if (odd / even) < OCT_SLOW_BALANCE:
+            return bpm
+        return dbl
+    except Exception:                                            # noqa: BLE001
+        return bpm
+
+
+def snap_bpm_to_int(t, env, bpm):
+    """候选 BPM 的小数部分很接近整数时，试一次整数版本，用跨段命中率裁决。
+
+    返回 `(bpm, gain)`；`gain > 0` 表示换成了整数版（并给出命中率提升）。
+
+    ★ 2026-10-30 用户「我扫了三遍还是 172.3」：生产路径重采样到 22050 之后，
+      `scan_bpm` 只能折出 172.3（细扫步长 + 折叠分辨率），而真实的 172.0 明显更贴合：
+      `tempo_fit_score` 172.3=0.620 / 172.0=0.674。差 0.3 BPM 在 200 秒里累积 1 拍，
+      现场表现就是"前面对得上、后面越来越偏"。
+
+    ⚠ 只在**小数部分离整数 ≤ INT_SNAP_TOL** 时才试（电子乐 BPM 基本是整数，
+      但像 129.2 那种"半拍不是半拍"的也要放过 ⇒ 超了就不试，不做无边界的搜索）。
+    ⚠ 成本：只在触发时多算 2 次 `tempo_fit_score`（约 0.1s）。
+    """
+    try:
+        b = float(bpm)
+        if b <= 0:
+            return bpm, 0.0
+        r = float(round(b))
+        if r <= 0 or abs(b - r) > INT_SNAP_TOL or abs(b - r) < 1e-6:
+            return bpm, 0.0
+        fit_o, _p1, _r1 = tempo_fit_score(t, env, b)
+        fit_r, _p2, _r2 = tempo_fit_score(t, env, r)
+        if fit_r >= fit_o + INT_SNAP_GAIN:
+            return r, float(fit_r - fit_o)
+        return bpm, 0.0
+    except Exception:                                            # noqa: BLE001
+        return bpm, 0.0
 
 
 def _octave_norm(b, ref):
@@ -972,7 +1142,8 @@ def analyze_track(path, maxsec=180.0, anchor_hint=None, bpm_hint=None, do_scan=T
                           do_scan=do_scan)
 
 
-def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
+def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True,
+                   out_feats=None):
     """从**已解码**的单声道信号分析 → {bpm, anchor, phrase, contrast, peaks, …}。
 
     - `bpm_hint` / `anchor_hint` 给定时（例如来自 VDJ），用它们做基准；
@@ -982,6 +1153,13 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
     dur = len(mono) / float(sr)
     f = features(mono, sr)
     env = onset_env(f, "mix")
+    # ★ 2026-10-30（扫描提速）：把这份 STFT 结果**交出去**，让曲库扫描的能量分段
+    #   直接复用 —— 它本来要 `resample + features` 再算一遍**完全相同**的东西
+    #   （实测 297 秒的歌白花 0.45s/首：resample 0.20 + features 0.25）。
+    #   ⚠ 只读不写：本函数与 `detect_segments` 都只读 `f`，调用方拿到后同样只读。
+    if isinstance(out_feats, dict):
+        out_feats["f"] = f
+        out_feats["dur"] = dur
 
     # ★ Beat This!（本地神经网络）补位：**只在没有 VDJ 提示时**用。
     #   它解决的是"哪一拍是小节头"（我们自算的 `phase_of` 实测 21 首全错、偏 1~2 拍），
@@ -1128,6 +1306,39 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True):
             phrase, contrast, _ = phrase_phase(f, base, period)
             anchor = base + phrase * period
 
+    # ★★ 2026-10-30（用户 `9 無邪気弾`「这首是 220」）：**半速检测（往上纠）**。
+    #   `pick_bpm` 的先验上限 210 会把真实的 220 排除 ⇒ 只能拿到 110；
+    #   Beat This 再给 110 当提示 ⇒ 锁死。`octave_fix` 只往下纠，这里补往上。
+    #   ⚠ 拍点位置沿用原 anchor（2× 只是把每拍再对半分，不会挪动已有的拍头），
+    #     但**小节相位必须重算** —— period 变了，"第几拍是小节头"跟着变。
+    try:
+        bpm3 = octave_fix_slow(f, onset_env(f, "low"), bpm, anchor, peaks)
+        if abs(float(bpm3) - float(bpm)) > 0.5:
+            bpm = float(bpm3)
+            bpm_auto = bpm
+            period = 60.0 / bpm
+            base = anchor
+            phrase, contrast, _ = phrase_phase(f, base, period)
+            anchor = base + phrase * period
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    # ★★ 2026-10-30（用户「我扫了三遍还是 172.3」）：**整数吸附**。
+    #   172.3 是"重采样 + 细扫步长"造成的折叠误差，不是真实 BPM；
+    #   用跨段命中率比较 172.0，明显更好就换掉（并重算小节相位）。
+    try:
+        _t = (np.arange(env.shape[0]) * f["dt"]).astype(np.float64)
+        bpm4, _gain = snap_bpm_to_int(_t, env.astype(np.float64), bpm)
+        if abs(float(bpm4) - float(bpm)) > 1e-6:
+            bpm = float(bpm4)
+            bpm_auto = bpm
+            period = 60.0 / bpm
+            base = anchor
+            phrase, contrast, _ = phrase_phase(f, base, period)
+            anchor = base + phrase * period
+    except Exception:                                            # noqa: BLE001
+        pass
+
     # ★★ 2026-10-28：多 BPM 段检测（用户问「一首歌有多个 BPM 段怎么办」）。
     #   恒速歌在 `detect_segments` 的预检里就返回 [] ⇒ 零额外成本、结果与以前完全一致；
     #   只有「全曲 BPM 逐窗对不上」时才会重算高帧率并真的分段。
@@ -1165,7 +1376,7 @@ def vdj_db_path():
       3) 各盘符下的 `VirtualDJ\\database.xml`（VDJ 允许把曲库放在任意磁盘）
 
     ⚠ 一台机器上可能同时存在**多个 VDJ 库**（例如旧库被弃用、新库放在别的盘）。
-      实测遇到过：`P:\\VirtualDJ\\` 里是 48 首的旧库，而真正在用的是另一盘上的
+      实测遇到过：`<VDJ目录>` 里是 48 首的旧库，而真正在用的是另一盘上的
       1421 首主库。**只按盘符顺序取第一个会取错** ⇒ 多个候选时取**体积最大**的
       （主库通常最大）；要精确指定就用 `AUTO_VJ_VDJ_DB`。
     """
@@ -1401,7 +1612,7 @@ def _file_duration(path):
 # ==========================================================================
 # 6. 统一入口
 # ==========================================================================
-def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
+def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True, out_feats=None):
     """把已重采样好的 mono 组装成 grid dict（compute_grid / grid_from_signal 共用）。"""
     if not isinstance(mono, np.ndarray) or mono.size < sr:      # 太短，放弃
         return None
@@ -1418,7 +1629,7 @@ def _assemble(mono, sr, e, dur, do_scan=None, allow_local=True):
     try:
         # ⚠ 2026-10-28：库扫描**不用**多窗投票（实测更差，见 analyze_track 注释）。
         a = analyze_signal(mono, sr, anchor_hint=anchor_hint, bpm_hint=bpm_hint,
-                           do_scan=do_scan)
+                           do_scan=do_scan, out_feats=out_feats)
     except Exception as ex:            # noqa: BLE001
         if e:                          # 分析失败但有 VDJ 数据 → 至少给网格
             return {"bpm": e["bpm"], "beat_len": e["beat_len"], "anchor": e["anchor"],
@@ -1477,7 +1688,7 @@ def compute_grid(path, vdj=None, maxsec=GRID_MAXSEC, allow_local=True, do_scan=N
 
 
 def grid_from_signal(mono, sr, vdj=None, path="", maxsec=GRID_MAXSEC, dur=None,
-                     allow_local=True, do_scan=None, use_vdj=True):
+                     allow_local=True, do_scan=None, use_vdj=True, out_feats=None):
     """从**已解码**的单声道整曲信号算网格。
 
     ★ 曲库扫描时用它：扫描已经为指纹解码过一次，这里直接复用，省掉第二次读盘
@@ -1499,7 +1710,8 @@ def grid_from_signal(mono, sr, vdj=None, path="", maxsec=GRID_MAXSEC, dur=None,
     n = min(len(mono), int(maxsec * sr))
     sig = np.ascontiguousarray(mono[:n], dtype=np.float32)
     sig, sr2 = resample(sig, sr, SR_TARGET)
-    return _assemble(sig, sr2, e, dur, do_scan=do_scan, allow_local=allow_local)
+    return _assemble(sig, sr2, e, dur, do_scan=do_scan, allow_local=allow_local,
+                     out_feats=out_feats)
 
 
 def store_grid(cfg, path, grid):
@@ -1559,7 +1771,7 @@ def grid_beat_index(grid, offset_sec, phrase_len=8):
 # ==========================================================================
 # 6.5 手工标注（grid_manual）与「有效网格」合并
 # ==========================================================================
-def effective_grid(grid, manual):
+def effective_grid(grid, manual, meta=None):
     """合并算法 `grid` + 手工 `manual` → 引擎/详情页统一消费的「有效网格」。
 
     规则（与架构设计 §3.2/§8-Q2 一致）：
@@ -1570,6 +1782,15 @@ def effective_grid(grid, manual):
       · 二者可共存（单段模式：手动 BPM + 多个八拍头）。
 
     返回**新 dict**（绝不原地改 `grid`——grid 是算法产物，重扫要能重建）。
+
+    :param meta: 可选，`cfg["music_meta"][path]` 那一层 dict。给了就从
+        `meta["grid_flip"]`（用户手工的「半句相位翻转」开关）换算成 `flip` 拍
+        写进返回值。
+
+    ⚠⚠ 2026-11-07（用户 `Northad - Frosty Dance`「这首歌的 8 拍的线偏移了 4 拍」）：
+      `grid_flip` 一直只有**引擎**在读（`ui_main.py` 注入 item 时换算成 `flip=4.0`），
+      详情页波形走的是本函数 ⇒ 拿不到 `flip` ⇒ 同一首歌「引擎的八拍头」和
+      「波形上的八拍线」差 4 拍（0.413793×4 = 1.655 s）。现在统一从这一处下发。
     """
     if not isinstance(grid, dict):
         grid = {}
@@ -1582,6 +1803,15 @@ def effective_grid(grid, manual):
         except (TypeError, ValueError):
             return default
 
+    def _with_flip(out):
+        src = meta if isinstance(meta, dict) else {}
+        try:
+            on = bool(src.get("grid_flip"))
+        except Exception:                                        # noqa: BLE001
+            on = False
+        out["flip"] = 4.0 if on else 0.0
+        return out
+
     segs = m.get("segments") or []
     if segs:
         g["segments"] = [dict(s) for s in segs if isinstance(s, dict)]
@@ -1593,7 +1823,7 @@ def effective_grid(grid, manual):
             g["beat_len"] = round(bl0, 6)
             g["anchor"] = _f(s0.get("anchor"))
             g["src"] = "manual"
-        return g
+        return _with_flip(g)
 
     bpm_m = _f(m.get("bpm_manual"))
     if bpm_m > 0:
@@ -1606,7 +1836,7 @@ def effective_grid(grid, manual):
         g["anchors"] = sorted({_f(a) for a in anchors if _f(a) >= 0.0})
         if g["anchors"]:
             g["anchor"] = g["anchors"][0]
-    return g
+    return _with_flip(g)
 
 
 def segment_at(segments, offset, grid=None):

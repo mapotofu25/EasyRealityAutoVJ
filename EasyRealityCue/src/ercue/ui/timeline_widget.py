@@ -44,7 +44,10 @@
       **提交**：原件留在按下位置 + 副本落在"松开左键的位置"，**此刻才发** `duplicate_requested`；
       提交后**自动退出**复制模式（不必再按一次右键）。
       中途取消：`Esc` 或再按一次右键 ⇒ 取消复制（不发副本、原件回原位）。
-      保留旧语义：**没有"拖动中"的普通右键**（片段已选中、未在拖动）⇒ 仍**立即复制一份**（一次性）。
+      ★★ 2026-11-03（用户：「右键两下就会复制一份出来，不需要这个逻辑」）：
+        **普通右键永远只弹菜单，绝不产份**。原来那条"已选中且未拖动 ⇒ 立即复制一份"的旧语义
+        已删除 —— 它导致"第一下右键选中、第二下右键就多一个片段"。
+        复制只有两个入口：① 上面这个 CDR 手势；② 右键菜单里的「复制片段」。
 """
 
 from __future__ import annotations
@@ -375,6 +378,11 @@ class CueTimeline(QWidget):
         self.bpm = 0.0
         self.view0 = 0.0                       # 视口起点（秒）
         self.view_span = 64.0                  # 视口跨度（秒）
+        # ★ 2026-11-03（用户：「缩小不能缩到音频的显示内容比时间轴还小」）：
+        #   视口跨度的**上限**。默认 = 硬上限（不额外限制，与旧行为一致）；
+        #   由窗口按"当前曲目内容长度"经 `set_max_span()` 喂进来（见 `window._content_sec()`）。
+        #   ⚠ 缩放上下限**只在这里定义**（`_clamp_span()`），窗口侧不再自己钳一套。
+        self.max_span = float(theme.VIEW_SPAN_MAX)
         self.playhead = None                   # 当前位置（秒）；None = 不画
         self.sel = ("", "")
         # ★ 第九轮（框选多选）：并行多选集合（**单选时清空**）。`self.sel` 仍是单选语义、结构不变。
@@ -687,8 +695,67 @@ class CueTimeline(QWidget):
 
     def set_view(self, sec0, span_sec):
         self.view0 = max(0.0, _units.to_float(sec0))
-        self.view_span = max(theme.VIEW_SPAN_MIN, _units.to_float(span_sec))
+        # ★ 2026-11-03：上界不再是硬上限 `VIEW_SPAN_MAX`，而是"内容上限" `self.max_span`
+        #   （见 `set_max_span()`）；钳制逻辑统一在 `_clamp_span()`，全程序只此一处。
+        self.view_span = self._clamp_span(_units.to_float(span_sec))
         self.update()
+
+    # ------------------------------------------------------------------
+    # ★ 2026-11-03（用户：「这个时间轴这个缩小不能缩到这个音频的显示内容比这个时间轴
+    #   还小这个长度上。就是要有一个限制。」）
+    #   旧行为：视口跨度只受 `theme.VIEW_SPAN_MAX`（20000s）约束 ⇒ 内容只有 8 秒也能缩到
+    #   视口几十秒，音频在视野里只剩一小段。现在上限 = **当前曲目的内容长度**，
+    #   即"最多缩到内容正好铺满整个时间轴"，再往外缩不动。
+    # ------------------------------------------------------------------
+    def set_max_span(self, sec):
+        """设定视口跨度的**上限**（秒）。由窗口按"当前曲目内容长度"喂入。
+
+        `sec` 有效（> 0）⇒ 落在 `[VIEW_SPAN_MIN, VIEW_SPAN_MAX]` 内（VIEW_SPAN_MAX 仍是
+        硬上限，防止内容长度被算成天文数字时把视图撑爆）。
+
+        `sec <= 0`（不知道内容多长 / 空表）⇒ 回落硬上限 `VIEW_SPAN_MAX`。
+        ⚠ **绝不退化成 0**：跨度 0 意味着"每秒 → 无穷像素"，视图既画不出来也放不回去。
+        """
+        try:
+            v = float(sec if sec is not None else 0.0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0.0:
+            self.max_span = max(float(theme.VIEW_SPAN_MIN),
+                                min(float(theme.VIEW_SPAN_MAX), v))
+        else:
+            self.max_span = float(theme.VIEW_SPAN_MAX)
+        if self.view_span > self.max_span:
+            # 用户可能**已经缩过头了**（先有空视野、后才有内容 / 换了更短的曲目）⇒ 立刻收敛，
+            # 否则会停在"内容只占一小段"的旧状态，看不出限制生效。
+            self.view_span = self.max_span
+            self.update()
+
+    def _clamp_span(self, span) -> float:
+        """把跨度钳进 `[VIEW_SPAN_MIN, self.max_span]` —— **缩放上下限的唯一实现**。"""
+        try:
+            v = float(span)
+        except (TypeError, ValueError):
+            v = float(self.view_span)
+        return max(float(theme.VIEW_SPAN_MIN), min(float(self.max_span), v))
+
+    def zoom_by(self, k) -> float:
+        """按倍率缩放视口跨度（`k > 1` 视野变大/内容变小；`k < 1` 放大），返回新的跨度。
+
+        `view0` **不动**（"纯缩放"语义，调用方要自己决定锚点）。当前唯一的**用户入口**是
+        Ctrl+滚轮：它取本函数的返回值、再按"鼠标位置为锚"重算 `view0`（见 `wheelEvent`）。
+        （T02#7 起工具条上的「放大/缩小」按钮已删，`window._zoom()` 只留给工具/测试/将来的
+        外部调用，别在注释里假设有个按钮。）
+        """
+        try:
+            kk = float(k)
+        except (TypeError, ValueError):
+            kk = 1.0
+        if kk <= 0.0:
+            kk = 1.0                                     # 非正倍率无意义 ⇒ 当 1 处理（不动）
+        self.view_span = self._clamp_span(self.view_span * kk)
+        self.update()
+        return self.view_span
 
     def set_playhead(self, sec):
         self.playhead = None if sec is None else _units.to_float(sec)
@@ -939,9 +1006,9 @@ class CueTimeline(QWidget):
             # 以**鼠标所在秒位**为锚缩放（PR 行为）：缩放时手不用重新找位置
             anchor = self._sec(e.position().x())
             frac = (anchor - self.view0) / max(1e-9, self.view_span)
-            span = max(theme.VIEW_SPAN_MIN,
-                       min(theme.VIEW_SPAN_MAX, self.view_span * (0.82 ** n)))
-            self.view_span = span
+            # ★ 2026-11-03：跨度钳制**一律走 `zoom_by()`**（上限唯一来源 = `self.max_span`），
+            #   这里只拿返回值按"鼠标为锚"把 view0 挪回去 —— 不再在此处重复写一套 min/max。
+            span = self.zoom_by(0.82 ** n)
             self.view0 = max(0.0, anchor - frac * span)
         elif mods & Qt.ShiftModifier:
             self._pan_sec(-n * max(1.0, self.view_span) * 0.08)
@@ -1544,23 +1611,16 @@ class CueTimeline(QWidget):
             _ly, it = self._hit(e.pos())[:2]
             lyr_id = (_ly.lyr_id if _ly is not None else "")
         if it is not None:
-            # ★ 第九轮：多选态下右键"多选成员" ⇒ **整组**按"锚点对齐到点击处"复制一份
+            # ★★ 2026-11-03 03:04（用户：「对着素材右键两下就会复制一份出来，不需要这个
+            #   逻辑；再制是**长按左键 + 按右键 + 松左键**」）：
+            #   **右键永远只弹菜单，绝不产份**。原来这里有两条"右键即复制"的分支
+            #   （多选整组 / 已选中单品）—— 第一下右键选中、第二下右键就多一个片段，
+            #   用户踩的就是它。现在复制只有：① CDR 手势（左键拖+右键+松左键）；
+            #   ② 菜单里的「复制片段」（多选时它自己整组处理）。
             if len(self.sel_multi) > 1 and (lyr_id, it.item_id) in self.sel_multi:
-                delta = max(0.0, self._sec(e.pos().x())) - _units.to_float(it.at_sec)
-                entries = []
-                for lid, iid in sorted(self.sel_multi):
-                    _l2, m2 = self._find(lid, iid)
-                    if m2 is not None:
-                        entries.append((lid, iid, max(0.0, _units.to_float(m2.at_sec) + delta)))
-                if entries:
-                    self.group_duplicate_requested.emit(entries)
-                    e.accept()
-                    return
-            if self.sel == (lyr_id, it.item_id):
-                # ★ 旧语义保留：右键"已选中片段"且**未在拖动** ⇒ 立即复制一份
-                #   （一次性；不进复制模式 ⇒ 无需再手动取消）
-                self.duplicate_requested.emit(lyr_id, it.item_id,
-                                              max(0.0, self._sec(e.pos().x())))
+                # 右键"多选成员" ⇒ **保持多选**、直接弹菜单（别收敛成单选，
+                #   否则菜单里的「复制片段」只会复制一个）
+                self.context_menu.emit(lyr_id, it.item_id, gpos)
                 e.accept()
                 return
             self.sel = (lyr_id, it.item_id)

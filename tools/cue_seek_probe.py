@@ -397,14 +397,17 @@ def auto_pick(limit=6):
       包里内嵌了 DXV 素材（`media/12.mov`，codec=dxv）⇒ 从包里解到临时目录用。
     """
     picked = []
+    # 真实素材目录不写死在仓库里（会暴露本机目录结构）——用环境变量给（多个用 os.pathsep 分隔）
+    _dirs = [d for d in os.environ.get("ERAVJ_PV_ROOT", "").split(os.pathsep) if d]
+    mp4s = [p for d in _dirs for p in glob.glob(os.path.join(d, "*.mp4"))]
     # 1) 短 H.264（< 10s）
-    for p in glob.glob(r"P:\avi~\*.mp4"):
+    for p in mp4s:
         m = _probe_meta(p)
         if m and m["codec"] == "h264" and 0.5 <= m["dur"] <= 10.0:
             picked.append(("短 H.264", p, m))
             break
     # 2) 长 H.264（> 120s）
-    for p in glob.glob(r"P:\宣传PV（改）\*.mp4") + glob.glob(r"P:\avi~\*.mp4"):
+    for p in mp4s:
         m = _probe_meta(p)
         if m and m["codec"] == "h264" and m["dur"] > 120.0:
             picked.append(("长 H.264(>2min)", p, m))

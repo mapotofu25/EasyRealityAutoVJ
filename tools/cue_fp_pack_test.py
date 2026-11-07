@@ -23,7 +23,7 @@
      （另一首原样保留）、幂等（再调 0 删除**不写盘**）、无撞车 0 写盘、
      **反向复现**（判据换成"路径相等" ⇒ 撞车判不出来）、对账后另一首仍能认出音频
 
-⚠ 真实素材：`Y:\\EasyRealityAutoVJ\\码表素材\\揽月 - Dreamira.flac`（+ Supa7onyz 那首）。
+⚠ 真实素材：`<素材库>\\揽月 - Dreamira.flac`（+ Supa7onyz 那首）。
   找不到时退回**合成音频**（正弦 + 噪声），报告里会明确标注用的是生成素材。
 
 运行：`venv\\Scripts\\python.exe tools\\cue_fp_pack_test.py`
@@ -54,10 +54,10 @@ import fp as fpvj                                                    # noqa: E40
 OK, FAIL = [], []
 TMP = tempfile.mkdtemp(prefix="cuefppack_")
 
-#: 真实素材（用户机器上的码表素材目录）
-MAT_DIR = r"Y:\EasyRealityAutoVJ\码表素材"
-MAT_A = os.path.join(MAT_DIR, "揽月 - Dreamira.flac")
-MAT_B = os.path.join(MAT_DIR, "Nimbus Spark 1999 - Supa7onyz.flac")
+#: 真实素材目录不写死在仓库里（会暴露本机目录结构）——用 `ERAVJ_CUE_MEDIA` 指过来
+MAT_DIR = os.environ.get("ERAVJ_CUE_MEDIA", "")
+MAT_A = os.path.join(MAT_DIR, "揽月 - Dreamira.flac") if MAT_DIR else ""
+MAT_B = os.path.join(MAT_DIR, "Nimbus Spark 1999 - Supa7onyz.flac") if MAT_DIR else ""
 
 #: 指纹对**整首**算（与编排端导出时完全一致：真实歌 49462 / 19607 条）。
 #: 真实包就是这么造出来的，所以这里也整首算 —— 报告的"灌库耗时"才是现场那个量级。

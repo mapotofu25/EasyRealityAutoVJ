@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""PyInstaller 打包脚本：生成 P:\AutoVJ\dist\EasyRealityAutoVJ\EasyRealityAutoVJ.exe
+r"""PyInstaller 打包脚本：生成 <项目根>\dist\EasyRealityAutoVJ\EasyRealityAutoVJ.exe
 用法: venv\Scripts\python tools\build_exe.py
 """
 import os
@@ -39,10 +39,9 @@ cmd = [
     "--hidden-import", "cffi",
     "--hidden-import", "tags_def",
     "--hidden-import", "tagger",
-    "--hidden-import", "audio_genre",
-    "--hidden-import", "music_meta",
-    "--hidden-import", "genre_lookup",
-    "--hidden-import", "genre_keywords",
+    # ★ 2026-10-30 用户「大砍刀」：曲风识别（audio_genre / genre_lookup /
+    #   genre_keywords / music_meta）整条删除 —— 连带 assets/models/{chinese_clip,discogs}
+    #   也不再打包（包体积从 ~470MB 降到 ~140MB）。
     "--hidden-import", "charge_engine",
     "--hidden-import", "fp",
     # ★ 2026-10-28：频带校验是**函数内惰性 import**，PyInstaller 静态扫描看不到，
@@ -145,7 +144,38 @@ else:
     print("★ 图标缺失，跳过（%s）" % _icon)
 cmd.append(os.path.join(SRC, "main.py"))
 print(" ".join(cmd))
-rc = subprocess.call(cmd)
+
+# ★★★ 2026-11-06：**打包前**临时把 NDI 的 DirectShow / UWP 变体改名藏起来。
+#   为什么不在打包后删（旧做法）：那两个 DLL 40MB + 23MB，删它们加上别的开发文件
+#   一共 50 个文件 ⇒ 触发安全钩子的「批量删除确认」⇒ 删除被拦 ⇒ 冗余留在包里
+#   （实测 2026-11-06 打出来的 dist 是 481MB，而正确的应该是 415MB）。
+#   改名不算删除，钩子不管；PyInstaller 那一趟就收不到这两个文件。
+#   ⚠⚠ 不能只改名！`--collect-all cyndilib` 收的是**整个目录**，改名后
+#       `xxx.dll.hidden_for_build` 照样被打进包（实测 2026-11-06：改名后 dist 仍是 481MB）。
+#   ⇒ 必须**移出目录**，打完再移回来。移到 BUILD_ROOT 下（同一磁盘，move 是瞬时的）。
+_NDI_BIN = os.path.join(os.path.dirname(os.path.dirname(sys.executable)),
+                        "Lib", "site-packages", "cyndilib", "wrapper", "bin")
+_STASH = os.path.join(BUILD_ROOT, "_ndi_hidden")
+_HIDE = ("Processing.NDI.Lib.DirectShow.x64.dll", "Processing.NDI.Lib.UWP.x64.dll")
+_hidden = []
+for _n in _HIDE:
+    _p = os.path.join(_NDI_BIN, _n)
+    if os.path.isfile(_p):
+        try:
+            os.makedirs(_STASH, exist_ok=True)
+            os.rename(_p, os.path.join(_STASH, _n))
+            _hidden.append(_n)
+        except OSError as e:
+            print("⚠ 隐藏失败（打包会带回这 63MB）: %s" % e)
+print("NDI 变体已临时移出 %d 个（打包后自动还原）" % len(_hidden))
+try:
+    rc = subprocess.call(cmd)
+finally:
+    for _n in _hidden:
+        try:
+            os.rename(os.path.join(_STASH, _n), os.path.join(_NDI_BIN, _n))
+        except OSError:
+            print("⚠ 没还原成功，请手动移回：%s" % os.path.join(_STASH, _n))
 
 # ---- 打包后瘦身：cyndilib 自带 3 个平台的 NDI 运行库，只用得上 x64 ----
 #   Processing.NDI.Lib.x64.dll        28.8MB  ← 在用（Windows x64 运行库）

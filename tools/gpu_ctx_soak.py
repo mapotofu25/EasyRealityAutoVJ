@@ -16,7 +16,9 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-LIB = r"Y:\EasyRealityAutoVJ\素材库"
+# 素材目录不写死在仓库里（会暴露本机目录结构）——环境变量优先，否则取项目根旁边的 `素材库`
+LIB = os.environ.get("ERAVJ_LIB") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "素材库")
 PID = os.getpid()
 k32 = ctypes.windll.kernel32
 psapi = ctypes.WinDLL("psapi")
@@ -65,6 +67,9 @@ def w(s=""):
 
 def main():
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 24
+    if not os.path.isdir(LIB):
+        w("★ 素材目录不存在：%s（可用 ERAVJ_LIB 指定）—— 跳过" % LIB)
+        return
 
     import av
     import glctx

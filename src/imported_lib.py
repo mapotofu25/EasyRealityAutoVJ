@@ -39,7 +39,11 @@ _SCHEMA = (
     #     保证 `add_song` 的显式列名顺序与建表顺序对齐（防"列插反"静默写错）。
     " pack TEXT DEFAULT '',"
     # ★ 2026-10-27 曲库识别增强：手工标注（bpm_manual/anchors/segments），JSON。
-    " manual TEXT DEFAULT '')",
+    " manual TEXT DEFAULT '',"
+    # ★★ 2026-10-31（用户「erlib 的扫描要和 eravj 一样」）：能量段落表随包导入。
+    #   没有它 ⇒ 导入的歌没有段落色带、也不按段落切素材（本机扫的歌有，所以"不一样"）。
+    #   ⚠ 必须是**独立列**，不能塞 `manual.segments`（那是多 BPM 分段网格）。
+    " sections TEXT DEFAULT '', sections_raw TEXT DEFAULT '')",
     "CREATE INDEX IF NOT EXISTS idx_imp_name ON songs(file_name)",
     # ★ 2026-10-27 曲库识别增强：导入歌的波形（zlib 压缩 JSON BLOB）。
     "CREATE TABLE IF NOT EXISTS waveforms ("
@@ -85,13 +89,19 @@ def _migrate(conn):
                 print("[imported_lib] 迁移补列 pack 失败（下次打开会重试）：%s" % e)
             except Exception:                                    # noqa: BLE001
                 pass
-    if "manual" not in cols:
+    # ★ 2026-10-31：改成**通用补列**（以后再加列只往这个列表里加一项）。
+    for _col, _ddl in (("manual", " manual TEXT DEFAULT ''"),
+                       ("sections", " sections TEXT DEFAULT ''"),
+                       ("sections_raw", " sections_raw TEXT DEFAULT ''")):
+        if _col in cols:
+            continue
         try:
-            conn.execute("ALTER TABLE songs ADD COLUMN manual TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE songs ADD COLUMN" + _ddl)
             conn.commit()
         except Exception as e:                                   # noqa: BLE001
             try:
-                print("[imported_lib] 迁移补列 manual 失败（下次打开会重试）：%s" % e)
+                print("[imported_lib] 迁移补列 %s 失败（下次打开会重试）：%s"
+                      % (_col, e))
             except Exception:                                    # noqa: BLE001
                 pass
 
@@ -167,14 +177,15 @@ def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None
         "INSERT OR REPLACE INTO songs ("
         " song_id, file_name, file_size, duration, artist, title, rel_path,"
         " genres, styles, source, level, ai_zh, grid, cover_path, imported_at,"
-        " pack, manual) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " pack, manual, sections, sections_raw)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (int(sid), m.get("file_name", ""), int(m.get("file_size") or 0),
          float(m.get("duration") or 0.0), m.get("artist", ""),
          m.get("title", ""), m.get("rel_path", ""),
          _j(m.get("genres")), _j(m.get("styles")), m.get("source", ""),
          m.get("level", ""), _j(m.get("ai_zh")), _j(m.get("grid")),
          cover_path or "", time.time(), str(pack or ""),
-         _j(manual_val)))
+         _j(manual_val), _j(m.get("sections")), _j(m.get("sections_raw"))))
     if waveform is not None:
         try:
             import waveform as _wf
@@ -229,28 +240,107 @@ def lookup_grids(base_dir):
     return out
 
 
-def lookup_genres(base_dir):
-    """`{sid: {"genres":[...], "ai_zh":[...], "artist":..., "title":...}}` ——
-    给 `engine.set_song_genres()` 用（指纹识别到歌时取精确曲风）。"""
+# ★ 2026-10-30 用户「大砍刀」：`lookup_genres()`（给 engine.set_song_genres 用）随
+#   曲风识别一并删除。包里的 genres 列保留不动（老包照常导入，只是不再读）。
+
+
+def lookup_sections(base_dir):
+    """`{sid: (raw_sections, dur, grid)}` —— 给 `engine.set_song_sections()` 用。
+
+    ★★ 2026-10-31（用户「erlib 的扫描要和 eravj 一样」）：本机扫的歌，段落表存在
+      `cfg["music_meta"][path]["sections"]`；导入的歌**没有 path**（文件不在这台机器）
+      ⇒ `engine._sections_for_sid()` 按路径取，永远取不到 ⇒ 导入歌没有段落色带、
+      也不按段落切素材。这里按 `song_id` 补一条取数路径。
+
+    只返回**真的有段落**的歌（空列表直接跳过，别让引擎缓存一堆空表）。
+    `dur`/`grid` 一起带出去 —— `sections.normalize()` 要靠它们把 t0 吸附到八拍头。
+    """
     out = {}
     try:
         if not os.path.isfile(meta_db_path(base_dir)):
             return out
         c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
         try:
-            for sid, gen, aizh, artist, title, name in c.execute(
-                    "SELECT song_id, genres, ai_zh, artist, title, file_name "
-                    "FROM songs"):
-                out[int(sid)] = {
-                    "genres": _p(gen) or [],
-                    "ai_zh": _p(aizh) or [],
-                    "artist": artist or "", "title": title or "",
-                    "file_name": name or "",
-                }
+            for sid, secs, dur, grid in c.execute(
+                    "SELECT song_id, sections, duration, grid FROM songs"):
+                if not secs:
+                    continue
+                try:
+                    raw = json.loads(secs)
+                except Exception:                                # noqa: BLE001
+                    continue
+                if not isinstance(raw, list) or not raw:
+                    continue
+                g = _p(grid)
+                if not isinstance(g, dict):
+                    g = {}
+                try:
+                    d = float(dur or g.get("dur") or 0.0)
+                except (TypeError, ValueError):
+                    d = 0.0
+                out[int(sid)] = (raw, d, g)
         finally:
             c.close()
     except Exception:                                            # noqa: BLE001
         pass
+    return out
+
+
+def waveforms_all(base_dir):
+    """`{sid: waveform}` —— **全部**导入歌的波形（一次连接、逐条解码）。
+
+    ★★ 2026-10-31（用户「eravj 的导入怎么没有波形」）：曲库面板的「波形」列要
+      显示导入歌的包络，而导入歌**本机没有音频文件**（伪路径），拿不到 `.wj`。
+      逐首调 `waveform_of()` 会为每首歌开一次 SQLite 连接（百首就是百次）；
+      这里一次读全表 —— 反正 BLOB 本来就是整批用的。
+    解不开的单条直接跳过（一条坏数据不该让整列都没波形）。
+    """
+    out = {}
+    try:
+        if not os.path.isfile(meta_db_path(base_dir)):
+            return out
+        import waveform as _wf
+        c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
+        try:
+            for sid, data in c.execute("SELECT song_id, data FROM waveforms"):
+                try:
+                    w = _wf.waveform_decode(bytes(data))
+                except Exception:                                # noqa: BLE001
+                    continue
+                if w and (w.get("amp") or []):
+                    out[int(sid)] = w
+        finally:
+            c.close()
+    except Exception:                                            # noqa: BLE001
+        return {}
+    return out
+
+
+def sections_display(base_dir):
+    """`{sid: [{"t0","t1","tier",...}, ...]}` —— 曲库面板画段落色带用。
+
+    与 `lookup_sections()` 的区别：那个是给引擎"按段落切素材"的（带 dur/grid 去吸附），
+    这里只要**展示**用的原始段落表（tier/区间），不做任何归一化。
+    """
+    out = {}
+    try:
+        if not os.path.isfile(meta_db_path(base_dir)):
+            return out
+        c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
+        try:
+            for sid, secs in c.execute("SELECT song_id, sections FROM songs"):
+                if not secs:
+                    continue
+                try:
+                    raw = json.loads(secs)
+                except Exception:                                # noqa: BLE001
+                    continue
+                if isinstance(raw, list) and raw:
+                    out[int(sid)] = [x for x in raw if isinstance(x, dict)]
+        finally:
+            c.close()
+    except Exception:                                            # noqa: BLE001
+        return {}
     return out
 
 
@@ -315,6 +405,36 @@ def display_rows(base_dir):
             c.close()
     except Exception:                                            # noqa: BLE001
         pass
+    return out
+
+
+def song_meta_by_sid(base_dir):
+    """`{sid: {"path":"", "title", "artist", "genres": [], "imported": True}}`。
+
+    ★★ 2026-10-31（用户「怎么输出预览不显示我在放那首歌」）：
+      导入包的歌**不在 `cfg["music_meta"]` 里**（本机根本没有音频文件，按 `song_id`
+      存在 `imported_meta.db`）。主窗口那张 `_song_meta_by_id` 只从本机曲库 + 码表
+      构建 ⇒ 导入歌被认出来（`recognized_song_id` 有了）却查不到歌名
+      ⇒ 输出预览的 HUD 只有「BPM / 能量」那一行，**没有 🎵 歌名**
+      （用户截图：正在放 `(10) [天音] Fly Anima.flac`，HUD 就是不显示它）。
+
+    2026-10-30「大砍刀」把 `lookup_genres` 那一整块删掉时，连 title/artist 的并入
+    也一起没了 —— 曲风确实不该恢复，但 **title/artist 是 HUD 要用的**，必须补回来。
+
+    `path` 故意留空：导入歌没有本机路径，任何按路径取文件的地方都不该拿到假路径。
+    """
+    out = {}
+    for r in display_rows(base_dir):
+        sid = int(r.get("sid") or 0)
+        if not sid:
+            continue
+        out[sid] = {
+            "path": "",
+            "title": r.get("title") or r.get("file_name") or "",
+            "artist": r.get("artist") or "",
+            "genres": [],            # 曲风已随"大砍刀"下线，别在这里复活
+            "imported": True,
+        }
     return out
 
 
@@ -410,6 +530,111 @@ def remove_songs(base_dir, sids):
     except Exception:                                            # noqa: BLE001
         pass
     return n
+
+
+def purge_sids(base_dir, sids, protect_sids=()):
+    r"""删掉这些**导入歌**（元数据 + 波形 + 封面 + **指纹**）。返回统计 dict。
+
+    ★★ 2026-10-31（用户「识别不到」的真正机理，主理人实测）：
+      同一段音频如果在 `fingerprints.db` 里有**两套 song_id**（本机一套 + 导入一套，
+      只因为路径写法不同），`fp.FingerprintDB.match()` 是按 song_id 分票的 ⇒
+      票被精确摊成 50/50（现场实测 6236 : 6236）⇒ 两边都够不到门槛 ⇒
+      **这首歌怎么都认不出来**。所以"以后不再导入"只能防新的，已经导进来的必须能清掉。
+
+    ## 安全约束（硬性，别"优化"掉）
+    · `sids` 必须是调用方用 `erlib.dupdetect` 判出来的"与本机同名同长"的那些，
+      本函数**不再自行判重**（判据只在一个地方，避免两处漂移）；
+    · **`protect_sids`（本机自己的 song_id）里的 sid：只删导入元数据，绝不删指纹** ——
+      否则删掉的就是本机那首歌的指纹，直接把歌从识别里抹掉；
+    · 删前备份 `imported_meta.db`（`*.bak-时间戳`，几百 KB）；
+    · **不备份 `fingerprints.db`**（现场 287MB，备份机制会整份复制，C 盘会爆）——
+      靠"只按 song_id 精确删 + 打印清单"保证可回溯（重新导入包即可重建）；
+    · 只按 **song_id** 删指纹，**绝不**按 hash（hash 会误伤本机那首的同内容指纹）。
+    """
+    import shutil
+    sids = [int(x) for x in (sids or ())]
+    protect = set(int(x) for x in (protect_sids or ()))
+    out = {"songs": 0, "waveforms": 0, "covers": 0, "fingerprints": 0,
+           "backup": "", "protected": []}
+    if not sids:
+        return out
+    mp = meta_db_path(base_dir)
+    # ① 备份元数据库（小文件；指纹库不备，见 docstring）
+    if os.path.isfile(mp):
+        try:
+            # ★ 2026-10-31（QA 提的隐患）：原来只到**秒** ⇒ 同一秒内连点两次会覆盖上一份，
+            #   把"清理前快照"直接盖成清理后状态（退路没了）。现在带毫秒 + 递增避让，
+            #   保证**永不覆盖**已有备份。
+            _stamp = (time.strftime("%Y%m%d-%H%M%S")
+                      + "-%03d" % int((time.time() % 1) * 1000))   # 带毫秒（末 3 位）
+            bak = "%s.bak-%s" % (mp, _stamp)
+            _i = 1
+            while os.path.exists(bak):
+                bak = "%s.bak-%s-%d" % (mp, _stamp, _i)
+                _i += 1
+            shutil.copy2(mp, bak)
+            out["backup"] = bak
+            print("[imported_lib] 已备份导入元数据：%s" % os.path.basename(bak))
+        except Exception as e:                                   # noqa: BLE001
+            # 备份失败 ⇒ **不删**（宁可清不掉，也不能在没有退路的情况下删用户数据）
+            print("[imported_lib] 备份失败，已中止清理：%s" % e)
+            return out
+    # ② 删三张表里的行（逐 sid 显式写条件）
+    try:
+        c = open_meta(base_dir)
+        try:
+            for sid in sids:
+                try:
+                    out["waveforms"] += max(0, int(c.execute(
+                        "DELETE FROM waveforms WHERE song_id=?", (sid,)).rowcount))
+                    out["songs"] += max(0, int(c.execute(
+                        "DELETE FROM songs WHERE song_id=?", (sid,)).rowcount))
+                except Exception as e:                           # noqa: BLE001
+                    print("[imported_lib] 删除导入歌 %d 失败：%s" % (sid, e))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:                                       # noqa: BLE001
+        # ★ 2026-10-31（QA 提的隐患）：原来只 print 就往下走 ⇒ 步骤④照删指纹，
+        #   结果留下"导入行还在、指纹没了"的孤儿行（面板看得到、永远认不出）。
+        #   与"备份失败中止"同一策略：**元数据没删干净就绝不继续删指纹**。
+        print("[imported_lib] 打开/删除导入元数据失败，已中止清理（未动指纹）：%s" % e)
+        return out
+    # ③ 封面文件（`imported_covers/<sid>.jpg`）
+    for sid in sids:
+        try:
+            p = os.path.join(cover_dir(base_dir), "%d.jpg" % sid)
+            if os.path.isfile(p):
+                os.remove(p)
+                out["covers"] += 1
+        except Exception:                                        # noqa: BLE001
+            pass
+    # ④ 指纹（主库）：**只按 song_id**，且跳过本机自己的 sid
+    try:
+        db = os.path.join(base_dir, "fingerprints.db")
+        if os.path.isfile(db):
+            c = sqlite3.connect(db, timeout=30.0)
+            try:
+                rows = []
+                for sid in sids:
+                    if sid in protect:
+                        out["protected"].append(sid)
+                        continue
+                    n = int(c.execute(
+                        "SELECT COUNT(*) FROM fingerprints WHERE song_id=?",
+                        (sid,)).fetchone()[0])
+                    rows.append((sid, n))
+                print("[imported_lib] 将删指纹：%s"
+                      % ", ".join("sid=%d(%d 条)" % (s, n) for s, n in rows))
+                c.executemany("DELETE FROM fingerprints WHERE song_id=?",
+                              [(s,) for s, _n in rows])
+                c.commit()
+                out["fingerprints"] = sum(n for _s, n in rows)
+            finally:
+                c.close()
+    except Exception as e:                                       # noqa: BLE001
+        print("[imported_lib] 删除重复指纹失败：%s" % e)
+    return out
 
 
 def clear(base_dir):

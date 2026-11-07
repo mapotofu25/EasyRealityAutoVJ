@@ -40,7 +40,7 @@ class LayerPlayState:
     __slots__ = ("lyr_id", "z", "blend", "opacity", "clip_id", "clip_path", "missing",
                  "item_id", "src_in_sec", "src_out_sec", "play_sec", "crop", "xform",
                  "speed", "active", "alpha", "trans", "trans_p", "note", "ended", "dur",
-                 "src_ended")
+                 "src_ended", "trans_is_out")
 
     def __init__(self, lyr_id="", z=0, blend="normal", opacity=1.0):
         self.lyr_id = lyr_id
@@ -61,6 +61,11 @@ class LayerPlayState:
         self.alpha = 0.0
         self.trans = "fade"
         self.trans_p = 0.0
+        # ★ 2026-11-02：本帧的转场是不是**出场**（淡出/滑出）。
+        #   为什么需要它：`trans_p` 对 slide/zoom/glitch 是"几何进度"，入场出场同为 0→1
+        #   （fade 才是 a_out）⇒ 绘制端**分不出方向**，滑动出场会被画成"从右边滑进来"。
+        #   只能由算 alpha 的这一层把方向告诉绘制端。
+        self.trans_is_out = False
         self.note = ""
         self.dur = 0.0               # 素材自身时长（秒）；0 = 未知
         self.ended = False           # 片段区间已结束（end_beats 到期且本层无后继）
@@ -96,6 +101,95 @@ def _eff_opacity(layer, item):
     return min(1.0, max(0.0, float(getattr(layer, "opacity", 1.0) or 0.0)))
 
 
+# ==========================================================================
+# ★ 2026-11-03「相邻同设置视为一个素材」（run）—— **与 Cue 端 `timeline` 同口径**
+# ==========================================================================
+#: 为什么演出端也要算一遍：`.ercue` 里存的是**每段自己的** `trans_in/trans_out`，
+#: 不存"哪些段属于同一个 run"。编排端预览自己算了一次（抑制段内过渡），
+#: 演出端若不算，就会"预览里是连续的、现场却切出再切入"（契约②破裂）。
+#: ⚠ 这段算法必须与 `EasyRealityCue/src/ercue/model/timeline.py` 的
+#:   `group_runs / run_flags / RUN_ATTRS / ADJ_EPS` **逐条一致**；改一边必须改另一边。
+ADJ_EPS_SEC = 0.02           # 秒。必须 > 包内 `at_sec` 的 0.01 写盘步长（实测 1e-3 会误断段）
+
+#: 参与"设置相同"判定的渲染属性（与 Cue 端同名同义；过渡时长这边是**拍**）。
+RUN_ATTRS = ("clip_id", "speed", "src_in_sec", "src_out_sec", "crop", "xform",
+             "blend", "opacity", "trans_in", "trans_in_beats",
+             "trans_out", "trans_out_beats")
+
+
+def _num_key(x):
+    """浮点归一（抹掉 1e-9 级表示噪声，保 6 位小数）。"""
+    if isinstance(x, bool) or x is None:
+        return repr(x)
+    if isinstance(x, (int, float)):
+        return "%.6f" % float(x)
+    return repr(x)
+
+
+def _run_key(it):
+    """把影响渲染的属性归一成可比较的键（dict/list 也归一，避免顺序敏感）。"""
+    vals = []
+    for k in RUN_ATTRS:
+        v = getattr(it, k, None)
+        # ⚠ **不要**把 `blend=""` 归一成 "normal"、`opacity=None` 归一成 1.0：
+        #   这两个是"**继承本层**"，归一化会在"层混合其实是 screen"时把
+        #   `""`(screen) 和 `"normal"` 判成相同 ⇒ **假合并**（两个不同混合被当成一段，
+        #   段内过渡被错误抑制）。保持原值比较既正确，也与 Cue 端 `_run_key` 逐字一致。
+        if isinstance(v, dict):
+            v = tuple(sorted((str(kk), _num_key(vv)) for kk, vv in v.items()))
+        elif isinstance(v, (list, tuple)):
+            v = tuple(_num_key(x) for x in v)
+        else:
+            v = _num_key(v)
+        vals.append(repr(v))
+    return tuple(vals)
+
+
+def same_render_settings(a, b):
+    return _run_key(a) == _run_key(b)
+
+
+def group_runs(items, eps):
+    """把片段按"同设置 + 紧挨"归成 `[(i, j)]`（**排序后的闭区间下标**）。
+
+    `eps` 单位与 `at_beats` 一致（拍）。`prev.end_beats is None` ⇒ 天然相邻。
+    """
+    src = list(items or [])
+    order = sorted(range(len(src)), key=lambda i: (src[i].at_beats, str(src[i].item_id)))
+    ordered = [src[i] for i in order]
+    runs = []
+    if not ordered:
+        return runs
+    start = 0
+    for i in range(1, len(ordered)):
+        prev, cur = ordered[i - 1], ordered[i]
+        if not same_render_settings(prev, cur):
+            runs.append((start, i - 1))
+            start = i
+            continue
+        if prev.end_beats is None:
+            adjacent = True
+        else:
+            adjacent = abs(float(cur.at_beats) - float(prev.end_beats)) <= eps
+        if not adjacent:
+            runs.append((start, i - 1))
+            start = i
+    runs.append((start, len(ordered) - 1))
+    return runs
+
+
+def run_flags(items, eps):
+    """`{item_id: (is_run_start, is_run_end)}`；单段 run ⇒ `(True, True)`（行为不变）。"""
+    src = list(items or [])
+    ordered = [src[i] for i in sorted(
+        range(len(src)), key=lambda i: (src[i].at_beats, str(src[i].item_id)))]
+    out = {}
+    for i, j in group_runs(src, eps):
+        for k in range(i, j + 1):
+            out[str(getattr(ordered[k], "item_id", ""))] = (k == i, k == j)
+    return out
+
+
 class CueRuntime:
     """一张码表 + 一首歌 的运行时。**每首歌 new 一个**（换歌即重建）。"""
 
@@ -116,6 +210,16 @@ class CueRuntime:
             for ly in track.sorted_layers():           # z 小 → 大（后画在上）
                 items = sorted([it for it in ly.items], key=lambda x: (x.at_beats, x.item_id))
                 self._lyrs.append((ly, items))
+        # ★ 2026-11-03：run 标记（"相邻同设置视为一个素材"）。
+        #   `ADJ_EPS_SEC` 是秒，这里按本曲拍长换成拍 —— 与 Cue 端同一判据、同一容差。
+        self._run_flags = {}
+        try:
+            _eps_beats = ADJ_EPS_SEC / float(self.beat_len) if self.beat_len > 0 else ADJ_EPS_SEC
+            for _ly, _items in self._lyrs:
+                self._run_flags.update(run_flags(_items, _eps_beats))
+        except Exception:                                        # noqa: BLE001
+            self._run_flags = {}          # 算不出来就退回"每段各自过渡"（旧行为，不炸）
+
         # ★ 素材时长表（clip_id → 秒）：用来**钳住**播放位置，见 `update()` 里的说明
         self._dur = {}
         for _m in (getattr(sheet, "media", None) or []):
@@ -188,7 +292,7 @@ class CueRuntime:
             return None, i, True            # 已结束（且本层后面没有新 item）
         return it, i, False
 
-    def _alpha_for(self, it, nxt, pos):
+    def _alpha_for(self, it, nxt, pos, is_start=True, is_end=True):
         """算这一层当前的显示强度 0~1 + 过渡信息 `(alpha, trans, trans_p)`。
 
         · 入场：`trans_in == "cut"` 或时长≈0 ⇒ 直接 1.0；否则按拍线性 0→1。
@@ -199,26 +303,34 @@ class CueRuntime:
         · `trans_p = a_in`（淡入）/ `1-a_out`（淡出）⇒ 合成器 `opacity × alpha × trans_p`
           得到有效 **α²**（契约②）。**这里不要改**，改了会与 Cue 端预览不一致。
         """
-        if abs(it.trans_in_beats) < 1e-6 or it.trans_in == "cut":
+        # ★★ 2026-11-03：run 段内抑制（用户：两个一样的 GIF 吸附紧挨，仍"先切出再切入"）。
+        #   `is_start/is_end` 来自 `run_flags()`（与 Cue 端 `timeline` 同一算法）：
+        #   段内片段 **不淡入**（直接从 1.0 起）、**不淡出**（不进入出场窗口）。
+        #   ⚠ 段首/段尾/单段 run ⇒ (True, True) ⇒ 与改动前逐值一致。
+        suppress_in, suppress_out = (not is_start), (not is_end)
+        if suppress_in or abs(it.trans_in_beats) < 1e-6 or it.trans_in == "cut":
             a_in = 1.0
         else:
             a_in = (pos - it.at_beats) / float(it.trans_in_beats)
             a_in = min(1.0, max(0.0, a_in))
         a_out = 1.0
-        trans = it.trans_in
-        trans_p = a_in
+        trans = "cut" if suppress_in else it.trans_in     # 段内 ⇒ 硬接（不淡入）
+        trans_p = a_in if not suppress_in else 1.0
+        is_out = False            # 本帧是不是出场过渡（见 `LayerPlayState.trans_is_out`）
         # 淡出窗口的右边界：本片段 end 优先，其次下一个片段的 at（与 Cue 端 A1 同口径）
         fade_out_start = None
         if it.end_beats is not None:
             fade_out_start = it.end_beats
         elif nxt is not None:
             fade_out_start = nxt.at_beats
-        if fade_out_start is not None and it.trans_out_beats > 1e-6 and it.trans_out != "cut":
+        if (not suppress_out) and fade_out_start is not None \
+                and it.trans_out_beats > 1e-6 and it.trans_out != "cut":
             left = fade_out_start - pos
             if left <= it.trans_out_beats:
                 a_out = max(0.0, left / float(it.trans_out_beats))
                 if a_out < a_in:            # 淡出优先（正在收尾）
                     trans = it.trans_out
+                    is_out = True
                     # ★★★ 2026-10-17（用户："编排结束后看不见淡出的过渡效果"）：
                     #   `fade` 的 `trans_p` 必须是**剩下的亮度**（a_out），不是"过渡进度"。
                     #   为什么：合成是 `opacity × alpha × trans_p`，而 alpha 本身就是 a_out
@@ -231,7 +343,7 @@ class CueRuntime:
                     #   ⚠⚠ 编排端（EasyRealityCue `timeline._alpha_for`）必须同步改，
                     #     否则预览与演出不一致（契约②两端口径）。
                     trans_p = (a_out if it.trans_out == "fade" else 1.0 - a_out)
-        return min(a_in, a_out), trans, trans_p
+        return min(a_in, a_out), trans, trans_p, is_out
 
     # ------------------------------------------------------------------
     def update(self, pos_beats, beat_len=None, rate=1.0, sheet_beat_len=None):
@@ -268,9 +380,11 @@ class CueRuntime:
                 ps.ended = bool(ended)
                 st["alpha"] = 0.0
             else:
-                a, trans, tp = self._alpha_for(it, nxt, pos)
+                _f = self._run_flags.get(str(getattr(it, "item_id", "")), (True, True))
+                a, trans, tp, t_out = self._alpha_for(it, nxt, pos,
+                                                      is_start=_f[0], is_end=_f[1])
                 if self.jumped:                    # 跳变后不做过渡，直接到位
-                    a, trans, tp = 1.0, it.trans_in, 1.0
+                    a, trans, tp, t_out = 1.0, it.trans_in, 1.0, False
                 ps.item_id = it.item_id
                 ps.clip_id = it.clip_id
                 ps.clip_path = self.media_paths.get(it.clip_id, "")
@@ -331,6 +445,7 @@ class CueRuntime:
                 ps.alpha = a
                 ps.trans = trans
                 ps.trans_p = tp
+                ps.trans_is_out = bool(t_out)
                 ps.note = it.note
                 ps.ended = bool(it.end_beats is not None and pos >= it.end_beats)
                 st["alpha"] = ps.alpha

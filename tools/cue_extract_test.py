@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """回归：**导入时解压内嵌素材**（`extract_media` 此前从未被调用）。
 
-用**用户那个真实包**（`Y:\\EasyRealityAutoVJ\\测试.ercue`，177MB / 内嵌 4 个素材）实测：
+用**用户那个真实包**（`<素材库>\\测试.ercue`，177MB / 内嵌 4 个素材）实测：
   1. `missing` 从 4 → **0**
   2. `<包路径>.media\\` 出现 **4 个文件**
   3. **幂等**：再导入一次 ⇒ **解压次数 = 0**，文件 mtime 不变
@@ -32,11 +32,10 @@ import cue_ui                                                       # noqa: E402
 import engine                                                       # noqa: E402
 from cue_seek_policy import CueSeekPolicy                            # noqa: E402
 
-#: 用户那个真实包（177MB / 内嵌 4 个素材）。2026-10-18 用户把它挪进了 `码表素材\`
-#: ⇒ 两个位置都试（老位置留着兼容，谁先存在用谁）。
-REAL_PKG = next((p for p in (r"Y:\EasyRealityAutoVJ\码表素材\测试.ercue",
-                             r"Y:\EasyRealityAutoVJ\测试.ercue")
-                 if os.path.isfile(p)), r"Y:\EasyRealityAutoVJ\码表素材\测试.ercue")
+#: 用户那个真实包（177MB / 内嵌 4 个素材）。目录不写死在仓库里（会暴露本机目录结构）
+#: ⇒ 用 `ERAVJ_CUE_MEDIA` 指到码表素材目录；不设就跳过这段。
+_CUE_MEDIA = os.environ.get("ERAVJ_CUE_MEDIA", "")
+REAL_PKG = os.path.join(_CUE_MEDIA, "测试.ercue") if _CUE_MEDIA else ""
 
 
 class FakeCfg:
@@ -87,7 +86,7 @@ def main():
             fails.append(name)
 
     if not os.path.isfile(REAL_PKG):
-        print("找不到真实包：%s（跳过）" % REAL_PKG)
+        print("跳过：未设置 ERAVJ_CUE_MEDIA 或找不到真实包（%s）" % REAL_PKG)
         return 2
 
     app = QApplication.instance() or QApplication(sys.argv)

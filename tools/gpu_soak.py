@@ -24,7 +24,9 @@ import numpy as np  # noqa: E402
 
 import media_manager as mm  # noqa: E402
 
-LIB = r"Y:\EasyRealityAutoVJ\素材库"
+# 素材目录不写死在仓库里（会暴露本机目录结构）——环境变量优先，否则取项目根旁边的 `素材库`
+LIB = os.environ.get("ERAVJ_LIB") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "素材库")
 OUT = []
 
 
@@ -68,6 +70,9 @@ def pick(n):
     import av
     import dxvnative
     out = []
+    if not os.path.isdir(LIB):
+        w("★ 素材目录不存在：%s（可用 ERAVJ_LIB 指定）" % LIB)
+        return out
     for f in sorted(os.listdir(LIB)):
         if not f.lower().endswith(".mov"):
             continue

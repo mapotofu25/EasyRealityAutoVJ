@@ -21,11 +21,11 @@ import logging
 import os
 import threading
 
-from PySide6.QtCore import QMimeData, Qt, QThread, Signal
+from PySide6.QtCore import QSize, Qt, QMimeData, QThread, Signal
 from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu,
     QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -167,6 +167,7 @@ class PkgPanel(QWidget):
             "每张码表是一个独立的 .ercue 包；切换列表里的一张 = 换一篇编排（互不影响）。")
         how.setWordWrap(True)
         how.setStyleSheet(_HOW)
+        self.lbl_how = how          # ★ 2026-11-03：四段竖排后由主窗口把它收进标题条 tooltip
         lv.addWidget(how)
 
         lv.addWidget(QLabel("码表包"))
@@ -195,14 +196,22 @@ class PkgPanel(QWidget):
         if it is not None:
             self.pickSheet.emit(str(it.data(Qt.UserRole) or ""))
 
-    def refresh(self, rows, current_key):
-        """`rows` = `[(key, label, unsaved)]`；**B1：blockSignals + 还原选中项**。"""
+    def refresh(self, rows, current_key, tips=None):
+        """`rows` = `[(key, label, unsaved)]`；**B1：blockSignals + 还原选中项**。
+
+        `tips`（可选）= `{key: tooltip}`：包内标题与文件名不一致时在这里看得到
+        （★ 2026-11-02 名字统一成文件名之后，`title` 信息不能丢）。
+        """
+        tips = tips or {}
         self.lst.blockSignals(True)
         try:
             self.lst.clear()
             for key, label, _unsaved in rows:
                 it = QListWidgetItem(label)
                 it.setData(Qt.UserRole, key)
+                _tip = str(tips.get(key) or "")
+                if _tip:
+                    it.setToolTip(_tip)
                 self.lst.addItem(it)
             for i in range(self.lst.count()):               # findData 还原选中项
                 if self.lst.item(i).data(Qt.UserRole) == current_key:
@@ -243,10 +252,11 @@ class TrackPanel(QWidget):
         lv.addWidget(how)
 
         row = QHBoxLayout()
-        b_add = QPushButton("＋ 曲目")
-        b_add.clicked.connect(self.addTrack.emit)
-        row.addWidget(b_add)
+        # ★ 2026-11-03 02:10（用户「去掉曲目里面那个加曲目那个选项，直接合并到那个
+        #   导入音频里面」）：**「＋ 曲目」按钮已去掉** —— 曲目一律由「导入音频…」产生
+        #   （选中音频文件即新建一条曲目）。`addTrack` 信号保留：别处（拖入音频等）仍可复用。
         b_imp = QPushButton("导入音频…")
+        b_imp.setToolTip("选一个音频文件 ⇒ 自动新建一条曲目（读标签/时长；BPM 可再点自动识别）")
         b_imp.clicked.connect(self.importAudio.emit)
         row.addWidget(b_imp)
         b_del = QPushButton("删除曲目")
@@ -431,6 +441,7 @@ class MediaPanel(QWidget):
             "**双击 = 在播放头位置给当前层加一个片段**；也可拖到时间轴某一层。")
         how.setWordWrap(True)
         how.setStyleSheet(_HOW)
+        self.lbl_how = how          # ★ 2026-11-03：同上，收起后挂标题条 tooltip
         lv.addWidget(how)
 
         b_add = QPushButton("＋ 素材…")
@@ -439,8 +450,24 @@ class MediaPanel(QWidget):
         lv.addWidget(b_add)
 
         self.lst = ClipList()
-        self.lst.setIconSize(QPixmap(96, 54).size())
-        self.lst.setToolTip("双击 = 在播放头位置给当前层加片段；可拖到时间轴；右键 = 定位 / 去掉")
+        # ★★ 2026-11-03（用户：「改成图标形式……就改成那种网格的」）：
+        #   原来是**一条一行**的列表（只有 96x54 的小图标 + 一行文件名）。
+        #   改成 IconMode 网格：缩略图在上、文件名在下、自动换行、随宽度重排。
+        #   ⚠ 仍然用 QListWidget（不是 QListView + model）：拖出 `CLIP_MIME` 的
+        #     `startDrag()` 是视图方法，换 model 要重写整条拖放链路。
+        self.lst.setViewMode(QListView.IconMode)
+        self.lst.setFlow(QListView.LeftToRight)
+        self.lst.setWrapping(True)
+        self.lst.setResizeMode(QListView.Adjust)      # 窗口变宽 ⇒ 自动多排一列
+        self.lst.setMovement(QListView.Static)        # 不许拖图标乱挪位置
+        self.lst.setUniformItemSizes(True)
+        self.lst.setWordWrap(False)
+        self.lst.setSpacing(2)
+        self.lst.setTextElideMode(Qt.ElideMiddle)
+        self._icon_size = 2                            # 1=小 2=中 3=大（右键可切）
+        self._apply_icon_size()
+        self.lst.setToolTip("双击 = 在播放头位置给当前层加片段；可拖到时间轴；"
+                            "右键 = 定位 / 去掉 / 缩略图大小")
         self.lst.itemDoubleClicked.connect(self._on_double)
         self.lst.setDragEnabled(True)
         self.lst.setDragDropMode(QAbstractItemView.DragOnly)
@@ -495,19 +522,101 @@ class MediaPanel(QWidget):
         if cid:
             self.addToTimeline.emit(cid)
 
+    # ---- 缩略图尺寸（右键三档，网格立刻重排）------------------------------
+    # ★ 2026-11-03 02:09（用户：「素材这个图标间隔太大了，图标也太大，
+    #   最小的这一档还能再小一点」）：三档整体调小 —— 96/144/208 → 68/96/144。
+    _ICON_SIZES = {1: 68, 2: 96, 3: 144}       # 只给宽度；高度固定 16:9
+
+    def _apply_icon_size(self):
+        w = self._ICON_SIZES.get(int(getattr(self, "_icon_size", 2)), 96)
+        h = int(round(w * 9 / 16.0))
+        self.lst.setIconSize(QSize(w, h))
+        # 格子 = 缩略图 + **一行**文件名。
+        # ⚠ 别开 wordWrap：文件名很长时文字要 3~4 行，Qt 会把图标垂直压扁
+        #   （实测 144x81 的图标被压成 ~140x35，看起来像"只有一条"），
+        #   而且格子里塞不下就干脆不画文字。改用单行 + 中间省略号。
+        # ★ 2026-11-03：**两处留白只能算一处**。
+        #   原来 `gridSize = w+16` **又** `spacing = w//12`（144 档 = 12px），
+        #   Qt 在 IconMode 下两者**叠加** ⇒ 视觉空隙接近 28px，看着稀稀拉拉。
+        #   现在：格子只留 8px 横向、20px 给文件名那一行；spacing 归 2。
+        self.lst.setGridSize(QSize(w + 8, h + 20))
+        self.lst.setSpacing(2)
+
+    def _set_icon_size(self, level):
+        self._icon_size = int(level)
+        self._apply_icon_size()
+
+    def build_menu(self, item=None):
+        """构造右键菜单（**纯构造、不 exec**，方便测试"哪些能点哪些不能点"）。
+
+        `item is None` ⇒ 右键点在**空白处**：
+          · 项相关的两条（定位 / 去掉）**禁用**（不是隐藏 —— 隐藏了就看不出"这里不能点"）；
+          · 面板级的（加素材 / 指定素材目录 / 缩略图大小）仍可用。
+        """
+        on_item = item is not None
+        cid = str(item.data(Qt.UserRole) or "") if on_item else ""
+        m = QMenu(self)
+        a_add = m.addAction("加素材…")
+        a_add.triggered.connect(lambda _c=False: self.addMedia.emit())
+        a_dir = m.addAction("指定素材目录…")
+        a_dir.triggered.connect(lambda _c=False: self.pickMediaDir.emit())
+        m.addSeparator()
+        a_reveal = m.addAction("在文件管理器里定位")
+        a_reveal.setEnabled(on_item)
+        if on_item:
+            a_reveal.triggered.connect(
+                lambda _c=False, x=cid: self.revealRequested.emit(x))
+        a_del = m.addAction("从这张码表里去掉")
+        a_del.setEnabled(on_item)
+        if on_item:
+            a_del.triggered.connect(
+                lambda _c=False, x=cid: self.removeRequested.emit(x))
+        m.addSeparator()
+        sub = m.addMenu("缩略图大小")
+        for lvl, name in ((1, "小"), (2, "中"), (3, "大")):
+            a = sub.addAction(name)
+            a.setCheckable(True)
+            a.setChecked(int(self._icon_size) == lvl)
+            a.triggered.connect(lambda _c=False, v=lvl: self._set_icon_size(v))
+        return m
+
     def _on_menu(self, pos):
         it = self.lst.itemAt(pos)
-        if it is None:
-            return
-        cid = str(it.data(Qt.UserRole) or "")
-        m = QMenu(self)
-        m.addAction("在文件管理器里定位").triggered.connect(
-            lambda _c=False, x=cid: self.revealRequested.emit(x))
-        m.addAction("从这张码表里去掉").triggered.connect(
-            lambda _c=False, x=cid: self.removeRequested.emit(x))
-        m.exec(self.lst.mapToGlobal(pos))
+        # 右键空白处也要能弹（用户要点"加素材/缩略图大小"），项相关动作在里面禁用
+        self.build_menu(it).exec(self.lst.mapToGlobal(pos))
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _media_tooltip(m, path, ok):
+        """单个素材项的**悬停提示**：完整名字（永不省略）+ 丢失原因 / 时长 / 素材编号。
+
+        ★ 2026-11-03（用户：「鼠标悬停在素材的那个窗口上面时……显示素材的完整名字」）：
+          网格里文件名只有一行且走 `Qt.ElideMiddle`（见 `_apply_icon_size` 的注释 ——
+          多行会把缩略图压扁），长名字必然只剩"开头…结尾"，**完整名字只能靠 tooltip 给**。
+        ⚠ 必须是**纯文本**：Qt tooltip 认富文本，名字里一旦出现 `<` / `&` 会被当标签吞掉，
+          而长名字用富文本自动换行也很难看（一段文字被折成三四行）。
+        """
+        name = str(getattr(m, "name", "") or "") or str(getattr(m, "clip_id", "") or "")
+        if not name:
+            # 极端兜底：name / clip_id 都空时 tooltip 不能是空串（Qt 不弹空 tooltip ⇒ 像没反应）
+            name = "（未命名素材）"
+        lines = [name]
+        if not ok:
+            # 丢失项要让用户看出"为什么找不到"：起码交代它尝试挂载的路径
+            lines.append("⚠ 文件丢失：本机找不到这个文件")
+            lines.append("尝试的路径：%s" % (str(path or "") or "未指定路径"))
+        else:
+            try:
+                dur = float(getattr(m, "duration_sec", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            if dur > 0.0:
+                lines.append("时长 %.2f 秒" % dur)
+        cid = str(getattr(m, "clip_id", "") or "")
+        if cid:
+            lines.append("素材编号：%s" % cid)
+        return "\n".join(lines)
+
     def fill(self, sheet, media_paths, cache_dir=None):
         """重填素材列表（B1：blockSignals）。缺失素材**标红**并加「（缺失）」。"""
         self.lst.blockSignals(True)
@@ -528,6 +637,9 @@ class MediaPanel(QWidget):
                 it = QListWidgetItem(text)
                 it.setData(Qt.UserRole, m.clip_id)           # ★ B6：UserRole = clip_id
                 it.setData(Qt.UserRole + 1, path)            # 路径另存
+                # ★ 2026-11-03：tooltip 放**完整名字**（列表里那行永远是被 ElideMiddle
+                #   截断的短名，两者刻意不同 —— 见 `_media_tooltip`）。
+                it.setToolTip(self._media_tooltip(m, path, ok))
                 if not ok:
                     # ★ 规格书 §15：前面加红色圆点 + 名称变灰 + 后缀「（丢失）」
                     it.setIcon(red_dot_icon())

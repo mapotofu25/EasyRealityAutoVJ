@@ -1,45 +1,191 @@
 # -*- coding: utf-8 -*-
-r"""ERLIB 详情页对话框 —— 复用共享 `waveform_mark` 控件编辑手工标注。
+r"""ERLIB 歌曲详情页 —— **整份照搬 ERAVJ 的 `music_detail.MusicDetailDialog`**，
+只把"存哪里"换成 erlib 的工作库（`.eravjlib`）。
 
-⚠ 与 `AutoVJ/src/erlib/detail.py` **逐字一致**（双实现纪律，见架构 §6.3）。
-  本文件是**薄壳**：只负责「读库 → 注入控件 → 编辑 → 写回 `songs.manual`」，
-  波形绘制/点选/拖拽/吸附全在共享模块 `waveform_mark.WaveformMarkWidget` 里。
+★ 2026-10-31 用户：「直接按着 eravj 的做 erlib」。
+  之前我自己攒了一个版本（右侧三个列表），和 ERAVJ 长得不一样、还少了波形下方的
+  段落色带。现在**结构、控件、行为全部沿用 ERAVJ**，只改四处存储/数据来源：
+      ① `__init__` 收的是 `(work, sid, root)`，不是 `(cfg, path)`；
+      ② `_load` 从 `LibReader.songs()` 读 grid / manual / sections / waveform；
+      ③ `_write_manual` 写 `LibWriter.update_manual`；
+      ④ 能量段落（`_resegment_by_bpm` / `_edit_energy_sections`）写 `update_sections`。
 
-## 数据流（对齐架构 §4 时序 ②）
-  - 打开：`LibReader` 读 `songs(grid)` + `waveform(sid)` + `manual_of(sid)`；
-  - 注入：`beatgrid.effective_grid(grid, manual)` 给控件做吸附/拍网；
-  - 保存：归一化 `grid_manual`（bpm_manual/anchors/segments）→ `LibWriter.update_manual`。
+⚠ 与 `src/music_detail.py` 是**双实现**：那边改 UI 时这里要跟着改（反之亦然），
+  否则两个软件的详情页又会长得不一样（这正是这一轮返工的原因）。
 """
+
 from __future__ import annotations
 
 import os
 import sys
 
-from PySide6.QtCore import Qt, QTimer, QTimer
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox,
-                               QFormLayout, QHBoxLayout, QInputDialog, QLabel,
-                               QListWidget, QListWidgetItem, QMessageBox,
-                               QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (QDialog, QDoubleSpinBox,
+                               QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+                               QLabel, QMenu, QMessageBox, QPushButton,
+                               QVBoxLayout)
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from erlib.format import LibReader, LibWriter                       # noqa: E402
+import sections as S                                        # noqa: E402
+from erlib.format import LibReader, LibWriter                # noqa: E402
+from section_ui import EnergySectionDialog                   # noqa: E402  能量段落编辑框
+
+
+def _spin_silent(spin, val):
+
+    """静默设置 `QDoubleSpinBox`（不触发 valueChanged）。
+
+    ⚠ 必须 `blockSignals`：否则 `_load` 回填 BPM 时会走 `_on_bpm_edited`，
+      把「刚读进来的手动值」当成「用户刚改的」，立刻标脏并弹提示。
+    """
+    try:
+        spin.blockSignals(True)
+        spin.setValue(float(val))
+    except (TypeError, ValueError):
+        pass
+    finally:
+        try:
+            spin.blockSignals(False)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _find_audio(song, root, max_walk=20000):
+    """按「本机绝对路径 → 曲库根+相对路径 → 曲库根+文件名」找这首歌的音频文件。
+
+    ★★ 2026-10-31（用户「这里还是得要能播放的，只是说导出的文件不要带位置」）：
+      **播放是"本机行为"，位置是"导出物里不能有的东西"** —— 这两件事必须分开：
+        · 工作库的 `songs.src_path`（本机绝对路径）+ `meta.root`：只在本机用，
+          `transfer.export_subset()` 导出时**整列丢弃 / 清空**；
+        · 导出包里只留 `rel_path` / `file_name`（相对、无盘符）。
+      之前一刀把 `rel_path` 改成纯文件名、又没留本机路径 ⇒ 详情页一开就
+      「无法播放：找不到音频文件」（用户 2026-10-31 截图）。
+
+    返回绝对路径；都找不到返回 ""（界面提示"本机没有这个音频文件"）。
+    """
+    song = song or {}
+    rel = str(song.get("rel_path") or "")
+    fn = str(song.get("file_name") or "")
+    cands = []
+    sp = str(song.get("src_path") or "")
+    if sp:
+        cands.append(sp)                       # ① 扫描时记下的本机绝对路径
+    for r in (rel, fn):
+        if r and root and not os.path.isabs(r):
+            cands.append(os.path.join(root, r))    # ② 曲库根 + 相对路径 / 文件名
+    for c in cands:
+        try:
+            if c and os.path.isfile(c):
+                return c
+        except OSError:
+            continue
+    # ③ 兜底：文件被挪到 root 下的别的子目录了 ⇒ 按文件名在 root 里找一次
+    #   ⚠ 带上限（`max_walk`）—— 几十万文件的目录不能让"点一下详情"卡死。
+    if root and fn and os.path.isdir(root):
+        n = 0
+        try:
+            for dp, _dns, fns in os.walk(root):
+                for f in fns:
+                    if f == fn:
+                        return os.path.join(dp, f)
+                    n += 1
+                    if n >= max_walk:
+                        raise StopIteration
+        except StopIteration:
+            pass
+        except OSError:
+            pass
+    return ""
+
+
+def _lazy_waveform(path):
+    """取波形：先查本地 `.wj` 缓存，缺失则**懒解码算一次**并写回缓存。失败返回 None。"""
+    try:
+        import waveform as _wf
+    except Exception:                                            # noqa: BLE001
+        return None
+    try:
+        wf = _wf.waveform_load(path)
+        if wf:
+            return wf
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from erlib.scanner import decode
+        sig, sr, _dur = decode(path)
+        wf = _wf.waveform_from_signal(sig, sr)
+        if wf:
+            try:
+                _wf.waveform_save(path, wf)
+            except Exception:                                    # noqa: BLE001
+                pass
+        return wf
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def info_text(cfg, path):
+    """曲目信息文本（**唯一真源**）。
+
+    原来「此曲目信息」弹窗在 `ui_main.show_music_info()` 里拼，详情页另有一套；
+    2026-10-28 用户要求把两个菜单项合并 ⇒ 文本收口到这里，两边都调它。
+    """
+    import os as _os
+    # ⚠ `Config` 没有 `.get()`（全项目一律 `cfg[k]`）；dict 也支持 `[]` ⇒ 统一走下标
+    try:
+        _mm = cfg["music_meta"] or {}
+    except Exception:                                            # noqa: BLE001
+        _mm = {}
+    m = _mm.get(path) or {}
+    dur = "未知"
+    sr_txt = ""
+    try:
+        import soundfile as _sf
+        info = _sf.info(path)
+        dur = "%.0f 秒" % info.duration
+        sr_txt = "%d Hz · %d 声道" % (info.samplerate, info.channels)
+    except Exception:                                            # noqa: BLE001
+        pass
+    # ★ 2026-10-30 用户「大砍刀」：曲风识别删除 ⇒ 信息块不再显示「曲风 / 曲风来源」。
+    return (
+        "文件：%s\n"
+        "歌名：%s\n"
+        "艺人：%s\n"
+        "时长：%s\n"
+        "采样率：%s\n"
+        "指纹ID：%s\n"
+        "\n完整路径：\n%s"
+        % (_os.path.basename(path), m.get("title") or "未知", m.get("artist") or "未知",
+           dur, sr_txt or "未知", m.get("song_id") or "-", path)
+    )
 
 
 class ErlibDetailDialog(QDialog):
-    """单曲详情编辑对话框。"""
+    """演出端单曲详情编辑对话框（读写 `music_meta[path]["grid_manual"]`）。"""
 
     def __init__(self, work, sid, root="", parent=None):
+        """`work` = `.eravjlib` 路径，`sid` = 工作库里的 song_id，`root` = 曲库根目录。
+
+        ※ UI 与行为**整份照搬 ERAVJ**（`music_detail.MusicDetailDialog`），
+          只把数据源从 `cfg["music_meta"][path]` 换成 `.eravjlib` 的 `songs` 表。
+        """
         super().__init__(parent)
-        self.work = work
+        self.work = str(work)
         self.sid = int(sid)
-        self.root = root or ""
-        self._song = {}
+        self.root = str(root or "")
+        self.path = ""              # 音频绝对路径（_load 里按 rel_path + root 算出来）
+        self._song = {}             # 工作库里这一行（songs 表）
+        self._info_text = ""
+        self._meta = {}             # 兼容 ERAVJ 代码里的 `_meta`（这里 = self._song）
         self._grid = {}
+        self._manual = None
+        self._wf = None
+        self._sections = []
+        self._sections_raw = []
         self._auto_bpm = 0.0
-        self._audio_path = ""              # 该曲目的音频绝对路径（找不到 = 不能试听）
         # ---- 试听播放（懒创建：只有点了 ▶ 才去探测声卡 / 解码）----
         self._player = None
         self._tick = None
@@ -54,7 +200,6 @@ class ErlibDetailDialog(QDialog):
         self.resize(1080, 640)
         v = QVBoxLayout(self)
 
-        # 顶栏：曲名/艺人/时长/曲风 + 自动 BPM
         top = QHBoxLayout()
         self.lbl_title = QLabel("—")
         self.lbl_title.setStyleSheet("font-weight:bold;font-size:15px;")
@@ -64,93 +209,77 @@ class ErlibDetailDialog(QDialog):
         top.addWidget(self.lbl_auto)
         v.addLayout(top)
 
-        # 手动 BPM
+        # 曲目信息（只读、可选中复制）——原来独立的「此曲目信息」菜单项的内容并到这里
+        # ⚠ ERLIB 的文本在 `_load()` 里才生成（要先读工作库）⇒ 这里**无条件**建好控件，
+        #   否则 `self._info_text` 为空时框根本不存在，后面 setText 全落空（实测白框都没有）。
+        box = QFrame()
+        box.setFrameShape(QFrame.StyledPanel)
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(8, 6, 8, 6)
+        self.lbl_info = QLabel(self._info_text or "—")
+        self.lbl_info.setWordWrap(True)
+        self.lbl_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_info.setStyleSheet("color:palette(mid);")
+        bl.addWidget(self.lbl_info)
+        v.addWidget(box)
+
+        # ★ 2026-10-28（用户要求「去掉手动覆盖 BPM 这个选项 改了就是手动」）：
+        #   不再有勾选框 —— 值一旦与自动值不同就视为手动（见 `_effective_manual`）。
         form = QFormLayout()
         self.spin_bpm = QDoubleSpinBox()
         self.spin_bpm.setRange(30.0, 300.0)
         self.spin_bpm.setDecimals(1)
         self.spin_bpm.setSingleStep(0.5)
-        self.spin_bpm.valueChanged.connect(self._mark_dirty)
-        self.chk_manual = QCheckBox("手动覆盖 BPM")
-        self.chk_manual.toggled.connect(self._mark_dirty)
-        row = QHBoxLayout()
-        row.addWidget(self.spin_bpm)
-        row.addWidget(self.chk_manual)
-        form.addRow("手动 BPM", row)
+        self.spin_bpm.setToolTip("改动这个值即为手动覆盖（与自动值相同则仍走自动）")
+        self.spin_bpm.valueChanged.connect(self._on_bpm_edited)
+        form.addRow("BPM", self.spin_bpm)
         v.addLayout(form)
 
-        # ★ 波形标记控件必须**先创建**：下面的工具栏（lambda 引用 self.wave.set_mode）与
-        #   吸附复选框（connect self.wave.set_snap）都会在 build 期访问 self.wave；
-        #   若等 body 段才建，会 AttributeError: 'ErlibDetailDialog' object has no attribute 'wave'。
+        # ★ self.wave 必须**先创建**（工具栏 lambda / 吸附 checkbox 在 build 期就引用它）。
         from waveform_mark import WaveformMarkWidget
         self.wave = WaveformMarkWidget()
-        self.wave.anchorsChanged.connect(self._on_anchors_changed)
         self.wave.segmentsChanged.connect(self._on_segments_changed)
-        self.wave.segmentSelected.connect(self._on_segment_selected)
-        self.wave.bpmPicked.connect(self._on_bpm_picked)
         self.wave.playheadMoved.connect(self._on_playhead_moved)
+        self.wave.contextMenuRequested.connect(self._on_wave_context_menu)
         # 操作提示（用户点名要 ERCUE 的键位：Ctrl+滚轮缩放）
         self.wave.setToolTip("Ctrl+滚轮 缩放 · Shift+滚轮 / 普通滚轮 平移 · "
-                             "在波形上拖动可移动播放头（播放从这里开始）")
+                             "拖动可移动播放头（播放从这里开始） · 右键编辑 BPM 分段")
 
-        # 模式工具栏
+        # ★ 2026-10-28（用户要求）：
+        #   · 去掉「选择/拖动 · 标八拍 · 标分段 · 标 BPM」模式按钮 —— 固定为选择/拖动；
+        #   · 播放 / 暂停 / 停止 三个按钮合成**一个切换键**。
         bar = QHBoxLayout()
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.setExclusive(True)
-        for key, label in (("select", "选择/拖动"), ("anchor", "标八拍"),
-                           ("segment", "标分段"), ("bpm", "标 BPM")):
-            b = QPushButton(label)
-            b.setCheckable(True)
-            self._mode_group.addButton(b)
-            bar.addWidget(b)
-            if key == "select":
-                b.setChecked(True)
-            b.clicked.connect(lambda _=False, k=key: self.wave.set_mode(k))
-        bar.addStretch(1)
-        # ★ 试听控制（用户要求）：播放起点 = 波形上的播放头竖线位置。
+        self.wave.set_mode("select")
         self.btn_play = QPushButton("▶ 播放")
-        self.btn_play.setToolTip("从播放头竖线所在位置开始播放")
-        self.btn_play.clicked.connect(self._on_play)
+        self.btn_play.setToolTip("从播放头竖线所在位置开始播放；播放中再点就是暂停")
+        self.btn_play.clicked.connect(self._on_play_toggle)
         bar.addWidget(self.btn_play)
-        self.btn_pause = QPushButton("⏸ 暂停")
-        self.btn_pause.clicked.connect(self._on_pause)
-        bar.addWidget(self.btn_pause)
-        self.btn_stop = QPushButton("⏹ 停止")
-        self.btn_stop.clicked.connect(self._on_stop)
-        bar.addWidget(self.btn_stop)
         self.lbl_pos = QLabel("位置 0.00s")
         self.lbl_pos.setMinimumWidth(150)
         bar.addWidget(self.lbl_pos)
-        self.chk_snap = QCheckBox("吸附到拍")
-        self.chk_snap.setChecked(True)
-        self.chk_snap.toggled.connect(self.wave.set_snap)
-        bar.addWidget(self.chk_snap)
+        bar.addStretch(1)
+        # ★ 2026-10-30 用户：「把这个吸附先去掉吧 我没搞明白有什么用」+「（重新分段）
+        #   放到原来吸附的位置」。⇒ 原来「吸附：拍 / 小节」的位置现在放
+        #   「按 BPM 重新分段」按钮。
+        #   为什么吸附可以删：它只影响**手动**拖段落/锚点的落点，自动分段和播放光标
+        #   都不受它影响（用户一直以为跟光标有关）；而波形控件的默认吸附粒度本来就是
+        #   1 拍（`waveform_mark._snap_beats=1`），删掉 UI 后手动编辑的行为与原来
+        #   "拍"选中时**完全一致**。
+        self.btn_resec = QPushButton("按 BPM 重新分段")
+        self.btn_resec.setToolTip(
+            "用上面 BPM 框里的值重算**能量段落**（前奏/中段/drop/尾奏）。\n"
+            "只重算这一首，不重扫曲库；会同时把这个 BPM 记为手动值。\n"
+            "自动 BPM 差半拍、或半速/倍速判错导致分段碎掉时点它。")
+        self.btn_resec.clicked.connect(lambda: self._resegment_by_bpm(ask=True))
+        bar.addWidget(self.btn_resec)
         v.addLayout(bar)
 
-        # 主体：左波形 / 右列表
+        # ★ 2026-10-28：右侧「八拍起点 / BPM 分段」整块去掉 —— 波形占满宽度；
+        #   多 BPM 分段的编辑改到**波形右键菜单**（见 `_on_wave_context_menu`）。
         body = QHBoxLayout()
         body.addWidget(self.wave, 1)
-
-        right = QVBoxLayout()
-        right.addWidget(QLabel("八拍起点（秒）"))
-        self.lst_anchors = QListWidget()
-        self.lst_anchors.setMaximumWidth(220)
-        right.addWidget(self.lst_anchors, 1)
-        self.btn_del_anchor = QPushButton("删除选中八拍")
-        self.btn_del_anchor.clicked.connect(self._del_anchor)
-        right.addWidget(self.btn_del_anchor)
-
-        right.addWidget(QLabel("BPM 分段"))
-        self.lst_segments = QListWidget()
-        self.lst_segments.setMaximumWidth(220)
-        right.addWidget(self.lst_segments, 1)
-        self.btn_del_seg = QPushButton("删除选中分段")
-        self.btn_del_seg.clicked.connect(self._del_segment)
-        right.addWidget(self.btn_del_seg)
-        body.addLayout(right)
         v.addLayout(body, 1)
 
-        # 底部按钮
         bot = QHBoxLayout()
         bot.addStretch(1)
         self.btn_revert = QPushButton("回退自动")
@@ -170,153 +299,371 @@ class ErlibDetailDialog(QDialog):
 
     # ---------------- 数据 ----------------
     def _load(self):
-        self._shutdown_audio()             # 重新读库（含「回退自动」）先停掉试听
+        self._shutdown_audio()             # 重新读数据（含「回退自动」）先停掉试听
         try:
-            with LibReader(self.work) as r:
-                for s in r.songs():
-                    if int(s.get("song_id") or 0) == self.sid:
-                        self._song = s
-                        break
-                self._manual = r.manual_of(self.sid)
-                self._wf = r.waveform(self.sid)
+            song, manual, wf = self._read_song()
         except Exception as e:                                   # noqa: BLE001
             QMessageBox.warning(self, "歌曲详情", "读取工作库失败：%s" % e)
             return
+        if not song:
+            QMessageBox.warning(self, "歌曲详情", "工作库里找不到这首歌（可能被删除）。")
+            return
+        self._song = song
+        self._meta = song
+        # 音频路径：本机绝对路径（src_path）优先，其次 曲库根 + 相对路径/文件名
+        # ★ 2026-10-31：导出包不带位置，所以这里**只在本机能找到就用**；
+        #   找不到也不报错，点 ▶ 时再提示（包在演出机上本来就没有音频文件）。
+        self.path = _find_audio(song, self.root)
+        self._audio_path = self.path
 
-        s = self._song
-        # 试听用的音频路径（曲库包只存相对路径；找不到文件 = 不能试听，不影响标注）
-        _rel = s.get("rel_path") or s.get("file_name") or ""
-        _p = os.path.join(self.root, _rel) if (_rel and self.root) else ""
-        self._audio_path = _p if (_p and os.path.isfile(_p)) else ""
-        g = s.get("grid") or {}
-        if not isinstance(g, dict):
-            g = {}
+        self._manual = manual if isinstance(manual, dict) else None
+        g = song.get("grid") if isinstance(song.get("grid"), dict) else {}
         try:
             import beatgrid as _bg
-            self._grid = _bg.effective_grid(g, self._manual)
+            self._grid = _bg.effective_grid(g, self._manual, song)
         except Exception:                                        # noqa: BLE001
             self._grid = dict(g)
         self._auto_bpm = float(self._grid.get("bpm") or 0.0)
+        # 能量段落
+        self._sections = song.get("sections") or []
+        self._sections_raw = song.get("sections_raw") or []
+        if isinstance(self._sections, str):
+            self._sections = []
 
-        title = s.get("title") or s.get("file_name") or ("song %d" % self.sid)
-        artist = s.get("artist") or ""
-        dur = s.get("duration") or self._grid.get("dur") or 0.0
+        title = song.get("title") or song.get("file_name") or ("song %d" % self.sid)
+        artist = song.get("artist") or ""
+        dur = 0.0
+        for _src in (song.get("duration"), self._grid.get("dur"),
+                     (wf or {}).get("dur")):
+            try:
+                if _src:
+                    dur = float(_src)
+                    break
+            except (TypeError, ValueError):
+                continue
         try:
             dtext = "%d:%02d" % (int(dur) // 60, int(dur) % 60)
         except (TypeError, ValueError):
             dtext = "—"
-        genres = s.get("genres") or []
-        if isinstance(genres, str):
-            genres = [genres]
-        self.lbl_title.setText("%s · %s" % (title, artist) if artist else title)
-        src = self._grid.get("src") or "—"
-        self.lbl_auto.setText("自动 BPM：%s（%s）· %s"
-                              % ((" %.1f" % self._auto_bpm) if self._auto_bpm else "—",
-                                 src, dtext) +
-                              (" · %s" % " / ".join(str(x) for x in genres[:3])
-                               if genres else ""))
+        # ★ 2026-10-31（用户「不要艺人和曲名」）：标题只显示文件名
+        self.lbl_title.setText(str(song.get("file_name") or ("song %d" % self.sid)))
 
-        # 手动值
-        m = self._manual if isinstance(self._manual, dict) else {}
-        bpm_m = m.get("bpm_manual") or 0.0
+        # 波形：优先用**包里带的**（扫描时算好）；没有才懒解码一次
+        self._wf = wf or _lazy_waveform(self.path)
+        if self._wf:
+            try:
+                dur = float(self._wf.get("dur") or dur)
+                dtext = "%d:%02d" % (int(dur) // 60, int(dur) % 60)
+            except (TypeError, ValueError):
+                pass
+        # ★ 2026-10-31（用户「bpm 不要写来源」）：只显示数值 + 时长
+        self.lbl_auto.setText("自动 BPM：%s · %s"
+                              % ((" %.1f" % self._auto_bpm) if self._auto_bpm else "—",
+                                 dtext) +
+                              ("" if self._wf else " · 无波形"))
+
+        # 曲目信息块（ERAVJ 那边由 music_info_text() 生成，这里按同一版式现造）
+        try:
+            import soundfile as _sf
+            _sr = int(_sf.info(self.path).samplerate) if self.path else 0
+        except Exception:                                        # noqa: BLE001
+            _sr = 0
+        # ★★ 2026-10-31（用户「erlib 不要带文件原位置，dj 和 vj 不是一台电脑」）：
+        #   **不显示、也不携带**源文件路径 —— 在 DJ 机上扫的 `<曲库目录>/…` 到演出机上
+        #   既没意义又容易让人以为"文件该在这个位置"。包里只留 `rel_path`（相对曲库根），
+        #   没有根目录就显示「—」。
+        self._info_text = (
+            "文件：%s\n"
+            "时长：%s    采样率：%s Hz\n"
+            "指纹：%s 条    ID：%s"
+            % (song.get("file_name") or "—", dtext,
+               _sr or "—", song.get("fp_count") or 0, self.sid))
+        try:
+            self.lbl_info.setText(self._info_text)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+        mm = self._manual if isinstance(self._manual, dict) else {}
+        bpm_m = mm.get("bpm_manual") or 0.0
         try:
             bpm_m = float(bpm_m)
         except (TypeError, ValueError):
             bpm_m = 0.0
-        self.chk_manual.setChecked(bpm_m > 0)
-        self.spin_bpm.setValue(bpm_m if bpm_m > 0 else (self._auto_bpm or 120.0))
+        _spin_silent(self.spin_bpm, bpm_m if bpm_m > 0 else (self._auto_bpm or 120.0))
+        self._bpm_auto_shown = float(self._auto_bpm or 0.0)
 
         self.wave.set_waveform(self._wf)
         self.wave.set_grid(self._grid)
-        self.wave.set_manual(m)
+        self.wave.set_manual(mm)
+        if not mm.get("segments") and (self._grid or {}).get("segments"):
+            self.wave.set_segments(self._grid["segments"])
+        try:
+            self.wave.set_energy_sections(self._energy_rows())
+        except Exception:                                        # noqa: BLE001
+            pass
         self.wave.set_playhead(0.0)
         self._dirty = False
         self._refresh_lists()
         self._update_title()
 
+    # ---------------- 工作库读写（ERLIB 的存储层） ----------------
+    def _read_song(self):
+        """返回 `(song_dict, manual, waveform)`。"""
+        with LibReader(self.work) as r:
+            for s in r.songs():
+                if int(s.get("song_id") or 0) == self.sid:
+                    return s, r.manual_of(self.sid), r.waveform(self.sid)
+        return {}, None, None
     def _effective_manual(self):
-        """把当前控件状态归一化成 grid_manual dict。"""
-        bpm_m = self.spin_bpm.value() if self.chk_manual.isChecked() else 0.0
+        """把当前控件状态归一化成 grid_manual dict；全空 → None（回退自动）。
+
+        ★ 2026-10-28：没有「手动覆盖」勾选框了 —— **BPM 与自动值不同即为手动**。
+          否则每次打开详情页都会把手动值写死一遍，之后重扫也不更新。
+        """
+        try:
+            bpm_now = float(self.spin_bpm.value())
+        except (TypeError, ValueError):
+            bpm_now = 0.0
+        auto = float(getattr(self, "_bpm_auto_shown", 0.0) or 0.0)
+        bpm_m = bpm_now if (bpm_now > 0 and (auto <= 0 or abs(bpm_now - auto) > 0.05)) else 0.0
         anchors = self.wave.anchors()
         segments = self.wave.segments()
+        # ★★ 2026-10-28：自动分段「只显示、不落成手动」。
+        #   波形控件只有一份 `_segments`，自动结果也画在那里；若原样写进 grid_manual，
+        #   `effective_grid` 就会走 manual 分支（src="manual"），之后重扫也不更新。
+        #   判据：与自动结果等价 ⇒ 视为「用户没改过」⇒ 不写。
+        auto = (self._grid or {}).get("segments") or []
+        if auto and self._segments_equal(segments, auto):
+            segments = []
         m = {"bpm_manual": round(float(bpm_m), 3),
              "anchors": [round(a, 4) for a in anchors],
              "segments": segments}
-        # 全空 → 视为无手工标注（回退自动）
         if m["bpm_manual"] <= 0 and not m["anchors"] and not m["segments"]:
             return None
         return m
 
+    @staticmethod
+    def _segments_equal(a, b, tol=0.01):
+        """两串分段是否等价（按 t0+bpm 比，容差 `tol` 秒 / `tol`*bpm）。"""
+        try:
+            if len(a) != len(b):
+                return False
+            for x, y in zip(a, b):
+                if abs(float(x.get("t0") or 0.0) - float(y.get("t0") or 0.0)) > tol:
+                    return False
+                bx, by = float(x.get("bpm") or 0.0), float(y.get("bpm") or 0.0)
+                if abs(bx - by) > max(0.05, tol * max(bx, by)):
+                    return False
+            return True
+        except (TypeError, ValueError, AttributeError):
+            return False
+
     def _update_title(self):
-        suf = " *" if self._dirty else ""
-        self.setWindowTitle("歌曲详情%s" % suf)
+        self.setWindowTitle("歌曲详情%s" % (" *" if self._dirty else ""))
 
     def _mark_dirty(self, *_):
         self._dirty = True
         self._update_title()
 
-    # ---------------- 列表 ----------------
+    # ---------------- 列表（2026-10-28：右侧列表已删，保留空壳供旧调用点） ----------------
     def _refresh_lists(self):
-        self.lst_anchors.clear()
-        for a in self.wave.anchors():
-            self.lst_anchors.addItem("%.2f s" % a)
-        self.lst_segments.clear()
-        for s in self.wave.segments():
-            self.lst_segments.addItem("%.1f s · %.1f BPM"
-                                      % (float(s.get("t0") or 0.0),
-                                         float(s.get("bpm") or 0.0)))
+        return
 
-    def _on_anchors_changed(self):
-        self._mark_dirty()
-        self._refresh_lists()
+    def _beat_len_now(self):
+        """当前有效拍长（秒）。优先 effective grid，其次手动 BPM。"""
+        try:
+            bl = float((self._grid or {}).get("beat_len") or 0.0)
+            if bl > 0:
+                return bl
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            b = float((self._grid or {}).get("bpm") or 0.0)
+            return 60.0 / b if b > 0 else 0.0
+        except Exception:                                        # noqa: BLE001
+            return 0.0
 
+    def _refresh_grid_preview(self):
+        """把当前手动状态重新合成「有效网格」并推给波形（改完立刻能看到线移动）。"""
+        try:
+            import beatgrid as _bg
+            m = self._effective_manual()
+            self._grid = _bg.effective_grid((self._meta or {}).get("grid") or {}, m,
+                                            self._meta)
+            self.wave.set_grid(self._grid)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    # ★ 2026-10-28：`_nudge_beats` / `_scale_bpm` / `_on_anchors_changed` /
+    #   `_del_anchor` / `_del_segment` 随右侧面板一起去掉
+    #   （用户要求去掉手工八拍与八拍起点；±1 小节/±1 拍/÷2/×2 改为右键菜单里的
+    #   「切分到此处」与「整段 ÷2 / ×2」）。
     def _on_segments_changed(self):
         self._mark_dirty()
-        self._refresh_lists()
 
-    def _del_anchor(self):
-        r = self.lst_anchors.currentRow()
-        if r < 0:
-            return
-        anchors = self.wave.anchors()
-        if 0 <= r < len(anchors):
-            anchors.pop(r)
-            self.wave.set_anchors(anchors)
-            self._mark_dirty()
-            self._refresh_lists()
+    # ---------------- 交互：波形右键 → BPM 分段 ----------------
+    def _segments_now(self):
+        """当前生效的分段（手动优先，否则自动）；空列表 ⇒ 单段模式。"""
+        segs = [dict(x) for x in (self.wave.segments() or []) if isinstance(x, dict)]
+        if segs:
+            return segs
+        auto = (self._grid or {}).get("segments") or []
+        return [dict(x) for x in auto if isinstance(x, dict)]
 
-    def _del_segment(self):
-        r = self.lst_segments.currentRow()
-        if r < 0:
-            return
-        segs = self.wave.segments()
-        if 0 <= r < len(segs):
-            segs.pop(r)
-            # 删掉首段后，把下一段顶到 0（保持首尾相接覆盖全曲）
-            if segs:
-                segs[0]["t0"] = 0.0
-            self.wave.set_segments(segs)
-            self._mark_dirty()
-            self._refresh_lists()
+    def _seg_at(self, sec):
+        """返回 (索引, 段) —— `sec` 落在哪一段（按 t0 升序）。"""
+        segs = self._segments_now()
+        idx = 0
+        for i, s in enumerate(segs):
+            try:
+                if float(s.get("t0") or 0.0) <= sec:
+                    idx = i
+            except (TypeError, ValueError):
+                pass
+        if not segs:
+            return 0, {"t0": 0.0, "bpm": float(self.spin_bpm.value() or 0.0)}
+        return idx, segs[idx]
 
-    # ---------------- 交互 ----------------
-    def _on_segment_selected(self, t0, t1):
-        bpm, ok = QInputDialog.getDouble(
-            self, "分段 BPM", "该段（%.1fs ~ %.1fs）的 BPM：" % (t0, t1),
-            self._auto_bpm or 128.0, 30.0, 300.0, 1)
-        if not ok:
-            return
-        self.wave.add_segment(t0, t1, bpm, default_bpm=self._auto_bpm)
+    def _apply_segments(self, segs):
+        """写回分段并立刻刷新预览（首段强制从 0 开始、按 t0 升序）。"""
+        segs = [dict(x) for x in segs if isinstance(x, dict)]
+        segs.sort(key=lambda x: float(x.get("t0") or 0.0))
+        if segs:
+            segs[0]["t0"] = 0.0
+        for x in segs:
+            try:
+                b = float(x.get("bpm") or 0.0)
+            except (TypeError, ValueError):
+                b = 0.0
+            if b > 0:
+                x["beat_len"] = round(60.0 / b, 6)
+        self.wave.set_segments(segs)
+        self._refresh_grid_preview()
         self._mark_dirty()
-        self._refresh_lists()
 
-    def _on_bpm_picked(self, sec):
-        # 「标 BPM」点选：以该点所在网格 BPM 回填（与直接手输等价）。
-        bpm = self._auto_bpm
-        if bpm > 0:
-            self.chk_manual.setChecked(True)
-            self.spin_bpm.setValue(bpm)
+    def _build_seg_menu(self, sec):
+        """构造右键菜单（**只构造不弹出** —— 便于单测；`_on_wave_context_menu` 负责 exec）。
+
+        返回 `(menu, {"cut":act, "edit":act, "del":act, "half":act, "dbl":act,
+        "clear":act}, idx, segs, cur_bpm)`。
+        """
+        segs = self._segments_now()
+        idx, cur = self._seg_at(sec)
+        try:
+            cur_bpm = float(cur.get("bpm") or 0.0)
+        except (TypeError, ValueError):
+            cur_bpm = 0.0
+        if cur_bpm <= 0:
+            cur_bpm = float(self.spin_bpm.value() or 0.0)
+
+        menu = QMenu(self)
+        acts = {}
+        # 能量段落放在最前：它决定**演出时**什么时候换素材池，与 BPM 分段是不同的东西
+        acts["esec"] = menu.addAction("编辑能量段落（演出到点直接切池）…")
+        menu.addSeparator()
+        acts["cut"] = menu.addAction("在 %.2fs 处切分（输入该段 BPM）…" % sec)
+        acts["edit"] = menu.addAction("修改本段 BPM（当前 %.1f）…" % cur_bpm)
+        acts["del"] = menu.addAction("删除本段（%.2fs 起，%.1f BPM）"
+                                     % (float(cur.get("t0") or 0.0), cur_bpm))
+        menu.addSeparator()
+        acts["half"] = menu.addAction("整段 ÷2 BPM（半速歧义）")
+        acts["dbl"] = menu.addAction("整段 ×2 BPM（倍速歧义）")
+        menu.addSeparator()
+        acts["clear"] = menu.addAction("清除全部分段（回到自动网格）")
+        # 首段不能删（网格必须从 0 开始）；单段也没有「删除本段」的意义
+        acts["del"].setEnabled(len(segs) >= 2 and idx > 0)
+        acts["edit"].setEnabled(bool(segs) or cur_bpm > 0)
+        acts["clear"].setEnabled(len(segs) >= 2 or bool(self.wave.segments()))
+        return menu, acts, idx, segs, cur_bpm
+
+    def _run_seg_action(self, key, idx, segs, cur_bpm, sec):
+        """执行右键菜单里的某一项（`key` 见 `_build_seg_menu` 的 acts）。"""
+        if key == "esec":
+            return self._edit_energy_sections(sec)
+        if key == "cut":
+            if sec < 1.0:
+                QMessageBox.information(self, "切分分段",
+                                        "切分点太靠前（< 1 秒），网格必须从 0 开始。")
+                return False
+            bpm, ok = QInputDialog.getDouble(
+                self, "切分分段",
+                "从 %.2fs 起改用哪个 BPM？（该点之前那段保持不变）" % sec,
+                cur_bpm or 128.0, 30.0, 300.0, 1)
+            if not ok:
+                return False
+            # ★ 单段（`segs` 为空）时必须先补出「首段」，
+            #   否则新段会被 `_apply_segments` 的首段归一化改成 t0=0 ⇒ 等于没切。
+            base = [dict(x) for x in segs] or [{"t0": 0.0, "bpm": cur_bpm}]
+            new = [x for x in base if float(x.get("t0") or 0.0) < sec - 1e-6]
+            new.append({"t0": sec, "bpm": float(bpm)})
+            self._apply_segments(new)
+            return True
+        if key == "edit":
+            bpm, ok = QInputDialog.getDouble(
+                self, "修改本段 BPM", "本段 BPM：", cur_bpm or 128.0, 30.0, 300.0, 1)
+            if not ok:
+                return False
+            if segs:
+                segs[idx]["bpm"] = float(bpm)
+                self._apply_segments(segs)
+            else:
+                self._spin_set(bpm)
+                self._refresh_grid_preview()
+                self._mark_dirty()
+            return True
+        if key == "del":
+            if len(segs) >= 2 and idx > 0:
+                segs.pop(idx)
+                self._apply_segments(segs)
+                return True
+            return False
+        if key in ("half", "dbl"):
+            f = 0.5 if key == "half" else 2.0
+            if segs:
+                for x in segs:
+                    try:
+                        b = float(x.get("bpm") or 0.0)
+                    except (TypeError, ValueError):
+                        b = 0.0
+                    if b > 0:
+                        x["bpm"] = max(30.0, min(300.0, b * f))
+                self._apply_segments(segs)
+            else:
+                self._spin_set(max(30.0, min(300.0, cur_bpm * f)))
+                self._refresh_grid_preview()
+                self._mark_dirty()
+            return True
+        if key == "clear":
+            self.wave.set_segments([])
+            self._refresh_grid_preview()
             self._mark_dirty()
+            return True
+        return False
+
+    def _on_wave_context_menu(self, sec, gpos):
+        """波形右键：多 BPM 段落的全部编辑入口（用户 2026-10-28 指定）。"""
+        try:
+            sec = float(sec)
+        except (TypeError, ValueError):
+            sec = 0.0
+        menu, acts, idx, segs, cur_bpm = self._build_seg_menu(sec)
+        act = menu.exec(gpos)
+        if act is None:
+            return
+        for k, a in acts.items():
+            if a is act:
+                self._run_seg_action(k, idx, segs, cur_bpm, sec)
+                return
+
+    # ---------------- BPM 输入框（改了就是手动） ----------------
+    def _spin_set(self, val):
+        """静默设置 BPM（不触发 `_on_bpm_edited` 的脏标记链）。"""
+        _spin_silent(self.spin_bpm, val)
+
+    def _on_bpm_edited(self, _v=None):
+        """BPM 一改就是手动：立刻重算网格预览（无勾选框）。"""
+        self._refresh_grid_preview()
+        self._mark_dirty()
 
     # ---------------- 试听播放（起点 = 播放头竖线） ----------------
     def _ensure_player(self):
@@ -350,8 +697,12 @@ class ErlibDetailDialog(QDialog):
 
     def _on_play(self):
         """▶：从播放头竖线所在秒起播（先 seek 再播）。"""
-        if not self._audio_path:
-            self.lbl_pos.setText("无法播放：找不到该曲目的音频文件（曲库根目录未设置？）")
+        # ★ 2026-10-31：本机找不到音频文件时**别去动声卡**，直接说明原因
+        #   （导出包按需求不带位置，到了演出机上本来就没有对应文件）。
+        if not self.path:
+            self.lbl_pos.setText(
+                "无法播放：本机找不到这个音频文件"
+                "（导出包只带文件名、不带位置）")
             return
         p = self._ensure_player()
         if p is None:
@@ -363,10 +714,10 @@ class ErlibDetailDialog(QDialog):
             return
         pos = float(self.wave.playhead_sec())
         # 未装载 / 装的是别的歌 → 后台解码，`_on_tick` 里就绪后自动起播
-        if not (p.loaded and p.loaded_path == self._audio_path):
+        if not (p.loaded and p.loaded_path == self.path):
             self._pending_play = True
             self.lbl_pos.setText("准备音频…（从 %.2fs 起播）" % pos)
-            if not p.load(self._audio_path):
+            if not p.load(self.path):
                 self._pending_play = False
                 self.lbl_pos.setText("无法播放：%s" % (p.error or "音频文件不可用"))
             return
@@ -378,35 +729,26 @@ class ErlibDetailDialog(QDialog):
         else:
             self.lbl_pos.setText("无法播放：%s" % (p.error or "未知原因"))
 
-    def _on_pause(self):
+    def _on_play_toggle(self):
+        """一个键管播放/暂停（用户 2026-10-28 要求三键合一）。"""
         p = self._player
-        if p is None:
-            return
-        if p.is_playing():
+        if self._playing and p is not None and p.is_playing():
             p.pause()
-        self._playing = False
-        self._pending_play = False
-        self.btn_play.setText("▶ 播放")
-        pos = p.position_sec()
-        self.wave.set_playhead(pos)          # 暂停后竖线留在原位
-        self.lbl_pos.setText("已暂停 %.2fs" % pos)
-
-    def _on_stop(self):
-        p = self._player
-        if p is not None:
-            p.stop()
-        self._playing = False
-        self._pending_play = False
-        self.btn_play.setText("▶ 播放")
-        self.wave.set_playhead(0.0)
-        self.lbl_pos.setText("位置 0.00s")
+            self._playing = False
+            self._pending_play = False
+            self.btn_play.setText("▶ 播放")
+            pos = p.position_sec()
+            self.wave.set_playhead(pos)      # 暂停后竖线留在原位
+            self.lbl_pos.setText("已暂停 %.2fs" % pos)
+            return
+        self._on_play()
 
     def _on_tick(self):
         """播放中：竖线跟着音频走；就绪后自动补起播；播完复位按钮。"""
         p = self._player
         if p is None:
             return
-        if self._pending_play and p.loaded and p.loaded_path == self._audio_path:
+        if self._pending_play and p.loaded and p.loaded_path == self.path:
             self._pending_play = False
             pos = float(self.wave.playhead_sec())
             if p.play(pos):
@@ -453,36 +795,233 @@ class ErlibDetailDialog(QDialog):
             except Exception:                                    # noqa: BLE001
                 pass
 
+    # ---------------- 能量段落 ----------------
+    def _energy_rows(self):
+        """当前曲目的能量段落（`songs.sections` → normalize，带 tier/energy/name）。"""
+        raw = self._sections or []
+        if not raw:
+            return []
+        try:
+            return [dict(x) for x in S.normalize(raw, self._dur_now(), self._grid or None)]
+        except Exception:                                        # noqa: BLE001
+            return [dict(x) for x in raw if isinstance(x, dict)]
+    def _dur_now(self):
+        try:
+            d = float((self._wf or {}).get("dur") or 0.0)
+        except (TypeError, ValueError):
+            d = 0.0
+        if d > 0:
+            return d
+        try:
+            return float((self._grid or {}).get("dur") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _grid_for_snap(self):
+        """给段落吸附用的 `{anchor, beat_len}`；没 BPM 时返回 {}（不吸附）。"""
+        g = self._grid or {}
+        try:
+            bl = float(g.get("beat_len") or 0.0)
+        except (TypeError, ValueError):
+            bl = 0.0
+        if bl <= 1e-6:
+            try:
+                bpm = float(g.get("bpm") or 0.0)
+            except (TypeError, ValueError):
+                bpm = 0.0
+            bl = 60.0 / bpm if bpm > 0 else 0.0
+        if bl <= 1e-6:
+            return {}
+        try:
+            a = float(g.get("anchor") or 0.0)
+        except (TypeError, ValueError):
+            a = 0.0
+        return {"anchor": a, "beat_len": bl}
+
+    def _resegment_by_bpm(self, ask=False):
+        """用**当前 BPM 框里的值**重算这一首的能量段落，并落盘。
+
+        ★ 2026-10-30 用户：「增加一个依据当前 bpm 重新分段的选项」。
+          为什么需要：自动 BPM 差半拍、或者半速/倍速判错时，能量分段是按
+          "2 个八拍 = 16 拍"切块的 ⇒ 整块错位，一首歌会被切成 0.88/0.94/0.16
+          这种碎段（现场 `Bunsen Burner` 就是这样）。手改 BPM 之后必须能
+          **立刻**按新 BPM 重切这一首，而不是等一次全库扫描（那要几分钟）。
+
+        口径与生产扫描**逐字一致**（`ui_main._one`）：全曲 `sf.read` → 重采样 →
+        `beatgrid.features` → `sections.auto_segments(grid=生效网格)`，再算一份
+        `sections_raw`（`grid=None, phrase_grid=生效网格`）。
+
+        写盘：`sections` / `sections_raw` / `sections_auto=True`，并把当前 BPM
+        记为 `grid_manual.bpm_manual`（用户就是在断言这个 BPM；不记的话下次
+        「扫描分析」又会按自动 BPM 重切，白改）。
+        """
+        try:
+            bpm = float(self.spin_bpm.value() or 0.0)
+        except (TypeError, ValueError):
+            bpm = 0.0
+        if bpm <= 0:
+            QMessageBox.information(self, "重新分段", "BPM 无效（必须 > 0）。")
+            return False
+        if ask:
+            ret = QMessageBox.question(
+                self, "按 BPM 重新分段",
+                "按当前 BPM %.1f 重新计算这首歌的能量段落（前奏/中段/drop/尾奏）？\n\n"
+                "· 只重算这一首，不重扫曲库\n"
+                "· 这个 BPM 会一并记为手动值\n"
+                "· 手动编辑过的段落会被覆盖" % bpm,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ret != QMessageBox.StandardButton.Yes:
+                return False
+        from PySide6.QtWidgets import QApplication
+        import numpy as np
+        try:
+            anchor = float((self._grid or {}).get("anchor") or 0.0)
+        except (TypeError, ValueError):
+            anchor = 0.0
+        grid = {"anchor": anchor, "beat_len": round(60.0 / bpm, 6), "bpm": bpm}
+
+        self._shutdown_audio()                 # 重算要独占读文件（试听可能正开着）
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.lbl_pos.setText("正在按 %.1f BPM 重新分段…" % bpm)
+            QApplication.processEvents()
+            import beatgrid as _bg
+            import soundfile as sf
+            data, sr = sf.read(self.path, dtype="float32", always_2d=True)
+            sig = np.mean(data, axis=1)
+            del data
+            m2, s2 = _bg.resample(sig, sr, _bg.SR_TARGET)
+            del sig
+            f = _bg.features(m2, s2)
+            dur = len(m2) / float(s2)
+            got = S.auto_segments(f, dur=dur, grid=grid)
+            raw = S.auto_segments(f, dur=dur, grid=None, phrase_grid=grid)
+            del m2, f
+        except Exception as e:                                    # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "重新分段", "重算失败：%s" % e)
+            self.lbl_pos.setText("重新分段失败")
+            return False
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:                                     # noqa: BLE001
+                pass
+        if not got:
+            QMessageBox.information(self, "重新分段", "这首算不出段落（特征不足）。")
+            return False
+
+        # ---- 落盘：sections + 手动 BPM（写工作库；ERLIB 没有 cfg）----
+        gm = dict(self._manual) if isinstance(self._manual, dict) else {}
+        gm["bpm_manual"] = float(bpm)
+        try:
+            w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
+            try:
+                n1 = w.update_manual(self.sid, gm)
+                n2 = w.update_sections(self.sid, [dict(x) for x in got],
+                                       [dict(x) for x in raw])
+            finally:
+                w.close()
+            if not (n1 or n2):
+                QMessageBox.warning(self, "重新分段", "写盘失败（工作库里找不到这首歌）。")
+                return False
+        except Exception as e:                                    # noqa: BLE001
+            QMessageBox.warning(self, "重新分段", "写盘失败：%s" % e)
+            return False
+
+        # ---- 刷新界面（网格 + 色带）----
+        self._manual = gm
+        self._sections = [dict(x) for x in got]
+        self._sections_raw = [dict(x) for x in raw]
+        try:
+            import beatgrid as _bg2
+            self._grid = _bg2.effective_grid((self._song or {}).get("grid") or {}, gm,
+                                             self._song)
+        except Exception:                                         # noqa: BLE001
+            self._grid = dict(grid)
+        for fn in (lambda: self.wave.set_grid(self._grid),
+                   lambda: self.wave.set_energy_sections(self._energy_rows()),
+                   self._refresh_lists):
+            try:
+                fn()
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._dirty = False                    # 已经落盘了，别再弹"有未保存的修改"
+        self._update_title()
+        n_hi = sum(1 for x in got if x.get("tier") == "high")
+        self.lbl_pos.setText("%.1f BPM · %d 段（drop %d）" % (bpm, len(got), n_hi))
+        return True
+
+    def _edit_energy_sections(self, sec):
+        """打开编辑框；确定后写回 `music_meta[path]["sections"]` 并落盘。
+
+        ⚠ 保存时**替换成新 list**（不是原地 append）：引擎那边按 `raw is cached_raw`
+          判缓存，引用一变就自动重算，不需要额外的"通知引擎"调用（少一个易漏点）。
+        """
+        try:
+            raw = list(self._sections or [])
+        except Exception:                                     # noqa: BLE001
+            raw = []
+        dlg = EnergySectionDialog(self, sections=raw, dur=self._dur_now(),
+                                  grid=self._grid_for_snap(),
+                                  cur_sec=float(sec or 0.0))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        got = dlg.sections()
+        raw = ([dict(x) for x in got]
+               if got else [])
+        try:
+            w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
+            try:
+                n = w.update_sections(self.sid, raw, raw)
+            finally:
+                w.close()
+            if not n:
+                QMessageBox.warning(self, "能量段落", "保存失败（工作库里找不到这首歌）。")
+                return False
+        except Exception as e:                                # noqa: BLE001
+            QMessageBox.warning(self, "能量段落", "保存失败：%s" % e)
+            return False
+        self._sections = raw
+        self._sections_raw = raw
+        try:
+            self.wave.set_energy_sections(got)
+        except Exception:                                     # noqa: BLE001
+            pass
+        self._mark_dirty()
+        return True
+
     # ---------------- 保存 / 回退 ----------------
-    def _save(self):
-        manual = self._effective_manual()
+    def _write_manual(self, manual):
+        """把 grid_manual 写回工作库 `songs.manual`。成功返回 True。"""
         try:
             w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
             try:
                 n = w.update_manual(self.sid, manual)
             finally:
                 w.close()
+            if not n:
+                QMessageBox.warning(self, "歌曲详情", "保存失败（工作库里找不到这首歌）。")
+            return bool(n)
         except Exception as e:                                   # noqa: BLE001
             QMessageBox.warning(self, "歌曲详情", "保存失败：%s" % e)
+            return False
+    def _save(self):
+        manual = self._effective_manual()
+        if not self._write_manual(manual):
             return
-        if n:
-            self._manual = manual
-            self._dirty = False
-            self._update_title()
-            QMessageBox.information(self, "歌曲详情", "已保存手工标注。")
+        self._manual = manual
+        if manual:
+            self._meta["grid_manual"] = manual
         else:
-            QMessageBox.warning(self, "歌曲详情", "保存失败（找不到这首歌）。")
+            self._meta.pop("grid_manual", None)
+        self._dirty = False
+        self._update_title()
+        QMessageBox.information(self, "歌曲详情", "已保存手工标注。")
 
     def _revert(self):
-        manual = None
-        try:
-            w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
-            try:
-                w.update_manual(self.sid, manual)
-            finally:
-                w.close()
-        except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, "歌曲详情", "回退失败：%s" % e)
+        if not self._write_manual(None):
             return
         self._load()
 

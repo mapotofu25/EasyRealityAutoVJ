@@ -306,11 +306,17 @@ def selftest() -> bool:
     assert is_gif("x.GIF") and is_gif("y.gif") and not is_gif("z.png")
     assert kind_of("x.gif") == "video", "GIF 仍按视频解（循环由 frames 侧环绕）"
     assert IMAGE_DEFAULT_SEC == 5.0, "图片默认时长常量被改动（需求 4 定为 5 秒）"
-    # GIF 必须不设 src_out（否则到出点冻结、循环失效）
+    # ★ 2026-11-03：本组断言原来写的是「GIF 设了 src_out 应判为违规」，但
+    #   `gif_src_out_conflict()` 自 **2026-10-22** 起**恒为 False**（GIF 现在按
+    #   `[src_in, src_out]` 区间循环，可以像视频一样掐头去尾 —— 见本文件 88-95 行的 docstring），
+    #   旧断言必然抛 ⇒ 自检常年是红的。现在按**现行语义**断言：任何入参都返回 False，
+    #   函数只为兼容旧调用点而保留（**不要**把它改成真有判断，产品里已无调用点）。
     assert not gif_src_out_conflict("a.gif", None), "GIF + src_out=None 合规"
-    assert gif_src_out_conflict("a.gif", 12.0), "GIF 设了 src_out 应判为违规"
-    assert not gif_src_out_conflict("a.mp4", 12.0), "非 GIF 可设 src_out"
-    print("[probe] 自检通过 ✓  坏路径返回 error 且不抛；扩展名分类 OK；is_gif / IMAGE_DEFAULT_SEC / GIF 约束 OK")
+    assert not gif_src_out_conflict("a.gif", 12.0), "现行语义：GIF 设出点也合规（旧约束已废止）"
+    assert not gif_src_out_conflict("a.gif", 0.0), "现行语义：设 0 也算设了，同样不判违规"
+    assert not gif_src_out_conflict("a.mp4", 12.0), "非 GIF 亦不报（函数恒 False）"
+    print("[probe] 自检通过 ✓  坏路径返回 error 且不抛；扩展名分类 OK；"
+          "is_gif / IMAGE_DEFAULT_SEC / GIF 约束（现行语义：恒无冲突）OK")
     return True
 
 

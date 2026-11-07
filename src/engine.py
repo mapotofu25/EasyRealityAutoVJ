@@ -103,6 +103,117 @@ _HEALTH_MAX_LINES = 600       # 环形上限（约 10 分钟）；超出就裁�
 _HEALTH_KEEP_LINES = 300      # 触发裁剪时保留的最新行数（=上限/2，摊薄重写频率，别每秒重写）
 
 
+# 库内 BPM 与实时 BPM 的「谐波修正」容差。实时值折到 0.5×/1×/2× 后，
+# 与库内值相差超过这个比例 ⇒ 判定"库内值不适用当前播放"（变速 / 认错歌 / 拍钟卡死），
+# 保持实时值。6% 能盖住 BPM 检测的正常抖动，又能挡住 190 vs 138（差 27%）这种不谐波关系。
+LIB_HARM_TOL = 0.06
+
+
+def content_speed(snap, sync_on=True):
+    """素材播放倍速 = 参照 BPM / 128（夹在 0.3~2.5）。
+
+    ★★★ 2026-11-02 现场取证（OBS 22:20–23:10，Funkot 实际 **190 BPM**）：
+      实时自相关在现场粒度（block=1323 ⇒ 33.3 帧/秒）下锁到 **125.5**（偶尔 95.5），
+      素材倍速只有 0.75~0.98×（应为 1.48×）—— 用户说的"素材速度没跟上来"。
+      根因是自相关这个**信号本身**分不出：190 的周期 10.53 帧落在整数格之间，
+      而 4/4 的 kick 每 2 拍一次 ⇒ 最强的周期是 95 BPM。详见 `bpm_anchor` 模块头。
+
+    ⇒ 参照值的优先级：
+      ① **离线锚点 `bpm_anchor`**（`beatgrid.analyze_bpm_only`，同一段音频稳定给 190.1）
+      ② 库内 BPM（只在**谐波对得上**时采信，见 `LIB_HARM_TOL`）
+      ③ 实时 `bpm`（兜底，逐值同改前）
+
+    ⚠ 锚点也要过一道合理性检查：与实时值比值落在 [0.4, 2.5] 之外说明两者严重分歧
+      （可能是换歌瞬间的旧锚点），此时退回实时值，宁可慢也不让锚点带飞。
+    ⚠ 这里**只影响素材播放倍速**，不参与拍钟 / 切素材节奏。
+
+    ★★★ 2026-11-04（用户：「歌扫出来是 180 BPM，演出时加速到 200，那素材播放速度按
+      180 还是 200？」）—— **按 200**。`lib_bpm` 是**原曲** BPM，DJ 推到 1.20× 后
+      现场听到的是 `lib × r`；素材要对齐的是"耳朵听到的拍速"，所以
+      「只能用库内值」这一条分支必须乘实测倍率 `recognized_rate`。
+
+      真机取证（`energy_log` CSV，1.20× 相位 库内 140 / 听感 168）：
+        19:11:23–19:11:44 共 **21 秒**  lib=140  bpm=0  bpm_anchor=0  →  spd=**1.094**，
+        而同一时刻位置层指纹已经算出 r=1.196 ⇒ 正确值 140×1.196/128 = **1.308**。
+        那 21 秒素材慢了 20%（用户报的"素材速度没跟上来"就是这一段）。
+        根因：`bpm` 还没收敛 ⇒ 走 lib 分支 ⇒ 只做 `lib/128`，倍率被整体漏掉。
+
+      ⚠⚠ 只改那**一条**分支。另外两条一个数都不许动：
+        · **`bpm_anchor` 分支**：锚点是离线对整段音频测出来的**听感值**，本身已含变速
+          （1.20× 时锚点给的就是 172.3 而不是 140）⇒ 再乘 r 是**重复计速**。
+        · **`live / 128` 兜底**：`bpm` 是实时听感值，同理不许乘。
+      ⚠ 倍率的容错与显示层（`ui_main._BPM_RATE_*` / `_rate_text`）**同口径**：
+        非数 / None / bool / NaN / 越界 [0.78, 1.25] ⇒ 当 1.0；
+        `|r-1| < 1%` ⇒ 当 1.0（死区防抖，和 KVJ「差不到 1% 不改速度」一致）。
+        于是 1.0× 正常播放时素材倍速与改前**逐值一致**（回归零变化）。
+    """
+    d = snap or {}
+    try:
+        live = float(d.get("bpm") or 0.0)
+    except (TypeError, ValueError):
+        live = 0.0
+    try:
+        lib = float(d.get("lib_bpm") or 0.0)
+    except (TypeError, ValueError):
+        lib = 0.0
+    try:
+        anchor = float(d.get("bpm_anchor") or 0.0)
+    except (TypeError, ValueError):
+        anchor = 0.0
+    # ★ 2026-11-04：实测变速倍率。容错风格与上面三个 try 块一致（同一位置、同一形态），
+    #   另外必须显式挡掉四类"看着像数其实不是倍率"的输入：
+    #     · None / 缺键 / 空串 / 非数字字符串  ⇒ 没有倍率信息
+    #     · bool（`True` 当 1.0 只是碰巧对，语义上不是倍率）
+    #     · NaN（`nan` 是 truthy，`x or 1.0` 挡不住）
+    #     · 越界 [0.78, 1.25]（`audio_engine` 发布前已钳过一次，这里是显示/使用层的
+    #       二次兜底，防的是读到别的中间态 / 旧快照）
+    #   死区 0.01 与 `ui_main._BPM_RATE_DEADBAND` 同值：1.0× 播放时 r 有 ±0.005 量级
+    #   的噪声，不过死区素材倍速会跟着 1.093 → 1.099 → 1.088 地抖（现场能看出来）。
+    _r_min, _r_max, _r_dead = 0.78, 1.25, 0.01
+    rate = 1.0
+    try:
+        _r = d.get("recognized_rate", 1.0)
+        if not isinstance(_r, bool) and isinstance(_r, (int, float)):
+            _r = float(_r)
+            if _r == _r and _r_min <= _r <= _r_max and abs(_r - 1.0) >= _r_dead:
+                rate = _r
+    except (TypeError, ValueError):
+        rate = 1.0
+    if not sync_on:
+        return 1.0
+
+    # ① 离线锚点（最可信）
+    if anchor > 0.0:
+        if live <= 0.0:
+            return max(0.3, min(2.5, anchor / 128.0))
+        ratio = live / anchor
+        if 0.4 <= ratio <= 2.5:
+            return max(0.3, min(2.5, anchor / 128.0))
+        # 分歧过大 ⇒ 锚点可能是上一首的，退回实时
+
+    if live <= 0.0 and lib <= 0.0:
+        return 1.0
+    if live <= 0.0:
+        # 实时还没测出来 ⇒ 只能用库内值。
+        # ★ 2026-11-04：库内值是**原曲** BPM，必须乘实测倍率才是"耳朵听到的拍速"
+        #   （1.20× ⇒ 140 × 1.196 / 128 = 1.308，而不再是 1.094）。详见 docstring。
+        return max(0.3, min(2.5, lib * rate / 128.0))
+    # ② 库内 BPM 只做谐波修正
+    if lib > 0.0:
+        cands = (live * 0.5, live, live * 2.0)
+        best = min(cands, key=lambda x: abs(x - lib))
+        if abs(best - lib) / lib <= LIB_HARM_TOL:
+            return max(0.3, min(2.5, lib / 128.0))
+    # ③ 实时值兜底
+    return max(0.3, min(2.5, live / 128.0))
+
+
+# 库内 BPM 与实时 BPM 的「谐波修正」容差。实时值折到 0.5×/1×/2× 后，
+# 与库内值相差超过这个比例 ⇒ 判定"库内值不适用当前播放"（变速 / 认错歌 / 拍钟卡死），
+# 保持实时值。6% 能盖住 BPM 检测的正常抖动，又能挡住 190 vs 138（差 27%）这种不谐波关系。
+LIB_HARM_TOL = 0.06
+
+
 def _health_log_path():
     """每层健康快照日志路径：`%LOCALAPPDATA%\\AutoVJ\\layer_health.log`。"""
     return os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ", "layer_health.log")
@@ -697,6 +808,7 @@ class AutoVJEngine(QObject):
         self.layers = []
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
         self._cue_sheet = None      # 当前码表（cuesheet.CueSheet）
+        self._cue_sheet_path = ""   # ★ 2026-11-02：当前码表的**文件路径**（界面按 basename 显示）
         self._cue_track = None      # 认到的曲目（TrackEntry）；None ⇒ 不接管
         self._cue_bound_cache = None    # (track, 主 song_id, frozenset(可接受 id)) 反查缓存
         self._cue_bad_song_n = 0        # 「认到另一首歌」累计次数（限流日志用）
@@ -714,6 +826,14 @@ class AutoVJEngine(QObject):
         #   而 `.ercue` 里 `media[].has_alpha` 是**编排端探测好的权威结论**，直接用，零成本。
         self._cue_alpha = {}
         self._cue_pos_beats = None  # 本帧拍位（S3 只初始化，S4 才写）
+        # ★★★ 2026-11-06：**无锁快照**（铁律 13：GUI 高频轮询只读无锁快照，绝不去抢 `_tick_lock`）
+        #   · `_cue_media_snap`：码表包里的素材路径元组（装表/卸表时整体赋值）
+        #   · `_cue_thumb_snap`：包内自带缩略图 `{素材路径: png}`（同上，整体替换）
+        #   · `_cue_active_snap`：此刻正在使用的素材路径集合（每帧 tick 整体赋值）
+        #   GUI 的图层行（缩略图 + 黄底高亮）只读这两个，不碰 `_cue_sheet` / `cs_states`。
+        self._cue_media_snap = ()
+        self._cue_thumb_snap = {}
+        self._cue_active_snap = frozenset()
         self._cue_pos_src = ""      # 位置来源（fingerprint / deck）
         self._cue_sid = -1          # 当前曲目 sid（换歌要重建 runtime）
         self._cue_jumped = False    # 本帧是否发生跳变重算
@@ -754,16 +874,15 @@ class AutoVJEngine(QObject):
         self._last_bar_count = 0
         self._last_beat_count = 0
         # 自动匹配（听歌识曲→自动配画面）
-        self._song_genre_lookup = {}   # song_id -> {"genres":[...], ...}（指纹识别歌的精确曲风）
-        self._last_genres = None       # 上次生效的曲风元组（用于曲风变化检测）
-        self._auto_refresh_t = 0.0     # 上次自动匹配重算时间
+        # ★ 2026-10-30 用户「大砍刀」：删掉 `_song_genre_lookup` / `_last_genres` /
+        #   `_auto_refresh_t` —— 曲风识别与曲风映射整条链路已移除，自动图层只按
+        #   「角色 + 动态档」挑素材（见 `_refresh_auto_layers` / `match_clips`）。
         # 后处理特效：事件触发时间（特效名 -> 上次 Drop 触发时刻）
         self._postfx_trig = {}
         self._frame_i = 0
         # 自动后处理「效果保持」：选中一组效果后保持 N 拍，到点/曲风变化才重挑
         self._fx_hold_pick = None
         self._fx_hold_due = 0.0
-        self._fx_hold_genres = None
         # Spout 输出（懒加载，运行在引擎线程）
         self._latest_frame = None      # 最新合成帧（frame_ready 只投序号，帧放这）
         self._frame_seq = 0            # 帧序号（绘制端用来去重）
@@ -788,6 +907,10 @@ class AutoVJEngine(QObject):
         self._mode_eval_t = 0.0
         self.switch_pos = 0.0
         self._next_due = None   # 已安排的下一次切换目标拍位（缓存：模式切换不重置，倒计时连续）
+        # ★ 2026-11-06：这一次的目标是"段落边界"还是"按拍"——HUD 文案据此换词
+        #   （有段落表时说「距下一个段落」比「还有 N 拍切换」准确）。
+        self._due_kind = None
+        self._due_cap = False   # 本次目标是不是"段落太长被 64 拍封顶"的强制切
         self._due_off = 0.0     # 排 _next_due 时用的小节头相位（相位变了要重新贴线）
         # 排 _next_due 时用的**栅格宽度**（4=小节线 / 8=八拍乐句）。用于识别「栅格变粗」
         # （4→8，未锁定→锁定交接）——此时必须把重贴限制在「绝不提前」，见 _next_switch_due。
@@ -798,6 +921,10 @@ class AutoVJEngine(QObject):
         self._pos_ref = None    # 上次切换时的连续拍位（非逐拍模式）
         # ---- 离线节拍网格（八拍乐句）驱动 ----
         self._song_grid_lookup = {}   # song_id -> grid（ui_main 在曲库就绪后注入）
+        # ★★ 2026-10-31：song_id -> (sections, dur, grid) —— **导入包**里的能量段落。
+        #   本机扫的歌从 `cfg["music_meta"][path]` 取；导入歌没有 path（文件不在本机）
+        #   ⇒ 只能按 song_id 查这张表（ui_main 通过 `set_song_sections()` 注入）。
+        self._song_sec_lookup = {}
         self._grid_clock = GridClock()   # 网格拍位时钟（连续/单调/防抖）
         # 上一帧处于网格模式的 song_id（None=当前不在网格模式）。
         # 用于检测「网格 → 音频拍钟」的切换边沿，做坐标续接（见 _beat_pos）。
@@ -832,7 +959,7 @@ class AutoVJEngine(QObject):
         self._sec_tier = None            # 段落目标档位
         self._sec_path = ""              # 段落表属于哪首歌（换歌要复位）
         self._sec_seen_path = None       # 上一次见过 path（判断"是否换歌"）
-        self._sec_cache = None           # (path, sections) 缓存
+        self._sec_cache = None           # (key, raw_sections, 已 normalize) 缓存
         self._sec_info = {}              # 取证：状态/段索引/目标值
         # 掉锁后「冻结段位」的计时（见 `_section_tick`）：掉锁 ≠ 音乐变了，
         # 立刻退回实测能量会让能量档跳变 ⇒ 素材池重 roll + 强切（用户 2026-10-30 实测）。
@@ -999,11 +1126,6 @@ class AutoVJEngine(QObject):
         self.cfg.data["layers"] = [l.to_dict() for l in self.layers]
 
     # ---------------- 自动匹配（听歌识曲→自动配画面） ----------------
-    @_locked
-    def set_song_genres(self, lookup):
-        """注入 song_id → {"genres":[...], ...} 映射（指纹识别到歌时取精确曲风）。ui_main 在曲库就绪后调用。"""
-        self._song_genre_lookup = lookup or {}
-
     def set_audio_engine(self, audio_engine):
         """注入**音频引擎**本体（不是它的 state）。ui_main 在构造本对象后立刻调用。
 
@@ -1026,6 +1148,22 @@ class AutoVJEngine(QObject):
         self._song_grid_lookup = mapping or {}
         # 换库 / 重扫：旧的网格时钟坐标系作废
         self._reset_grid_clock()
+
+    @_locked
+    def set_song_sections(self, mapping):
+        """注入 `song_id → (raw_sections, dur, grid)`（导入包带的段落表）。
+
+        ★ 2026-10-31（用户「erlib 的扫描要和 eravj 一样」）：`_sections_for_sid()`
+          原来**只按路径**查 `cfg["music_meta"]`，而导入的歌文件不在本机、没有 path
+          ⇒ 段落表永远取不到 ⇒ 导入曲库没有段落色带、不按段落切素材。
+          `mapping=None/{}` 等价于关闭（本机曲库不受影响）。
+
+        ⚠ 与 `set_song_grids` 一样是**整体替换引用**（GIL 下原子），不就地改 dict ——
+          引擎线程可能正在读。
+        """
+        self._song_sec_lookup = mapping or {}
+        # 换库/重导入：段落缓存可能指向旧对象，作废
+        self._sec_cache = None
 
     def _reset_grid_clock(self):
         """作废局部网格时钟（换库/重扫/关闭网格时调用）。"""
@@ -1294,43 +1432,29 @@ class AutoVJEngine(QObject):
             return None          # 尚未锁定坐标系：不进入网格模式（走原有拍钟）
         return info
 
-    def _current_genres(self, snap):
-        """当前生效曲风（英文原词）：指纹识别歌的精确曲风优先，兜底实时本地AI曲风"""
-        sid = snap.get("recognized_song_id", -1)
-        if sid is not None and sid >= 0 and self._song_genre_lookup:
-            meta = self._song_genre_lookup.get(sid)
-            if meta:
-                g = meta.get("genres") or []
-                if g:
-                    return g
-        return list(snap.get("genre_tags") or [])
-
     @_locked
-    def _refresh_auto_layers(self, snap, force_tier=None):
-        """曲风变化时（或能量跨档 force_tier 时）用 match_clips 重新挑素材池并立即切换。
+    def _refresh_auto_layers(self, snap, force_tier=None, force=False):
+        """用 `match_clips` 重新挑自动图层的素材池并立即切换。
 
-        force_tier: None=常规（曲风变化触发，带门控）；"low"/"mid"/"high"=能量跨档重 roll，
-        跳过曲风门控，池子按动态档过滤/前置（match_clips 的 tier 参数）。"""
-        genres = self._current_genres(snap)
-        key = tuple(sorted(set(g.lower() for g in genres if g)))
-        now = time.perf_counter()
-        if force_tier is None:
-            if not key:
-                self._last_genres = key      # 无曲风（静音/未识别）：不重算，保持现状
-                return
-            if key == self._last_genres or now - self._auto_refresh_t < 3.0:
-                return
-        self._last_genres = key
-        self._auto_refresh_t = now
+        ★★ 2026-10-30 用户「大砍刀」：**曲风没了**，所以这里不再有"曲风变化才重算"
+          的门控（`_current_genres` / `_last_genres` / `_auto_refresh_t` 一并删除）。
+          现在的重算时机只有两个：
+            · `force_tier` 给定时（能量跨档 / 段落切换 / 实时档位变化）——按该档重 roll；
+            · `force=True`（换库、重扫素材、手动重排角色后由 UI 调用）；
+            · 否则（每帧 tick 调进来）**只在某层池子为空时补一次**，绝不每帧重 roll
+              （那会让随机序列每帧变化 ⇒ 画面狂切）。
+        force_tier: None / "low" / "mid" / "high" —— 池子按动态档过滤/前置。"""
         # ★ 段落接管时用目标能量（见 `_energy_for_switch`）
         energy = self._energy_for_switch(snap)   # 注意：0.0 就是 0.0，不能当成 0.5
         changed = []
         for lay in self.layers:
             if not getattr(lay, "auto_mode", False):
                 continue
-            # 记住当前正在播的素材：曲风变化换池时保留画面，等切换点（小节线）再切
+            if force_tier is None and not force and lay.clips:
+                continue                      # 池子非空且非强制 ⇒ 保持现状（不 churn）
+            # 记住当前正在播的素材：换池时保留画面，等切换点（小节线）再切
             cur_path = lay.clips[lay.cur].path if (0 <= lay.cur < len(lay.clips)) else None
-            picked = list(match_clips(genres, energy, self.library, role=lay.role, n=8,
+            picked = list(match_clips(energy, self.library, role=lay.role, n=8,
                                       tier=force_tier))
             lay.clips = list(picked)
             lay.auto_clips = list(picked)
@@ -1356,9 +1480,23 @@ class AutoVJEngine(QObject):
             # - 曲风变化但当前还没画面：先放一个（避免黑屏）
             # - 纯曲风变化且正在播：只换池、保留当前画面，等下一个切换点（小节线）再切 → 对齐
             if force_tier is not None or lay.player is None or lay.cur < 0:
+                # ★★★ 2026-11-07（用户：「The Songbird 来回放，素材固定在那几个」）：
+                #   这里原来**永远挑新池的第 0 个**（`_switch_layer_to(lay, 0)`）。
+                #   段落边界每次都走 `force_tier` ⇒ 每次都切到池里的第 0 个；
+                #   而自动层的兜底切换又被 `_apply_section_switch` 跳过（避免同帧两刀），
+                #   于是整首歌反复看到的就是同样那一两个素材。
+                #   ⇒ 在池里**随机挑一个、且尽量避开当前正在播的**。
+                _k = 0
+                try:
+                    if len(picked) > 1:
+                        _cand = [i for i, _c in enumerate(picked)
+                                 if getattr(_c, "path", None) != cur_path]
+                        _k = random.choice(_cand or list(range(len(picked))))
+                except Exception:                                # noqa: BLE001
+                    _k = 0
                 lay.cur = -1
                 lay.prev_idx = -1
-                self._switch_layer_to(lay, 0, instant=True)
+                self._switch_layer_to(lay, _k, instant=True)
             else:
                 # 当前素材仍在新池 → 保持索引（画面不断）；已不在新池 → -1（画面暂留旧 player，
                 # 由 _auto_switch_tick 的下一个小节线切换点换成新池素材）
@@ -1385,27 +1523,43 @@ class AutoVJEngine(QObject):
             path = self._cue_song_path(int(sid)) if int(sid) >= 0 else ""
         except (TypeError, ValueError):
             path = ""
-        if not path:
-            return []
         raw, dur, grid = [], 0.0, {}
-        try:
-            rec = (self.cfg["music_meta"] or {}).get(path) or {}
-            raw = rec.get("sections") or []
-            dur = float(rec.get("dur") or 0.0)
-            grid = rec.get("grid") or {}
-            if dur <= 0:
-                dur = float(grid.get("dur") or 0.0)
-        except Exception:                                     # noqa: BLE001
-            raw, dur, grid = [], 0.0, {}
+        if path:
+            try:
+                rec = (self.cfg["music_meta"] or {}).get(path) or {}
+                raw = rec.get("sections") or []
+                dur = float(rec.get("dur") or 0.0)
+                grid = rec.get("grid") or {}
+                if dur <= 0:
+                    dur = float(grid.get("dur") or 0.0)
+            except Exception:                                 # noqa: BLE001
+                raw, dur, grid = [], 0.0, {}
+        # ★★ 2026-10-31：本机没有（或没段落）⇒ 查**导入包**里的段落表。
+        #   导入歌 `path == ""`（文件不在这台机器），以前这里直接 `return []`。
+        if not raw and int(sid) >= 0:
+            try:
+                imp = self._song_sec_lookup.get(int(sid))
+            except Exception:                                 # noqa: BLE001
+                imp = None
+            if imp:
+                try:
+                    raw = imp[0] or []
+                    dur = float(imp[1] or 0.0) or dur
+                    grid = imp[2] or grid
+                    if dur <= 0:
+                        dur = float((grid or {}).get("dur") or 0.0)
+                except Exception:                             # noqa: BLE001
+                    raw = []
         # ★ 缓存按 **raw 列表的引用** 失效：详情页保存时替换成新 list ⇒ 这里 `is` 判否
         #   ⇒ 自动重算。这样不需要"保存后记得通知引擎"，少一个易漏的跨模块调用。
+        key = path or ("imp", int(sid))
         cached = getattr(self, "_sec_cache", None)
-        if cached is not None and cached[0] == path and cached[1] is raw:
+        if cached is not None and cached[0] == key and cached[1] is raw:
             return cached[2]
         # ★ 传 grid ⇒ `normalize` 会把每个 t0 吸附到最近的八拍头
         #   （与 waveform_mark.grid_times 同一组 anchor/beat_len）。
         secs = sections.normalize(raw, dur, grid if grid else None) if raw else []
-        self._sec_cache = (path, raw, secs)
+        self._sec_cache = (key, raw, secs)
         self._sec_path = path
         return secs
 
@@ -1500,6 +1654,24 @@ class AutoVJEngine(QObject):
                 self._section_log("未接管：没认到歌或位置过期（退回实测能量）")
             return
 
+        # ★★★ 2026-11-07（用户：「The Songbird 来回放，素材固定不动」）：
+        #   `cue_health.log` 会被环形裁剪，播放结束后的静音期足以把"切换记录"全刷掉
+        #   ⇒ 事后查不到。这里加一条**每 20 秒**的心跳，记录段索引 / 累计切换次数 /
+        #   距上次切换多久 / 每层当前素材索引 ⇒ 下次一定能看见到底有没有在切。
+        try:
+            _now_hb = time.perf_counter()
+            if _now_hb - float(getattr(self, "_sec_hb_t", 0.0)) >= 20.0:
+                self._sec_hb_t = _now_hb
+                _cur = ",".join(str(getattr(l, "cur", -1)) for l in (self.layers or [])[:4])
+                _since = _now_hb - float(getattr(self, "_sec_last_switch_t", 0.0))
+                self._section_log(
+                    "心跳 段%d/%s 切换%d次 距上次%.1fs 素材[%s] 运行=%s"
+                    % (int(getattr(self, "_sec_idx", -1)) + 1,
+                       str(getattr(self, "_sec_energy", None)),
+                       int(getattr(self, "_sec_switch_n", 0)), _since, _cur,
+                       bool(getattr(self, "running", False))))
+        except Exception:                                      # noqa: BLE001
+            pass
         secs = self._sections_for_sid(sid)
         if not secs:
             # ★★ 2026-10-28 真机抓到（r35 一首歌切了 15 次）：**绝对不能在这里清
@@ -1531,7 +1703,22 @@ class AutoVJEngine(QObject):
 
         self._sec_list = secs
         self._sec_lost_t = 0.0          # 位置回来了 ⇒ 掉锁计时复位（见掉锁冻结分支）
-        i, cur = sections.section_at(secs, sec)
+        # ★★★ 2026-11-06（用户：「按段落切换加一个」）：按**提前一拍**的位置判段，
+        #   等价于在段落边界前 1 拍就切过去（听感上正好对上）。
+        #   ⚠ 只影响"什么时候认为进了新段"，`_sec_info["sec"]` 仍记真实秒数。
+        _adv_beats = float(getattr(self, "SECTION_ADVANCE_BEATS", 1.0))
+        # ⚠ `trk` 在**本函数更后面**才赋值（`_trk = self._cue_pos_tracker`），
+        #   这里直接用会 NameError ⇒ 整个 `_section_tick` 每帧抛异常 ⇒
+        #   段落切换**一次都不执行**（用户 2026-11-07：素材固定不动）。
+        #   拍长从 tracker 上取；取不到就不加提前量（绝不因此不切段）。
+        _bl = 0.0
+        try:
+            _trk0 = getattr(self, "_cue_pos_tracker", None)
+            _bl = float(getattr(_trk0, "beat_len", 0.0) or 0.0)
+        except Exception:                                      # noqa: BLE001
+            _bl = 0.0
+        _sec_eff = float(sec) + _adv_beats * _bl if _bl > 1e-6 else float(sec)
+        i, cur = sections.section_at(secs, _sec_eff)
         self._sec_idx = i
         self._sec_tier = cur["tier"]
         self._sec_energy = cur["energy"]
@@ -1581,6 +1768,11 @@ class AutoVJEngine(QObject):
             return                        # 没点「开始」：只记状态，不动画面
         tier = cur.get("tier") or "mid"
         tms = cur.get("trans_ms", None)
+        # ★★★ 2026-11-07（用户：「两段连续的 JUMP 都是 0.9 能量，切换段落素材不换」）：
+        #   同档位的两段（high → high），`_refresh_auto_layers(force_tier=tier)` 重 roll 出来的
+        #   仍是同一档素材池，自动层往往**保持 index 不变** ⇒ 段落切了、画面没变。
+        #   记下上一档，同档时下面**主动**给自动层换一条。
+        _prev_tier = getattr(self, "_last_energy_tier", None)
         # ① 重 roll 素材池（★ 2026-10-30 起 mid 也按档位过滤 —— 用户要求中动态也强制换池）
         try:
             self._refresh_auto_layers(snap, force_tier=tier)
@@ -1595,6 +1787,7 @@ class AutoVJEngine(QObject):
         except Exception:                                     # noqa: BLE001
             pass
         self._next_due = None
+        self._due_cap = False        # 新段落 ⇒ 重新算（见 `_next_switch_due`）
         # ④ 立刻逐层切一次
         _n_sw = 0
         for lay in self.layers:
@@ -1604,6 +1797,21 @@ class AutoVJEngine(QObject):
                 continue
             if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
                 continue
+            # ★★★ 2026-11-06（连切两个素材的第二条成因）：
+            #   上面 `_refresh_auto_layers(force_tier=…)` 对**自动图层**已经 instant 切到新池了
+            #   （见它内部 `_switch_layer_to(lay, 0, instant=True)`）⇒ 这里再切一刀就是同一帧内
+            #   两次换素材：解码器白开一次，带过渡时还会闪一下。
+            #   `_energy_tier_switch` 一直是这么跳过的（它写着"自动图层上面已重 roll + instant 切"），
+            #   这里漏了，补上，两条路径口径一致。
+            if getattr(lay, "auto_mode", False):
+                # 同档位（如连续两段都 high）：池没换，但段落变了 ⇒ 也要换一条素材
+                if _prev_tier == tier:
+                    try:
+                        self._switch_layer_random(lay, snap)
+                        _n_sw += 1
+                    except Exception:                          # noqa: BLE001
+                        pass
+                continue
             try:
                 if tms is not None:
                     lay.trans_ms = int(tms)
@@ -1612,6 +1820,7 @@ class AutoVJEngine(QObject):
             except Exception:                                 # noqa: BLE001
                 continue
         self._sec_switch_n = getattr(self, "_sec_switch_n", 0) + 1
+        self._sec_last_switch_t = time.perf_counter()
         _sec = self._sec_info.get("sec", -1.0)
         _trk = getattr(self, "_cue_pos_tracker", None)
         self._section_log(
@@ -1644,16 +1853,19 @@ class AutoVJEngine(QObject):
         # ★★ 2026-10-30 用户：「除了高动态低动态 再把中动态也加进来 0.4到0.8」「高动态提到 0.8」
         #   ⇒ 三段边界改成 0.40 / 0.80（和 `sections.TIER_LO/TIER_HI`、`match_clips` 同一套）。
         # ★★ 2026-10-30 晚（`Rolling Contact`）：「中能量改回 0.4 0.75」⇒ 高门槛 0.80 → 0.75。
-        #   进出阈值仍不对称，留 0.06 的滞回带（进档按用户给的 0.40/0.75 原值）：
-        #     进 high 要 >=0.75，退回 mid 要 <0.69；进 low 要 <0.40，退回 mid 要 >0.46。
-        #   能量在 0.4/0.75 附近小幅波动时不会反复跨档（纯一刀切会来回切池子）。
+        # ★★★ 2026-11-06：**改成直接读 `sections` 的常量**（0.72 / 0.35，见 `sections.TIER_HI`
+        #   的注释）。之前这里硬编码 0.75/0.40，而 `sections` 那边已经调到 0.72/0.35
+        #   ⇒ 库里标成 high 的段（e=0.73）在引擎里被判成 mid，档位和显示对不上。
+        #   以后只改 `sections.TIER_*` 一处，这里自动跟随。
+        #   滞回带仍是 0.06：进 high 要 >=0.72，退回 mid 要 <0.66；进 low 要 <0.35，退回 mid 要 >0.41。
+        _TH, _TL, _HYS = sections.TIER_HI, sections.TIER_LO, 0.06
         cur = self._last_energy_tier
         if cur == "high":
-            tier = "mid" if E < 0.69 else "high"
+            tier = "mid" if E < _TH - _HYS else "high"
         elif cur == "low":
-            tier = "mid" if E > 0.46 else "low"
+            tier = "mid" if E > _TL + _HYS else "low"
         else:  # mid
-            tier = "high" if E >= 0.75 else ("low" if E < 0.40 else "mid")
+            tier = "high" if E >= _TH else ("low" if E < _TL else "mid")
         if tier == self._last_energy_tier:
             self._tier_since = None
             return
@@ -1797,10 +2009,16 @@ class AutoVJEngine(QObject):
             self._energy_tier_switch(snap)
 
         # BPM 速度同步
-        if self.cfg["auto"].get("bpm_speed_sync") and snap["bpm"] > 0:
-            speed = max(0.3, min(2.5, snap["bpm"] / 128.0))
-        else:
-            speed = 1.0
+        # ★★★ 2026-11-02（用户直播：「200+ BPM 的歌，素材速度没跟上来、很慢」）：
+        #   **认到歌时优先用库内 BPM**，而不是拍钟那个实时估计值。
+        #   为什么：库内 BPM 是离线整曲细扫（`audio_engine` 自己的注释写着
+        #   "比实时自相关准一个量级"），而实时值可能**卡在上一首**——
+        #   现场取证见 `_bpm_relock_after_veto`：14 分钟里 `bpm=133.5` 一条没变，
+        #   200BPM 那首的素材因此跑 `133.5/128 = 1.04×` 而不是 `1.56×`（慢 1.5 倍），
+        #   切换间隔也被拖成 10.8s（应 7.2s）。用户看到的"素材速度没跟上来"就是这个。
+        #   ⚠ 只在 `lib_bpm > 0`（= 认到歌且库里有 BPM）时换基准；
+        #     没认到歌时逐值同改前（仍走 `snap["bpm"]`）。
+        speed = content_speed(snap, bool(self.cfg["auto"].get("bpm_speed_sync")))
 
         # 非逐拍模式的按拍位切换
         if self.running and not _no_auto_switch and self.mode != "beat":
@@ -1910,6 +2128,10 @@ class AutoVJEngine(QObject):
         #   @_locked 方法不会死锁；`_beat_pos` 按时间戳重算且幂等（见其注释），额外调用不改行为。
         try:
             _ui = {"switch_cd": self.switch_countdown(snap),
+                   # ★ 2026-11-06：告诉 HUD 这次是"段落接管"（用段落措辞）还是"按拍"
+                   "switch_kind": getattr(self, "_due_kind", None),
+                   # ★ 2026-11-06：当前段落名（设置页「当前节奏」直接显示"跟随段落「X」"）
+                   "sec_name": str((getattr(self, "_sec_info", None) or {}).get("name") or ""),
                    "phrase_cd": self.phrase_countdown(snap),
                    "grid_view": self.beat_grid_view(snap),
                    # ★ T05②：当前段/多锚（有分段/多锚才有值，否则 None ⇒ HUD 一字不变）
@@ -2611,6 +2833,14 @@ class AutoVJEngine(QObject):
     # 现在只有 ≥1 拍（= 一个小节的 1/4）的错位才拉正；小偏差保持不变（它是**恒定**的、
     # 不会累积漂移，因为下一轮的目标始终是「上一轮目标 + 固定间隔」）。
     ALIGN_MIN_OFFSET = 1.0
+    # ★ 2026-11-06：段落接管素材切换后的「最长不换素材」上限（拍）。
+    #   段落可能很长（20 个八拍 = 160 拍），不做上限的话现场会出现"十几秒不换画面"。
+    #   64 拍 ≈ 4 个八拍乐句，也是常规切（16 拍）的 4 倍，够宽松又不会闷。
+    AUTO_SWITCH_MAX_BEATS = 64.0
+    #: **段落切换**提前多少拍触发（用户 2026-11-06：「按段落切换加一个」）。
+    #: ⚠ 按拍切换**不加**（用户明确「按拍切换不要加」）；段落边界实测准到 0.01s，
+    #:   但听感上整体慢一拍，所以只给段落这一条加提前量。
+    SECTION_ADVANCE_BEATS = 1.0
 
     def _next_switch_due(self, snap):
         """下一次切换的目标拍位：**就近对齐到栅格线**（网格模式=八拍头，否则=4 拍小节线）。
@@ -2641,12 +2871,63 @@ class AutoVJEngine(QObject):
             return None
         w = self._align_width(snap)
         off = self._bar_off(snap)
+        # ★★★ 2026-11-06（用户：「有段落分析时就用段落分析，没有时再用常规/快切兜底，
+        #   不然有时候它会连着切两次素材」）：
+        #   问题：段落边界（能量跨档 `_energy_tier_switch`）会切一次，紧接着按拍位的
+        #   切换点又在附近 ⇒ 同一秒附近连切两次，画面像抽搐。
+        #   改法：**这首歌有段落表时，下一次切换点直接取"下一个段落起点"**，不再按
+        #   16/8 拍硬算；没有段落表才退回原来的固定间隔。
+        #   ⚠ 代价（用户已知并接受）：段落很长时素材会停留很久 ⇒ 加一道
+        #     `AUTO_SWITCH_MAX_BEATS` 上限，超了就按上限强制切一次，避免长时间不动。
+        #   ⚠ 段落起点是**秒**，这里换算成拍位增量；只有 bpm / 当前秒都拿得到才用，
+        #     否则退回原逻辑（绝不因为缺字段而不切）。
+        _secs = getattr(self, "_sec_list", None)
+        _sec_beat = None
+        if _secs and len(_secs) > 1:
+            # ★★★ 2026-11-06（测试 `_test_section_single_switch.py` 抓到的真 bug）：
+            #   原来写 `int(getattr(self, "_sec_idx", -1) or -1)` —— **第 0 段会被 or 变成 -1**，
+            #   于是"第一段→第二段"这个最关键的边界（intro→drop）根本不走段落排期，
+            #   退回 16 拍硬算 ⇒ 拍位路径先切一刀、段落路径再切一刀（用户报的"连切两个素材"）。
+            #   `_cur_sec` 同理：`x or -1.0` 会把**歌刚开头的 0.0 秒**变成 -1.0。
+            #   ⚠ 铁律：`or 默认值` 不能用来兜"拿不到"——合法的 0/0.0 会被当空值。
+            _i_raw = getattr(self, "_sec_idx", -1)
+            _i = int(_i_raw) if isinstance(_i_raw, (int, float)) else -1
+            try:
+                _bpm = float(snap.get("bpm") or 0.0)
+                _cur_raw = (getattr(self, "_sec_info", None) or {}).get("sec")
+                _cur_sec = float(_cur_raw) if isinstance(_cur_raw, (int, float)) else -1.0
+                if _bpm > 0 and 0 <= _i < len(_secs) - 1 and _cur_sec >= 0:
+                    _nxt = float(_secs[_i + 1].get("t0") or 0.0)
+                    _dsec = _nxt - _cur_sec
+                    if 1.0 <= _dsec <= 120.0:            # 合理区间，防脏数据
+                        _pos_now = self._beat_pos(snap)
+                        _sec_beat = _pos_now + _dsec * _bpm / 60.0
+                        # 上限：段落再长也别超过 MAX 拍不换素材
+                        _cap = _pos_now + float(self.AUTO_SWITCH_MAX_BEATS)
+                        _capped = _sec_beat > _cap
+                        if _capped:
+                            _sec_beat = _cap
+                        # ★ 2026-11-06：记下"这一刀是段落边界还是封顶强制切"。
+                        #   段落边界只能由 `_section_tick` 执行（它要换池），拍位路径再切一次
+                        #   就是用户报的"连切两个素材"。
+                        self._due_cap = bool(_capped)
+            except Exception:                                    # noqa: BLE001
+                _sec_beat = None
         if self._next_due is None:
+            if _sec_beat is not None:
+                # 段落模式：目标就是段落起点（不贴 16/8 拍栅格 —— 段落边界本身就在八拍头上）
+                self._next_due = _sec_beat
+                self._due_off = off
+                self._due_kind = "section"
+                self._due_cap = bool(getattr(self, "_due_cap", False))
+                return self._next_due
+            self._due_cap = False
             target = self.switch_pos + iv
             near = off + math.floor((target - off) / w + 0.5) * w
             # 只有明显偏移才拉正（见 ALIGN_MIN_OFFSET）：小偏差原样保留，不打断节奏
             self._next_due = near if abs(near - target) >= self.ALIGN_MIN_OFFSET else target
             self._due_off = off
+            self._due_kind = "beat"
         elif (getattr(self, "_due_w", None) is not None) and w > self._due_w:
             # ★ 栅格变粗（4→8，锁定交接）：只许往后贴，绝不允许提前。
             pos = getattr(self, "_grid_last_out", None)
@@ -2704,7 +2985,41 @@ class AutoVJEngine(QObject):
             self.switch_pos = pos
             self._next_due = None
             return
-        if pos >= due:
+        # ★★★ 2026-11-06（用户：「切换段落的时候会连着切两个素材」）：
+        #   段落边界的目标点是由 `_next_switch_due` 算出来的（= 下一段起点），但真正的执行
+        #   在 `_section_tick`（同一帧稍后几行）—— 它会**换池**（按新档位挑素材）+ 切层 +
+        #   重置排期。原来这里也会照 due 切一刀（旧池），于是同一秒切两次：
+        #   先按旧池切一个，紧接着段落那边换池再切一个，用户看到的就是"切一个、半拍后又切一个"。
+        #   ⇒ 段落边界（非封顶）**只让 `_section_tick` 切**：这里放弃本次 due 并清排期。
+        #   ⚠ 只在"段落表确实接管着"时让路（`_sec_energy is not None`）——否则段落层没认到歌，
+        #     让路就会变成"再也不切"。封顶（`_due_cap`，段落太长强制切）照旧在这里切。
+        # ⚠ 判"到点"必须和下面真正切换用**同一个口径**（含提前量）：
+        #   上一版这里写的是 `pos >= due`，而切换那行是 `pos + 提前量 >= due`
+        #   ⇒ 提前量生效的那一拍正好落在"守卫不成立、切换成立"的缝里，
+        #   拍位路径先切一刀（旧池）、一拍后段落路径再切一刀 ⇒ 用户报的"连跳两次画面"。
+        _reached = pos >= due
+        # ★★★ 2026-11-06 21:xx（用户第二次报「两个段落之间多一拍其他画面」）：
+        #   日志里每次段落边界前 1 秒都有一条「拍位切换」（残差 +0.42~+1.52 拍），
+        #   紧接着才是「段落切换」⇒ 还是同一处两刀。
+        #   根因：`_next_switch_due` 只有在 `_dsec` 落在 [1.0, 120.0] 秒时才把目标设成
+        #   段落起点（kind=section）；否则退回按拍排期（kind=beat）—— 而那条拍线正好
+        #   落在段落边界前 1 秒 ⇒ 上一版的"kind==section 才让路"根本挡不住它。
+        #   ⇒ 只要**段落表在接管**（`_sec_energy is not None`），拍位路径一律让路，
+        #     只有"段落太长被封顶"（`_due_cap`）那一刀仍在这里切。
+        #     这样两段之间绝不会插进第三个画面。
+        if (_reached and not getattr(self, "_due_cap", False)
+                and getattr(self, "_sec_energy", None) is not None):
+            self.switch_pos = pos
+            self._next_due = None
+            return
+        # ★★★ 2026-11-06（用户：「现在所有素材的切换时间都比真实听歌慢了一拍，
+        #   给它默认加一拍上去」）：
+        #   按拍切换实际落在听到的那一刻之后约一拍（听感与鼠标/画面之间差一个八拍内的拍）。
+        #   做法：判断"到了"时给当前拍位**加 `SWITCH_ADVANCE_BEATS` 拍**（默认 1.0），
+        #   等价于把切换点整体提前一拍。
+        #   ⚠ 只动"按拍排期"这一条路；段落边界（`_section_tick`）是预置事件、
+        #     实测迟到 0.01~0.03s，不在这里加，否则会抢到段前。
+        if _reached:
             self.switch_pos = due
             self._next_due = None   # 切换后按最新模式/间隔重新安排下一次
             # ★★ 2026-10-30 用户报「好几首歌切素材和八拍线差四拍」：把**每次按拍切换**
@@ -3553,7 +3868,7 @@ class AutoVJEngine(QObject):
 
     def set_cue_sheet(self, sheet, media_paths=None, track=None, layer=None,
                       sheet_id="", track_title="", track_artist="",
-                      track_duration=0.0):
+                      track_duration=0.0, sheet_path=""):
         """装载一张码表（**数据面**：本步不参与渲染，渲染在 S4/S5）。
 
         · `track` 给了就直接用；否则按 (title/artist/duration) 自动认一首；
@@ -3565,7 +3880,14 @@ class AutoVJEngine(QObject):
         import cuesheet_runtime as _cr
         self.clear_cue_sheet(silent=True)
         self._cue_sheet = sheet
+        # ★ 2026-11-02（用户「码表图层和码表管理里显示的名字不一样」）：
+        #   界面要统一按**文件名**显示（`cue_page.sheet_label` 定的口径 — 用户是在文件系统里
+        #   管理码表的）。而这里原来只把包内 `title` 带出去 ⇒ 同一个包在码表管理叫
+        #   `测试151.ercue`、在图层/对话框叫 `测试11`（title），对不上。
+        #   把路径也带出去，界面就能自己取 basename。
+        self._cue_sheet_path = str(sheet_path or "")
         self._cue_media = dict(media_paths or {})
+        self._rebuild_cue_media_snap(sheet)
         # ★ 用包内 `media[].has_alpha` 建 alpha 事实表（见 `__init__` 的说明）。
         #   键是**解压后的实际路径**，与 `_cue_item()` 拿到的 `ps.clip_path` 同源。
         self._cue_alpha = {}
@@ -3608,11 +3930,17 @@ class AutoVJEngine(QObject):
         · 返回 True（幂等：没装载时调用也安全）。
         """
         self._cue_sheet = None
+        self._cue_sheet_path = ""        # ★ 2026-11-02：卸表 ⇒ 路径一并清（否则界面会显示上一张表的名字）
         self._cue_track = None
         self._cue_bound_cache = None     # ★ 卸表 ⇒ 反查缓存失效（铁律 11：两处独立复位）
         self._cue_bad_song_n = 0
         self._cue_rt = None
         self._cue_media = {}
+        # 无锁快照一并复位（铁律 11：新增标志必须有 ≥2 处独立复位 —— 这里是卸表，
+        # 另一处是 `__init__`；装表会重新赋值）
+        self._cue_media_snap = ()
+        self._cue_thumb_snap = {}      # 包内缩略图快照（卸表 ⇒ 一并清空）
+        self._cue_active_snap = frozenset()
         self._cue_alpha = {}
         self._cue_pos_beats = None
         self._cue_pos_src = ""
@@ -3667,6 +3995,8 @@ class AutoVJEngine(QObject):
         return {
             "loaded": sheet is not None,
             "title": str(getattr(sheet, "title", "") or ""),
+            # ★ 2026-11-02：包文件名（界面显示名统一用它，见 `set_cue_sheet` 的注释）
+            "path": str(getattr(self, "_cue_sheet_path", "") or ""),
             "tracks": len(getattr(sheet, "tracks", None) or []),
             "res": (sheet.aspect() if sheet is not None else (1920, 1080)),
             "track_title": str(getattr(idn, "title", "") or "") if idn else "",
@@ -4589,6 +4919,69 @@ class AutoVJEngine(QObject):
                 return True
         return False
 
+    def _rebuild_cue_media_snap(self, sheet):
+        """按码表包重建 `_cue_media_snap` + `_cue_thumb_snap`（装表时调用一次）。
+
+        ⚠ 顺序取**包内 `sheet.media` 的顺序**并按路径去重 —— 同一个素材在多个片段里
+          复用是常态，不去重会出现一堆重复格子。
+        ⚠ 这里同时清空 `_cue_active_snap`：刚装上表时 nothing is playing yet。
+        ★★★ 2026-11-06（用户：「素材缩略图不是已经打包在码表导出包里面了吗」）：
+          是 —— `.ercue` 里有 `thumbs/<clip_id>.png`，`cuesheet.load()` 已经幂等解到
+          `<包>.thumbs/` 并填好 `sheet.thumbs`。所以这里顺手建一张
+          `{素材路径(normcase): 缩略图 png 路径}` 快照，图层行**直接用包内小图**，
+          不再去解码视频重新生成（那样又慢、又可能和码表里看到的不是同一帧）。
+          老包没有 `thumbs/` ⇒ 快照为空 ⇒ 退回"后台补生成"（行为不变）。
+        """
+        out, thumbs, seen = [], {}, set()
+        media = (getattr(self, "_cue_media", None) or {})
+        for m in (getattr(sheet, "media", None) or []):
+            cid = str(getattr(m, "clip_id", "") or "")
+            p = media.get(cid)
+            if not p:
+                continue
+            k = os.path.normcase(str(p))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(str(p))
+            try:
+                tp = str(sheet.thumb_path(cid) or "")
+                if tp and os.path.isfile(tp):
+                    thumbs[k] = tp
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._cue_media_snap = tuple(out)
+        self._cue_thumb_snap = thumbs
+        self._cue_active_snap = frozenset()
+        return self._cue_media_snap
+
+    def cue_thumb_map(self):
+        """码表包内自带的素材缩略图：`{素材路径(normcase): png 绝对路径}`。
+
+        只读一次引用（`_rebuild_cue_media_snap` 整体替换，绝不原地改）⇒ 无需加锁
+        （铁律 13）。返回副本，调用方随便用。
+        """
+        d = getattr(self, "_cue_thumb_snap", None)
+        return dict(d) if isinstance(d, dict) else {}
+
+    def cue_media_paths(self):
+        """码表图层要显示在行里的素材路径（按**码表包内顺序**去重）。
+
+        ★★★ 2026-11-06（用户：「码表图层在右边把这个码表里面缩略图显示出来」）：
+          码表图层的素材来自 `.ercue` 包，**不在** `lay.clips` 里 —— 所以这一行的素材格
+          一直是空的。这里返回装表时算好的**无锁快照**（`_cue_media_snap`）。
+        ⚠ 只读一次引用赋值，不遍历任何"可能正在变"的结构（铁律 13）。
+        """
+        return list(getattr(self, "_cue_media_snap", ()) or ())
+
+    def cue_active_media(self):
+        """此刻**正在使用**的码表素材路径集合（已 normcase，供格子打黄底）。
+
+        数据源是 `_cuesheet_tick` 每帧整体赋值的 `_cue_active_snap`（frozenset 赋值在 GIL
+        下原子），GUI 侧不会看到"半更新"的中间态。
+        """
+        return set(getattr(self, "_cue_active_snap", frozenset()) or ())
+
     def _cue_set_active(self, lay, paths):
         """把该层缓存里的播放器按需激活（**两个缓存都必须遍历**）。
 
@@ -4710,6 +5103,7 @@ class AutoVJEngine(QObject):
                     lay.cs_states = []
                 lay.cs_active = False
                 self._cue_set_active(lay, set())   # ★ 不接管 ⇒ 全部失活（别让解码器白烧 CPU）
+            self._cue_active_snap = frozenset()    # ★ 快照同步清空（GUI 黄底随之熄灭）
             return
         try:
             # ★ 2026-10-18：把**输入音乐的播放速率**一并传进去 —— 码表把播放器倍速
@@ -4737,12 +5131,19 @@ class AutoVJEngine(QObject):
             for lay in lays:
                 lay.cs_states = []
                 lay.cs_active = False
+            self._cue_active_snap = frozenset()   # ★ 解释失败 ⇒ 快照清空（界面不留假高亮）
             return
         on_any = bool(states)
         # ★ 每帧按"当前片段 + 过渡中片段 + 预加载的下一个"算活跃路径 —— 解码器有界的前提
         paths = {ps.clip_path for ps in states
                  if getattr(ps, "active", False) and getattr(ps, "clip_path", "")
                  and not getattr(ps, "missing", False)}
+        # ★ 无锁快照：GUI 图层行只读它来打黄底（见 `cue_active_media`）。
+        #   frozenset 整体赋值在 GIL 下原子 ⇒ 界面不会读到"半更新"的集合。
+        try:
+            self._cue_active_snap = frozenset(os.path.normcase(str(_p)) for _p in paths)
+        except Exception:                                         # noqa: BLE001
+            self._cue_active_snap = frozenset()
         # ★★★ 2026-10-18（用户："码表偶尔会突然消失零点几秒"）——**帧级暗场计时**。
         #   为什么必须单独做：`_cue_diag` 是 **2s 一行**，抓不到"不出画持续了多久"
         #   （88 个采样里那 1 行 `sub=3/0` 到底是 16ms 还是 400ms，完全看不出来）。
@@ -4991,14 +5392,16 @@ class AutoVJEngine(QObject):
                 tp = QPainter(tmp)
                 tp.setRenderHint(QPainter.SmoothPixmapTransform)
                 self._draw_layer(tp, stub, img, W, H, prog, tr, 1.0, snap, 0.0, 0.0,
-                                 crop=ps.crop)
+                                 crop=ps.crop,
+                                 out_dir=bool(getattr(ps, "trans_is_out", False)))
                 tp.end()
                 subtract_jobs.append((tmp, op))
             else:
                 p.setCompositionMode(
                     BLEND_QT.get(blend, QPainter.CompositionMode_SourceOver))
                 self._draw_layer(p, stub, img, W, H, prog, tr, 1.0, snap, 0.0, 0.0,
-                                 crop=ps.crop)
+                                 crop=ps.crop,
+                                 out_dir=bool(getattr(ps, "trans_is_out", False)))
                 p.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
     def _preload_clips(self, lay, clips=None, max_preload=3):
@@ -5440,7 +5843,6 @@ class AutoVJEngine(QObject):
 
         触发模式（每个特效独立）：
         - constant 常驻：恒定按手动强度
-        - genre    曲风：当前曲风命中绑定曲风才生效
         - event    事件：Drop 触发后从峰值按 decay 秒衰减回 0
         自动联动总开关 auto=False 时，全部退化为常驻。
         """
@@ -5476,7 +5878,6 @@ class AutoVJEngine(QObject):
         _rg = float(cfg.get("global_level", 60) or 0.0)
         if 0.0 < _rg < 1.0:
             g = min(1.0, _rg)
-        genres_now = [x.lower() for x in self._current_genres(snap)] if auto_link else []
         # 全局唤醒系数：能量映射 0~1（0.2 以下归零=缓拍段休眠，0.65 以上满额=高潮活跃）。
         E = snap.get("energy", 0.0)
         wake = max(0.0, min(1.0, (E - 0.2) / 0.45))
@@ -5503,10 +5904,9 @@ class AutoVJEngine(QObject):
             # 会反复进出效果链，画面上就是「效果忽有忽无」；按拍保持后变化才有节奏感。
             hold = max(0, int(cfg.get("auto_hold_beats", 0) or 0))
             if hold <= 0:
-                chosen = self._auto_pick_effects(snap, genres_now)
+                chosen = self._auto_pick_effects(snap)
                 self._fx_hold_pick = None
                 self._fx_hold_due = 0.0
-                self._fx_hold_genres = None
             else:
                 pos = self._beat_pos(snap)
                 # 拍位倒退（换歌 / 拍钟重置）= 之前的保持计时失效，必须重挑，
@@ -5514,18 +5914,15 @@ class AutoVJEngine(QObject):
                 last = getattr(self, "_fx_hold_last", 0.0)
                 back = pos < last - 0.5
                 self._fx_hold_last = pos
-                gkey = tuple(genres_now or ())
                 need = (self._fx_hold_pick is None or back
-                        or pos >= getattr(self, "_fx_hold_due", 0.0)
-                        or getattr(self, "_fx_hold_genres", None) != gkey)
+                        or pos >= getattr(self, "_fx_hold_due", 0.0))
                 if need:
-                    self._fx_hold_pick = self._auto_pick_effects(snap, genres_now)
+                    self._fx_hold_pick = self._auto_pick_effects(snap)
                     # ★ 2026-10-28：到期点**吸附到八拍头**（用户要求"画面效果里的选项
                     #   也要和波形图八拍对齐"）。原写法 `pos + hold` 会落在任意拍上 ——
                     #   换效果就切在半拍里，跟素材切换不在同一条网格上。
                     self._fx_hold_due = self._snap_to_phrase(pos + hold, snap,
                                                              forward=True)
-                    self._fx_hold_genres = gkey
                 chosen = self._fx_hold_pick
             effects_override = {n: {"on": True, "level": 100} for n in chosen}
             # ★ 2026-10-23：不再把三个乘数连乘（见 AUTO_FX_MAX 注释），
@@ -5548,11 +5945,9 @@ class AutoVJEngine(QObject):
                 trig = e.get("trigger", "constant")
                 if not auto_link or trig == "constant":
                     m = 1.0
-                elif trig == "genre":
-                    bound = [x.strip().lower() for x in (e.get("genres") or "").split(",") if x.strip()]
-                    m = 1.0 if (bound and genres_now and any(
-                        b in c or c in b for b in bound for c in genres_now)) else 0.0
-                    m *= wake
+                # ★ 2026-10-30 砍掉曲风后，原 `trig == "genre"`（"曲风命中才生效"）分支删除。
+                #   老配置里残留的 "genre" 会落到下面的 `else: m = 1.0` ⇒ 退化为常驻
+                #   （用户选过这个触发方式，但曲风已经没有了；常驻至少看得见效果）。
                 elif trig == "event":
                     if snap.get("drop"):
                         self._postfx_trig[name] = now
@@ -5612,28 +6007,13 @@ class AutoVJEngine(QObject):
         except Exception:
             pass
 
-    _AUTO_FX_BY_GENRE = [
-        (("hardcore", "frenchcore", "gabber", "uptempo"), ["chromatic", "glitch"]),
-        (("trance",), ["bloom", "trails"]),
-        (("house", "disco", "funk", "garage"), ["saturation", "bloom"]),
-        (("techno", "industrial"), ["deform", "chromatic"]),
-        (("drum & bass", "dnb", "dubstep", "breakbeat", "breakcore"), ["glitch", "deform"]),
-        (("ambient", "downtempo", "chillout"), ["softfocus", "trails"]),
-        (("synthwave",), ["chromatic", "bloom"]),
-        (("hardstyle", "rawstyle"), ["chromatic", "deform"]),
-        (("hip hop", "trap"), ["glitch", "grain"]),
-        (("pop", "anime", "future bass"), ["saturation", "softfocus"]),
-    ]
+    def _auto_pick_effects(self, snap):
+        """自动模式：底效 bloom + chromatic；高潮加曝光脉冲，缓拍加柔焦，最多 3 个。
 
-    def _auto_pick_effects(self, snap, genres_now):
-        """自动模式：按曲风挑 2 个基础效果，高潮加曝光脉冲，缓拍加柔焦，最多 3 个"""
-        chosen = []
-        for keys, fx in self._AUTO_FX_BY_GENRE:
-            if any(k in gn or gn in k for gn in genres_now for k in keys):
-                chosen = list(fx)
-                break
-        if not chosen:
-            chosen = ["bloom", "chromatic"]
+        ★ 2026-10-30 用户「大砍刀」：曲风识别整条链路删除，这里不再按曲风分组挑
+          （原 `_AUTO_FX_BY_GENRE` 的 10 组映射一并删除）。底效固定，变化交给能量。
+        """
+        chosen = ["bloom", "chromatic"]
         E = snap.get("energy", 0.0)
         if E > 0.75 and "exposure" not in chosen:
             chosen.append("exposure")
@@ -5807,7 +6187,7 @@ class AutoVJEngine(QObject):
                 pass  # 单个图层失败就跳过它，不影响整帧
 
     def _draw_layer(self, p, lay, img, W, H, prog, tr, pulse, snap,
-                    drift_x=0.0, drift_y=0.0, crop=None):
+                    drift_x=0.0, drift_y=0.0, crop=None, out_dir=False):
         """把一层画到画布上。
 
         `crop`：码表（cue）用的**源矩形裁切**，归一化 `[x, y, w, h]`（0~1）；`None` = 不裁。
@@ -5887,6 +6267,30 @@ class AutoVJEngine(QObject):
                     painter.drawImage(_tgt, image, src)
             painter.restore()
 
+        def _own_w(image, item, scale=1.0):
+            """该素材**实际画出来**的宽度（px）—— 与 `paint_cover` 同一套公式。
+
+            ★★ 2026-11-02（用户：「缩小图滑动时从屏幕最右边进来」）：
+              slide 的位移量原来直接用**画布宽 W**。素材被 xform 缩小到 0.28~0.4 之后，
+              它实际只有 300~430 px 宽，却要横穿 1920 px ⇒ 看着就是"从屏幕外飞进来"。
+              ⇒ 位移量一律按**素材自身宽度**算，小图只在自己那块地方进出。
+              ⚠ 旋转不改变宽度，这里不需要分支。
+            """
+            if image is None or image.isNull() or image.width() <= 0:
+                return 0.0
+            custom_w, _ux, _uy, us, _rot = _t(item)
+            iw, ih = image.width(), image.height()
+            src = _crop_src_rect(image, crop)
+            if src is not None:
+                iw, ih = src.width(), src.height()
+            if iw <= 0 or ih <= 0:
+                return 0.0
+            if custom_w:
+                s = min(W / iw, H / ih) * scale * us   # 完整显示 + 用户缩放
+            else:
+                s = max(W / iw, H / ih) * scale        # 铺满
+            return iw * s
+
         dx = drift_x * (0.5 + (lay.cur % 3) * 0.25)  # 各图层漂移相位不同
         dy = drift_y * (0.5 + (lay.cur % 2) * 0.5)
         if getattr(lay, "lock_motion", False):
@@ -5901,10 +6305,16 @@ class AutoVJEngine(QObject):
                 paint_cover(p, prev, prev_item, pulse, dx, dy, alpha)
             paint_cover(p, img, cur_item, pulse, dx, dy, alpha * prog)
         elif tr == "slide":
-            off = W * (1 - prog)
+            # ★★ 2026-11-02（用户：「滑动消失不是从原位置滑，是从屏幕最右边滑」）：
+            #   ① 位移量从 `W`（整屏）改成 **d = 素材自己的宽度**；
+            #   ② 方向按 `out_dir` 反向 —— 入场 `+d → 0`（从自己右边一格滑到位），
+            #      出场 `0 → −d`（继续向左滑出）。原来两者共用 `W*(1-prog)`，
+            #      而出场时 prog 是 1→0，于是出场也演成"从右边滑进来"。
+            d = _own_w(img, cur_item, pulse)
+            sgn = -1.0 if out_dir else 1.0
             if prev is not None:
-                paint_cover(p, prev, prev_item, pulse, -W * prog, dy, alpha)   # 旧画面左移出
-            paint_cover(p, img, cur_item, pulse, off, dy, alpha)         # 新画面右移入
+                paint_cover(p, prev, prev_item, pulse, -sgn * d * prog, dy, alpha)
+            paint_cover(p, img, cur_item, pulse, sgn * d * (1.0 - prog), dy, alpha)
         elif tr == "zoom":
             if prev is not None:
                 paint_cover(p, prev, prev_item, pulse * (1 + 0.4 * prog), dx, dy, alpha * (1 - prog))
@@ -5916,21 +6326,44 @@ class AutoVJEngine(QObject):
                 paint_cover(p, prev, prev_item, pulse, 0, 0, alpha)
             # 随机行错位（用源矩形绘制，避免每行 copy）
             # ★ crop：在**裁切窗口内**按比例切；`src` 为 None 时与原式逐像素一致
+            # ★★ 2026-11-02（用户：「缩小图消失时先把它拉成全屏，然后再淡出消失」）：
+            #   本分支原来写死 `QRectF(off, y, W, step)` —— 把素材**铺满整个画布**，
+            #   完全无视 `xform(scale/x/y/rot)`。被缩到 0.36 的图在 glitch 过渡里
+            #   就变成 1080p 满屏，再随 alpha 消失（用户看到的就是这个）。
+            #   ⇒ 改成按**该素材自己的目标矩形**切片；默认 xform（cover）时
+            #     tx=0 / tw=W / th=H，输出与改动前逐像素一致。
             src = _crop_src_rect(img, crop)
             if src is None:
                 sx0, sy0, sw, sh_img = 0.0, 0.0, float(img.width()), float(img.height())
             else:
                 sx0, sy0, sw, sh_img = (src.x(), src.y(),
                                         src.width(), src.height())
-            p.save()
-            p.setOpacity(alpha)
-            step = max(8, H // 24)
-            for y in range(0, H, step):
-                off = rng.randint(-40, 40) if rng.random() < 0.35 else 0
-                sy = sy0 + min(sh_img - 1, int(y / H * sh_img))
-                sh = max(1, int(step / H * sh_img))
-                p.drawImage(QRectF(off, y, W, step), img, QRectF(sx0, sy, sw, sh))
-            p.restore()
+            custom_g, ux_g, uy_g, us_g, rot_g = _t(cur_item)
+            if sw <= 0 or sh_img <= 0 or abs(rot_g) > 1e-3:
+                # 旋转状态下做行错位会把图切成斜碎片 ⇒ 退回正常绘制（宁可没特效）
+                paint_cover(p, img, cur_item, pulse, dx, dy, alpha)
+            else:
+                if custom_g:
+                    _s = min(W / sw, H / sh_img) * pulse * us_g
+                else:
+                    _s = max(W / sw, H / sh_img) * pulse
+                _tw, _th = sw * _s, sh_img * _s
+                _tx = (W - _tw) / 2.0 + ux_g
+                _ty = (H - _th) / 2.0 + uy_g
+                _th_i = max(1, int(round(_th)))
+                step = max(8, _th_i // 24)
+                p.save()
+                p.setOpacity(alpha)
+                yy = 0
+                while yy < _th_i:
+                    off = rng.randint(-40, 40) if rng.random() < 0.35 else 0
+                    sy = sy0 + min(sh_img - 1, int(yy / float(_th_i) * sh_img))
+                    sh = max(1, int(step / float(_th_i) * sh_img))
+                    p.drawImage(QRectF(_tx + off, _ty + yy, _tw,
+                                       min(step, _th_i - yy)),
+                                img, QRectF(sx0, sy, sw, sh))
+                    yy += step
+                p.restore()
         else:
             paint_cover(p, img, cur_item, pulse, dx, dy, alpha)
 

@@ -551,15 +551,23 @@ def test_thumbnail_produced(fx):
         w.new_sheet("THUMB")
         ids = w.add_media_paths([fx["a"]])    # 触发后台缩略图线程
         cid = ids[0]
-        ok = False
+        # ★ 2026-11-02：`_thumbs_ready` 的键已从 **clip_id** 改成 **规范化路径**
+        #   ★★ 2026-11-03 实测纠正（第三次才对）：`_thumbs_ready` 的键是
+        #   **`thumbs.cache_key(path)` = md5(路径 + mtime)[:16]**（`panels._icon_key`），
+        #   既不是 clip_id 也不是路径本身。之前两版断言（按 clip_id / 按路径）都找不到，
+        #   于是这条一直是**假红**——产品从来没坏。这里直接调产品自己的函数算键。
+        from ercue.media.thumbs import cache_key as _ck
+        want_key = _ck(fx["a"])
+        key = None
         for _ in range(500):                  # 等后台生成（绝不在 GUI 线程做）
             APP.processEvents()
-            if cid in w.media_panel._thumbs_ready:
-                ok = True
+            if want_key in w.media_panel._thumbs_ready:
+                key = want_key
                 break
             time.sleep(0.01)
-        assert ok, "缩略图没有生成（_thumbs_ready 为空）"
-        icon = w.media_panel._thumbs_ready[cid]
+        assert key is not None, ("缩略图没有生成（want=%s 实际键=%s）"
+                                 % (want_key, list(w.media_panel._thumbs_ready)[:4]))
+        icon = w.media_panel._thumbs_ready[key]
         assert icon is not None and not icon.isNull(), "缩略图 QIcon 为空"
         pm = icon.pixmap(96, 54)
         assert not pm.isNull() and pm.width() > 0 and pm.height() > 0, "缩略图 pixmap 为空"

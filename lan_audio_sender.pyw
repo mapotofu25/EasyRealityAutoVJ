@@ -33,12 +33,14 @@ import lan_audio as LA                                          # noqa: E402
 import lan_audio_send as LS                                     # noqa: E402
 
 APP_TITLE = "EasyReality 音频发送端"
+# ★ 2026-11-08：对外版本通道（RC3 → RC4）
+APP_CHANNEL = "RC4"
 
 
 class SenderWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle("%s · %s" % (APP_TITLE, APP_CHANNEL))
         self.resize(560, 260)
         self.snd = None
         self._devs = []

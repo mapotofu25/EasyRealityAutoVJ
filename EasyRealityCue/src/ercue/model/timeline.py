@@ -86,6 +86,7 @@ class LayerDrawState:
     alpha: float = 0.0            # 含过渡量的最终不透明度系数（合成时只乘一次，D2）
     trans: str = "fade"           # 当前正在进行的过渡类型
     trans_p: float = 0.0          # 过渡进度 0~1
+    trans_is_out: bool = False    # ★ 本帧是不是**出场**（决定 slide 往哪边滑）
     src_out_sec: Optional[float] = None   # ★ A2：素材出点（None = 到素材末尾）
     src_ended: bool = False       # ★ A2：素材已放到出点（play_sec 已钳在出点，此帧起冻结）
     note: str = ""
@@ -102,7 +103,13 @@ class LayerDrawState:
 # ==========================================================================
 # ★ #17「相邻同设置视为一个素材」（run）—— 纯逻辑，零 Qt
 # ==========================================================================
-ADJ_EPS = 1e-3     # 秒：相邻判定阈值（"紧挨着"的容差）
+#: 秒：相邻判定阈值（"紧挨着"的容差）。
+#: ★★ 2026-11-03（用户：两个一样的 GIF 吸附紧挨，切入切出没关掉）：
+#:   原来 1e-3，而包内 `at_sec` 只写 **2 位小数**（10 ms 粒度）、`end_sec` 是全精度
+#:   ⇒ 同一处边界可以有 0~5 ms 的"假缝隙"（实测 0.00101 / 0.004495 s），
+#:   逐段判成不相邻，run 被打断。容差必须**大于写盘量化步长**，取 20 ms
+#:   （1 拍 @120BPM = 500 ms 的 4%，用户不可能用它表达"故意的缝隙"）。
+ADJ_EPS = 0.02     # 秒：相邻判定阈值（"紧挨着"的容差，必须 > 包内 at_sec 的 0.01 步长）
 
 #: 参与"设置相同"判定的**渲染属性**。
 #: ⚠ `item_id`（身份）、`at_sec`/`end_sec`（位置）、`note`（不影响画面）**不算**。
@@ -119,13 +126,26 @@ def _as_items(items) -> list:
 
 def _run_key(it) -> tuple:
     """把影响渲染的属性归一成**可比较**的键（dict/list 也归一，避免不可哈希 / 顺序敏感）。"""
+    def _n(x):
+        """浮点归一：把 1e-9 级的表示噪声抹平（`repr(0.1+0.2) != repr(0.3)`）。
+
+        ⚠ 只抹 **6 位小数**以下的噪声，不改判据语义（滑条精度远低于此）。
+        """
+        if isinstance(x, bool) or x is None:
+            return repr(x)
+        if isinstance(x, (int, float)):
+            return "%.6f" % float(x)
+        return repr(x)
+
     vals = []
     for k in RUN_ATTRS:
         v = getattr(it, k, None)
         if isinstance(v, dict):
-            v = tuple(sorted((str(kk), repr(vv)) for kk, vv in v.items()))
+            v = tuple(sorted((str(kk), _n(vv)) for kk, vv in v.items()))
         elif isinstance(v, (list, tuple)):
-            v = tuple(repr(x) for x in v)
+            v = tuple(_n(x) for x in v)
+        else:
+            v = _n(v)
         vals.append(repr(v))
     return tuple(vals)
 
@@ -306,6 +326,7 @@ class CueRuntime:
         a_out = 1.0
         trans = "cut" if suppress_in else it.trans_in
         trans_p = a_in
+        is_out = False            # ★ 出场标记（见 `LayerDrawState.trans_is_out`）
         # ★ A1：淡出窗口的右边界。
         #   本 item **有 end_sec**（面板「时长」/ 拖右边缘都会写它）⇒ 以本 item 的 `end_sec`
         #   为准；**只有开放结尾（end_sec is None）**才退回用下一个 item 的 `at_sec`。
@@ -324,6 +345,7 @@ class CueRuntime:
                 a_out = max(0.0, left / tout)
                 if a_out < a_in:                  # 淡出优先（正在收尾）
                     trans = it.trans_out
+                    is_out = True
                     # ★★★ 2026-10-17：`fade` 的 `trans_p` = **剩下的亮度**（a_out），
                     #   不是"过渡进度"（1-a_out）。合成是 `opacity × alpha × trans_p`，
                     #   而 alpha 本身就是 a_out ⇒ 旧写法有效 α = a_out(1-a_out)：
@@ -333,7 +355,7 @@ class CueRuntime:
                     #   ⚠ slide/zoom/glitch 的 trans_p 是**几何进度**，仍是 1-a_out；
                     #   ⚠⚠ 演出端 `src/cuesheet_runtime.py::_alpha_for` 必须同步（已同步）。
                     trans_p = (a_out if it.trans_out == "fade" else 1.0 - a_out)
-        return min(a_in, a_out), trans, trans_p
+        return min(a_in, a_out), trans, trans_p, is_out
 
     # ------------------------------------------------------------------
     def update(self, pos_sec: float) -> list:
@@ -368,7 +390,7 @@ class CueRuntime:
                 st.ended = bool(ended)
             else:
                 nxt = plan.items[idx + 1] if 0 <= idx and idx + 1 < len(plan.items) else None
-                a, trans, tp = self._alpha_for(it, nxt, pos)
+                a, trans, tp, t_out = self._alpha_for(it, nxt, pos)
                 if self.jumped:                   # 跳变后不做过渡，直接到位
                     a, tp, trans = 1.0, 1.0, it.trans_in
                 clip_id = it.clip_id or ""
@@ -426,6 +448,7 @@ class CueRuntime:
                 st.alpha = a
                 st.trans = trans
                 st.trans_p = tp
+                st.trans_is_out = bool(t_out)
                 st.note = it.note
                 st.ended = False
                 st.active = True

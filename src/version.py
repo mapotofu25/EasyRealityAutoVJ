@@ -14,10 +14,11 @@ try:
 except Exception:                      # 源码模式 / 未经打包
     BUILD_DATE, BUILD_SEQ, BUILD_VER, ZIP_NAME = "", 0, "dev", ""
 
-# ★ 2026-10-22：RC2 → RC3。识别防误报（白名单+峰值门槛+id 自愈）、ASIO 开放、码表 GIF 修复。
-#   打包版显示 2026.10.19.xx-RC1；源码运行显示 dev-RC1。
-APP_CHANNEL = "RC3"
-APP_VERSION = ((BUILD_VER + "-RC3") if BUILD_VER and BUILD_VER != "dev" else "dev-RC3")
+# ★ 2026-11-08：RC3 → RC4。自动段落重做（8 拍乐句对齐 / 边界搬去真台阶）、
+#   图层行高可压到 38、BPM 双行显示（原曲 + 变速倍率）、第三方署名全面校正。
+#   打包版显示 2026.11.08.xx-RC4；源码运行显示 dev-RC4。
+APP_CHANNEL = "RC4"
+APP_VERSION = ((BUILD_VER + "-RC4") if BUILD_VER and BUILD_VER != "dev" else "dev-RC4")
 APP_BUILD = BUILD_DATE or ""           # 2026-09-23
 APP_SEQ = BUILD_SEQ                    # 7
 APP_ZIP_NAME = ZIP_NAME                # EasyRealityAutoVJ_测试版092307.zip
@@ -41,9 +42,9 @@ HIGHLIGHTS = [
     ("颜色渲染", "Color rendering",
      "一键调色，让同一批素材换个颜色就不一样，降低对素材数量的依赖",
      "One-click grading so the same clips look different — less reliance on clip quantity"),
-    ("听歌识曲 + 曲风匹配", "Song ID + genre matching",
-     "识别正在播放的歌，按曲风自动挑选匹配的画面",
-     "Recognizes the playing track and picks matching visuals by genre"),
+    ("听歌识曲", "Song ID",
+     "靠音频指纹认出正在播放的歌，认出后按这首歌的能量段落走",
+     "Identifies the playing track by audio fingerprint and follows its energy sections"),
     ("NDI 输出", "NDI output",
      "画面作为 NDI 源「Easy Reality Output」直出：本机走 TCP 回环，局域网走直连，"
      "OBS 里直接选它就行",
@@ -112,36 +113,6 @@ HIGHLIGHTS = [
      "boundaries, clip switching, effect switching and colour rotation all snap to the "
      "same 8-beat grid as the waveform (anchor + 8n×beat_len); tracks without sections "
      "keep the old measured-energy behaviour"),
-    ("曲库查重（扫到重复会弹窗让你选）", "Duplicate detection with a side-by-side dialog",
-     "同一段音频在曲库里放两份，认歌的票会被劈成两半 —— 表现是「有时认得出、有时认不出」，"
-     "而且引擎会在两份之间来回跳。现在扫描结束后会自动查一遍（曲库面板也有「查重」按钮），"
-     "把疑似重复的两份并排列出来：文件名、标题、作者、时长、格式大小、BPM，"
-     "由你选保留哪一份。「移除」只删曲库条目，不会删除磁盘上的音频文件。"
-     "判据是「标题相似 + 时长接近」或「指纹重合」两条通道，"
-     "并专门排除 remix / VIP / extended 这类不同版本",
-     "Two copies of the same audio split recognition votes in half (the symptom is "
-     "'sometimes it recognises, sometimes it doesn't'), and the engine flip-flops between "
-     "them. After a scan the library is checked automatically (there is also a "
-     "'Find duplicates' button): suspected pairs are listed side by side with file name, "
-     "title, artist, duration, format/size and BPM, and you choose which one to keep. "
-     "'Remove' only deletes the library entry -- audio files on disk are untouched. "
-     "Detection has two paths (similar title + close duration, or fingerprint overlap) and "
-     "explicitly excludes different versions such as remix / VIP / extended"),
-    ("曲库查重（扫到重复会弹窗让你选）", "Duplicate detection with a side-by-side dialog",
-     "同一段音频在曲库里放两份，认歌的票会被劈成两半 —— 表现是「有时认得出、有时认不出」，"
-     "而且引擎会在两份之间来回跳。现在扫描结束后会自动查一遍（曲库面板也有「查重」按钮），"
-     "把疑似重复的两份并排列出来：文件名、标题、作者、时长、格式大小、BPM，"
-     "由你选保留哪一份。「移除」只删曲库条目，不会删除磁盘上的音频文件。"
-     "判据是「标题相似 + 时长接近」或「指纹重合」两条通道，"
-     "并专门排除 remix / VIP / extended 这类不同版本",
-     "Two copies of the same audio split recognition votes in half (the symptom is "
-     "'sometimes it recognises, sometimes it doesn't'), and the engine flip-flops between "
-     "them. After a scan the library is checked automatically (there is also a "
-     "'Find duplicates' button): suspected pairs are listed side by side with file name, "
-     "title, artist, duration, format/size and BPM, and you choose which one to keep. "
-     "'Remove' only deletes the library entry -- audio files on disk are untouched. "
-     "Detection has two paths (similar title + close duration, or fingerprint overlap) and "
-     "explicitly excludes different versions such as remix / VIP / extended"),
     ("认歌校验（得分 / 最弱窗 / 领先）", "Match verification: score / weakest / lead",
      "照 KDJ 作者公开的判据把认歌的「确认」从一条门槛改成三条：得分（平均）、"
      "最弱窗（把查询窗分三段，取最低的一段）、领先（得分减去别的位置的次高分）。"
@@ -188,7 +159,8 @@ PROJECTS = [
      "https://github.com/spatialaudio/python-sounddevice", "MIT"),
     ("PySoundFile (libsndfile)", "音频读写", "audio file I/O",
      "https://github.com/bastibe/python-soundfile", "BSD 3-Clause / LGPL"),
-    ("onnxruntime", "本地 AI 曲风识别", "on-device AI genre detection",
+    ("onnxruntime", "Beat This! 小节检测的推理后端",
+     "inference backend for Beat This! downbeat detection",
      "https://github.com/microsoft/onnxruntime", "MIT"),
     ("mutagen", "音乐元数据（歌名 / 曲风）", "music metadata (title / genre)",
      "https://github.com/quodlibet/mutagen", "GPL v2+"),
@@ -196,7 +168,10 @@ PROJECTS = [
      "https://github.com/cyndilib/cyndilib", "Apache 2.0"),
     ("SpoutGL (Spout SDK)", "Spout 输出（发给 OBS / Resolume）",
      "Spout output (to OBS / Resolume)",
-     "https://github.com/jlai/Python-SpoutGL", "BSD 2-Clause"),
+     "https://github.com/jlai/Python-SpoutGL", "BSD 3-Clause"),
+    ("GLFW", "GPU 解码用的离屏 OpenGL 上下文",
+     "offscreen OpenGL context for GPU decoding",
+     "https://github.com/glfw/glfw", "MIT (zlib/libpng)"),
     ("Pillow", "缩略图处理", "thumbnail processing",
      "https://github.com/python-pillow/Pillow", "MIT-CMU"),
     ("cffi", "底层库绑定（SoundCard 依赖）", "C bindings (SoundCard dependency)",
@@ -210,12 +185,9 @@ PROJECTS = [
 
 # AI 模型（随软件分发，放在 assets/models）
 MODELS = [
-    ("Chinese-CLIP (OFA-Sys)", "素材内容打标：识别画面里有什么",
-     "clip content tagging (what is in the picture)",
-     "https://github.com/OFA-Sys/Chinese-CLIP", "MIT"),
-    ("Discogs-EffNet (Essentia / MTG)", "曲风识别：400 种 Discogs 风格",
-     "genre detection: 400 Discogs styles",
-     "https://github.com/MTG/essentia", "CC BY-NC-SA 4.0 (non-commercial only)"),
+    ("Beat This! (CPJKU)", "小节头（downbeat）判定：给没有 VDJ 数据的曲目补小节相位",
+     "downbeat detection for tracks without VDJ data",
+     "https://github.com/CPJKU/beat_this", "MIT"),
 ]
 
 # 来源与致谢：代码或思路的来源项目（MIT 署名要求，须保留）
@@ -225,11 +197,6 @@ CREDITS = [
      "Music Battery (ChargeBar) decision engine & fingerprint peak detection "
      "(origin of charge_engine.py / fp.py)",
      "https://github.com/ichiryu0021/VJVision", "MIT"),
-    ("Genre Police Visualizer (lbnandy)", "细分曲风关键词表、按曲风切换视觉的思路"
-     "（本项目 genre_keywords.py 的来源）",
-     "fine-grained genre keyword table & genre-driven visual switching "
-     "(origin of genre_keywords.py)",
-     "https://github.com/lbnandy/genre-police-visualizer", "MIT"),
     ("KVJ / KDJ (kumoSleeping)", "变速与「能不能作准」的思路参考：白化频带相关打分、"
      "互不重叠的多次印证、按倍率档位检索。**仅参考思路，未取用任何代码**"
      "（对方为 GPL-3.0，本项目独立实现）",

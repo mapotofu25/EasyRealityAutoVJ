@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """T01 · 需求 4 图片默认 5 秒 + GIF 标记 + "GIF 不设 src_out"约束。
 
+★ 2026-11-03：第三条"约束"已**废止**（2026-10-22 起 GIF 允许掐尾、按 `[src_in, src_out]`
+  区间循环）⇒ 本文件里那条断言已按新语义更新，见 `test_gif_src_out_constraint_checker()`。
+
 跑法：<Cue>\\venv\\Scripts\\python.exe tests\\test_image_gif_defaults.py
 """
 from __future__ import annotations
@@ -34,12 +37,21 @@ def test_is_gif():
 
 
 def test_gif_src_out_constraint_checker():
-    assert probe.gif_src_out_conflict("a.gif", None) is False, "GIF + src_out=None 应合规"
-    assert probe.gif_src_out_conflict("a.gif", 0.0) is True, "设为 0 也算设了"
-    assert probe.gif_src_out_conflict("a.gif", 12.5) is True
+    """★ 2026-11-03 QA 修正（**过期断言，不是回归**）。
+
+    `probe.gif_src_out_conflict()` 自 **2026-10-22** 起**恒为 False**：GIF 现在可以像视频
+    一样掐头去尾，运行时按 `[src_in, src_out]` 区间循环（见 `model/timeline.py` 的 GIF 分支），
+    所以"GIF 不许设 src_out"这条旧约束已经废止，函数只为兼容旧调用点而保留。
+
+    原断言（`0.0` / `12.5` 应判 True）写于 2026-10-16，比语义变更**早 6 天**，之后一直没同步；
+    按新语义改成断言"对任何输入都是 False"，并保留"非 GIF 也不报"的既有行为。
+    """
+    assert probe.gif_src_out_conflict("a.gif", None) is False, "GIF + src_out=None 合规"
+    assert probe.gif_src_out_conflict("a.gif", 0.0) is False, "现行语义：GIF 设 0 也合规"
+    assert probe.gif_src_out_conflict("a.gif", 12.5) is False, "现行语义：GIF 可设 src_out（区间循环）"
     assert probe.gif_src_out_conflict("a.mp4", 12.5) is False, "非 GIF 不受此约束"
     assert probe.gif_src_out_conflict("a.png", 5.0) is False
-    print("  ✓ gif_src_out_conflict 检查器正确（约束可被机器检查）")
+    print("  ✓ gif_src_out_conflict 恒为 False（2026-10-22 起 GIF 允许掐尾，旧约束已废止）")
 
 
 def test_model_never_fabricates_src_out():

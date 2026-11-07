@@ -148,6 +148,23 @@ def test_e17_interior_suppresses_fade():
     print("  ✓ E17：段首淡入 / 段内 cut / 段尾淡出")
 
 
+def test_snap_rounding_is_not_a_gap():
+    """★ 2026-11-03（用户：两个一样的 GIF 吸附紧挨，切入切出没关掉）。
+
+    包内 `at_sec` 只写 **2 位小数**（10 ms 粒度），`end_sec` 是全精度 ⇒
+    同一处"紧挨"的边界会读出 1~5 ms 的**假缝隙**（现场实测 0.004495 s）。
+    旧容差 1e-3 会被这点量化噪声骗到，判成"有缝隙"⇒ run 断段 ⇒ 段内照旧淡出+淡入。
+    """
+    its = _chain_fade((0, 5), (5.0045, 10))          # 4.5 ms 假缝隙
+    assert group_runs(its) == [(0, 1)], group_runs(its)
+    assert abs(_alpha_at(its, 5.1) - 1.0) < 1e-6, ("段内应无淡入", _alpha_at(its, 5.1))
+    assert abs(_alpha_at(its, 4.9) - 1.0) < 1e-6, ("段内应无淡出", _alpha_at(its, 4.9))
+    # 真缝隙（0.5 s）必须仍然断段
+    its2 = _chain_fade((0, 5), (5.5, 10))
+    assert group_runs(its2) == [(0, 0), (1, 1)], group_runs(its2)
+    print("  ✓ 4.5ms 假缝隙 ⇒ 仍算相邻（段内 cut）；0.5s 真缝隙 ⇒ 断段")
+
+
 def test_e17_single_item_behaviour_unchanged():
     """★ 回归底线：**单片段**（run 长度 1）行为与改动前一致（正常淡入淡出）。"""
     its = _chain_fade((0, 5))
@@ -185,6 +202,7 @@ def main() -> int:
         ("单片段不变", test_single_item_unchanged),
         ("乱序输入排序", test_unsorted_input_is_sorted),
         ("same_render_settings", test_same_render_settings_helper),
+        ("吸附取整不是缝隙", test_snap_rounding_is_not_a_gap),
         ("E17 段内 cut", test_e17_interior_suppresses_fade),
         ("E17 单片段回归", test_e17_single_item_behaviour_unchanged),
         ("E17 有缝隙不变", test_e17_gap_keeps_per_clip_fades),

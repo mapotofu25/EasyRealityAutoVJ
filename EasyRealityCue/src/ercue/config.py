@@ -39,6 +39,11 @@ DEFAULTS = {
     "autosave": True,
     # ★ T02：关窗时的"未导出提醒"（默认开；关掉即完全静默退出）
     "prompt_export_on_close": True,
+    # ★ 2026-11-03 用户要求「自动吸附默认打开」⇒ 默认值改成 True。
+    #   ⚠ 这个键**必须登记在 DEFAULTS 里**：`_merge()` 只合并 DEFAULTS 中存在的键，
+    #   键不在表里 ⇒ 用户手动关过写下的 `"snap": false` 在下次 `load()` 时被**丢掉**，
+    #   于是"关了重启又变开"（用户永远关不掉）。写在这里才能被读回。
+    "snap": True,
 }
 
 
@@ -141,6 +146,16 @@ class Config:
         return self.data.get(key, DEFAULTS.get(key, default))
 
     def set(self, key, value, save: bool = True) -> None:
+        """写入一个键（可选立刻落盘）。
+
+        ★ 2026-11-03：**没登记进 DEFAULTS 的键要吼一声**。`_merge()` 只合并 DEFAULTS
+          中列出的键 ⇒ 这种键写下去也读不回来（"重启丢偏好"，`snap` 就是这么中招的：
+          默认 False 时丢键恰好也得 False，谁都没发现）。这里只记 warning、**不改行为**
+          （照样写），目的是让同一个坑下次在日志里现形，而不是靠人肉 grep。
+        """
+        if key not in DEFAULTS:
+            log.warning("配置键 %r 未登记进 DEFAULTS —— 下次启动会被 _merge() 丢弃"
+                        "（请先加进 DEFAULTS 再写）", key)
         self.data[key] = value
         if save:
             self.save()
@@ -229,8 +244,18 @@ def selftest() -> bool:
     assert ok is False and cu.writable is False, (ok, cu.writable)
     assert "PermissionError" in cu.error, cu.error
 
+    # 5) ★ 2026-11-03：「自动吸附」默认开，但**用户关过必须读得回**。
+    #    `_merge()` 只合并 DEFAULTS 里的键 ⇒ 键没登记就会被 load() 静默丢掉
+    #    （症状：关了重启又变开，用户永远关不掉）。
+    sp = os.path.join(d, "snap.json")
+    cs = Config(sp)
+    assert cs.get("snap") is True, "没设过时 snap 默认开"
+    cs.set("snap", False)
+    cs2 = Config(sp)
+    assert cs2.get("snap", True) is False, "显式关闭的 snap 必须能读回（DEFAULTS 里要有这个键）"
+
     print("[config] 自检通过 ✓  最近文件上限=%d  坏文件回落默认  不可写优雅降级(不抛)"
-          % RECENT_CAP)
+          "  snap 默认开/显式关可读回" % RECENT_CAP)
     return True
 
 

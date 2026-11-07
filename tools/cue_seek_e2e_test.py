@@ -34,8 +34,11 @@ import cuesheet                                                   # noqa: E402
 import cuesheet_runtime as crt                                    # noqa: E402
 from cue_seek_policy import CueSeekPolicy                          # noqa: E402
 
-REAL_VIDEO = r"P:\宣传PV（改）\东方·临时结界 夏夜星律 宣传PV.mp4"
-ALT_VIDEO = r"P:\avi~\2-11-2025 (3).mp4"
+# 真实素材目录不写死在仓库里（会暴露本机目录结构）——用环境变量指过来；不设就整条用例跳过
+_VIDEO_ROOT = os.environ.get("ERAVJ_PV_ROOT", "")
+REAL_VIDEO = (os.path.join(_VIDEO_ROOT, "东方·临时结界 夏夜星律 宣传PV.mp4")
+              if _VIDEO_ROOT else "")
+ALT_VIDEO = ""      # 旧的本机备用素材已移除（需要时把 ERAVJ_PV_ROOT 指到含素材的目录）
 W, H = 960, 540
 BPM = 120.0
 BL = 60.0 / BPM          # 0.5 s/拍
@@ -153,7 +156,7 @@ def main():
 
     video = REAL_VIDEO if os.path.isfile(REAL_VIDEO) else ALT_VIDEO
     if not os.path.isfile(video):
-        print("没有可用真实视频，退出")
+        print("跳过：未设置 ERAVJ_PV_ROOT 或目录里没有真实视频，退出")
         return 2
     print("真实素材：%s（%.1f MB）" % (os.path.basename(video),
                                     os.path.getsize(video) / 1048576.0))

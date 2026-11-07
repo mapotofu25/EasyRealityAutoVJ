@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""项目一键备份：把「不可再生的最小集合」拷到 P:\AutoVJ_备份\AutoVJ_<时间戳>\
+r"""项目一键备份：把「不可再生的最小集合」拷到 <备份目录>\AutoVJ_<时间戳>\
 
 为什么不整目录复制：`venv`(925MB) / `dist`(1.3GB) / `build*` / 各种测试 zip 都能重新生成，
 而且会拖慢拷贝。真正**丢了就没了**的只有：
@@ -9,7 +9,7 @@ r"""项目一键备份：把「不可再生的最小集合」拷到 P:\AutoVJ_�
   · 根目录的文档与配置样例（使用说明 / 更新内容 / 能量算法说明 / requirements / .bat / build_seq.json）
 
 用法：
-  venv\Scripts\python.exe tools\backup_project.py            → 备份到 P:\AutoVJ_备份\
+  venv\Scripts\python.exe tools\backup_project.py            → 备份到 <备份目录>\
   venv\Scripts\python.exe tools\backup_project.py D:\mybak   → 指定备份根目录
 """
 import os
@@ -60,7 +60,10 @@ def dir_size(p):
 
 
 def main():
-    bak_root = sys.argv[1] if len(sys.argv) > 1 else r"P:\AutoVJ_备份"
+    # 默认备份到**项目根的同级目录**（不写死盘符/本机目录名）；`ERAVJ_BACKUP_DIR` 优先
+    bak_root = (sys.argv[1] if len(sys.argv) > 1
+                else (os.environ.get("ERAVJ_BACKUP_DIR")
+                      or os.path.join(os.path.dirname(ROOT), "AutoVJ_备份")))
     stamp = time.strftime("%Y%m%d_%H%M")
     dst = os.path.join(bak_root, "AutoVJ_" + stamp)
     if os.path.exists(dst):

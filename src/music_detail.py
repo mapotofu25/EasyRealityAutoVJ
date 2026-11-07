@@ -102,20 +102,17 @@ def info_text(cfg, path):
         sr_txt = "%d Hz · %d 声道" % (info.samplerate, info.channels)
     except Exception:                                            # noqa: BLE001
         pass
-    genres = "、".join(m.get("genres") or []) or "未分析"
+    # ★ 2026-10-30 用户「大砍刀」：曲风识别删除 ⇒ 信息块不再显示「曲风 / 曲风来源」。
     return (
         "文件：%s\n"
         "歌名：%s\n"
         "艺人：%s\n"
-        "曲风：%s\n"
-        "曲风来源：%s\n"
         "时长：%s\n"
         "采样率：%s\n"
         "指纹ID：%s\n"
         "\n完整路径：\n%s"
         % (_os.path.basename(path), m.get("title") or "未知", m.get("artist") or "未知",
-           genres, m.get("source") or "未分析", dur, sr_txt or "未知",
-           m.get("song_id") or "-", path)
+           dur, sr_txt or "未知", m.get("song_id") or "-", path)
     )
 
 
@@ -262,7 +259,7 @@ class MusicDetailDialog(QDialog):
         self._manual = manual
         try:
             import beatgrid as _bg
-            self._grid = _bg.effective_grid(g, manual)
+            self._grid = _bg.effective_grid(g, manual, m)
         except Exception:                                        # noqa: BLE001
             self._grid = dict(g)
         self._auto_bpm = float(self._grid.get("bpm") or 0.0)
@@ -282,9 +279,6 @@ class MusicDetailDialog(QDialog):
             dtext = "%d:%02d" % (int(dur) // 60, int(dur) % 60)
         except (TypeError, ValueError):
             dtext = "—"
-        genres = m.get("genres") or []
-        if isinstance(genres, str):
-            genres = [genres]
         self.lbl_title.setText("%s · %s" % (title, artist) if artist else title)
 
         # 波形（懒加载；可能为空 → 控件显示"无波形"背景，仍可标秒）
@@ -299,8 +293,6 @@ class MusicDetailDialog(QDialog):
         self.lbl_auto.setText("自动 BPM：%s（%s）· %s"
                               % ((" %.1f" % self._auto_bpm) if self._auto_bpm else "—",
                                  src, dtext) +
-                              (" · %s" % " / ".join(str(x) for x in genres[:3])
-                               if genres else "") +
                               ("" if self._wf else " · 无波形"))
 
         mm = manual or {}
@@ -404,7 +396,8 @@ class MusicDetailDialog(QDialog):
         try:
             import beatgrid as _bg
             m = self._effective_manual()
-            self._grid = _bg.effective_grid((self._meta or {}).get("grid") or {}, m)
+            self._grid = _bg.effective_grid((self._meta or {}).get("grid") or {}, m,
+                                            self._meta)
             self.wave.set_grid(self._grid)
         except Exception:                                        # noqa: BLE001
             pass
@@ -826,6 +819,10 @@ class MusicDetailDialog(QDialog):
             f = _bg.features(m2, s2)
             dur = len(m2) / float(s2)
             got = S.auto_segments(f, dur=dur, grid=grid)
+            # ★ 折过锚点 ⇒ 写回（详情页"重新分段"也要更新 8 拍线相位）
+            _af = S.take_folded_anchor()
+            if _af is not None and isinstance(grid, dict):
+                grid["anchor"] = _af
             raw = S.auto_segments(f, dur=dur, grid=None, phrase_grid=grid)
             del m2, f
         except Exception as e:                                    # noqa: BLE001
@@ -851,7 +848,15 @@ class MusicDetailDialog(QDialog):
                 mm[self.path] = rec
             gm = rec.get("grid_manual")
             gm = dict(gm) if isinstance(gm, dict) else {}
-            gm["bpm_manual"] = float(bpm)
+            # ★★★ 2026-11-07（用户：「自动扫描的，标签怎么写手动」）：
+            #   点「按 BPM 重新分段」时，BPM 框里如果还是**自动值**，原来也无条件写
+            #   `grid_manual.bpm_manual` ⇒ 这首歌从此被标成"手动"，用户一头雾水。
+            #   ⇒ 与自动 BPM 相同（±0.05）就不写，并清掉历史遗留的同值记录。
+            _auto_bpm = float((rec.get("grid") or {}).get("bpm") or 0.0)
+            if _auto_bpm > 0 and abs(float(bpm) - _auto_bpm) < 0.05:
+                gm.pop("bpm_manual", None)
+            else:
+                gm["bpm_manual"] = float(bpm)
             rec["grid_manual"] = gm
             rec["sections"] = [dict(x) for x in got]
             rec["sections_raw"] = [dict(x) for x in raw]
@@ -866,7 +871,7 @@ class MusicDetailDialog(QDialog):
         self._manual = gm
         try:
             import beatgrid as _bg2
-            self._grid = _bg2.effective_grid(rec.get("grid") or {}, gm)
+            self._grid = _bg2.effective_grid(rec.get("grid") or {}, gm, rec)
         except Exception:                                         # noqa: BLE001
             self._grid = dict(grid)
         for fn in (lambda: self.wave.set_grid(self._grid),

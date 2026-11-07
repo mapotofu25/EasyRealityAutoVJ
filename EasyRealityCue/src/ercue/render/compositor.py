@@ -210,7 +210,7 @@ def _target_src(st, fw: int, fh: int, w: int, h: int):
       ⚠ 改前本函数**永远**用 contain，导致非 16:9 素材的预览构图与现场不符。
     · **A4 crop 基准**：裁切后以**裁切尺寸**为新基准再算适配（`engine.py:2796 iw, ih = cw, ch`），
       而不是用整幅尺寸算框再把裁切区拉伸进去（那样裁切会被放大变形）。
-    · 过渡空间变换：slide 从右侧滑入、zoom 从 70% 放大到 100%（fade/cut 无空间变换）。
+    · 过渡空间变换：slide 入场从右侧滑入 / 出场向左滑出（位移量 = 素材自身宽度）、zoom 从 70% 放大到 100%（fade/cut 无空间变换）。
     """
     us, ux, uy, rot = _xform_values(st)
     custom = _is_custom(us, ux, uy, rot)
@@ -232,7 +232,13 @@ def _target_src(st, fw: int, fh: int, w: int, h: int):
     trans = getattr(st, "trans", None) or "fade"
     tp = _clamp01(getattr(st, "trans_p", 1.0))
     if trans == "slide":
-        dx = (1.0 - tp) * w                              # 从画布右侧滑入
+        # ★★ 2026-11-02：与演出端 `engine._draw_layer` 同步 ——
+        #   ① 位移量 = **素材自身显示宽度** `tw`（原来用画布宽 `w`，
+        #      0.28 的缩小图要横穿整屏，看着像"从屏幕外飞进来"）；
+        #   ② 方向由 `trans_is_out` 决定：入场 +tw→0，出场 0→−tw
+        #      （原来入场出场共用同一个正方向，出场也演成"从右边滑进来"）。
+        _sgn = -1.0 if bool(getattr(st, "trans_is_out", False)) else 1.0
+        dx = _sgn * (1.0 - tp) * tw
     elif trans == "zoom":
         f = 0.7 + 0.3 * tp
         tw, th = tw * f, th * f

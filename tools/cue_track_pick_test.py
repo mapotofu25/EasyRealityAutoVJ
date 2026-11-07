@@ -53,10 +53,10 @@ W, H = 320, 180
 BPM = 120.0
 OK, FAIL = [], []
 
-#: 用户那个真实包（2026-10-18 挪进了 `码表素材\\`；老位置也留着兼容）
-REAL_PKG = next((p for p in (r"Y:\EasyRealityAutoVJ\码表素材\测试.ercue",
-                             r"Y:\EasyRealityAutoVJ\测试.ercue")
-                 if os.path.isfile(p)), "")
+#: 用户那个真实包。目录不写死在仓库里（会暴露本机目录结构）——用 `ERAVJ_CUE_MEDIA` 指过来
+_CUE_MEDIA = os.environ.get("ERAVJ_CUE_MEDIA", "")
+_PKG = os.path.join(_CUE_MEDIA, "测试.ercue") if _CUE_MEDIA else ""
+REAL_PKG = _PKG if os.path.isfile(_PKG) else ""
 
 
 def chk(cond, desc, detail=""):

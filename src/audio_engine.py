@@ -48,6 +48,27 @@ EN_VOC_MAX, EN_VOC_KNEE, EN_VOC_SPAN = 0.45, 0.30, 0.35
 EN_ABS_LO_DB, EN_ABS_HI_DB = -14.0, -6.0
 EN_LV_TAU = 1.0                    # 绝对响度（RMS dBFS）的平滑时间常数（秒）
 EN_ABS_W = 1.0                     # 兜底项权重（0 = 关闭该项，用于 A/B 对照）
+# ★★ 2026-11-01（用户「放 hard 能量一直上不去」）：「全曲慢峰」只升不降这件事，
+#   会让**一段持续大声**在开头把峰顶高、之后相对值全掉进死区 ⇒ 越放越没能量
+#   （实测同一段：0.47 → 0.34 逐秒下滑，而电平一点没变）。
+#   这里给三个慢峰加**缓慢回落**（半衰期 `EN_PEAK_DECAY_TAU` 秒）：
+#     · 0     = 关闭 = 旧行为（默认保持 0，避免未经现场验证就改手感）；
+#     · 180~300 = 一场演出里"上一首的峰值"逐渐让位，但不会因为一个 breakdown 就崩掉。
+EN_PEAK_DECAY_TAU = 0.0
+# ★ 2026-11-01：改用**滚动窗口分位**当参考峰（>0 秒时生效；0 = 关闭 = 旧行为）。
+#   与 `EN_PEAK_DECAY_TAU` 互斥：这里算的是"最近 N 秒的 90 分位"，不需要识别换歌，
+#   连跑几小时也不会累积（窗口一滚自然让位）。300 秒是折中：
+#   · 太短（<60s）⇒ 一个 breakdown 就没了参考；
+#   · 太长（>900s）⇒ 又变回"整晚最高"。
+EN_PEAK_WINDOW_SEC = 0.0
+# ★ 2026-11-01 实测结论：**只把 kick 换成滚动窗口**就够，bass/fluct 保持"全曲峰"。
+#   用你的录屏 A/B（连续 4 分钟 hardstyle）：
+#     · 旧：E 从 0.47 一路掉到 0.40（越放越低）
+#     · 只 kick 滚动 300s：0.61 → 0.63（稳住了），≥0.65 占比 27% → 53%
+#   三项全滚动能到 0.77，但会把"低频稀疏的段落"一起抬起来（安静段 45% → 98%），
+#   判据就废了 ⇒ 只动 kick 这一项（它是 hardstyle 的核心证据，也是被棘轮压死的那一项）。
+EN_PEAK_WINDOW_KICK = 180.0
+EN_PEAK_WINDOW_BASS = 0.0
 # kick_density 的「真 kick」绝对强度下限（1s 低频通量累计，与 RMS 线性相关）。
 # 实测：drop@-7.7dBFS ≈ 4.6~5.7、drop@-10 ≈ 4.0、钢琴 breakdown（即使拉到 -7.7）≈ 1.6、
 # 钢琴@-14.9 ≈ 0.7。取 2.0 分隔「真鼓点 drop」与「钢琴/人声 breakdown 的偶发低频敲击」。
@@ -58,6 +79,10 @@ _KICK_PEAK_ABS_FLOOR = 2.0
 # 取 0.785 分隔：只在下半拍周期**足够接近**主拍强度时才修正，防止真实 80+offbeat 被误升到 160，
 # 同时保住「160 被减半成 80 仍能回正」。
 _HALFSPEED_RATIO_MIN = 0.785
+# ★ 2026-11-02：半速修正的**绝对强度门**——从"整数 lag 的 acn"改成"8× 上采样的峰"。
+#   实测标定（OBS 22:20 那段，实际 190）：`_peak_up(10.53×8) ≈ 0.20`；
+#   而正常 128 的歌在 cand=10 附近 `acn ≈ -0.11`（上采样峰也近 0）⇒ 0.15 能干净分开。
+_HALFSPEED_PEAK_MIN = 0.15
 
 
 def _sc():
@@ -174,8 +199,7 @@ BPM_OCTAVE_SET = (0.5, 1.0, 2.0)
 #     ① 撞顶（≥ BPM_RAIL，即落在 min(220) 上限 2 BPM 内）⇒ 这个数**不携带信息**，跳过校验；
 #     ② 谐波集补上 1/3、3 —— 检测器估成三倍/三分之一同样常见（与 0.5/2 同一个道理）。
 #   ⚠ 受影响的是 110~183 BPM 的**主力曲速段**（双倍后必然撞顶），不是边缘情况。
-BPM_RAIL = 218.0
-# ★★★ 2026-10-27 实机定案：谐波集**只能是 (0.5, 1, 2)**。
+BPM_RAIL = 218.0# ★★★ 2026-10-27 实机定案：谐波集**只能是 (0.5, 1, 2)**。
 #   曾扩到 (1/3, 3) 并加"用未钳位原始值判谐波"的兜底，实机立刻在 C 组误锁：
 #   日志证据 `lbpm=180.0 rbpm=219.5 brel=0.220` 本该拒绝，但原始值 360/180=2.0
 #   正好构成谐波 ⇒ 放行。**只要允许"任何倍率关系"，BPM 否决就失去意义**（检测器几乎总能
@@ -187,6 +211,77 @@ BPM_HARM_SET = (0.5, 1.0, 2.0)
 #   否则丢弃本次跳变（保持期望值）并累计异常；连续异常超过 MAX 才认定为真 seek。
 OFF_STATE_TOL_SEC = 2.0
 OFF_STATE_ABNORMAL_MAX = 6
+
+
+def _fp_lead(fp_db):
+    """「第一名票数 / 第二名票数」——指纹的领先倍数（铁律 33）。
+
+    没有候选（只认到一首或全空）⇒ 给一个大值（不构成阻碍）。
+    """
+    try:
+        best = dict(getattr(fp_db, "last_song_best", {}) or {})
+    except (TypeError, ValueError):
+        return 99.0
+    if len(best) < 2:
+        return 99.0
+    v = sorted(best.values(), reverse=True)
+    if v[1] <= 0:
+        return 99.0
+    return float(v[0]) / float(v[1])
+
+
+def lib_bpm_publish_ok(sid, sid_conf, bpm_ok_flag, hit, tot, lead=0.0):
+    """「这首歌的库内 BPM」能不能发布给界面/素材倍速用。
+
+    ★★★ 2026-11-02（用户直播：「200+ BPM 的歌，素材速度没跟上来」）。
+      BPM 一致性校验否决的是**「曲目 + 位置」这一对**（防止把别首歌的位置硬套上来）。
+      但指纹 `hit=230/248`（92.7%）这种命中率已经足够说明"就是这首歌" ——
+      此时连库内 BPM 一起丢掉，会让**素材倍速**（`engine.content_speed`）只剩
+      卡死的实时值可用（现场 133.5 / 128 = 1.04×，而正确是 200 / 128 = 1.56×）。
+      ⇒ 指纹确认过 sid（哪怕随后被校验清零）时，库内 BPM 照常发布。
+      ⚠ 只放宽"发布库内 BPM"，**不**放宽识别与位置（防误识别的护栏原样保留）。
+    """
+    try:
+        if float(lead or 0.0) < LIB_BPM_LEAD_MIN:
+            return False        # 认不准是哪首歌 ⇒ 它的 BPM 也不能拿来用
+        if int(sid) >= 0 and int(bpm_ok_flag or 0) != 0:
+            return True
+        return bool(int(sid_conf) >= 0 and int(bpm_ok_flag or 0) == 0
+                    and float(hit or 0.0) >= 0.50 and int(tot or 0) >= 30)
+    except (TypeError, ValueError):
+        return False
+
+
+def fold_bpm_to_range(raw, lo=60.0, hi=220.0):
+    """把超范围的 BPM 按 **2×** 折回 `[lo, hi]`（实时估计器的双倍歧义修正）。
+
+    ★★★ 2026-10-31（用户「实时分析的 bpm 怎么一直 219」）：
+      175 BPM 的歌在 drop / 密集段落会被估成 **350**（每个 8 分音符算一拍），
+      老代码用 `min(220)` 把 350 钳成 **219.5** —— 这个值比原始误判更糟，三处全错：
+        · 拍钟：`60/219.5 = 0.273s`，真实是 `60/175 = 0.343s` ⇒ 拍间隔短 20%，卡点全错；
+        · 校验：`219.5/175 = 1.254` 不在谐波集 `(0.5,1,2)` ⇒ 本来正确的匹配被当误识别否决；
+        · 锁定：60s 众数被 219.5 灌满 ⇒ 20 秒后连已锁定的 175 都被解掉（实测 110s 处复现）。
+      ⇒ 钳位前**先折半**：`350 → 175`、`440 → 220`、`256 → 128`。
+
+    ⚠ 只折 2 的幂（最多两次，`_bpm_raw` 上限 400 ⇒ 实际一次），**绝不折 3×/5×**：
+      那会把 `262（真实 131）` 折成 87，制造新的错误；也会让"任意倍率"重新成立，
+      把 2026-10-27 定案的 BPM 否决护栏拆掉。
+    ⚠ 折完仍高于 `hi` 才钳（例如 `250 → 125` 正常；`470 → 235 → 117.5` 两折）。
+    """
+    try:
+        b = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if b <= 0.0:
+        return 0.0
+    for _ in range(2):
+        if b <= hi:
+            break
+        half = b / 2.0
+        if half < lo:
+            break
+        b = half
+    return max(lo, min(hi, b))
 
 
 # ==========================================================================
@@ -275,6 +370,16 @@ CHROMA_BPMVETO_TOT = 120
 # 采信它就会把前馈带跑（一次 4.27 拍/秒的位置窜动）。0.10 是能分开的量级。
 CHROMA_SLOPE_MARGIN_FULL = 0.10
 CHROMA_COOLDOWN = 0.0        # 每窗都做（实测 ~100ms；需要减负时调到 1.0）
+# ★★★ 2026-11-02：BPM 一致性校验否决识别时，**强制让实时 BPM 重估**的冷却秒数。
+#   太短（每窗都清）⇒ 票永远攒不到 20、锁不上，拍钟反而钉死在旧值；
+#   太长 ⇒ 现场换歌后要等很久才纠正。20s ≈ 一次"清票 + 重新锁上"的两倍余量。
+BPM_VETO_RELOCK_SEC = 20.0
+# ★★★ 2026-11-02：**库内 BPM 的"证据门槛"——第一名票数必须是第二名的 N 倍**。
+#   现场实测（OBS 22:20 那段，实际 190BPM）：票数 top4 = 11/10/8/8，
+#   领先只有 **1.10 倍** ⇒ 那是同专辑近似曲之间"瞎猜"，`lib_bpm` 拿到的是 138（错歌）。
+#   铁律 33：指纹证据不能只看命中率/总票，必须看**与第二名的领先倍数**。
+#   1.6 能挡住这种近似曲互掐，同时正常认出时（领先常见 3~10 倍）完全不受影响。
+LIB_BPM_LEAD_MIN = 1.6
 # ★★★ 2026-10-29 冷启动 chroma（真正的「变速也能认出来」那一环）
 #   问题：0.80× 时指纹票被摊到几十个位置，`fp_lock_gate` 的「领先 2 倍」过不去
 #   （真机实测 ptot=166 vs 第二名 141，要求 332）⇒ 锁不上 ⇒ `_chroma_try` 根本
@@ -719,6 +824,13 @@ class AudioState:
         self.high = 0.0
         self.energy = 0.0           # 综合能量 0..1
         self.bpm = 0.0              # 平滑后的 BPM（**已锁定**，拍钟/切换节奏只用这个）
+        # ★★★ 2026-11-02：**离线 BPM 锚点**（`bpm_anchor.BpmAnchor` 写的）。
+        #   只给「素材播放倍速」用，**不参与拍钟 / 切素材节奏**（那两个仍走 `bpm`）。
+        #   为什么必须单独一个字段：现场 Funkot 190BPM 的自相关只能给到 95/125，
+        #   而离线两级细扫稳定给 190（详见 `bpm_anchor` 模块头注释）。
+        self.bpm_anchor = 0.0
+        self.bpm_anchor_t = 0.0     # 锚点写入时刻（墙钟）
+        self.anchor_req = 0.0       # 请求重算的时刻戳（`_Analyzer` 打标记，锚点线程消费）
         # 显示用 BPM：未锁定阶段也把「票数够、众数够集中」的估计值暴露出来给界面显示。
         # 为什么分开（2026-09-24 用户报「BPM 不显示了，一直是 0」）：
         #   建锁门控要求众数∈[115,185]，于是 慢歌(<115)、极快曲(>185) 以及
@@ -773,8 +885,6 @@ class AudioState:
         self.segment = "none"       # none/quiet/build/drop/peak/outro
         self.silent_sec = 0.0       # 连续静音秒数
         self.lv_db = -80.0          # 当前 RMS 电平（dBFS），供 Kv 主视觉图层的静音判定使用
-        self.genre_tags = []        # 实时曲风英文标签（如 ['Hardcore','House']）
-        self.genre_styles = []      # 实时曲风英文风格名
         self.recognized_song_id = -1  # 指纹识别确认的歌 id（-1=无/待机）
         self.recognized_offset = -1.0  # 该歌当前播放位置（秒，来自指纹匹配 offset；-1=无）
         # 输入音乐播放速率（EMEA 估计，默认 1.0）：指纹链路用它把"识别窗口起点偏移"
@@ -808,6 +918,8 @@ class AudioState:
                 "high": self.high, "energy": self.energy, "bpm": self.bpm,
                 "bpm_display": self.bpm_display, "bpm_locked": self.bpm_locked,
                 "lib_bpm": self.lib_bpm,
+                # ★ 2026-11-02：离线 BPM 锚点（素材倍速优先用它）
+                "bpm_anchor": self.bpm_anchor,
                 "beat_phase": self.beat_phase, "beat_count": self.beat_count,
                 "bar_count": self.bar_count, "downbeat_off": self.downbeat_off,
                 "downbeat_conf": self.downbeat_conf, "drop": self.drop,
@@ -832,7 +944,6 @@ class AudioState:
                 "recognized_rate": self.recognized_rate,
                 "recognized_t": self.recognized_t,
                 "recognized_votes": self.recognized_votes,
-                "genre_tags": list(self.genre_tags),
                 "dbg": dict(self.dbg),      # 能量分项（诊断工具用）
             }
 
@@ -922,6 +1033,10 @@ class _Analyzer:
 
     def __init__(self, sr, block=BLOCK):
         self.sr = sr
+        # ★ 2026-11-02：累计喂进来的块数（只给 `energy_log` 的 CSV 看）。
+        #   用途：`blk` 一秒不长 ⇒ 采集根本没喂数据；`blk` 变小 ⇒ 采集重启换了新分析器。
+        #   跟能量算法无关，别拿它做业务判断。
+        self.blk = 0
         # ★ 2026-10-08：block 可由采集层传入（原生采集路径用 pkt 的整数倍，
         #   见 _BlockAssembler）。默认仍取模块级 BLOCK，行为不变。
         self.block = int(block)
@@ -937,8 +1052,15 @@ class _Analyzer:
         self._bpm_votes = deque(maxlen=60)   # 60s 投票窗口，众数取 BPM（换歌静音清空）
 
         self._bpm_lock = False               # 锁定建立标志（主段稳定后锁定，breakdown 不扰动）
+        # ★ 2026-11-02：离线锚点的请求节流状态
+        self._anchor_sid = -1                # 上次请求时的 song_id（换歌 ⇒ 立刻请求）
+        self._anchor_bad_sec = 0.0           # 实时值与锚点"长期不符"的累计秒
+        self._t_start = time.perf_counter()  # 冷启动计时（够 15 秒才允许首次请求）
         self._bpm_song = -1                  # 上次识别到的 song_id：变了就清投票+解锁（见 feed）
         self._bpm_far_sec = 0.0              # 众数持续偏离锁定值的累计秒（未识别到歌时的换歌兜底）
+        # ★ 2026-11-02：因「BPM 校验否决」而强制作废实时 BPM 的时刻/次数（冷却用）
+        self._bpm_veto_t = 0.0
+        self._bpm_veto_n = 0
         self.prev_bass_spec = None         # kick 频段上一帧谱（低频通量用）
         self.bass_flux_hist = np.zeros(max(16, int(round(10.0 / self.block_sec))), dtype=np.float32)
         self.beat_interval = 0.5
@@ -957,6 +1079,23 @@ class _Analyzer:
         self.e_loud_smooth = 0.0               # e_loud 中速平滑（τ≈1.2s，压秒级波动）
         self._kick_e_smooth = 0.0              # kick_e 持续打击平滑（τ≈0.8s EMA，抹钢琴偶发尖峰）
         self.bass_peak = 0.0                   # 低频能量的全曲慢峰（只升不降，换歌重置）——低频能量分量参考
+        # ★★ 2026-11-01（用户「放 hard 能量一直上不去」/「没导入歌怎么办」）：
+        #   「只升不降」的参考峰有两个死穴：
+        #     · 连 mix 几小时没有 3s 静音 ⇒ 峰一路被顶到全场最高，之后每段都"不够猛"，
+        #       实测同一段音频连喂 120s，E 从 0.47 逐秒滑到 0.34（电平没变）；
+        #     · 想"按换歌重校准"又依赖识别，**歌没进曲库时 sid 恒为 -1，永远不触发**。
+        #   所以改用**不依赖识别的滚动窗口**：参考值 = 最近 `EN_PEAK_WINDOW_SEC` 秒的
+        #   90 分位（而不是历史最大值）。窗口一滚，几小时前的峰值自然让位；
+        #   单曲内的 breakdown 也不会被误抬 —— 窗口里就躺着刚过去的 drop。
+        self._peak_win = (int(round(EN_PEAK_WINDOW_KICK / self.block_sec))
+                          if EN_PEAK_WINDOW_KICK > 0 else 0)
+        self._kick_hist = deque(maxlen=self._peak_win) if self._peak_win else None
+        self._peak_win_b = (int(round(EN_PEAK_WINDOW_BASS / self.block_sec))
+                            if EN_PEAK_WINDOW_BASS > 0 else 0)
+        self._bass_hist = deque(maxlen=self._peak_win_b) if self._peak_win_b else None
+        self._fluct_hist = deque(maxlen=self._peak_win_b) if self._peak_win_b else None
+        self._peak_tick = 0
+        self._kick_p90 = self._bass_p90 = self._fluct_p90 = 0.0
         # 低频通量（kick 冲击）1s 累计 + 全曲慢峰——鼓点强度的正确度量。
         # 人声段有贝斯垫底（低频能量 bass 不低），但 kick 脉冲的「瞬时起伏」远大于贝斯的
         # 「缓慢起伏」（实测 2.8 倍）。窗口必须够短（1s）才能凸现 kick 脉冲——
@@ -1002,6 +1141,40 @@ class _Analyzer:
                           "was_high": False, "high_since": None, "label": "none",
                           "seg_until": 0.0, "prev_e": 0.0}
 
+    def _maybe_request_anchor(self, st, now):
+        """判断要不要请 `BpmAnchor` 重算一次离线 BPM（**只打时间戳，不做分析**）。
+
+        三个触发条件（缺一个都会让现场"该纠的时候不纠"）：
+          ① **换歌**（指纹认到新的 song_id）—— 立刻请求，不用等实时值漂；
+          ② 从来没有锚点（冷启动后音频攒够由锚点线程自己判断）；
+          ③ 实时值与锚点**长期不符**：比值脱离 [0.85, 1.18] 连续 8 秒。
+             现场 190BPM 那段的实例：实时 125.5 / 锚点 190 = 0.66 ⇒ 必触发。
+        ⚠ 只写 `st.anchor_req`，真正的节流（最小间隔 6s / 兜底 120s）在锚点线程里。
+        """
+        anchor = float(getattr(st, "bpm_anchor", 0.0) or 0.0)
+        live = float(self.bpm_smooth or 0.0)
+        sid = int(getattr(st, "recognized_song_id", -1) or -1)
+        if sid >= 0 and sid != self._anchor_sid:
+            self._anchor_sid = sid
+            st.anchor_req = time.time()
+            self._anchor_bad_sec = 0.0
+            return
+        if anchor <= 0.0:
+            if (now - self._t_start) > 15.0 and not getattr(st, "anchor_req", 0.0):
+                st.anchor_req = time.time()
+            return
+        if live > 0.0:
+            ratio = live / anchor
+            if 0.85 <= ratio <= 1.18:
+                self._anchor_bad_sec = 0.0
+            else:
+                self._anchor_bad_sec += self.block_sec
+                if self._anchor_bad_sec >= 8.0:
+                    self._anchor_bad_sec = 0.0
+                    st.anchor_req = time.time()
+        else:
+            self._anchor_bad_sec = 0.0
+
     def _fft_plan(self):
         """FFT 相关的预算表：(freqs, 低频区间, 中频区间, 高频区间, 24 段边界, BPM 周期)。
 
@@ -1030,9 +1203,71 @@ class _Analyzer:
         self._fft_plan_cache = (self.sr, plan)
         return plan
 
+    def _recalc_peaks_p90(self):
+        """每 ~0.3 秒重算一次「最近 N 秒的 90 分位」（仅 `EN_PEAK_WINDOW_SEC>0` 时用到）。
+
+        ⚠ 不能每块都算：窗口 300s ≈ 1.4 万个点，`percentile` 一次约 0.4ms，
+          每 21ms 算三次就吃掉 6% CPU。16 块（≈0.34s）一次足够稳。
+        """
+        self._peak_tick += 1
+        if self._peak_tick % 16 != 1:
+            return
+        for hist, name in ((self._kick_hist, "_kick_p90"),
+                           (self._bass_hist, "_bass_p90"),
+                           (self._fluct_hist, "_fluct_p90")):
+            if hist:
+                setattr(self, name, float(np.percentile(
+                    np.fromiter(hist, dtype=np.float64), 90.0)))
+
+    def _bpm_relock_after_veto(self, lbpm, rbpm, brel, hit, tot):
+        """BPM 一致性校验否决识别时，**同时**让实时 BPM 重估一次 —— 解自锁。
+
+        ★★★ 2026-11-02（用户直播：「200+ BPM 的歌，素材速度没跟上来、很慢」）。
+          现场取证（`cue_health.log`，2026-11-01 23:50 启动 → 01:14 退出那场）：
+            · 69 条 `[R]` 里 `bpm=133.5` **一条没变**，而 `lbpm` 在 175→145→200→145 之间换
+            · `brel` 只有三个值：0.237(175) / 0.333(200) / 0.079(145)
+              —— 全是 `(lbpm − 133.5) / lbpm`，即实时值恒 133.5
+            · 69 条里只有 **2 条**认到歌（`sid≥0`），其余全被 BPM 校验否决
+            · 素材倍速 = `bpm / 128`（`engine._tick_locked`）⇒ 该 1.56× 的那首实际跑 1.04×
+            · 素材切换间隔全程 **10~11s**（= 24 拍 ÷ 133.5），200BPM 那首本该 7.2s
+          自锁链条（环）：
+            拍钟 BPM 卡在旧值 → 拿它跟库内 200 校验 ⇒ 偏差 33%、比值 1.5 不在 2 的幂谐波集
+            ⇒ `bpmok=0` ⇒ 识别被否决 ⇒ `sid=-1` ⇒ 换歌解锁（`_bpm_song` 变化）永不触发
+            ⇒ **BPM 永远停在旧值**，谁也解不开。
+          ⇒ 校验失败本来就是说「这两个值里有一个错了」。既有处理只怀疑**识别**（否决它），
+            从不怀疑**实时 BPM**。这里补上另一半：冷却期内清票重估。
+            ⚠ 冷却必须够长：`_bpm_votes` 要 ≥20 票 + 众数集中度 ≥0.45 才重锁，
+              每窗都清就永远锁不上（等于把拍钟钉死得更彻底）。
+            ⚠ 不清 `bpm_smooth`：重锁成功前拍钟继续按旧值走，不停摆（既有约定）。
+            ⚠ 只在指纹**确实认得这首歌**（命中率/总票够）时做 —— 低票误匹配重估毫无意义。
+        """
+        try:
+            now = time.perf_counter()
+            if (now - float(getattr(self, "_bpm_veto_t", 0.0))) < BPM_VETO_RELOCK_SEC:
+                return
+            self._bpm_veto_t = now
+            self._bpm_veto_n = int(getattr(self, "_bpm_veto_n", 0) or 0) + 1
+            self._bpm_votes.clear()
+            self._bpm_lock = False
+            self._bpm_far_sec = 0.0
+            log_capture_event(
+                "[BPM] 校验否决 ⇒ 实时 BPM 重估（第%d次）lbpm=%.1f rbpm=%.1f rel=%s "
+                "hit=%.2f tot=%d" % (
+                    self._bpm_veto_n, float(lbpm or 0.0), float(rbpm or 0.0),
+                    ("%.3f" % float(brel)) if brel is not None else "-",
+                    float(hit or 0.0), int(tot or 0)))
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def feed(self, data, st):
         """分析一个采集块并更新共享状态。任何异常由调用方兜底，不影响线程存活。"""
         now = time.perf_counter()
+        # ★ 2026-11-02：块计数（给能量 CSV 用）。放在最前面 —— 只要本块喂进来了就计，
+        #   哪怕下面某一步抛异常（那种情况能量本来也会失真，正好能从 CSV 里看出来）。
+        try:
+            self.blk += 1
+        except Exception:                                        # noqa: BLE001
+            self.blk = 1
         # ★ 换歌检测（指纹认出的歌变了）→ 清空 BPM 投票并解锁，让新歌的 BPM 能被重新估计。
         #   为什么必须做：`_bpm_lock` 建立后只接受与锁定值 **±8 BPM** 内的修正（见下方 BPM 段），
         #   而解锁原来只靠「连续静音 >10s」。**DJ 接歌混播没有静音** ⇒ 132BPM 切到 150BPM 时
@@ -1041,6 +1276,11 @@ class _Analyzer:
         #   用指纹识别结果判换歌最准（每 0.5s 一轮），而且不怕两首歌混音重叠。
         #   ⚠ 只清投票 + 解锁，**不清 bpm_smooth** —— 保留它让拍钟继续走，等新歌重新投票
         #     出够票数（约几秒）自然接管，避免换歌瞬间拍钟停摆。
+        # ★★ 2026-11-02：按需请求离线 BPM 锚点（只打时间戳，分析在独立线程）
+        try:
+            self._maybe_request_anchor(st, time.perf_counter())
+        except Exception:                                     # noqa: BLE001
+            pass
         sid = getattr(st, "recognized_song_id", -1)
         if sid is not None and sid >= 0 and sid != self._bpm_song:
             self._bpm_song = sid
@@ -1112,7 +1352,19 @@ class _Analyzer:
         kick_density = float(sum(self._bflux_recent))
         # 低频「起伏变化量」：1s 窗口内低频能量的上升差分累计（与 kick 的频谱通量互补）
         fluct_density = float(sum(self._bdelta_recent)) if self._bdelta_recent else 0.0
-        self.kick_peak = max(self.kick_peak, kick_density)
+        # 慢峰缓慢回落（`EN_PEAK_DECAY_TAU=0` 时完全不动 = 旧行为）
+        if EN_PEAK_DECAY_TAU > 0.0:
+            _d = float(np.exp(-self.block_sec / EN_PEAK_DECAY_TAU))
+            self.kick_peak *= _d
+            self.bass_peak *= _d
+            self.fluct_peak *= _d
+        if self._kick_hist is not None:
+            # 滚动窗口模式：参考值 = 最近 N 秒 90 分位（不依赖识别，连跑几小时不累积）
+            self._kick_hist.append(kick_density)
+            self._recalc_peaks_p90()
+            self.kick_peak = max(self._kick_p90, kick_density)
+        else:
+            self.kick_peak = max(self.kick_peak, kick_density)
 
         # ---- BPM 估计 v6（每 ~1s）：kick 节奏优先 + 谐波梳状 + 60s 投票众数 ----
         if self.flux_i % bpm_period == 0:
@@ -1184,7 +1436,14 @@ class _Analyzer:
                         return float(np.max(_acn_up[lo:hi]))
 
                     for cand in range(lo_lag, int(lag)):
-                        if acn[cand] < 0.30:
+                        # ★★★ 2026-11-02（Funkot 素材慢的根因）：
+                        #   原来这里判 `acn[cand] < 0.30` —— 用的是**整数 lag 的原始值**。
+                        #   现场 block=1323（33.3 帧/秒）时，190BPM 的周期是 lag=10.53，
+                        #   能量摊到 10/11 两格（实测 0.158 / 0.194），**永远过不了 0.30**
+                        #   ⇒ 这条"把 95 升回 190"的修正从没生效，实时就停在 95.2 / 漂到 125.5。
+                        #   ⇒ 改用 8× 上采样的峰（`_peak_up`，它本来就是为
+                        #     "kick 周期非整数 lag" 写的），能取到 10.53 的真实峰。
+                        if _peak_up(cand * 8) < _HALFSPEED_PEAK_MIN:
                             continue
                         left = acn[cand - 1] if cand > 0 else -1.0
                         right = acn[cand + 1] if cand + 1 < len(acn) else -1.0
@@ -1211,12 +1470,21 @@ class _Analyzer:
                 #   ⇒ 另开一条**不钳位的原始值** `bpm_raw`，只供 BPM 一致性校验用（保谐波关系）。
                 _bpm_raw = 60.0 / ((lag + delta) / fps)
                 _bpm_raw = float(max(60.0, min(400.0, _bpm_raw)))
-                bpm = float(max(60.0, min(220.0, _bpm_raw)))
-                # 60s 投票众数 + 两阶段锁定：一首歌 BPM 恒定。
-                # 未锁定阶段：主段众数集中(conf≥0.45)且票数足(≥20)才建立锁定；
-                # 已锁定阶段：只接受与锁定值 ±8 内的微调，breakdown/outro 的飞值（无 kick
-                # 时全频被旋律带飞）一律忽略，避免「2:20 飞到 180」。静音换歌重置解锁。
-                self._bpm_votes.append(bpm)
+                # ★★★ 2026-10-31（用户「实时分析的 bpm 怎么一直 219」）：
+                #   **先折半再钳位**。`min(220)` 把 350（=175×2）压成 219.5 这种非法值，
+                #   会让拍钟、BPM 校验、锁定众数三处同时错（详见 `fold_bpm_to_range`）。
+                bpm = fold_bpm_to_range(_bpm_raw, 60.0, 220.0)
+                # ★★★ 同一轮：**撞顶区的票在已锁定后直接丢弃**。
+                #   实测 175 那批歌（`Edge -intro-` / `熾熱迴路` / `Deep Sleep`）在 drop/intro
+                #   仍会零星产出 218~220 的值 —— 那是"估计器抓错周期"的残余，不是真值：
+                #   · 丢掉它，`bpm_display`/`bpm_smooth` 都不再被它带跑（实测 smooth 偏差
+                #     从 44.5 降到 0.5，拍钟始终按 175 走）；
+                #   · 未锁定时**不丢**（冷启动只有这些票，丢了就永远锁不上）。
+                _rail_hit = bpm >= BPM_RAIL
+                if _rail_hit and self._bpm_lock:
+                    pass                     # 已锁定 + 撞顶 ⇒ 假值，不投票、不改显示
+                else:
+                    self._bpm_votes.append(bpm)
                 vals = np.array(self._bpm_votes, dtype=np.float32)
                 if len(vals) >= 6:
                     bins = np.arange(60.0, 221.0, 1.0)
@@ -1259,6 +1527,11 @@ class _Analyzer:
                     if len(vals) >= 10 and conf >= 0.40:
                         if self._bpm_lock:
                             self.bpm_display = self.bpm_smooth
+                        elif mode >= BPM_RAIL and self.bpm_display > 0:
+                            # ★ 2026-10-31：撞顶区的众数 = 被压平的双倍假值，不携带信息。
+                            #   已有显示值时**不拿它盖掉**（实测 `Edge -intro-` / `熾熱迴路`
+                            #   就在这种时段把 175.5 闪成 219.5）。
+                            pass
                         else:
                             self.bpm_display = mode
 
@@ -1407,12 +1680,18 @@ class _Analyzer:
         # 低频能量分量（相对全曲峰值，只升不降，换歌重置）：drop 段 bass 高（0.7~0.9）、
         # 钢琴段低（0.3~0.4）、人声段中但被 vocal_factor 压。用于「录屏削瞬态」场景兜底——
         # NVIDIA 录制会抹平 kick 冲击（低频通量），但低频持续能量还在，用它区分 drop/钢琴。
-        self.bass_peak = max(self.bass_peak, bass)
+        self.bass_peak = max(self.bass_peak, bass) if self._bass_hist is None else \
+            max(self._bass_p90, bass)
+        if self._bass_hist is not None:
+            self._bass_hist.append(bass)
         bass_rel = bass / max(self.bass_peak, 1e-6)
         bass_factor = max(0.0, min(1.0, (bass_rel - EN_BASS_DEAD) / EN_BASS_SLOPE))
         # 低频起伏变化量因子（用户：高能量时低频起伏大）：起伏量相对全曲慢峰（只升不降）。
         # 映射与 bass_factor 同构（拐点 0.45/斜率 0.22）——起伏和低频水平高度相关。
-        self.fluct_peak = max(self.fluct_peak, fluct_density)
+        self.fluct_peak = max(self.fluct_peak, fluct_density) if self._fluct_hist is None \
+            else max(self._fluct_p90, fluct_density)
+        if self._fluct_hist is not None:
+            self._fluct_hist.append(fluct_density)
         fluct_rel = fluct_density / max(self.fluct_peak, 1e-9)
         fluct_factor = max(0.0, min(1.0, (fluct_rel - EN_FLUCT_DEAD) / EN_FLUCT_SLOPE))
         # 门控（用户语义：低频值超过阈值后起伏才算高能量）：低频水平不足（bass_factor 低）时
@@ -1840,14 +2119,14 @@ class AudioEngine:
 
     def __init__(self):
         self.state = AudioState()
+        # ★★★ 2026-11-02：离线 BPM 锚点线程（按需触发，只影响素材倍速）
+        self._anchor = None
         self._gen = 0            # 采集代际编号：start/stop 递增，旧采集自动失效
         self._asio_cap = None    # 当前 ASIO 会话（切设备/停止时要关掉，见 _run_asio）
         self.energy_scale = 1.0  # 能量伽马校正，运行时实时透传给采集分析器
         self._jobs = queue.Queue()
-        # 曲风识别：环形缓冲 + 后台线程（每 3 秒用最近 2 秒音频跑一次 Discogs-EffNet）
-        # 用 numpy 环形缓冲（原来 deque + tolist，读取端每 0.5 秒复制 38 万元素 → 0.78 核）
-        self._genre_buf = _AudioRing(48000 * 8)
-        self._genre_sr = 48000
+        # ★ 2026-10-30 用户「大砍刀」：曲风识别（`_genre_buf` / `_genre_sr` /
+        #   `_genre_loop` / `autovj-genre` 线程 / `state.genre_tags`）整条删除。
         # ★★ 指纹专用缓冲（2026-10-17）：**必须与建库时的单声道口径一致**。
         #   建库（`ui_main._one`）用 `np.mean(data, axis=1)`（左右平均）；
         #   而曲风缓冲用的是 `data[:, 0]`（只取左声道）。实测同一段现场音频：
@@ -1884,11 +2163,13 @@ class AudioEngine:
         self._band_sid = -2        # 锁变化检测（变了就清空 _band_obs）
         self._eng_state = (0, -1, 0, 0)   # 取证：电荷条 (cur, cand, bar, hits)
         self._rec_err_t = 0.0
-        self._genre_lock = threading.Lock()
-        self._genre_stop = threading.Event()
-        self._genre_thread = threading.Thread(
-            target=self._genre_loop, daemon=True, name="autovj-genre")
-        self._genre_thread.start()
+        # ★ 2026-10-30：曲风线程删除。这把锁**保留**（改名）—— 它历史上是曲风/指纹
+        #   两条缓冲共用的，现在只保护 `_fp_buf`（指纹窗口读写），改名以正视听。
+        self._audio_buf_lock = threading.Lock()
+        # ⚠ 识别线程 `_recognize_loop` 的退出条件原来是**借用曲风的 `_genre_stop`**
+        #   （历史遗留）。曲风线程删掉后必须给它自己的事件，否则循环永不退出、
+        #   `shutdown()` 也停不下来（关软件时线程 leak）。
+        self._rec_stop = threading.Event()
         # 现场指纹识别：指纹库 + 音乐电池引擎（main 用 set_recognizer 启用）
         self._fp_db = None
         self._recognizer_engine = None
@@ -2080,7 +2361,10 @@ class AudioEngine:
 
     def shutdown(self):
         self._gen += 1
-        self._genre_stop.set()
+        try:
+            self._rec_stop.set()          # 停识别线程（原来借的是曲风的 stop 事件）
+        except Exception:                                     # noqa: BLE001
+            pass
         self._ndi_stop = True
         try:
             with self._ndi_cv:
@@ -2092,35 +2376,12 @@ class AudioEngine:
             self._jobs.put(None)
         except Exception:
             pass
-
-    def _genre_loop(self):
-        import time as _t
-        from audio_genre import get_genre_classifier, GenreTracker, style_name
         try:
-            gc = get_genre_classifier()
-        except Exception:
-            return
-        tracker = GenreTracker()
-        while not self._genre_stop.is_set():
-            _t.sleep(3.0)
-            if not self.state.running:
-                continue
-            with self._genre_lock:
-                if self._genre_buf.filled < 16000:
-                    continue
-                # classify 内部只取最近 need 个样本，给 8 秒足够，省一次整段拷贝
-                buf = self._genre_buf.last(int(self._genre_sr * 8))
-            try:
-                r = gc.classify(buf, self._genre_sr)
-                tracker.push(r["styles"])
-                stable = tracker.stable()
-                if stable:
-                    with self.state.lock:
-                        self.state.genre_styles = [stable]
-                        self.state.genre_tags = [style_name(stable)]
-                # 证据不足时不更新，保持上一次结果（避免闪烁）
-            except Exception:
-                pass
+            if self._anchor is not None:
+                self._anchor.stop()
+                self._anchor = None
+        except Exception:                                     # noqa: BLE001
+            pass
 
     def set_allowed_provider(self, fn):
         """注册"有效 song_id 集合"的提供者；识别线程每 10 秒刷新一次白名单。"""
@@ -2309,7 +2570,7 @@ class AudioEngine:
                 if now - float(getattr(self, "_rec_hash_t", 0.0) or 0.0) >= 10.0:
                     self._rec_hash_t = now
                     from fp import fingerprint_audio as _fa
-                    with self._genre_lock:
+                    with self._audio_buf_lock:
                         _seg = self._fp_buf.last(int(self._fp_sr * 4.5))
                     _seg = np.asarray(_seg, dtype=np.float32)
                     seg_n = int(_seg.size)
@@ -2458,7 +2719,7 @@ class AudioEngine:
         """
         import numpy as _np
         n = int(self._fp_sr * float(win_sec))
-        with self._genre_lock:
+        with self._audio_buf_lock:
             if int(getattr(self._fp_buf, "filled", 0) or 0) < n:
                 return None
             buf = self._fp_buf.last(n)
@@ -2489,7 +2750,7 @@ class AudioEngine:
         import time as _t
         import numpy as _np
         from charge_engine import FpResult
-        while not self._genre_stop.is_set():
+        while not self._rec_stop.is_set():
             # ★ 2026-10-19 排查：每轮实际耗时 + 缓冲样本数（判断'循环慢'还是'采集停'）
             try:
                 _nowp = time.perf_counter() if os.environ.get('AUTOVJ_REC_PROBE') else 0.0
@@ -2529,7 +2790,7 @@ class AudioEngine:
                     self.state.recognized_rate = 1.0
                     self.state.recognized_votes = 0
                 continue
-            with self._genre_lock:
+            with self._audio_buf_lock:
                 if self._fp_buf.filled < 16000:
                     continue
                 # 只要最近 4.5 秒（指纹匹配窗口）；numpy 切片拷贝，不再 list(deque) 全量复制
@@ -2845,7 +3106,9 @@ class AudioEngine:
                 _lbpm = 0.0        # ★ sid<0 时也要有定义（下面「显示用库内 BPM」要用）
                 _rbpm = 0.0
                 _bflag = None      # ★ 同上：`_bflag` 是 BPM 校验的放行档（见 bpm_gate_ok）
+                _sid_conf = -1     # ★ 2026-11-02：校验**前**的 sid（被否决后会清零，这里留底）
                 if sid >= 0:
+                    _sid_conf = int(sid)
                     _lbpm, _rbpm, _brel = 0.0, 0.0, None
                     _bprov = getattr(self, "_song_bpm_provider", None)
                     if _bprov is not None:
@@ -2911,6 +3174,16 @@ class AudioEngine:
                             else:
                                 self._last_gate = "bpm"
                                 sid, votes, off = -1, 0, 0.0
+                                # ★★★ 2026-11-02：**否决识别的同一时刻也要怀疑实时 BPM**，
+                                #   否则「BPM 错 → 校验否决 → 认不到歌 → 不解锁 BPM」自锁。
+                                #   只在指纹确实认得这首歌时做（低票误匹配没有重估的意义）。
+                                try:
+                                    if (_hit_now >= 0.50 and int(_tot or 0) >= 30
+                                            and _fp_lead(fp_db) >= LIB_BPM_LEAD_MIN):
+                                        self._bpm_relock_after_veto(
+                                            _lbpm, _rbpm, _brel, _hit_now, _tot)
+                                except Exception:            # noqa: BLE001
+                                    pass
                         else:
                             self._last_gate = _gate_before     # 通过：恢复 strict/warp/recode
 
@@ -2918,7 +3191,18 @@ class AudioEngine:
                 #   只有「认到歌 + BPM 校验通过 + 库里有值」才发布；其余一律清零，
                 #   免得没认到歌时还挂着上一首的 BPM。
                 try:
-                    if (sid >= 0 and _lbpm > 0 and self._bpm_ok_flag != 0):
+                    # ★★★ 2026-11-02：**BPM 校验否决 ≠ 没认出这首歌**。
+                    #   校验否决的是「曲目 + 位置」这一对；而 `hit=230/248`（92.7%）这种
+                    #   命中率已经足够说明"就是这首歌"。原来连库内 BPM 一起丢掉，
+                    #   于是**素材倍速**（`engine` 里 `bpm/128`）只剩卡死的实时值可用
+                    #   ⇒ 用户看到的正是「识别到歌了，但素材速度没跟上」。
+                    #   ⇒ 指纹确认了 sid（哪怕随后被校验清零）时，库内 BPM 照常发布。
+                    #   ⚠ 只放宽"发布库内 BPM"，**不**放宽识别/位置（护栏原样保留）。
+                    _ok_pub = lib_bpm_publish_ok(
+                        sid, _sid_conf, self._bpm_ok_flag,
+                        getattr(fp_db, "last_hit_rate", 0.0), _tot,
+                        lead=_fp_lead(fp_db))
+                    if _ok_pub and _lbpm > 0:
                         self.state.lib_bpm = float(_lbpm)
                     else:
                         self.state.lib_bpm = 0.0
@@ -3391,8 +3675,8 @@ class AudioEngine:
 
         `device_name` 在这一路是「端口 / 对端IP」（用户可填）：
           - `"47811"`               → 只听本机 47811 端口，对端自动发现
-          - `"192.168.31.96"`       → 只听这个 IP 发来的包，端口用默认 47811
-          - `"192.168.31.96:47811"` → 指定 IP + 端口
+          - `"192.168.1.100"`       → 只听这个 IP 发来的包，端口用默认 47811
+          - `"192.168.1.100:47811"` → 指定 IP + 端口
         返回 None = 正常跑完（切设备/停止）；返回字符串 = 出错原因。
         """
         port = lan_audio.DEFAULT_PORT
@@ -3558,6 +3842,11 @@ class AudioEngine:
                 _pkt = 0
                 _block = BLOCK
         analyzer = _Analyzer(sr, block=_block)
+        # ★ 2026-11-02（用户「能量大部分时候还是很低」）：把分析器挂到引擎上，
+        #   让 `energy_log.EnergyCsvLogger` 能读到 `analyzer.blk`（累计块数）。
+        #   `blk` 每秒不长 ⇒ 采集根本没在喂数据（和"能量低"是两件不同的事，必须分得开）。
+        #   ⚠ 每次进本函数都会新建 analyzer ⇒ `blk` 归零 = 采集重启过一次（这是免费的重启标记）。
+        self._analyzer = analyzer
         assembler = _BlockAssembler(_block, _pkt) if _pkt else None
         # 连续读块失败计数：设备被拔掉时 record() 会不停抛异常，
         # 旧写法「单块出错就跳过、继续循环」会让采集线程一直占着 worker，
@@ -3595,15 +3884,38 @@ class AudioEngine:
         _push_ok = 0              # ★ 采集心跳：成功入队给 NDI 的次数
         _push_err = ""            # ★ 采集心跳：最近一次投递异常（诊断）
         _hb_t0 = time.perf_counter()   # ★ 采集心跳计时起点
+        # ★ 2026-11-02（用户「能量大部分时候还是很低」）：采集每**启动一次**就记一行。
+        #   配合 `energy_*.csv` 的 `blk_delta`：若某段时间 `blk_delta=0` 而这里正好有 start，
+        #   就能证明"能量掉零"是采集重启造成的，而不是音乐变安静。
+        try:
+            from energy_log import log_capture_event
+            log_capture_event("[CAP] start gen=%s dev=%s sr=%s block=%s pkt=%s wrap=%s"
+                              % (gen, getattr(mic, "name", "?") or "?", sr,
+                                 _block, _pkt, wrap_native))
+        except Exception:                                        # noqa: BLE001
+            pass
+        # ★★★ 2026-11-02：按**实际采集采样率**创建离线 BPM 锚点线程。
+        #   必须在 `_capture_loop` 里建（不是在 __init__）：sr 只有到这一步才知道，
+        #   用错采样率会让重采样比例偏，锚点直接算错。sr 变了（换设备/换采样率）就重建。
+        try:
+            _old = self._anchor
+            if _old is None or int(getattr(_old, "sr", 0) or 0) != int(sr):
+                if _old is not None:
+                    try:
+                        _old.stop()
+                    except Exception:                             # noqa: BLE001
+                        pass
+                from bpm_anchor import BpmAnchor
+                self._anchor = BpmAnchor(self.state, sr=int(sr))
+                self._anchor.start()
+        except Exception:                                        # noqa: BLE001
+            self._anchor = None
         with mic.recorder(samplerate=sr, channels=2) as rec:
-            with self._genre_lock:
-                self._genre_sr = sr
+            with self._audio_buf_lock:
                 # ★ 缓冲容量必须按**实际采样率**给足：原来写死 `48000 * 8`，
                 #   设备跑 96k 时 8 秒的缓冲只剩 4 秒 ⇒ 识别窗（FP_WIN_SEC）被截短、
-                #   票数变少、甚至低于对齐门槛。12 秒足够容纳识别窗 + 曲风窗（8s）。
+                #   票数变少、甚至低于对齐门槛。12 秒足够容纳识别窗。
                 need = int(sr * 12)
-                if self._genre_buf.cap < need:
-                    self._genre_buf = _AudioRing(need)
                 self._fp_sr = sr
                 if self._fp_buf.cap < need:
                     self._fp_buf = _AudioRing(need)
@@ -3751,11 +4063,21 @@ class AudioEngine:
                                         and sum(_dead_win) >= _WIN_DEAD:
                                     use_right = True
                         if use_right:
-                            analyzer.feed(data[:, 1:2], st)
+                            _fed = data[:, 1:2]
                         else:
-                            analyzer.feed(data[:, :1], st)
+                            _fed = data[:, :1]
+                        analyzer.feed(_fed, st)
                     else:
-                        analyzer.feed(data, st)
+                        _fed = data
+                        analyzer.feed(_fed, st)
+                    # ★ 2026-11-02：同一块再喂给离线锚点（内部只做一次 mean + 环形写，
+                    #   约几微秒；真正的分析在 `BpmAnchor` 自己的线程里）
+                    try:
+                        _an = self._anchor
+                        if _an is not None:
+                            _an.feed(_fed)
+                    except Exception:                         # noqa: BLE001
+                        pass
                     # ★ 一次性告警（如"设备未找到，已改用 X"）的收尾：
                     #   既不能永久挂着（会顶掉后续「没有检测到声音」提示 ——
                     #   ui_main 是 if error / elif silent>5 互斥），
@@ -3841,15 +4163,12 @@ class AudioEngine:
                                    _push_err or "-"))
                         except Exception:                          # noqa: BLE001
                             pass
-                    # 喂曲风环形缓冲（左声道 float32）——numpy 环形缓冲，零对象分配
+                    # 指纹缓冲：**左右平均**（与建库同口径 `np.mean(data,axis=1)`）。
+                    # ★ 2026-10-30 曲风缓冲删除后，这里只喂 `_fp_buf`。
                     try:
-                        mono_sig = data[:, 0] if data.ndim == 2 else data
-                        with self._genre_lock:
-                            self._genre_buf.write(mono_sig)
-                        # ★ 指纹用**左右平均**（与建库同口径）；曲风继续用左声道（不动它）
                         fp_sig = (np.asarray(data).mean(axis=1)
                                   if getattr(data, "ndim", 1) == 2 else data)
-                        with self._genre_lock:
+                        with self._audio_buf_lock:
                             self._fp_buf.write(fp_sig)
                     except Exception:
                         pass

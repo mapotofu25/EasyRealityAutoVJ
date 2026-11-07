@@ -971,9 +971,8 @@ class CueSheetPanel(QWidget):
                 _m = getattr(self.owner, "_merge_cue_song_meta", None)
                 if _m is not None:
                     _m()
-                    _sg = getattr(getattr(self.owner, "engine", None), "set_song_genres", None)
-                    if _sg is not None:
-                        _sg(getattr(self.owner, "_song_meta_by_id", {}) or {})
+                    # ★ 2026-10-30：engine.set_song_genres 已删除（曲风整条砍掉），
+                    #   HUD 歌名映射走 `_merge_cue_song_meta` 就够了。
             except Exception:                                    # noqa: BLE001
                 pass
 
@@ -1276,11 +1275,17 @@ class CueSheetPanel(QWidget):
             QMessageBox.warning(self, T( T("绑到图层")),
                                 Tf("加载码表模块失败：{}", str(e)))
             return False
-        ok, msg = cue_ui.load_and_bind(self.owner, path, layer, parent=self)
+        _lv = []
+        ok, msg = cue_ui.load_and_bind(self.owner, path, layer, parent=self, out_level=_lv)
         self._after_layers_changed()
         self.refresh()
         if msg:
-            QMessageBox.warning(self, T( T("绑到图层")), msg)
+            # ★ 2026-11-02：「已装表但此刻没在放歌」是常态 ⇒ 用信息图标；
+            #   只有真的需要用户动手（缺素材 / 正在放的不是这首）才用警告。
+            if _lv and _lv[0] == "info":
+                QMessageBox.information(self, T(T("绑到图层")), msg)
+            else:
+                QMessageBox.warning(self, T(T("绑到图层")), msg)
         elif ok:
             self._flash(Tf("已把「{}」绑到图层「{}」。",
                            sheet_label(self._entry_for(path) or {"path": path}),

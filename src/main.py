@@ -28,6 +28,50 @@ import config
 import theme
 from ui_main import MainWindow
 
+#: 保持打开状态（faulthandler / excepthook 写的就是它），**不能是局部变量**
+_CRASH_FP = None
+
+
+def _install_crash_log():
+    """把「Python 异常」和「进程级崩溃（段错误 / 访问冲突）」都落到文件上。
+
+    ★ 2026-11-06（用户：「刚刚在调整行高的时候软件闪退了」）：
+      Windows 事件日志只给了 `EasyRealityAutoVJ.exe` + `shiboken6.abi3.dll` +
+      `0xc0000005`（访问冲突），没有 Python 栈 ⇒ 完全看不出是哪一行。
+      `faulthandler.enable(file=...)` 会在**崩溃那一刻**把当时所有线程的 Python 栈
+      写进 `crash.log`；`sys.excepthook` 把未被捕获的 Python 异常写进 `error.log`
+      （打包成 --windowed 后 stderr 不可见，等于白丢）。
+    失败绝不影响启动（连目录都建不了就直接放弃）。
+    """
+    global _CRASH_FP
+    try:
+        import faulthandler
+        import traceback
+        d = config.app_base_dir()
+        os.makedirs(d, exist_ok=True)
+        _CRASH_FP = open(os.path.join(d, "crash.log"), "a", buffering=1,
+                         encoding="utf-8", errors="replace")
+        _CRASH_FP.write("\n===== %s 启动 pid=%d =====\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid()))
+        faulthandler.enable(file=_CRASH_FP, all_threads=True)
+
+        def _hook(tp, val, tb):
+            try:
+                with open(os.path.join(d, "error.log"), "a", encoding="utf-8",
+                          errors="replace") as f:
+                    f.write("\n===== %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+                    traceback.print_exception(tp, val, tb, file=f)
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                sys.__excepthook__(tp, val, tb)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+        sys.excepthook = _hook
+    except Exception:                                            # noqa: BLE001
+        _CRASH_FP = None
+
 
 def _make_splash(theme_name):
     """自绘启动画面：让人一眼看到「在加载」，而不是「打不开」。
@@ -78,6 +122,7 @@ def _log_startup(rows):
 def main():
     t_all = time.perf_counter()
     marks = []
+    _install_crash_log()      # ★ 必须在最前面：后面任何 import/构造崩了才有栈可查
 
     def mark(label, t0):
         marks.append("%s %.2fs" % (label, time.perf_counter() - t0))

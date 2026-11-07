@@ -148,7 +148,9 @@ def main():
     # ---------- 4) 下一素材重置倒计时 ----------
     w("")
     w("[4]「下一素材」重置切换倒计时")
-    lib = r"Y:\EasyRealityAutoVJ\素材库"
+    # 素材目录不写死在仓库里（会暴露本机目录结构）——环境变量优先，否则取项目根旁边的 `素材库`
+    lib = os.environ.get("ERAVJ_LIB") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "素材库")
     clips = []
     if os.path.isdir(lib):
         fs = sorted((os.path.getsize(os.path.join(lib, f)), f) for f in os.listdir(lib)
@@ -296,7 +298,7 @@ def main():
     if FAIL:
         for f in FAIL:
             w("   ✗ " + f)
-    # 报告写到项目根（旧硬编码 P:\AutoVJ 已随迁移失效）
+    # 报告写到项目根（旧硬编码 <项目根> 已随迁移失效）
     open(os.path.join(os.path.dirname(HERE), "_ui_batch_selftest.txt"), "w",
          encoding="utf-8").write("\n".join(out))
 

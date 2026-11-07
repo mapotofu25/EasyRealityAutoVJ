@@ -18,7 +18,7 @@ DXV 素材 · GPU 解码 · 局域网音频传输。
 |---|---|---|
 | **EasyRealityAutoVJ.exe** | 演出机（B 机） | 主程序：音乐分析 → 自动切素材 → 输出给 OBS |
 | **EasyReality_音频发送端.exe** | 放歌机（A 机） | 把 A 机的系统声音实时发给 B 机（配合「局域网音频」音源） |
-| **ERLIB曲库分析.exe** | DJ 机 | 扫曲库、导出 `.eravjlib` 曲库包（带封面 / 指纹 / 节拍网格 / 曲风），给演出机做「认歌」用 |
+| **ERLIB曲库分析.exe** | DJ 机 | 扫曲库、导出 `.eravjlib` 曲库包（带封面 / 指纹 / 节拍网格 / 能量段落），给演出机做「认歌」用 |
 | **NDI接收自检.exe** | 任一台 | 排查用：确认能不能收到 NDI 画面，连上后存一张截图 |
 
 > **演出机不需要有歌文件** —— 靠指纹就能认出 DJ 那边正在放的是哪首。
@@ -31,8 +31,9 @@ DXV 素材 · GPU 解码 · 局域网音频传输。
 （GitHub 上的附件名会把中文去掉，形如 `EasyRealityAutoVJ_092615.zip`，就是它），
 解压后双击 `EasyRealityAutoVJ.exe` 即可，**无需安装 Python**。
 
-⚠️ 发行包内包含第三方模型（详见 [NOTICE.md](NOTICE.md)），其中 **Discogs-EffNet 为
-CC BY-NC-SA 4.0，仅限非商业使用**。个人演出 / 学习使用完全没问题。
+⚠️ 发行包内只带一个第三方模型 **Beat This!**（小节检测，**MIT**，约 10 MB），
+代码与模型权重都是 MIT —— 个人演出与商业演出都可以用。完整第三方署名见
+[NOTICE.md](NOTICE.md)。
 
 ---
 
@@ -45,7 +46,7 @@ CC BY-NC-SA 4.0，仅限非商业使用**。个人演出 / 学习使用完全没
 |---|---|
 | **🎬 演出台** | 演出时用。图层、素材库、播放控制都在这一页 —— **拖素材进图层只在这里能拖**（跨页面拖拽系统不允许）。 |
 | **🗂 素材库** | 演出台那份的**全屏副本**：同一批素材、共用搜索/筛选状态，专门给「导入 + 打标签 + 整理」用。**演出台那一栏原样不动**，演出中照样能取素材。双击缩略图 = 播放到当前图层。 |
-| **曲库·曲风** | 演出前的准备工作：导入音乐、扫描分析曲风（每首歌的曲风 + 节拍网格）、编辑「曲风 → 画面标签」的绑定。左侧带**排序 / 筛选**。 |
+| **🎵 音乐曲库** | 演出前的准备工作：导入音乐、扫出节拍网格与能量段落、标 BPM。左侧带**排序 / 筛选**，右键「曲目信息与详情」看波形与分段。 |
 
 **曲库的排序 / 筛选**（左侧栏）：
 - **排序**：原顺序 / 曲名 / 艺人 / BPM 从低到高 / BPM 从高到低 / 时长从短到长 / 时长从长到短
@@ -62,15 +63,15 @@ CC BY-NC-SA 4.0，仅限非商业使用**。个人演出 / 学习使用完全没
   ⚠ ASIO 的采样率是驱动全局的，本软件一律沿用驱动当前值、不去改它。
 - **局域网音频（另一台电脑）** —— 接收 A 机（跑 VirtualDJ 那台）通过
   `EasyReality_音频发送端.exe` 发来的系统声音。零第三方协议依赖（自研 UDP），
-  支持**自动发现**（填端口即可）和**直接填对端 IP**（`192.168.31.96` 或
-  `192.168.31.96:47811`，自动发现连不上时 / 多机环境下用）。
+  支持**自动发现**（填端口即可）和**直接填对端 IP**（`192.168.1.100` 或
+  `192.168.1.100:47811`，自动发现连不上时 / 多机环境下用）。
 - 设备选择、电平表、静音提示
 
 ### 曲库分析包（跨机认歌）
 - 在 DJ 机上用 **`ERLIB曲库分析.exe`** 扫曲库 → 导出 `.eravjlib` 包
-  （**不含音频文件**，只带封面、音频指纹、节拍网格、曲风）
+  （**不含音频文件**，只带封面、音频指纹、节拍网格、能量段落）
 - 在演出机「曲库」面板点 **「导入曲库分析包」** → 后台导入，大包不卡界面
-- 导入后演出机**不需要有歌文件**也能认出 DJ 正在放的是哪首，并按它的节拍网格 / 曲风驱动画面
+- 导入后演出机**不需要有歌文件**也能认出 DJ 正在放的是哪首，并按它的节拍网格 / 能量段落驱动画面
 - 曲库面板支持**复选框多选 / 全选**、按**来源**筛选（全部 / 仅本机 / 某个导入包）、
   批量删除（二次确认）
 
@@ -131,8 +132,7 @@ venv\Scripts\python.exe src\main.py
 **模型文件**（体积较大）不在仓库内。首次运行前请把模型放到：
 
 ```
-assets/models/chinese_clip/    # Chinese-CLIP（MIT）
-assets/models/discogs/         # Discogs-EffNet（CC BY-NC-SA 4.0）
+assets/models/beat_this/       # Beat This! 小节检测（MIT，约 10 MB，small0_fixed.onnx）
 ```
 
 或直接下载 [Releases](../../releases) 里的发行包，里面已包含。
@@ -166,7 +166,7 @@ venv\Scripts\python.exe tools\make_zip.py       :: 生成发行压缩包
 ```
 ├─ src/                 源码
 │   ├─ main.py          入口
-│   ├─ ui_main.py       主界面（三页：演出台 / 素材库 / 曲库·曲风）
+│   ├─ ui_main.py       主界面（三页：演出台 / 素材库 / 音乐曲库）
 │   ├─ engine.py        渲染引擎（多图层合成 / Spout / NDI 输出）
 │   ├─ audio_engine.py  音频采集与实时分析（BPM / 拍位 / 能量 / 指纹认歌）
 │   ├─ beatgrid.py      节拍网格：BPM / 锚点 / 八拍乐句相位（离线计算）
@@ -194,21 +194,24 @@ venv\Scripts\python.exe tools\make_zip.py       :: 生成发行压缩包
 ## 许可 / License
 
 - **源代码**：**MIT**（见 [LICENSE](LICENSE)）—— 可自由使用、修改、分发。
-- **打包发行版**：内含 `Discogs-EffNet`（**CC BY-NC-SA 4.0**），因此
-  **发行包仅限非商业用途**。
+- **打包发行版**：唯一随包的模型是 `Beat This!`（**MIT**），可商业使用。
+  ⚠ 但发行包内静态打包了 **`mutagen`（GPL-2.0-or-later）**，按 GPL 通常解释，
+  **二进制发行包整体应按 GPL-2.0-or-later 分发**（源码仍为 MIT，本仓库公开可取）。
+  详见 [NOTICE.md](NOTICE.md)。
 - **名称与标识**：「Easy Reality AutoVJ」不随代码授权，请勿用于发布衍生版本。
 - 第三方署名与完整说明见 **[NOTICE.md](NOTICE.md)**。
 
-The **source code** is licensed under **MIT**. However, packaged releases bundle
-`Discogs-EffNet` (**CC BY-NC-SA 4.0**), so **binary releases are non-commercial only**.
+The **source code** is licensed under **MIT**. Packaged releases bundle only the
+`Beat This!` model (**MIT**), but they also statically bundle **`mutagen`
+(GPL-2.0-or-later)**; following the usual reading of the GPL, the **binary release as a
+whole should be treated as GPL-2.0-or-later** (the matching source is this repository).
 See [NOTICE.md](NOTICE.md) for full third-party attributions.
 
 ---
 
 ## 致谢
 
-本项目参考或改写了若干优秀的开源项目（VJVision、Genre Police Visualizer、
-Genre Police AutoVJ），并使用了 Chinese-CLIP、Discogs-EffNet 等模型。
-完整署名与许可见 [NOTICE.md](NOTICE.md)。
+本项目参考或改写了若干优秀的开源项目（VJVision、Genre Police AutoVJ），
+小节检测使用 Beat This! 模型。完整署名与许可见 [NOTICE.md](NOTICE.md)。
 
 反馈 / 交流：QQ 群 **ERAVJ测试**（543643838）

@@ -37,10 +37,13 @@ DEFAULT_SPOUT_NAME = "EasyRealityAutoVJ"
 DEFAULT_NDI_NAME = "EasyRealityAutoVJ"
 
 DEFAULT_HOTKEYS = {
-    "toggle_run": {"key": "Space", "global": False, "enabled": True},
-    "blackout": {"key": "B", "global": False, "enabled": True},
-    "freeze": {"key": "F", "global": False, "enabled": True},
-    "pause_auto": {"key": "P", "global": False, "enabled": True},
+    # ★★ 2026-11-06（用户：「键里面所有的操作都改成组合键，不然太容易误触了」）：
+    #   这几个原来是**裸键**（空格/B/F/P/C），演出时手一碰就触发（黑场、冻结、暂停自动）。
+    #   全部改成 Ctrl/Shift 组合；旧的裸键配置由 `_migrate_hotkeys()` 自动升级。
+    "toggle_run": {"key": "Ctrl+Space", "global": False, "enabled": True},
+    "blackout": {"key": "Ctrl+B", "global": False, "enabled": True},
+    "freeze": {"key": "Ctrl+Shift+F", "global": False, "enabled": True},
+    "pause_auto": {"key": "Ctrl+P", "global": False, "enabled": True},
     # 「下一素材」默认 = **Ctrl+Right + 全局**（2026-10-18 用户要求）。
     # 演出时主窗口常常没有焦点（VDJ / 播放器在前台），必须走全局 RegisterHotKey；
     # 用 Ctrl+Right 而不是裸 Right —— 全局注册会整个系统吞掉该键，
@@ -57,9 +60,47 @@ DEFAULT_HOTKEYS = {
     "lock_clip": {"key": "Ctrl+L", "global": False, "enabled": True},
     "output_fullscreen": {"key": "Ctrl+F", "global": False, "enabled": True},
     "toggle_ui": {"key": "Ctrl+H", "global": False, "enabled": True},
-    "color_bypass": {"key": "C", "global": False, "enabled": True},
+    "color_bypass": {"key": "Ctrl+Shift+C", "global": False, "enabled": True},
     "panic_reset": {"key": "Ctrl+Shift+R", "global": False, "enabled": True},
 }
+
+#: 2026-11-06 快捷键改组合键时的「旧默认 → 新默认」对照。
+#  只替换**仍然是旧默认值**的项：用户自己改过的一律不动（否则等于替人做主）。
+#  裸键默认：Space / B / F / P / C。
+_HOTKEY_V2 = {
+    "toggle_run": ("Space", "Ctrl+Space"),
+    "blackout": ("B", "Ctrl+B"),
+    "freeze": ("F", "Ctrl+Shift+F"),
+    "pause_auto": ("P", "Ctrl+P"),
+    "color_bypass": ("C", "Ctrl+Shift+C"),
+}
+#: 迁移版本号（写在 `data["_hotkey_ver"]`；到 2 之后再启动就不再动）
+HOTKEY_VER = 2
+
+
+def _migrate_hotkeys(data):
+    """把旧的**裸键**默认值升级成组合键（用户改过的不动；幂等）。"""
+    if not isinstance(data, dict):
+        return False
+    hk = data.get("hotkeys")
+    if not isinstance(hk, dict):
+        return False
+    try:
+        if int(data.get("_hotkey_ver", 0) or 0) >= HOTKEY_VER:
+            return False
+    except (TypeError, ValueError):
+        pass
+    n = 0
+    for act, (old, new) in _HOTKEY_V2.items():
+        conf = hk.get(act)
+        if not isinstance(conf, dict):
+            continue
+        if str(conf.get("key") or "").strip() == old:
+            conf["key"] = new
+            n += 1
+    data["_hotkey_ver"] = HOTKEY_VER
+    return n > 0
+
 
 DEFAULTS = {
     "lang": "zh",
@@ -208,15 +249,20 @@ DEFAULTS = {
     "hotkeys": DEFAULT_HOTKEYS,
     "library": [],
     "clip_adj": {},                # 每素材独立的大小/位置：path -> {scale, x, y}
-    "clip_tags": {},              # 每素材自动 tag（视觉扫描）：path -> [tag, ...]
-    "clip_tags_manual": {},      # 每素材手动 tag（永不覆盖）：path -> [tag, ...]
+    # ★★ 2026-10-30 用户「大砍刀」：`custom_tags` / `genre_visual_map` / `custom_genres`
+    #   三个键删除（CLIP 内容词表、曲风映射、自定义曲风全部砍掉）。
+    #   `clip_tags` / `clip_roles` / `clip_excluded` / `dyn_tag_ver` **保留**：
+    #   素材标签现在只剩「动态/频闪 + 铺满/局部」，仍然存在同一批键里（数据格式不变，
+    #   老配置里的旧词条读进来也不会崩，只是不再产出）。
+    "clip_tags": {},              # 每素材自动 tag（动态/频闪/铺满度）：path -> [tag, ...]
+    "clip_tags_manual": {},      # 预留：手动 tag（2026-10-30 手动标签 UI 已删，字段保留兼容）
     "clip_tags_disabled": {},    # 每素材被取消的自动 tag（重扫不复活）：path -> [tag, ...]
-    "custom_tags": {},           # 用户新建的标签词条：分类 -> [tag, ...]
-    "clip_roles": {},             # 每素材多重角色：path -> {"fg":bool,"mg":bool,"bg":bool}                    # media paths
-    "clip_excluded": {},          # 排除自动打标/匹配的素材（logo 等固定素材）：path -> True
-    "dyn_tag_ver": 0,             # 动态标签版本：动态检测算法升级时 +1，启动时 dyn_tag_ver<当前版本 触发一次快速重扫
-    "genre_visual_map": {},       # 用户自定义的曲风→画面标签映射：曲风(英文) -> [画面标签中文]
-    "custom_genres": {},          # 用户新建的曲风：大类名 -> [曲风名]（曲风映射里「+ 新建曲风」写入；纠正曲风也显示）
+    # ★ 2026-10-30 用户「给素材打分 0-1」：帧差细分（见 `tagger.dynamic_score`）。
+    #   与 `clip_tags` 的三档并行存在：档位决定"进哪个池"，分决定"池里挑谁"。
+    "clip_score": {},             # 每素材动态分 0~1：path -> float
+    "clip_roles": {},             # 每素材角色：path -> {"fg":bool,"bg":bool}
+    "clip_excluded": {},          # 排除自动匹配的素材（logo 等固定素材）：path -> True
+    "dyn_tag_ver": 0,             # 动态标签版本：动态检测算法升级时 +1，启动时 <当前版本 触发一次重扫
     "music_library": [],          # 音乐曲库：音频文件路径列表（演出前分析用）
     "music_meta": {},             # 每首歌的曲风：path -> {"artist","title","genre","zh":[],"source"}
     "layers": [
@@ -278,6 +324,10 @@ class Config:
                 if not isinstance(stored, dict):
                     raise ValueError("config 顶层不是对象")
                 self.data = deep_merge(self.data, stored)
+                try:
+                    _migrate_hotkeys(self.data)      # 裸键 → 组合键（见函数注释）
+                except Exception:                    # noqa: BLE001
+                    pass
                 return
             except FileNotFoundError:
                 continue

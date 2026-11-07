@@ -19,14 +19,7 @@ required by their respective licenses.
 - 出处 / Source: https://github.com/ichiryu0021/VJVision
 - 许可 / License: **MIT**
 
-### 2. Genre Police Visualizer — lbnandy
-- 用途：细分曲风关键词表、按曲风切换视觉的思路（本项目 `genre_keywords.py` 的来源）
-- Usage: fine-grained genre keyword table & genre-driven visual switching
-  (origin of `genre_keywords.py`)
-- 出处 / Source: https://github.com/lbnandy/genre-police-visualizer
-- 许可 / License: **MIT**
-
-### 3. Genre Police AutoVJ — lbnandy
+### 2. Genre Police AutoVJ — lbnandy
 - 用途：「演出前分析曲库 + 现场识别曲目 + Spout / NDI 输出」的整体思路参考
 - Usage: overall reference — pre-show library analysis + live track ID + Spout / NDI output
 - 出处 / Source: https://github.com/lbnandy/genre-police-autovj
@@ -34,39 +27,18 @@ required by their respective licenses.
 
 ---
 
-## 二、模型权重（⚠️ 其中 Discogs-EffNet **仅限非商业**）
+## 二、模型权重
 
-### Chinese-CLIP — OFA-Sys
-- 用途：素材内容打标（识别画面里有什么）
-- Usage: clip content tagging
-- 出处 / Source: https://github.com/OFA-Sys/Chinese-CLIP
-- 许可 / License: **MIT** ✅
+### Beat This! — CPJKU
+- 用途：小节头（downbeat）判定 —— 给没有 VDJ / rekordbox 数据的曲目补小节相位
+- Usage: downbeat detection for tracks without DJ-software metadata
+- 出处 / Source: https://github.com/CPJKU/beat_this
+- 许可 / License: **MIT**（代码与已发布的模型权重同为 MIT）
 
-### Discogs-EffNet — Essentia / MTG
-- 用途：曲风识别（400 种 Discogs 风格）
-- Usage: genre detection (400 Discogs styles)
-- 出处 / Source: https://github.com/MTG/essentia
-- 许可 / License: **CC BY-NC-SA 4.0（NonCommercial）** ⚠️
-
-> ### ⚠️ 重要：非商业限制 / Important: Non-Commercial Restriction
->
-> `assets/models/discogs/` 下的 **Discogs-EffNet** 采用 **CC BY-NC-SA 4.0**，
-> **明确禁止商业使用**。因此：
->
-> - 本项目的**源代码**按 **MIT** 授权（见 `LICENSE`）；
-> - 但**任何包含该模型的打包发行版**（包括本仓库 Releases 中提供的压缩包）
->   **仅可用于非商业用途**。
-> - 如需商业使用，请自行从发行版中移除该模型，或自行取得该模型的商业授权。
->
-> The **Discogs-EffNet** model under `assets/models/discogs/` is licensed
-> **CC BY-NC-SA 4.0**, which **forbids commercial use**. Hence:
->
-> - the **source code** of this project is licensed under **MIT** (see `LICENSE`);
-> - but **any packaged release including that model** (including the archives
->   offered in this repository's Releases) **may be used for non-commercial
->   purposes only**.
-> - For commercial use, remove the model from the distribution or obtain a
->   separate commercial license for it.
+> 发行包内 `assets/models/beat_this/` 是**唯一**随包分发的模型（约 10 MB）。
+> ⚠ 模型文件本身**不进仓库**（体积大，见 `.gitignore` 的 `assets/models/`），
+> 由 `tools/build_exe.py` 的 `--add-data assets/models` 打进发行包。
+> 源码运行时缺这个模型不会崩 —— 小节相位会退回到纯信号侧的判定。
 
 ---
 
@@ -74,17 +46,42 @@ required by their respective licenses.
 
 以下组件以库的形式被调用，本仓库不分发其源码，各自遵循原始许可：
 
-| 组件 | 许可 |
-|---|---|
-| PySide6 / Qt | LGPL-3.0 |
-| OpenCV (`opencv-python`) | Apache-2.0 |
-| FFmpeg（经 PyAV / OpenCV 调用） | LGPL / GPL（视构建而定） |
-| onnxruntime | MIT |
-| numpy | BSD-3-Clause |
-| soundfile (libsndfile) | BSD-3-Clause / LGPL |
-| soundcard | BSD-3-Clause |
-| `cyndilib` | 见其仓库许可 |
+| 组件 | 许可 | 用途 |
+|---|---|---|
+| PySide6 / Qt | LGPL-3.0 | 界面 |
+| OpenCV (`opencv-python`) | Apache-2.0 | 颜色 LUT / 图像处理 |
+| **PyAV**（含 FFmpeg 运行库） | BSD-3-Clause；其内置 FFmpeg 为 LGPL / GPL（视构建而定） | 带 alpha 的视频解码 |
+| FFmpeg（经 PyAV / OpenCV 调用） | LGPL / GPL（视构建而定） | 底层多媒体库 |
+| onnxruntime | MIT | Beat This! 的推理后端 |
+| numpy | BSD-3-Clause | 数值计算 |
+| soundfile (libsndfile) | BSD-3-Clause / LGPL | 音频读写 |
+| soundcard | BSD-3-Clause | WASAPI 回环采集 |
+| **sounddevice (PortAudio)** | MIT | 详情页试听播放 |
+| **mutagen** | **GPL-2.0-or-later** ⚠ | 音乐元数据 / 封面（见下方说明） |
+| **SpoutGL (Spout SDK)** | BSD-3-Clause | Spout 输出 |
+| **GLFW** | MIT (zlib/libpng) | GPU 解码的离屏 OpenGL 上下文 |
+| **Pillow** | MIT-CMU | 缩略图处理 |
+| **cffi** | MIT-0 | SoundCard 的底层绑定 |
+| **PyInstaller** | GPL-2.0-or-later（含打包例外） | 打包为 exe |
+| `cyndilib` | Apache-2.0 | NDI 输出 |
 | **NDI® SDK / Runtime** | NDI 为 NewTek 的商标与技术，**其分发与商业使用另有专门条款**。<br>本项目不修改、不重新分发 NDI SDK 源码，仅依赖其运行时；<br>如需在商业场景使用 NDI 输出，请自行确认并遵守 NDI 官方许可。 |
+
+> ### 关于 `mutagen`（GPL-2.0-or-later）与发行包的许可
+>
+> 本项目的**源代码**是 MIT（见 `LICENSE`）。但发行包里**静态打包了 `mutagen`**，
+> 它采用 **GPL-2.0-or-later**。按 GPL 的通常解释：
+>
+> - **源代码**（本仓库）仍按 MIT 提供；
+> - **打包后的发行包**（Releases 里的压缩包 / exe）因为包含 GPL 组件，
+>   整体应视为 **GPL-2.0-or-later** 分发 —— 想再分发这个二进制包时请遵守 GPL；
+> - 对应源码在本仓库公开可取，满足 GPL 的源码提供要求。
+>
+> 如果你的场景不能接受 GPL，可以自行从发行包中移除 `mutagen`（此时封面读取会失效，
+> 其余功能不受影响），或只使用本仓库源码并自行替换成 MIT 许可的标签读取库。
+>
+> **Source code is MIT. Packaged releases bundle `mutagen` (GPL-2.0-or-later), so the
+> binary distribution should be treated as GPL-2.0-or-later; the corresponding source
+> is available in this repository.**
 
 ---
 

@@ -54,6 +54,7 @@ from .media_wave import MediaWaveWorker
 from .panels import MediaPanel, PkgPanel, TrackPanel
 from .preview import PreviewCanvas
 from .props_panel import PropsPanel
+from .section_stack import SectionStack, make_tabs, wrap_scroll
 from .timeline_widget import CueTimeline, mmss
 
 log = logging.getLogger("ercue.ui.window")
@@ -73,7 +74,7 @@ def _app_version() -> str:
         return "0.0.0-dev"
 
 
-APP_VERSION = (_app_version()) + "-RC3"
+APP_VERSION = (_app_version()) + "-RC4"
 UNDO_CAP = 50
 # 滑杆 seek 防抖：拖动停止这么久之后才真正给音频重定位一次（P1，避免每帧重启音频）
 SEEK_DEBOUNCE_MS = 100
@@ -307,9 +308,19 @@ class MainWindow(QMainWindow):
         环境变量 `ERCUE_NO_AUTOSAVE=1` 也会全关（P0 测试隔离）。
         """
         super().__init__(parent)
-        self.setWindowTitle("EasyRealityCue —— DJ 码表编排编辑器")
+        self.setWindowTitle("EasyRealityCue —— DJ 码表编排编辑器 · %s"
+                            % APP_VERSION.rsplit("-", 1)[-1])
         self.resize(1240, 800)
         self.setStyleSheet(theme.stylesheet())
+        # ★★ 2026-11-03 03:56（用户：「鼠标悬停在选项上滚轮会调整选项，经常误操作，去掉」）：
+        #   装**一次**应用级滚轮护栏 —— 组合框 / 数字框 / 滑条不再被滚轮改值，
+        #   滚轮改成滚最近的滚动区（页面照常滚）。幂等，重复构造窗口不会叠加。
+        #   ⚠ 时间轴自己的 wheelEvent（平移/Ctrl 缩放/Alt 行高）不受影响（不是这三类控件）。
+        try:
+            from . import wheel_guard
+            wheel_guard.install()
+        except Exception:                                    # noqa: BLE001
+            log.exception("安装滚轮护栏失败（界面照常可用，只是滚轮仍可能改值）")
 
         self.sessions = {}                        # key -> SheetSession
         self.current_key = ""
@@ -417,6 +428,14 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_undo)
         self.btn_redo = QPushButton("重做")
         top.addWidget(self.btn_redo)
+        # ★ 2026-11-03：左侧四段的一键展开 / 收起（默认全展开；收起来才回到"省地方"的用法）
+        top.addSpacing(8)
+        self.btn_sec_expand = QPushButton("展开全部")
+        self.btn_sec_expand.setToolTip("把左侧 ① 码表包 / ② 曲目 / ③ 素材 / ④ 片段属性 四段全部展开")
+        top.addWidget(self.btn_sec_expand)
+        self.btn_sec_collapse = QPushButton("折叠全部")
+        self.btn_sec_collapse.setToolTip("把四段都收起，只留标题条（再点标题条可单独展开）")
+        top.addWidget(self.btn_sec_collapse)
         top.addStretch(1)
         # ★ 需求 6：顶栏**右上角**独立「导出」入口（裁定=双入口，保留「码表▾ / ① 码表包」原入口）
         #   ★ T02（#8）：文案明确为「导出当前码表」+ **视觉强调**（强调色底 + 加粗）
@@ -439,20 +458,51 @@ class MainWindow(QMainWindow):
         v.addWidget(self.lbl_state)
 
         # ---------- 主区 ----------
+        # ★★ 2026-11-03 01:42（用户）：**整窗两栏**
+        #   「码表包 / 曲目 / 素材 共一列占左边整个左边的位置，
+        #     时间轴 / 片段属性 / 预览 占右边一块」
+        #   ⇒ 外层 `hsplit`（左列 | 右块），右块内部再 `vsplit`（预览 / 时间轴 / ④）。
+        #   ⚠ 与旧布局的区别：时间轴**不再整窗通宽**，它只在右块里。
+        hsplit = QSplitter(Qt.Horizontal)
         vsplit = QSplitter(Qt.Vertical)
-        up = QSplitter(Qt.Horizontal)
 
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
+        # ★★ 2026-11-03（用户：「把那四个折叠起来内容给它展开」）：
+        #   原来是 QTabWidget —— 一次只显示一块，另外三块等于折叠在标签后面。
+        #   现在换成**可折叠竖排**：四块**默认全部展开**，标题条可单独收起，
+        #   分隔条可拖、双击恢复默认。`SectionStack` 保留了 indexOf/tabText/
+        #   setCurrentWidget 等接口，下面 `self.tabs.setCurrentWidget(props_panel)`
+        #   之类不用改。见 `section_stack.py` 开头的设计约束。
+        self.tabs = SectionStack()
         self.pkg_panel = PkgPanel()
         self.track_panel = TrackPanel()
         self.media_panel = MediaPanel()
         self.props_panel = PropsPanel()
-        self.tabs.addTab(self.pkg_panel, "① 码表包")
-        self.tabs.addTab(self.track_panel, "② 曲目")
-        self.tabs.addTab(self.media_panel, "③ 素材")
-        self.tabs.addTab(self.props_panel, "④ 片段属性")
-        up.addWidget(self.tabs)
+        # ★★ 2026-11-03 02:08（用户：「把码表包和曲目还是改成一开始那种，
+        #   点击上方栏目然后切换的样子」）：**合并成一段 + 段内页签**。
+        #   —— 上一版是段内上下并排，两个都要占高度；页签一次只显示一个，
+        #     同样是 560px，单个面板能拿满，不再互相挤压。
+        #   曲目那块是表单（信息十几行），包滚动区，窗口矮时自己滚。
+        _pk_tk = make_tabs([(self.pkg_panel, "① 码表包", False),
+                            (self.track_panel, "② 曲目", True)])
+        self.tabs.add_section(_pk_tk, "① 码表包 / ② 曲目", default_h=560)
+        self.tabs.add_section(self.media_panel, "③ 素材", default_h=420)
+        # ★ 2026-11-03：四段竖排后每段只有 90~200px，面板顶部那段 onboarding 说明
+        #   （3 行）会把列表挤到只剩一行（截图实测：① 只剩一条「sheet2」、③ 连缩略图都没有）。
+        #   ⇒ 说明文字**保留**（仍在 `lbl_how.text()` 里，自检脚本靠它断言），
+        #     只是不再占版面，改为挂在标题条 tooltip 上。
+        for _p in (self.pkg_panel, self.track_panel, self.media_panel):
+            _lb = getattr(_p, "lbl_how", None)
+            if _lb is None:
+                continue
+            # ⚠ 索引用 `indexOf` 动态取：①② 合并后 track_panel 也属于第 0 段，
+            #   写死 enumerate 的下标会把 tooltip 挂到错的段上。
+            _i = self.tabs.indexOf(_p)
+            if _i >= 0:
+                _tip = self.tabs._secs[_i].header.toolTip()
+                self.tabs.set_header_tooltip(
+                    _i, ("%s\n\n%s" % (_tip, _lb.text())) if _tip else _lb.text())
+            _lb.setVisible(False)
+        hsplit.addWidget(self.tabs)
 
         # 右上：节目监视器 + 传输条
         prevw = QWidget()
@@ -489,9 +539,10 @@ class MainWindow(QMainWindow):
         self.lbl_total.setStyleSheet("color:%s;font-size:11px;" % theme.c("fg_dim"))
         bot.addWidget(self.lbl_total)
         pv.addLayout(bot)
-        up.addWidget(prevw)
-        up.setSizes([460, 760])
-        vsplit.addWidget(up)
+        # ★★ 2026-11-03 01:44（用户）：**预览中上 | 属性右上 / 时间轴下方**
+        #   「素材属性放到右上角，时间放到右下角和中间，预览放到正中间上面」
+        toprow = QSplitter(Qt.Horizontal)
+        toprow.addWidget(prevw)
 
         # 下：时间轴（全宽）+ 工具条
         down = QWidget()
@@ -517,11 +568,14 @@ class MainWindow(QMainWindow):
         self.chk_clip_audio = QCheckBox("显示素材音轨")
         self.chk_clip_audio.setToolTip("在片段块内绘制该素材自己的音轨波形（与歌曲音频轨互相独立）")
         clipbar.addWidget(self.chk_clip_audio)
-        # ★ 第五轮①（24 条 #14）：时间轴工具条上的「自动吸附」开关（默认关；状态存 `cfg["snap"]`）。
+        # ★ 第五轮①（24 条 #14）：时间轴工具条上的「自动吸附」开关（状态存 `cfg["snap"]`）。
+        #   ★ 2026-11-03 用户要求：**默认开**（「自动吸附」——编排时片段端点几乎总要贴齐）。
+        #     ⚠ 仍尊重用户显式关过：配置里写着 `"snap": false` 时取到的就是 False，
+        #     只有**从没设过**（键不存在）才落到默认 True。
         self.chk_snap = QCheckBox("自动吸附")
         self.chk_snap.setToolTip("拖动片段时自动吸附到其它片段两端 / 播放头 / 0"
                                  "（只影响正在拖的那一个；约 8px 内才吸）")
-        self.chk_snap.setChecked(bool(self.cfg.get("snap", False)))   # 初值（连线前设，避免伪信号）
+        self.chk_snap.setChecked(bool(self.cfg.get("snap", True)))   # 初值（连线前设，避免伪信号）
         clipbar.addWidget(self.chk_snap)
         # ★ 第十一轮（用户反馈"Alt+滚轮始终无效"）：给出**不依赖 Alt** 的显式入口
         #   —— 轨道行高 −/+（有些环境 Alt 键会被菜单栏/输入法/驱动吞掉，键盘手势不可靠）
@@ -539,9 +593,27 @@ class MainWindow(QMainWindow):
         clipbar.addWidget(self.btn_rowh_plus)
         clipbar.addStretch(1)
         dv.addLayout(clipbar)
-        vsplit.addWidget(down)
-        vsplit.setSizes([420, 340])
-        v.addWidget(vsplit, 1)
+        # ④ 片段属性：**右上角**（和预览同一排，窄栏 ~420；面板内部按宽度自适应列数）
+        self.props_stack = SectionStack()
+        self.props_stack.add_section(self.props_panel, "④ 片段属性", scroll=True,
+                                     default_h=520)
+        self.props_stack.set_default_sizes([520])
+        toprow.addWidget(self.props_stack)
+        # ★ 2026-11-03：属性栏给到 520（面板宽 ≥ 500 才会排 2 列，见 `_reflow`）；
+        #   太窄时它会自动降到 1 列并纵向滚动，不会把控件切掉。
+        self.props_panel.setMinimumWidth(340)
+        toprow.setSizes([900, 520])
+        vsplit.addWidget(toprow)      # 右块上排：预览 | 属性
+
+        vsplit.addWidget(down)        # 右块下：时间轴（横跨"中间 + 右下"）
+        vsplit.setSizes([560, 330])
+
+        hsplit.addWidget(vsplit)
+        # 左列 420 / 右块其余；用户拖过之后以拖动结果为准
+        hsplit.setSizes([400, 1200])
+        # 左列三段按"谁更要地方"给默认高度（贯穿全高，每段约 300）
+        self.tabs.set_default_sizes([620, 360])
+        v.addWidget(hsplit, 1)
 
         # ---------- 日志 ----------
         self.txt = QPlainTextEdit()
@@ -609,12 +681,27 @@ class MainWindow(QMainWindow):
             log.exception("接线失败：%s.%s", type(obj).__name__, name)
             return False
 
+    def _expand_all_sections(self):
+        """顶栏「展开全部」：左列三段 + 右块底部 ④ 一起展开。"""
+        for st in (getattr(self, "tabs", None), getattr(self, "props_stack", None)):
+            if st is not None:
+                st.expand_all()
+
+    def _collapse_all_sections(self):
+        """顶栏「折叠全部」：两处一起收起（只留标题条）。"""
+        for st in (getattr(self, "tabs", None), getattr(self, "props_stack", None)):
+            if st is not None:
+                st.collapse_all()
+
     def _wire(self):
         # 顶栏
         self.cb_sheet.currentIndexChanged.connect(self._on_sheet_combo)
         self.btn_undo.clicked.connect(self.undo)
         self.btn_redo.clicked.connect(self.redo)
         self.btn_export.clicked.connect(self._export_dialog)      # ★ 需求 6：右上角独立导出
+        # ★ 2026-11-03：左侧四段一键展开 / 收起
+        self.btn_sec_expand.clicked.connect(self._expand_all_sections)
+        self.btn_sec_collapse.clicked.connect(self._collapse_all_sections)
 
         # 码表包
         self.pkg_panel.newSheet.connect(self._new_sheet_dialog)   # ★ 需求1：带比例弹窗
@@ -785,17 +872,47 @@ class MainWindow(QMainWindow):
         if key:
             self._switch_to(key)
 
+    def _confirm_close_sheet(self, sess) -> bool:
+        """「删除这张码表包」的**二次确认**（用户 2026-11-02：「删除码表的时候得加二次弹窗」）。
+
+        ⚠ 为什么必须"总是"问：旧行为只在**有未导出改动**时才弹（`_warn_unsaved`
+          干净就静默放行）—— 而这一步会把表**同时**从列表和自动保存里移除，
+          干净的表被误点就没了，只能重新「导入…」。
+        ⚠ 默认按钮 = **取消**：破坏性操作绝不让回车落到"移除"上（10-31 导入弹窗踩过同款坑）。
+        ⚠ 非交互 / 无 QApplication（无头测试）⇒ 直接放行，保持既有测试可用。
+        """
+        if not self._interactive or QApplication.instance() is None:
+            return True
+        from PySide6.QtWidgets import QMessageBox
+        sh = sess.sheet
+        bp = str(getattr(sess, "backing_path", "") or "")
+        nm = os.path.basename(bp) if bp else (sh.title or sess.key)
+        box = QMessageBox(self)
+        box.setWindowTitle("删除码表包")
+        box.setIcon(QMessageBox.Question)
+        box.setText("从列表里移除「%s」？" % nm)
+        info = "只会从列表移除，**不会删除磁盘上的 .ercue 文件**。"
+        if sess.dirty:
+            info += ("\n这张表有改动还没导出 —— 移除后自动保存也一并清掉，"
+                     "**无法**恢复；要保留请先「取消」并导出。")
+        box.setInformativeText(info)
+        b_del = box.addButton("移除", QMessageBox.DestructiveRole)
+        b_cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(b_cancel)
+        box.setEscapeButton(b_cancel)
+        box.exec()
+        return box.clickedButton() is b_del
+
     def _close_sheet(self):
         s = self.session
         if s is None:
             return
-        # ★ T02：**非阻断**提醒（取代原"保存/丢弃/取消"三选）。⚠ 与"关窗"不同：
-        #   这张表会被移出列表、autosave 条目也会一并删除 ⇒ 未导出就真的恢复不了，故文案照实说。
-        if not self._warn_unsaved([s], "关闭",
-                                  "这张码表将从列表里移除（磁盘上的 .ercue 文件没动）；\n"
-                                  "它的改动没有导出，移除后**无法**从自动保存恢复。"):
+        # ★★ 2026-11-02（用户「删除码表的时候得加二次弹窗」）：先无条件确认一次。
+        if not self._confirm_close_sheet(s):
             self._log("已取消关闭。")
             return
+        # ⚠ 不再调 `_warn_unsaved`：脏状态的提醒已经并进上面那个确认框了，
+        #   连着弹两个只会让人烦（T02 的语义没丢，只是合并了）。
         key = self.current_key
         self._flush_autosave()
         self._stop_play()
@@ -1751,13 +1868,27 @@ class MainWindow(QMainWindow):
             self, "导入音频", self.session.dir if self.session else "",
             "音频 (*.mp3 *.flac *.wav *.m4a *.aac *.ogg *.opus);;所有文件 (*)")
         if p:
-            self.import_track_audio(p)
+            self.import_audio_as_new_track(p)
+
+    def import_audio_as_new_track(self, path) -> bool:
+        """导入音频 = **新建一条曲目 + 读标签/时长**。
+
+        ★★ 2026-11-03 02:10（用户「去掉曲目里面那个加曲目那个选项，直接合并到那个
+          导入音频里面」）：原来「＋ 曲目」只建一个空曲目、还要再点「导入音频…」填信息；
+          现在合成一步 —— 选一个音频就是一条曲目。否则按钮去掉之后，空码表根本没法开始。
+        ★ 抽成独立方法（不塞在对话框回调里）：无头测试要直接驱动它，不能弹文件框。
+        """
+        base = os.path.splitext(os.path.basename(str(path or "")))[0]
+        if self.add_track(title=base or "新曲目") < 0:
+            return False
+        return self.import_track_audio(path)
 
     def import_track_audio(self, path) -> bool:
         """用 mutagen 读标签与时长，填进当前曲目的 identity（只读信息，不拷贝文件）。"""
         tr = self._track()
         if tr is None:
-            self._log("先加一首曲目（「＋ 曲目」）再导入音频。")
+            # 正常走不到（入口已保证先建曲目）；留着兜底并如实说明入口在哪。
+            self._log("没有曲目：请点「导入音频…」（会自动新建一条曲目）。")
             return False
         meta = self._read_audio_meta(path)
         self._push_undo()
@@ -2102,7 +2233,15 @@ class MainWindow(QMainWindow):
         ly, it = self._find_item(lyr_id, item_id)
         if it is None:
             return
-        self.timeline.set_selected(lyr_id, item_id)
+        # ★ 2026-11-03：右键"多选成员"时**不要**收敛成单选 —— 否则菜单里的「复制片段」
+        #   只会复制一个（多选整组复制靠的就是保持 sel_multi）。
+        _in_multi = False
+        try:
+            _in_multi = (lyr_id, item_id) in set(self.timeline.multi_selection())
+        except Exception:                                # noqa: BLE001
+            _in_multi = False
+        if not _in_multi:
+            self.timeline.set_selected(lyr_id, item_id)
         self._sync_props_selection()
         # ⚠ 无头/测试模式**绝不弹菜单**（`menu.exec()` 会阻塞）。`_build_item_menu()` 仍可单测。
         if not self._interactive or QApplication.instance() is None:
@@ -2113,7 +2252,10 @@ class MainWindow(QMainWindow):
             log.exception("弹出片段菜单失败")
 
     def _focus_props_tab(self):
-        self.tabs.setCurrentWidget(self.props_panel)
+        try:
+            self.props_stack.setCurrentWidget(self.props_panel)   # ★ ④ 已挪到右块底部
+        except AttributeError:
+            self.tabs.setCurrentWidget(self.props_panel)
 
     def _copy_item(self, lyr_id, item_id, at=None):
         """★ 需求 12「复制片段」/ 第五轮②（#18）「再制」：**必须走 `CueItem.deep_clone()`**
@@ -2399,7 +2541,11 @@ class MainWindow(QMainWindow):
             ly = self.timeline.selected_layer()
         self.props_panel.layer = ly
         self.props_panel.item = it
-        self.props_panel.set_media_list(self._sheet())
+        # ★ 2026-11-03：把"素材 → 绝对路径"一起递进去 —— 属性面板要显示
+        #   「素材文件已找到 / 缺失」，现场排查"这段没画面"最需要这一行。
+        _s = self.session
+        self.props_panel.set_media_list(
+            self._sheet(), (_s.media_paths if _s is not None else {}))
         self.props_panel.refresh()
         # ★ 第九轮（框选多选）：多选（>1）⇒ 属性面板**整体灰化不可编辑**；单选/空 ⇒ 恢复。
         #   只在整个面板上 `setEnabled`（Qt 父禁用天然覆盖子控件），**不碰 props_panel.py**。
@@ -2546,20 +2692,84 @@ class MainWindow(QMainWindow):
             log.exception("PyAV 读音频时长失败: %s", path)
         return 0.0
 
+    def _content_sec(self) -> float:
+        """当前曲目**真实内容长度**（秒）；返回 0 = "这张表还没有内容，不要限制缩放"。
+
+        ★ 2026-11-03（用户：「这个时间轴这个缩小不能缩到这个音频的显示内容比这个时间轴还小
+          这个长度上。就是要有一个限制。」）：
+          时间轴的视口跨度上限取这个值 ⇒ "最多缩到内容正好铺满整个时间轴"。
+
+        三种情况：
+          · 曲目有音频时长（`identity.duration_sec > 1.0`）⇒ 用它（用户说的"音频的显示内容"）；
+          · 没音频时长，但**有片段** ⇒ 用 `timeline_total_sec()`（= 最后片段终点 + 5s，
+            与标尺/总长显示同口径，用户看到的"内容有多长"就是它）；
+          · 空表（无音频、无片段）⇒ **0.0**（不限制）。
+
+        ⚠ **绝不能**无脑用 `timeline_total_sec()`：它在空表时返回 **10 秒兜底**（那是给总长
+          标签/播放条用的），拿它当上限会把空表锁死在 10 秒视野 —— 用户明明没内容却缩不出去。
+
+        ⚠ 边界：`duration_sec <= 1.0` 一律视为"没有有效音频时长"（与 `timeline_total_sec()`
+          同口径）⇒ 退到"有片段/空表"两档。所以 0.5 秒这种极短音频**不设上限**；
+          真实歌曲不会这么短，仅作边界记录。
+        """
+        tr = self._track()
+        dur = 0.0
+        if tr is not None:
+            try:
+                dur = float(getattr(getattr(tr, "identity", None), "duration_sec", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                dur = 0.0
+        if dur > 1.0:
+            return dur
+        if any(getattr(ly, "items", None) for ly in self._layers()):
+            return float(self.timeline_total_sec())
+        return 0.0
+
+    def _sync_span_limit(self):
+        """把"内容上限"推给时间轴控件（`set_max_span`）。
+
+        模型一变就喂（`_sync_timeline_data` / `_sync_view`）—— 既保证"缩不出去"，
+        也保证**内容变长后还能再缩出去**（上限跟着内容走，不是一个定值）。
+        """
+        setter = getattr(self.timeline, "set_max_span", None)
+        if callable(setter):
+            try:
+                setter(self._content_sec())
+            except Exception:                          # noqa: BLE001
+                log.exception("设置时间轴缩放上限失败")
+
     def _sync_view(self):
         total = self.timeline_total_sec()
         self.timeline.set_bpm(self._bpm())
-        self.timeline.set_view(0.0, max(8.0, total))
+        # ★ 2026-11-03：先把"内容上限"喂给控件，再给初始跨度 —— 顺序不能反，
+        #   否则 `set_view()` 会按**旧**上限钳制，首帧又变成"内容只占一小段"。
+        self._sync_span_limit()
+        # 上限取控件的实际值（`getattr` 兜底：万一控件没有该属性——例如测试桩——就按硬上限算）
+        limit = float(getattr(self.timeline, "max_span", theme.VIEW_SPAN_MAX))
+        self.timeline.set_view(0.0, min(max(8.0, total), limit))
         self.sld.setRange(0, int(round(total)))
         self.lbl_total.setText("总长 " + mmss(total))
 
     def _zoom(self, k):
-        # ★ P0-5：工具条缩放与 Ctrl+滚轮**用同一套上下限**（`VIEW_SPAN_MIN/MAX`）。
-        #   旧写法只走 `set_view()`（只钳下界），「缩小」可无限放大跨度（实测连点 12 次 → 9383s，
-        #   标尺标签挤成一团）。
-        span = self.timeline.view_span * float(k)
-        span = max(theme.VIEW_SPAN_MIN, min(theme.VIEW_SPAN_MAX, span))
-        self.timeline.set_view(self.timeline.view0, span)
+        """缩放视口跨度（`k>1` 视野变大、内容变小；`k<1` 放大）。
+
+        ⚠ 当前**没有**任何 UI 调用它：T02#7 已删掉工具条上的「放大/缩小」两个按钮，
+          真实的**用户入口只有 Ctrl+滚轮**（`CueTimeline.wheelEvent`）。本方法保留为
+          窗口级 API（工具/测试/将来要加按钮时直接用），语义与滚轮完全一致 —— 因为钳制
+          只有一处（`CueTimeline._clamp_span`）。
+
+        ★ P0-5 的历史教训：旧写法只走 `set_view()`（它当年只钳下界），「缩小」可无限放大跨度
+          （实测连点 12 次 → 9383s，标尺标签挤成一团）。
+        ★ 2026-11-03：上限改成"内容长度"后，钳制**只在控件里定义一次**
+          （`CueTimeline._clamp_span` / `max_span`）—— 窗口侧绝不再写一套，否则两套上限
+          迟早不一致（"按钮能缩出去、滚轮缩不出去"这类怪现象）。
+        """
+        zoom = getattr(self.timeline, "zoom_by", None)
+        if callable(zoom):
+            zoom(float(k))
+        else:                                          # 兜底：控件没这个方法时退回旧语义
+            span = self.timeline.view_span * float(k)
+            self.timeline.set_view(self.timeline.view0, span)
 
     def _sync_timeline_data(self):
         """把当前码表 / 曲目 / 素材映射喂给时间轴控件（时间轴只画，不改模型）。"""
@@ -2576,6 +2786,9 @@ class MainWindow(QMainWindow):
                 _snap(self._snap_on())
             except Exception:                          # noqa: BLE001
                 log.exception("同步自动吸附开关失败")
+        # ★ 2026-11-03：模型一变就重算"缩放上限"（加/删片段、换曲目、掐尾巴都会走到这里）——
+        #   否则内容变长后仍卡在旧上限、缩不出去（反之内容变短会停在"内容只占一小段"）。
+        self._sync_span_limit()
 
     def _rebuild_runtime(self):
         s = self.session
@@ -3165,12 +3378,34 @@ class MainWindow(QMainWindow):
     # 刷新（B1：所有重填都 blockSignals）
     # ==================================================================
     def _sheet_label(self, sess: SheetSession) -> str:
+        """列表/下拉里显示的名字 —— **文件名优先**（与演出端 AutoVJ 统一口径）。
+
+        ★★ 2026-11-02（用户：「码表图层和码表管理里显示的名字不一样」）：
+          实测 `测试151.ercue` 的**文件名**是 `测试151.ercue`，而包内 `cuesheet.json`
+          的 `title` 是 `测试11`（导出时写残）。
+          演出端早就统一成文件名了（`AutoVJ/src/cue_page.py::sheet_label` 有同样的注释），
+          编排端这里却用 `sh.title` ⇒ 同一张表在两边名字不同，用户对不上。
+          ⇒ 这里也改成**文件名**；`title` 放进 tooltip（`_pkg_tooltip`）不丢信息。
+          ⚠ 新建但没导出过的表没有 `backing_path` ⇒ 回落 title/内部 key。
+        """
         sh = sess.sheet
         present = sum(1 for m in sh.media
                       if os.path.isfile(sess.media_paths.get(m.clip_id) or ""))
         miss = len(sh.media) - present
+        bp = str(getattr(sess, "backing_path", "") or "")
+        name = os.path.basename(bp) if bp else (sh.title or sess.key)
         return "%s（%d 首 / 缺 %d 个素材）%s" % (
-            sh.title or sess.key, len(sh.tracks), miss, "（未导出）" if sess.dirty else "")
+            name, len(sh.tracks), miss, "（未导出）" if sess.dirty else "")
+
+    def _pkg_tooltip(self, sess: SheetSession) -> str:
+        """码表包的 tooltip：包内标题（可能和文件名不同）+ 磁盘路径。"""
+        sh = sess.sheet
+        bp = str(getattr(sess, "backing_path", "") or "")
+        lines = []
+        if sh.title and (not bp or os.path.basename(bp) != sh.title):
+            lines.append("包内标题：%s" % sh.title)
+        lines.append(bp or "（还没导出到磁盘）")
+        return "\n".join(lines)
 
     def _refresh_all(self):
         self._refresh_sheet_combo()
@@ -3215,7 +3450,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_pkg_list(self):
         rows = [(k, self._sheet_label(s), s.dirty) for k, s in self.sessions.items()]
-        self.pkg_panel.refresh(rows, self.current_key)
+        tips = {k: self._pkg_tooltip(s) for k, s in self.sessions.items()}
+        self.pkg_panel.refresh(rows, self.current_key, tips=tips)
 
     def _refresh_track_panel(self):
         sh = self._sheet()

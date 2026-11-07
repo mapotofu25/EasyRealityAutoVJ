@@ -1,0 +1,66 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant W as MainWindow
+    participant D as dialogs
+    participant IO as ercue_io
+    participant TL as CueTimeline
+    participant P as PreviewCanvas
+    participant MW as MediaWaveWorker
+    participant C as compositor
+
+    rect rgb(238,246,255)
+    note over U,C: 流程1 新建码表（选比例，需求1）
+    U->>W: 码表菜单 -> 新建
+    W->>D: ask_new_sheet(parent)
+    D-->>W: (title, res_w, res_h)
+    W->>IO: new_sheet(title, author, res_w, res_h)
+    IO-->>W: CueSheet(res_w, res_h)
+    W->>W: SheetSession + _refresh_all()
+    W->>P: _rebuild_runtime() -> set_runtime(rt)
+    P->>P: _canvas_size() 用 rt.sheet.res_w/h（letterbox）
+    end
+
+    rect rgb(245,255,240)
+    note over U,W: 流程2 双击进剪辑态 -> 拖左把手 trim 开头（需求3）
+    U->>TL: 双击时间轴片段
+    TL->>TL: _edit_mode = item（高亮 + 把手）
+    U->>TL: 拖左把手 mouseMove
+    TL->>TL: 算 (at', end, src_in', src_out)（speed 锁定）
+    U->>TL: 松手 mouseRelease
+    TL->>W: trimmed(lyr, item, at', end, src_in', src_out')
+    W->>W: _push_undo() + 写 it.at/src_in + normalized() + 排序
+    W->>W: _rebuild_runtime() + _sync_props_selection()
+    end
+
+    rect rgb(255,250,235)
+    note over U,C: 流程3 预览画布拖拽位移（实时 override -> 松手提交，需求8）
+    U->>P: 模式=位移，拖动画面
+    P->>P: _override = (lyr, item, xform', crop)
+    P->>C: compose(size, states(补丁 st.xform), frame_lookup)
+    C-->>P: QImage（含新位移）
+    U->>P: 松手
+    P->>W: xform_committed(lyr, item, xform', crop)
+    W->>W: _push_undo() + 写 item.xform/crop + _rebuild_runtime()
+    end
+
+    rect rgb(250,240,250)
+    note over U,W: 流程4 右键复制片段（deep_clone 保证独立，需求12 + 10）
+    U->>TL: 右键片段
+    TL->>W: context_menu(lyr, item, globalPos)
+    U->>W: 选“复制片段”
+    W->>W: new = item.deep_clone(new_item_id)
+    W->>W: new.at_sec = 播放头; 目标层 items.append(new)
+    W->>W: _push_undo() + _rebuild_runtime()
+    note over W: xform/crop 为新对象 => 与源片段互不影响
+    end
+
+    rect rgb(240,250,250)
+    note over U,MW: 流程5 视频导入 -> 后台分析音轨波形（需求11）
+    U->>W: 加素材（选视频）
+    W->>W: add_media_paths() -> probe 写 MediaRef
+    W->>MW: request(clip_id, path)
+    MW->>MW: waveform.load_or_compute(path)（缓存）
+    MW-->>W: done(clip_id, WaveformData)
+    W->>W: 勾选“显示素材音轨” -> timeline.set_clip_waves()
+    end

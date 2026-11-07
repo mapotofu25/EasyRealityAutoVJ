@@ -1,0 +1,127 @@
+classDiagram
+    class CueSheet {
+        +str title
+        +str author
+        +int format_version
+        +int res_w
+        +int res_h
+        +list~MediaRef~ media
+        +list~TrackEntry~ tracks
+        +aspect() tuple
+        +media_by_id(clip_id) MediaRef
+        +match_track(title, artist, duration_sec, fp_id, file_name, file_md5) tuple
+        +to_state_dict() dict
+        +from_state_dict(d) CueSheet
+    }
+    class TrackEntry {
+        +str track_key
+        +Identity identity
+        +Composition composition
+        +sorted_layers() list
+    }
+    class Identity {
+        +str fp_id
+        +str file_md5
+        +str meta_id
+        +str title
+        +str artist
+        +float duration_sec
+        +float bpm
+        +str file_name
+        +meta_key(title, artist, duration_sec) str
+    }
+    class Composition {
+        +list~CompLayer~ layers
+        +sorted_layers() list
+    }
+    class CompLayer {
+        +str lyr_id
+        +str name
+        +int z
+        +str blend
+        +float opacity
+        +list~CueItem~ items
+        +normalized() CompLayer
+    }
+    class CueItem {
+        +str item_id
+        +str clip_id
+        +float at_sec
+        +float end_sec
+        +float src_in_sec
+        +float src_out_sec
+        +float speed
+        +list~float~ crop
+        +dict xform
+        +str trans_in
+        +float trans_in_sec
+        +str trans_out
+        +float trans_out_sec
+        +str snap
+        +str note
+        +deep_clone(new_item_id) CueItem
+        +normalized() CueItem
+        +to_state_dict() dict
+        +from_state_dict(d) CueItem
+    }
+    class MediaRef {
+        +str clip_id
+        +str name
+        +str sha256
+        +bool embedded
+        +float duration_sec
+        +bool has_alpha
+    }
+    class CueRuntime {
+        +float bpm
+        +update(pos_sec) list~LayerDrawState~
+    }
+    class LayerDrawState {
+        +str lyr_id
+        +int z
+        +str blend
+        +float opacity
+        +str clip_id
+        +float play_sec
+        +list~float~ crop
+        +dict xform
+        +float speed
+        +float alpha
+        +bool active
+    }
+    class CueTimeline {
+        +Signal picked
+        +Signal moved
+        +Signal resized
+        +Signal trimmed
+        +Signal context_menu
+        +bool _show_clip_audio
+        +set_show_clip_audio(on)
+        +set_clip_waves(waves)
+        +mouseDoubleClickEvent(e)
+        +contextMenuEvent(e)
+    }
+    class PreviewCanvas {
+        +Signal xform_committed
+        +_override
+        +set_ratio(res_w, res_h)
+        +set_selection(lyr_id, item_id)
+        +set_override(lyr_id, item_id, xform, crop)
+    }
+    class MediaWaveWorker {
+        +Signal done
+        +request(clip_id, path)
+        +stop()
+    }
+
+    CueSheet "1" o-- "*" MediaRef
+    CueSheet "1" o-- "*" TrackEntry
+    TrackEntry "1" *-- "1" Identity
+    TrackEntry "1" *-- "1" Composition
+    Composition "1" o-- "*" CompLayer
+    CompLayer "1" o-- "*" CueItem
+    CueItem ..> MediaRef : clip_id
+    CueRuntime ..> CueSheet : read res and media
+    CueRuntime ..> LayerDrawState : produce
+    MediaWaveWorker ..> MediaRef : waveform by clip_id
+    PreviewCanvas ..> CueRuntime : update()

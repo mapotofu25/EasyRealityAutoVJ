@@ -1,7 +1,25 @@
-PySide6>=6.8
-numpy
-soundcard
-opencv-python
-soundfile
-av                 # PyAV：alpha 视频（DXV/ProRes4444）必须用它，OpenCV 会丢 alpha
-glfw               # GPU 解码（实验）：建离屏 OpenGL 上下文；不带它则自动回退软解
+# Easy Reality AutoVJ —— 运行期依赖（**全部钉死版本**，2026-11-08 RC4）
+# ---------------------------------------------------------------------------
+# 为什么要钉死：不钉版本时上游发一个新版就可能让打包结果变样、甚至构建失败
+# （2026-10-23 安全审计 P1 项）。下面每一个版本号都是**本版 exe 实际构建时用的那个**，
+# 想升级就整组一起升，并重跑 `tools/build_exe.py` + `tools/smoke_exe.py 40`。
+#
+# 安装：
+#   python -m venv venv
+#   venv\Scripts\python.exe -m pip install -r requirements.txt
+#   venv\Scripts\python.exe -m pip install -r requirements-dev.txt   # 只在要打包时
+# ---------------------------------------------------------------------------
+
+PySide6-Essentials==6.11.2   # Qt 界面（本项目只用 QtWidgets / QtGui / QtCore）
+numpy==2.5.3                 # 全流程数值计算
+SoundCard==0.4.6             # WASAPI 回环 / 麦克风采集
+sounddevice==0.5.6           # 详情页试听播放（PortAudio）
+soundfile==0.14.0            # 音频读写（libsndfile）
+av==18.1.0                   # PyAV：带 alpha 的 DXV / ProRes4444 必须用它，OpenCV 会丢 alpha
+opencv-python==4.10.0.84     # 颜色 LUT / 缩放 / 图像处理
+glfw==2.10.2                 # GPU 解码的离屏 OpenGL 上下文（缺它会自动回退软解）
+cyndilib==0.1.1              # NDI 输出（wheel 内自带 NDI 运行库）
+SpoutGL==0.1.1               # Spout 输出（发给 OBS / Resolume）
+onnxruntime==1.30.0          # Beat This! 小节检测的推理后端
+mutagen==1.48.1              # 音乐元数据 + 封面（⚠ GPL-2.0-or-later，见 NOTICE.md）
+pillow==12.3.0               # 缩略图 / 封面缩放

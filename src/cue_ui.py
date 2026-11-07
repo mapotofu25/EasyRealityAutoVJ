@@ -371,8 +371,13 @@ class CueSheetDialog(QDialog):
         else:
             idn = getattr(self.track, "identity", None) if self.track is not None else None
             bpm = float(getattr(idn, "bpm", 0.0) or 0.0) if idn is not None else 0.0
+            # ★ 2026-11-02（用户「码表图层和码表管理里显示的名字不一样」）：
+            #   这里原来显示包内 `title`（实测 `测试151.ercue` 的 title 是 `测试11`），
+            #   而码表管理/图层下拉/曲库来源列**一律按文件名** ⇒ 同一张表两个名字。
+            #   口径统一到文件名；title 不一致时放进 tooltip（信息不丢）。
+            _nm = sheet_display_name(st, getattr(self, "pkg", "") or "")
             self.lbl_status.setText( T("码表：%s ｜ 画布 %dx%d ｜ 曲目：%s ｜ BPM：%s ｜ 片段：%d ｜ 已绑图层：%s")
-                % (st.get("title") or "(无标题)", int(st.get("res", (1920, 1080))[0]),
+                % (_nm, int(st.get("res", (1920, 1080))[0]),
                    int(st.get("res", (1920, 1080))[1]),
                    ("%s — %s" % (getattr(idn, "artist", ""), getattr(idn, "title", "")))
                    if idn is not None else "**未绑定**（不接管）",
@@ -930,7 +935,49 @@ def _extract_embedded_media(pkg, sheet):
     return out
 
 
-def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track=False):
+def sheet_display_name(status, pkg=""):
+    """码表在界面上显示的名字 —— **文件名优先**，包内 `title` 只在没有路径时兜底。
+
+    ★★ 2026-11-02（用户：「码表图层和码表管理里显示的名字不一样」）：
+      实测 `测试151.ercue` 的包内 `title` 是 `测试11`（导出时写残）。
+      码表管理 / 图层下拉 / 曲库来源列**一律按文件名**（`cue_page.sheet_label`），
+      而码表对话框的状态行原来显示 `title` ⇒ 同一张表两个名字。
+      统一到文件名；不一致时把 title 附在括号里（信息不丢）。
+    """
+    st = status or {}
+    sp = str(st.get("path") or pkg or "")
+    nm = os.path.basename(sp) if sp else ""
+    if not nm:
+        return str(st.get("title") or "") or "(无标题)"
+    t = str(st.get("title") or "")
+    return ("%s（标题 %s）" % (nm, t)) if (t and t != nm) else nm
+
+
+def bound_head(sheet_name, layer_name):
+    """绑定成功后的首行文案（用户要求：加进图层后必须明确说成功）。"""
+    return Tf("✓ 已把「{}」绑到图层「{}」。", str(sheet_name or "?"),
+              str(layer_name or "?"))
+
+
+def unbind_hint(how, n_tracks):
+    """没绑上曲目时的提示文案与级别 → `(msg, level)`。
+
+    ★★ 2026-11-02（用户截图问「不是已经对好歌了吗？」）：
+      两件事被同一个说法糊住了 ——
+        · 导入对话框的「指纹吻合 100%」= **静态校验**：码表里存的就是你曲库那个文件；
+        · 「绑定曲目」= **动态状态**：此刻在放哪首（靠实时指纹识别）。
+      静音导入必然绑不上，这是常态；只有「在放歌但这首不在表里」才是要提醒的。
+      所以必须按 `how`（正在播放的曲目描述，空 = 没在放歌）分开措辞与级别。
+    """
+    if how:
+        return (Tf("正在播放的是「{}」，但这张表里没有它的编排 "
+                   "⇒ 图层暂不接管（画面仍走普通自动调度）。", how), "warn")
+    return (Tf("已装表（{} 首编排）。现在没有在播放的曲目，"
+               "放歌后会自动绑定对应的那首。", int(n_tracks)), "info")
+
+
+def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track=False,
+                  out_level=None):
     """把 `.ercue` 装到指定图层。返回 `(ok, msg)`：`ok` = 引擎已建立运行时（能接管）。
 
     这是**导入/换表的唯一实现**，调它的人：
@@ -1026,9 +1073,9 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track
             # 只有**显式要求**（用户主动点「绑定」）才问 —— 导入路径问会让人以为二选一
             track = pick_track(sheet, parent)
         else:
-            # 多曲目 + 认不出 ⇒ **装表不绑曲目**（安全降级），放歌后自动选对应那首
-            warnings.append(Tf("这张表有 {} 首歌的编排：已装表，放歌后会自动选对应的那首。",
-                               len(tracks)))
+            # 多曲目 + 没绑上 ⇒ **装表不绑曲目**（安全降级）。文案统一在函数尾部按
+            # 「有没有在放歌」二选一输出（见 `if track is None:`），这里不再重复。
+            pass
     if track is not None:
         try:
             if float(getattr(track.identity, "bpm", 0.0) or 0.0) <= 0.0:
@@ -1041,7 +1088,11 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track
     try:
         ok = bool(engine.set_cue_sheet(
             sheet, media_paths=media_paths, track=track, layer=layer,
-            sheet_id=os.path.basename(str(path))))
+            sheet_id=os.path.basename(str(path)),
+            # ★ 2026-11-02（「码表图层和码表管理里显示的名字不一样」）：
+            #   界面显示名统一按**文件名**（`cue_page.sheet_label` 的口径），
+            #   所以把路径也交给引擎，图层/对话框才能取到 basename。
+            sheet_path=str(path)))
     except Exception as e:                                       # noqa: BLE001
         return False, "装载失败（引擎）：%s" % e
 
@@ -1066,9 +1117,33 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track
         msg = (msg + "\n" if msg else "") + (
             "缺 %d 个素材：%s%s" % (len(missing), "、".join(missing[:6]),
                                   "…" if len(missing) > 6 else ""))
+    level = "info"
+    if missing or warnings:
+        level = "warn"
     if track is None:
-        msg = (msg + "\n" if msg else "") + T(
-            "已装载码表，但没有绑定曲目 ⇒ 这个图层暂不接管（画面仍走普通自动调度）。")
+        # ★★ 2026-11-02（用户：「不是已经对好歌了吗？」）：
+        #   **「指纹吻合 100%」≠「绑定曲目」**。前者是静态校验（码表里存的就是你曲库
+        #   那个文件，同一版本），在导入对话框里已经验证过；后者问的是"**此刻**在放哪首"，
+        #   靠实时指纹识别。静音导入必然绑不上 —— 这是常态，不是故障。
+        #   ⇒ 按有没有在放歌分别措辞；只有"在放歌但这首不在表里"才值得警告。
+        _n = len(list(getattr(sheet, "tracks", None) or []))
+        extra, level = unbind_hint(_how or "", _n)
+        msg = (msg + "\n" if msg else "") + extra
+    if out_level is not None:
+        try:
+            out_level.append(level)
+        except Exception:                                        # noqa: BLE001
+            pass
+    # ★★ 2026-11-02（用户：「它这个添加码表软件里面，图层加了之后提示一个成功不成功」）：
+    #   成功必须**先说出来**。旧行为是"只要有任何补充说明就只弹警告、成功一声不响"，
+    #   用户看到黄叹号就以为没加上。⇒ 成功首行永远在最前面，补充说明接在后面。
+    if ok:
+        try:
+            head = bound_head(os.path.basename(str(path)),
+                              getattr(layer, "name", "") or "")
+        except Exception:                                         # noqa: BLE001
+            head = T("✓ 已绑定到图层。")
+        msg = (head + "\n\n" + msg) if msg else head
     return ok, msg
 
 

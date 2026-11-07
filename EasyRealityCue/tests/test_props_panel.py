@@ -234,23 +234,28 @@ def test_selection_semantics_item_vs_layer():
     assert p.lbl_blend.text() == LBL_BLEND_ITEM, p.lbl_blend.text()
     assert p.lbl_op.text() == LBL_OP_ITEM, p.lbl_op.text()
 
-    # (D) 未选中：标签 = 本层…；写层，片段不受影响
+    # (D) 未选中：★ 2026-10-22 用户明确要求「去掉本层混合 / 本层不透明度」——
+    #   现在这两行**整体隐藏**（不显示、也不写 layer.*），而不是切标签后写层。
+    #   ⚠ 本用例原来断言的是"标签切到 本层…并写 layer"，那是改动**之前**的语义，
+    #     已按用户决定更新（否则永远红）。
     p.set_selection(ly, None)
     p.refresh()
-    assert p.lbl_blend.text() == LBL_BLEND_LAYER, p.lbl_blend.text()
-    assert p.lbl_op.text() == LBL_OP_LAYER, p.lbl_op.text()
-    assert p.cb_blend.currentData() == "screen"
-    p.cb_blend.setCurrentIndex(p.cb_blend.findData("multiply"))
-    p.sp_op.setValue(30)
-    assert p.commit() is True
-    assert ly.blend == "multiply" and abs(ly.opacity - 0.3) < 1e-9, (ly.blend, ly.opacity)
-    assert it.blend == "" and it.opacity is None, "未选中时**片段**不该被改"
+    # ⚠ 用 `isHidden()` 而不是 `isVisible()`：面板没 `show()` 时 `isVisible()` 恒 False，
+    #   会把"没隐藏"误判成"已隐藏"（本用例第一次就踩了这个）。
+    assert p.lbl_blend.isHidden() and p.cb_blend.isHidden(), "未选中 ⇒ 混合行隐藏"
+    assert p.lbl_op.isHidden() and p.sp_op.isHidden(), "未选中 ⇒ 不透明度行隐藏"
+    blend0, op0 = ly.blend, ly.opacity
+    p.commit()          # 用户碰不到隐藏控件 ⇒ 原样提交必须什么都不改
+    assert ly.blend == blend0 and abs(ly.opacity - op0) < 1e-9, \
+        ("未选中时**不该**写 layer.*", ly.blend, ly.opacity)
+    assert it.blend == "" and it.opacity is None, "未选中时**片段**也不该被改"
 
-    # 回到选中：标签切回「本素材…」
+    # 回到选中：标签 = 本素材…，两行重新出现
     p.set_selection(ly, it)
     p.refresh()
     assert p.lbl_blend.text() == LBL_BLEND_ITEM and p.lbl_op.text() == LBL_OP_ITEM
-    print("  ✓ 选中态语义：选中写 item（层不动）/ 未选写 layer（片段不动）；标签切换正确")
+    assert not p.lbl_blend.isHidden() and not p.lbl_op.isHidden(), "选中 ⇒ 两行回来"
+    print("  ✓ 选中态语义：选中才显示并写 item；未选中两行隐藏且不写 layer（2026-10-22 决定）")
 
 
 # ==========================================================================

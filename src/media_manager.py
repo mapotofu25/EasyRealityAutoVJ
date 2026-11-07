@@ -233,6 +233,10 @@ class MediaItem:
         self.thumb = self._thumb_path()
         self._icons = {}
         self._pix = {}
+        # ★ 2026-11-06（拖行高闪退）：图标/像素缓存按 (w,h) 做键，**行高每变 1px 就多一条**。
+        #   拖动时能攒几百条（每条一张缩放后的图）⇒ 内存猛涨 + 反复分配。
+        #   这里封顶：超过上限就整体丢弃（下一帧按需重建，代价只有几毫秒）。
+        self._CACHE_MAX = 24
         # 每素材独立的大小/位置（图片摆位用，默认铺满）
         self.img_scale = 1.0
         self.img_x = 0.0
@@ -244,17 +248,37 @@ class MediaItem:
         self.disabled_tags = []              # [中文tag, ...] 被用户取消的自动标签（重扫不复活）
         self.roles = {"fg": False, "bg": False}   # 多重角色：前景/背景
         self.excluded = False                # 排除自动打标/匹配（logo 等固定素材）
+        # ★ 2026-10-30（用户「给素材打分 0-1」）：动态分，None = 还没扫过。
+        #   三档只决定进哪个池，这个分决定池里挑谁（`match_engine.match_clips`）。
+        self.score = None
         self._has_alpha = None               # 视频 alpha 探测缓存（None=未探测，避免每次切换重复打开文件）
         self._codec = None                   # 视频编码名缓存（后台普查填；决定能否走 GPU 解码）
         self._is_dxv = None                  # 是否 DXV（同上）
 
     def all_tags(self):
-        """生效标签 = (自动 + 手动) - 被取消的自动，去重（显示/筛选用）"""
+        """生效标签 = (自动 + 手动) - 被取消的自动，去重（显示/筛选用）
+
+        ★★ 2026-10-30（用户「怎么会有低动态又频闪的素材呢」）：
+          频闪是**整帧亮暗交替**，画面内容其实没怎么动 ⇒ 帧差中位很低 ⇒
+          老扫描会同时打上「低动态 + 频闪」（库里现有 25 个），tooltip 里还写着
+          动态分 0.85，自相矛盾。而换池（`_is_hi`）和打分（`score_of`）一直
+          把频闪当高动态用 ⇒ **读标签时统一归一化**：有频闪就去掉低/中动态、
+          补「高动态」。这样老库不用重扫，显示和筛选也不会再出现矛盾组合。
+        """
         dis = set(self.disabled_tags or [])
         seen, out = set(), []
         for t in list(self.tags) + list(self.manual_tags):
             if t and t not in dis and t not in seen:
                 seen.add(t); out.append(t)
+        try:
+            from tags_def import (DYNAMIC_FLICKER, DYNAMIC_HIGH,
+                                  DYNAMIC_LOW, DYNAMIC_MID)
+            if DYNAMIC_FLICKER in seen:
+                out = [t for t in out if t not in (DYNAMIC_LOW, DYNAMIC_MID)]
+                if DYNAMIC_HIGH not in out:
+                    out.append(DYNAMIC_HIGH)
+        except Exception:                                          # noqa: BLE001
+            pass
         return out
 
     def _thumb_path(self, ext=None):
@@ -499,6 +523,8 @@ class MediaItem:
             self.ensure_thumbnail()
             path = self.resolve_thumb()
             ic = QIcon(path) if path else QIcon()
+        if len(self._icons) >= self._CACHE_MAX:      # 见 `_CACHE_MAX` 的注释
+            self._icons.clear()
         self._icons[key] = ic
         return ic
 
@@ -523,6 +549,8 @@ class MediaItem:
                 p.end()
             else:
                 pm = scaled
+        if len(self._pix) >= self._CACHE_MAX:
+            self._pix.clear()
         self._pix[key] = pm
         return pm
 
@@ -559,6 +587,8 @@ class MediaItem:
         except Exception:
             pm = QPixmap()
         ic = QIcon(pm) if not pm.isNull() else QIcon()
+        if len(self._icons) >= self._CACHE_MAX:
+            self._icons.clear()
         self._icons[key] = ic
         return ic
 
@@ -2564,6 +2594,52 @@ def checkerboard(w, h, cell=8):
     p.end()
     _CHECKER_CACHE[key] = pm
     return pm.copy()
+
+
+# ---------------- 磁盘上现成的小图（码表包内 thumbs/<clip_id>.png）----------------
+_FILE_PIX = {}
+_FILE_PIX_CAP = 600
+
+
+def pixmap_file(path, w, h):
+    """把**磁盘上一张现成的图**按尺寸缩放成 QPixmap（进程内缓存；透明区合成棋盘格）。
+
+    用途：码表图层行里的素材格。缩略图**本来就在 `.ercue` 包里**
+    （`thumbs/<clip_id>.png`，长边 ≤256，带 alpha 的素材保留透明），
+    `cuesheet.extract_thumbs()` 装表时已幂等解到 `<包>.thumbs/` ⇒
+    显示这一格只需读这张小 PNG，**不需要解码视频、也不必等后台补图**。
+
+    ⚠ 缓存键带 `(mtime_ns, size)`：重新导出的码表包换了图但 clip_id/文件名不变，
+      只按路径做键会一直显示旧图（"换了素材图还是老的"这种排查很贵）。
+    ⚠ 只读小 PNG（毫秒级），主线程调用安全；**绝不在这里解码视频**。
+    """
+    try:
+        st = os.stat(str(path))
+        key = (os.path.normcase(str(path)), int(st.st_mtime_ns), int(st.st_size),
+               int(w), int(h))
+    except (OSError, TypeError, ValueError):
+        return QPixmap()
+    pm = _FILE_PIX.get(key)
+    if pm is not None:
+        return pm
+    src = QPixmap(str(path))
+    if src.isNull():
+        pm = QPixmap()
+    elif w and h:
+        pm = src.scaled(int(w), int(h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if pm.hasAlphaChannel():
+            from PySide6.QtGui import QPainter
+            base = checkerboard(pm.width(), pm.height())
+            p = QPainter(base)
+            p.drawPixmap(0, 0, pm)
+            p.end()
+            pm = base
+    else:
+        pm = src
+    if len(_FILE_PIX) >= _FILE_PIX_CAP:
+        _FILE_PIX.clear()             # 简单封顶：宁可偶尔重读，也不无限涨
+    _FILE_PIX[key] = pm
+    return pm
 
 
 def invalidate_checker_cache():

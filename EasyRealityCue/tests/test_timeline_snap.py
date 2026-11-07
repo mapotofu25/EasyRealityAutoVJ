@@ -12,7 +12,8 @@
   #10 点空白 ⇒ `picked("","")`（取消选择）
   #13 空白右键 ⇒ `context_menu("","",gpos)`
   #18 再制状态机（★ 第六轮 CDR 式）：左键按→拖动→右键（进复制模式、不产份）→松右键→松左键
-      （提交：原件不动 + 副本落松手处，自动退出）；旧语义（未拖动的普通右键⇒立即复制，一次性）；
+      （提交：原件不动 + 副本落松手处，自动退出）；
+      ★ 2026-11-03：**普通右键永远只弹菜单、绝不产份**（旧的"右键已选中⇒立即复制"已删除）；
       复制模式再按右键 / Esc ⇒ 取消；未选中 ⇒ 菜单
   ★ 第九轮 框选多选：空白左键"立即移动"⇒框选（多选）/ "长按≥250ms后移动"⇒平移；
       多选拖动=整组一起移动（相对位置不变）；单击成员（不拖）⇒收敛单选
@@ -516,10 +517,11 @@ def test_widget_blank_rightclick():
 # #18 再制状态机
 # ==========================================================================
 def test_widget_duplicate_legacy_and_cancel():
-    """★ 第六轮 #18：**旧语义**（未拖动的普通右键 ⇒ 立即复制一份，一次性）+ **复制模式中途取消**。
+    """★ #18：CDR 式再制 + **普通右键绝不产份** + 复制模式中途取消。
 
       · 未选中 + 右键 ⇒ 菜单（不产份、不进复制模式）
-      · 已选中 + 未拖动 + 右键 ⇒ **立即复制一份**，且**不残留**复制模式（满足"再制后自动取消"）
+      · 已选中 + 未拖动 + 右键 ⇒ **只弹菜单，不产份**（2026-11-03 用户要求删掉旧语义）
+      · 对着同一片段**连点两下右键** ⇒ 仍然一份都不产（用户踩到的正是这个）
       · 复制模式（拖动中按过右键）⇒ 再按右键 / Esc ⇒ **取消**（不产份、原件回原位）
       · 普通态左键拖 ⇒ 平移（moved），不产份
     """
@@ -537,18 +539,20 @@ def test_widget_duplicate_legacy_and_cancel():
     assert tl.sel == ("L1", "i1")
     print("  ✓ #18 未选中 ⇒ 右键弹菜单（不发 duplicate、不进复制模式）")
 
-    # 已选中且**未拖动** ⇒ 右键 = 立即复制一份（一次性，**不进**复制模式）
+    # 已选中且**未拖动** ⇒ 右键 = **只弹菜单，不产份**
+    #   ★ 2026-11-03 03:04 用户：「对着素材右键两下就会复制一份出来，不需要这个逻辑；
+    #     再制是长按左键 + 按右键 + 松左键」。旧的"已选中⇒立即复制"已删。
     tl.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(xmid, y), QPoint(2, 2)))
     APP.processEvents()
-    assert len(dups) == 1 and len(menus) == 1, (dups, menus)
-    assert dups[0][0] == "L1" and dups[0][1] == "i1"
-    assert tl.duplicate_mode() is False, "旧语义一次性再制后必须**自动取消**（不残留复制模式）"
+    assert len(dups) == 0 and len(menus) == 2, ("右键不得产份", dups, menus)
+    assert tl.duplicate_mode() is False, "普通右键不该进复制模式"
     assert tl.cursor().shape() == Qt.ArrowCursor
-    # 再来一次（仍选中）⇒ 再复制一份，仍不残留
+    # ★ 用户踩到的正是这个：对着**同一个已选中片段**再右键一次 ⇒ 仍然不产份
     tl.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(xmid, y), QPoint(3, 3)))
     APP.processEvents()
-    assert len(dups) == 2 and tl.duplicate_mode() is False, (dups, tl.duplicate_mode())
-    print("  ✓ #18 右键已选中（未拖）⇒ 立即复制 1 份 + **自动取消**（不残留复制模式）")
+    assert len(dups) == 0 and len(menus) == 3, ("连点右键也不得产份", dups, menus)
+    assert tl.duplicate_mode() is False
+    print("  ✓ #18 右键（含连点两下）⇒ 只弹菜单，**一份都不产**")
 
     # —— 复制模式取消①：再按一次右键 ——
     moved = []

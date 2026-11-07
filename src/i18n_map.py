@@ -92,6 +92,32 @@ ZH2EN = {
     "锁定画面（不随脉冲/漂移）": "Lock frame (no pulse / drift)",
     "锁定画面（logo/字幕用）：不随能量脉冲缩放、不随氛围漂移":
         "Lock frame (for logos / subtitles): no energy-pulse scaling, no drift",
+    # ---- 2026-11-06：设置页「素材切换节奏」的说明与「当前节奏」显示 ----
+    "当前节奏：{}": "Current rhythm: {}",
+    "当前节奏：不自动切换（手动）": "Current rhythm: no auto switching (manual)",
+    "跟随段落「{}」": "following section \"{}\"",
+    "还有 {} 拍": "{} beats to go",
+    "未开始": "not started",
+    "自动（推荐）——让软件自己决定什么时候换素材：\n"
+    "· 这首歌在曲库里标过「能量段落」⇒ 跟着段落边界切：进 drop 那一拍就换，\n"
+    "  并提前换好符合该段动态（低/中/高）的素材池，不再等 8/16 拍排期；\n"
+    "· 没有段落表 ⇒ 按能量在「常规切（16 拍）/ 快切（8 拍）」之间自动选；\n"
+    "· 一个段落再长，最多 64 拍也会换一次，不会长时间不动；\n"
+    "· 段落边界只切一次（同一次边界不会连着切两个素材）。\n\n"
+    "常规切 / 快切 / 逐拍交替：固定用这一种节奏（有段落表时，段落边界仍会先切一次）。\n"
+    "手动（不自动切换）：永远不自动换素材，只在素材右键「手动切换素材」、"
+    "「播放此素材」或按「下一素材」快捷键时换。Kv 待机层与码表不受影响。":
+        "Auto (recommended) - the app decides when to switch://n"
+        "- If the track has energy sections in the library, switches follow the section "
+        "boundaries (the pool is swapped for the incoming section's level, no 8/16-beat wait);\n"
+        "- Without sections, it picks between Normal (16 beats) and Fast (8 beats) by energy;\n"
+        "- However long a section is, one switch happens at least every 64 beats;\n"
+        "- Each section boundary switches exactly once (never two clips in a row).\n\n"
+        "Normal / Fast / Per-beat: fixed rhythm (a section boundary still switches once first).\n"
+        "Manual: never switches automatically.",
+    "锁定画面：只固定这一层的画面（不随脉冲缩放/漂移），与选素材无关":
+        "Lock frame: freezes this layer's motion only (no pulse scaling / drift), "
+        "not related to clip selection",
     "固定播放本层当前素材": "Loop this layer's current clip",
     "无声音时隐藏本层": "Hide this layer when silent",
     "静音时暂停播放": "Pause playback when silent",
@@ -129,6 +155,7 @@ ZH2EN = {
     "数量:": "Count:",
     "搜索文件名 / 标签": "Search filename / tag",
     "扫描打标": "Scan & Tag",
+    "扫描素材的动态/铺满度": "Rescan motion / coverage",
     "用本地视觉模型为素材自动打内容标签（后台、可续扫）":
         "Auto-tag clips with a local vision model (background, resumable)",
     "从素材库移除": "Remove from Library",
@@ -449,6 +476,18 @@ ZH2EN = {
     "忽略已有结果，重新分析全部": "Ignore existing results and re-analyze everything",
     "删除全部指纹与自动识别的曲风（可选保留手动设置）":
         "Delete all fingerprints and auto-detected genres (optionally keep manual ones)",
+    # ★ 2026-10-30「大砍刀」后新增/改名的文案
+    "扫描素材": "Scan Media",
+    "扫描素材的动态/铺满度": "Rescan motion / coverage",
+    "重扫此素材的动态/铺满度": "Rescan this clip's motion / coverage",
+    "全量重扫素材": "Rescan all media",
+    "按动态档给本层自动挑素材": "Auto-pick clips by motion tier",
+    "自动（按动态档匹配画面）": "Auto (match by motion tier)",
+    "自动图层会按「低/中/高动态」实时替换画面，手动拖入的素材不生效":
+        "Auto layers swap clips by motion tier; manually dropped clips are ignored",
+    "　记得点「扫描素材」给新素材标动态/铺满度":
+        "  Remember to hit Scan Media so new clips get motion/coverage tags",
+    "导出素材清单": "Export clip list",
     "纠正曲风…": "Correct Genre…",
     "重新分析扫描此曲目": "Re-analyze this track",
     "此曲目信息": "Track Info",
@@ -534,14 +573,14 @@ ZH2EN = {
     "扫描正在进行中，请稍后再清除。": "A scan is running, please try again later.",
     # ★ 2026-10-30：文案随「清除分析数据」的语义一起改（只清本机算法产物，
     #   码表与导入的曲库分析包一律保留）。中文原文是 key，必须与 ui_main 逐字一致。
-    "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、曲风、自动段落。\n"
+    "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、自动段落。\n"
     "以下内容一律保留：\n"
     "  · 音乐文件与曲库列表\n"
     "  · 手工标注（手改的 BPM / 拍锚点 / 段落）\n"
     "  · **码表**：码表本身与它内嵌曲目的指纹（照常认歌）\n"
-    "  · **导入的曲库分析包**：曲风、节拍网格、封面、指纹":
+    "  · **导入的曲库分析包**：节拍网格、封面、指纹":
         "This clears **this machine's auto-analysis**: fingerprints, BPM, beat grid, "
-        "genres, auto sections.\n"
+        "auto sections.\n"
         "These are always kept:\n"
         "  · Music files and the library list\n"
         "  · Manual edits (hand-set BPM / beat anchors / sections)\n"
@@ -623,7 +662,9 @@ ZH2EN = {
     "上移": "Move Up",
     "下移": "Move Down",
     "播放到图层": "Play to Layer",
-    "排除自动打标/匹配": "Exclude from auto-tag/match",
+    "排除自动匹配": "Exclude from auto-match",
+    "已排除自动匹配（logo 等固定素材）": "Excluded from auto-match (logos etc.)",
+    "未扫描（点扫描素材）": "Not scanned (hit Scan Media)",
     "全量重扫打标": "Full re-scan & tag",
     "只显示本层": "Show this layer only",
     "按曲风给本层自动挑素材": "Auto-pick clips for this layer by genre",
@@ -1001,16 +1042,16 @@ ZH2EN = {
         "LAN peer not found — check that the other PC selected LAN Audio, ports match, and the firewall allows UDP",
     "端口 / 对端IP":
         "Port / Remote IP",
-    "接收另一台电脑通过局域网发来的音频（需在 A 机运行「EasyReality 音频发送端」）。零第三方依赖，两机需在同一局域网，防火墙放行 UDP。下方「设备」填端口（默认 47811），或直接填 A 机的 IP（如 192.168.31.96）以跳过自动发现。":
+    "接收另一台电脑通过局域网发来的音频（需在 A 机运行「EasyReality 音频发送端」）。零第三方依赖，两机需在同一局域网，防火墙放行 UDP。下方「设备」填端口（默认 47811），或直接填 A 机的 IP（如 192.168.1.100）以跳过自动发现。":
         "Receive audio sent over LAN from another PC (run the EasyReality audio sender on PC A). "
         "No third-party dependencies; both PCs must be on the same LAN with UDP allowed. "
         "In the field below enter the port (default 47811) or the IP of PC A "
-        "(e.g. 192.168.31.96) to skip auto-discovery.",
-    "在 A 机运行「EasyReality 音频发送端」，两台电脑需在同一局域网。\n• 默认自动发现（填端口 47811 即可）\n• 自动发现连不上时，在这里直接填 A 机的 IP，如 192.168.31.96（也可写 192.168.31.96:47811）":
+        "(e.g. 192.168.1.100) to skip auto-discovery.",
+    "在 A 机运行「EasyReality 音频发送端」，两台电脑需在同一局域网。\n• 默认自动发现（填端口 47811 即可）\n• 自动发现连不上时，在这里直接填 A 机的 IP，如 192.168.1.100（也可写 192.168.1.100:47811）":
         "Run the EasyReality audio sender on PC A; both PCs must be on the same LAN.\n"
         "• Auto-discovery by default (just enter port 47811)\n"
-        "• If auto-discovery fails, enter PC A's IP here, e.g. 192.168.31.96 "
-        "(or 192.168.31.96:47811)",
+        "• If auto-discovery fails, enter PC A's IP here, e.g. 192.168.1.100 "
+        "(or 192.168.1.100:47811)",
     # ★ 2026-10-08（erlib 第二步）：导入曲库分析包（DJ 机扫好的曲风/封面/指纹/网格）
     "导入曲库分析包": "Import analysis package",
     "导入 erlib 导出的 .eravjlib（DJ 机扫好的曲风/封面/指纹/节拍网格）":
@@ -1019,6 +1060,8 @@ ZH2EN = {
     # ---- 曲库列表里的「导入包」展示（2026-10-08）----
     "导入包": "Import",
     "   ｜ 含导入包 {} 首": "   | incl. {} imported",
+    # ★ 2026-10-31（用户「导入重复的歌也没提醒」）：导入行与本机重复时在状态栏说明
+    "（与本机合并 {} 首）": " ({} merged with local)",
     "查看信息": "View Info",
     "曲名": "Title",
     "艺人": "Artist",
@@ -1246,24 +1289,16 @@ ZH2EN = {
 # 数据层始终用中文原值，所以切换语言不会影响匹配结果。
 # ============================================================================
 def _inject_tag_labels():
+    """素材标签的显示名。★ 2026-10-30 用户「大砍刀」后只剩两组（动态/频闪、铺满/局部），
+    CLIP 内容词表与亮度三档一并删除，这里不再遍历 TAG_CATEGORIES / ALL_TAGS。"""
     try:
-        from tags_def import (ALL_TAGS, TAG_CATEGORIES,
-                              DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
-                              COVERAGE_FULL, COVERAGE_PART,
-                              BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT)
+        from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
+                              COVERAGE_FULL, COVERAGE_PART)
     except Exception:
         return
-    for zh, en, _cat in ALL_TAGS:
-        ZH2EN.setdefault(zh, en.title())
-    for cat, _items in TAG_CATEGORIES:
-        ZH2EN.setdefault(cat, CATEGORY_EN.get(cat, cat))
-    # 动态词 + 亮度词 + 铺满度词都是「确定性产出、会显示在标签网格里」的数据型标签，与
-    # TAG_CATEGORIES 里的词一样需要显示名（显示名只影响 UI，数据层仍用中文原值，不影响匹配）。
     for zh, en in ((DYNAMIC_LOW, "Low Motion"), (DYNAMIC_MID, "Mid Motion"),
                    (DYNAMIC_HIGH, "High Motion"), (DYNAMIC_FLICKER, "Flicker"),
-                   (COVERAGE_FULL, "Full Frame"), (COVERAGE_PART, "Partial"),
-                   (BRIGHT_DARK, "Dark Tone"), (BRIGHT_MID, "Mid Brightness"),
-                   (BRIGHT_LIGHT, "Bright Tone")):
+                   (COVERAGE_FULL, "Full Frame"), (COVERAGE_PART, "Partial")):
         ZH2EN.setdefault(zh, en)
 
 

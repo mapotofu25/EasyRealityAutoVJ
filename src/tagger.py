@@ -1,30 +1,33 @@
 # -*- coding: utf-8 -*-
-"""Chinese-CLIP 本地视觉打标模块（离线，无网络上传）。
+"""素材"硬指标"检测 —— 动态三档 / 频闪 / 铺满度，以及据此自动分配图层角色。
 
-运行时只用「视觉编码器 ONNX + 预计算标签向量表」，
-文本编码器只在 tools/precompute_tag_emb.py 里离线用过一次。
+★★ 2026-10-30 用户「大砍刀」后，本模块**不再有任何视觉模型**：
+  删掉了 Chinese-CLIP（`cn_clip_vision.onnx` + `tag_emb.npy` + `tags.txt`，331 MB）、
+  内容标签（颜色/元素/场景/人物/风格）、亮度三档（暗基调/中亮度/亮基调）。
+  留下的两个检测都是"拿帧直接算"：
+    · `Tagger.analyze_dynamic()` —— 顺序解码全片，算相邻帧差中位数 → 三档动态；
+      再取 40 点亮度序列算跳变占比 → 频闪。
+    · `Tagger.coverage_score()`  —— 取一帧，算边缘带亮度/有内容占比 + 16 分块广度 → 铺满度。
+  `auto_roles()` 只用「alpha / 铺满度 / 高动态」判前景还是背景（用户要求保留铺满度，
+  它就是自动分配角色的唯一依据）。
+
+⚠ 帧差阈值来自 `tags_def`（唯一来源），调阈值只改那里。
 """
 import os
-import sys
-import threading
 
 import numpy as np
 
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH,
-                      DYNAMIC_FLICKER, DYNAMIC_TAGS,
-                      DIFF_MID_THRESHOLD, DIFF_HIGH_THRESHOLD,
-                      DIFF_HIGH_RATIO,
-                      COVERAGE_TAGS, COVERAGE_FULL_THRESHOLD,
-                      COVERAGE_FULL_THRESHOLD_DYNAMIC,
-                      BRIGHTNESS_TAGS, BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT,
-                      BRIGHTNESS_DARK_THRESHOLD, BRIGHTNESS_BRIGHT_THRESHOLD)
+                      DYNAMIC_FLICKER, DIFF_MID_THRESHOLD, DIFF_HIGH_THRESHOLD,
+                      DIFF_HIGH_RATIO, COVERAGE_FULL_THRESHOLD,
+                      COVERAGE_FULL_THRESHOLD_DYNAMIC)
 
 
 def _cv_imread(path, flags=None):
     """cv2.imread 的**非 ASCII 安全**封装。
 
     ⚠ OpenCV 在 Windows 上读不了含中文等非 ASCII 字符的路径（实测素材库 5 张图片
-      因 `Y:/.../素材库/xxx.png` 全部 cv2.imread 返回 None → 无 med/颜色/CLIP 标签）。
+      因 `<素材库>/xxx.png` 全部 cv2.imread 返回 None）。
       `imread` 内部走 C 层 narrow 字符 API，Python 层无法修复，须先经
       `media_manager._ascii_safe_path()` 复制到临时 ASCII 副本再读。
 
@@ -40,261 +43,32 @@ def _cv_imread(path, flags=None):
     return cv2.imread(safe, flags) if flags is not None else cv2.imread(safe)
 
 
-# 内容 tag → 图层角色（两角色制，v2）
-# 前景=可叠加元素/主体（粒子、光效、线条、人物…）；背景=铺满环境（海洋、城市、星空…）
-FG_TAGS = {"粒子", "光斑", "光效", "光线", "激光", "霓虹", "烟雾", "火焰", "闪电",
-           "星轨", "几何", "线条", "网格", "波纹", "气泡", "碎片", "辉光", "液态",
-           "水墨", "渐变", "马赛克", "剪影", "眼睛", "人物", "女性", "男性", "舞者",
-           "动物", "鸟", "抽象"}
-BG_TAGS = {"海洋", "沙滩", "星空", "夜空", "天空", "云", "日出", "日落", "森林",
-           "山", "沙漠", "雪", "雨", "火", "水", "花", "草地", "宇宙", "极光",
-           "月亮", "太阳", "城市", "夜景", "舞台", "废墟", "室内", "工业", "阳光"}
-# 中性词：既可铺满当背景、也可局部当前景，需按「铺满度+动态」二次分流
-NEUTRAL_TAGS = {"科技", "机械", "未来", "赛博朋克", "暗黑"}
-# 明确主体词：画面主体是局部实体（人物/动物等）→ 无论铺满度一律前景。
-# 与其他 FG 词（烟雾/水墨/粒子等"氛围词"）区分——氛围词既可全屏也可局部，交给铺满度裁决。
-SUBJECT_TAGS = {"人物", "女性", "男性", "舞者", "剪影", "眼睛", "动物", "鸟"}
+def auto_roles(kind="video", has_alpha=False, coverage=None, dynamic=False):
+    """按「alpha / 铺满度 / 高动态」自动建议角色（单一角色：前景或背景二选一）。
 
+    2026-10-30 砍掉内容标签后，判据只剩这三条（顺序即优先级）：
+      ① `has_alpha`（带透明通道）⇒ **前景**：透明叠加元素天然是叠加层；
+      ② 铺满度 ≥ `COVERAGE_FULL_THRESHOLD`（或高动态且 ≥ 宽松档）⇒ **背景**：
+         全屏环境素材，铺满画面；
+      ③ 其余（黑底/局部）⇒ **前景**。
 
-def auto_roles(tags, kind="video", has_alpha=False, coverage=None, dynamic=False, scored=None):
-    """按内容 tag 自动建议角色（单一角色：前景或背景二选一，不产生双角色）。
-    scored: [(tag, score)] 带相似度的内容标签（推荐传入）——按最强命中定单一主角色，
-    分差极小/存疑时用铺满度裁决；否则任何前景词+背景词并存会把所有素材都标成双角色。
-    coverage: 0-1 铺满度（边缘带内容占比，越高越铺满）；dynamic: 是否高动态。
-    v3 裁决原则（治「全屏氛围场景被误判前景」）：
-    ① alpha → 前景（透明叠加元素）；② 明确主体词（人物/舞者等）→ 前景；
-    ③ 其余以铺满度为主裁决——烟雾/水墨/霓虹这类"氛围词"既可全屏也可局部，
-    CLIP 分数分不出铺满与否，铺满(coverage≥COVERAGE_FULL_THRESHOLD)一律背景。"""
-    ts = set(tags or [])
+    为什么高动态给宽松档：整屏流动的抽象背景（粒子海/光流）边缘常常很暗，
+    严格档会把它们误判成前景，铺到画面上就是"一块黑的"。
+    """
     roles = {"fg": False, "bg": False}
-    cov = 0.5 if coverage is None else coverage
-
-    # 0) alpha → 透明叠加元素，必前景
+    cov = 0.5 if coverage is None else float(coverage)
     if has_alpha:
         roles["fg"] = True
         return roles
-
-    # 0.5) 明确主体词：黑底局部 → 前景（人物特写/抠像素材）；
-    #      画面铺满时不特判（人物剪影看星系这类"人在环境中"是背景），交给下面的铺满度裁决
-    if (ts & SUBJECT_TAGS) and cov < COVERAGE_FULL_THRESHOLD:
+    if cov >= COVERAGE_FULL_THRESHOLD or (dynamic and cov >= COVERAGE_FULL_THRESHOLD_DYNAMIC):
+        roles["bg"] = True
+    else:
         roles["fg"] = True
-        return roles
-
-    # 1) 有带分数的标签 → 按最强命中 + 铺满度定角色
-    if scored:
-        cat_best = {}
-        for z, s in scored:
-            if z in FG_TAGS:
-                c = "fg"
-            elif z in BG_TAGS:
-                c = "bg"
-            elif z in NEUTRAL_TAGS:
-                c = "neutral"
-            else:
-                continue
-            if c not in cat_best or s > cat_best[c]:
-                cat_best[c] = s
-        if "fg" in cat_best or "bg" in cat_best:
-            cands = [(c, s) for c, s in cat_best.items() if c in ("fg", "bg")]
-            if len(cands) == 2:
-                fb, bs = cands
-                if abs(fb[1] - bs[1]) <= 0.008:
-                    roles["bg" if cov >= COVERAGE_FULL_THRESHOLD else "fg"] = True   # 分差极小 → 铺满度裁决
-                elif cov >= COVERAGE_FULL_THRESHOLD:
-                    roles["bg"] = True   # 铺满 → 背景（氛围词分数差不再一票定前景）
-                else:
-                    roles[max(cands, key=lambda x: x[1])[0]] = True
-            else:
-                c = cands[0][0]
-                if c == "fg" and cov >= COVERAGE_FULL_THRESHOLD:
-                    roles["bg"] = True   # 只有模糊前景词命中但画面铺满 → 背景（水墨/烟雾全屏）
-                else:
-                    roles[c] = True
-            return roles
-        if "neutral" in cat_best:
-            # 只有中性词 → 按铺满度/动态分流
-            if cov >= COVERAGE_FULL_THRESHOLD or (dynamic and cov >= COVERAGE_FULL_THRESHOLD_DYNAMIC):
-                roles["bg"] = True
-            else:
-                roles["fg"] = True
-            return roles
-
-    # 2) 无分数时的简化逻辑（对齐 scored 分支的裁决原则）
-    hit_fg = bool(ts & FG_TAGS)
-    hit_bg = bool(ts & BG_TAGS)
-    if hit_fg or hit_bg:
-        if hit_bg:
-            roles["bg"] = True          # 有明确环境词 → 背景
-        elif cov >= COVERAGE_FULL_THRESHOLD:
-            roles["bg"] = True          # 只有氛围词但画面铺满 → 背景
-        else:
-            roles["fg"] = True          # 氛围词 + 黑底局部 → 前景
-
-    # 3) 只有中性词命中（无明确词）→ 按铺满度 + 动态分流
-    if not any(roles.values()) and (ts & NEUTRAL_TAGS):
-        # 铺满 → 背景；局部 → 前景（高动态且铺满更偏向整屏流动环境）
-        if cov >= COVERAGE_FULL_THRESHOLD or (dynamic and cov >= COVERAGE_FULL_THRESHOLD_DYNAMIC):
-            roles["bg"] = True
-        else:
-            roles["fg"] = True
-
-    # 4) 什么都没命中 → 铺满度分流，再退回透明度兜底
-    if not any(roles.values()):
-        if cov >= COVERAGE_FULL_THRESHOLD:
-            roles["bg"] = True
-        else:
-            roles["fg"] = True
     return roles
 
 
-def _model_dir():
-    # exe 模式：PyInstaller 打包后资源在 sys._MEIPASS（_internal 目录）
-    base = getattr(sys, "_MEIPASS", None)
-    if base is None:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "assets", "models", "chinese_clip")
-
-
-_MODEL_DIR = _model_dir()
-
-_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
-
-# 色相(hue, 0-180) → 颜色词
-_HUE_COLORS = [
-    ((0, 10), "红色"), ((10, 22), "橙色"), ((22, 38), "黄色"),
-    ((38, 70), "绿色"), ((70, 100), "青色"), ((100, 125), "蓝色"),
-    ((125, 145), "紫色"), ((145, 158), "粉色"), ((158, 180), "红色"),
-]
-
-
 class Tagger:
-    """Chinese-CLIP 视觉打标（单例，懒加载）"""
-
-    _instance = None
-    _lock = threading.Lock()
-
-    def __init__(self):
-        import onnxruntime as ort
-        # ⚠ 限制线程数 + **关掉池线程自旋**（同 audio_genre.py 的理由，见那里注释）。
-        # 这个 session 只在**导入/重扫素材**时用（不在演出路径上），所以给 4 线程 ——
-        # 在"导入速度"与"不抢 CPU"之间折中（单次 embed 约 77ms@16线程 / 94ms@4线程）。
-        # 想改回去：AUTO_VJ_ORT_SPIN=1（恢复自旋）、AUTO_VJ_ORT_THREADS_CLIP=N。
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = int(os.environ.get("AUTO_VJ_ORT_THREADS_CLIP", "4"))
-        opts.inter_op_num_threads = 1
-        if os.environ.get("AUTO_VJ_ORT_SPIN", "0") != "1":
-            try:
-                opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
-                opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
-            except Exception:
-                pass
-        self.session = ort.InferenceSession(
-            os.path.join(_MODEL_DIR, "cn_clip_vision.onnx"),
-            sess_options=opts, providers=["CPUExecutionProvider"])
-        self.tag_emb = np.load(os.path.join(_MODEL_DIR, "tag_emb.npy")).astype(np.float32)
-        self.tags = []
-        with open(os.path.join(_MODEL_DIR, "tags.txt"), encoding="utf-8") as f:
-            for line in f:
-                z, e = line.strip().split("|")
-                self.tags.append((z, e))
-        # 相似度校准：实测（2026-09-18，用户 VJ 抽象光效素材 8 个样本 alpha 扫描）
-        # 原始相似度排序本来就多样且准确（霓虹/激光/烟雾/几何/粒子各有区分），
-        # 任何强度的先验减法都会让"稀有词"（宇宙/赛博朋克）霸榜——alpha=0.35 起全面失真。
-        # 结论：88 标签词表上不存在"泛化词霸榜"问题，不校准。
-        self._calib_alpha = 0.0
-
-    # ---------- 视觉 ----------
-    def _embed(self, bgr):
-        import cv2
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-        rgb = (rgb - _MEAN) / _STD
-        x = np.transpose(rgb, (2, 0, 1))[None].astype(np.float32)
-        emb = self.session.run(None, {"pixel_values": x})[0]
-        return (emb / np.linalg.norm(emb, axis=1, keepdims=True))[0]
-
-    def _rank(self, raw_sims, top):
-        """排序：原始相似度降序（不校准，实测校准会让稀有词霸榜）+ 相对下限过滤"""
-        order = np.argsort(-raw_sims)
-        raw_top = float(raw_sims[order[0]])
-        out = []
-        for i in order:
-            if float(raw_sims[i]) < raw_top - 0.12:   # 与最强标签相似度差太多的不要
-                break
-            out.append((self.tags[i][0], float(raw_sims[i])))
-            if len(out) >= top:
-                break
-        return out
-
-    def tag_frame(self, bgr, top=8):
-        """对单帧返回 [(中文tag, 相似度)]，按校准后的相似度降序"""
-        emb = self._embed(bgr)
-        return self._rank(emb @ self.tag_emb.T, top)
-
-    def tag_image(self, path, top=8):
-        import cv2
-        img = cv2.imread(path)
-        if img is None:
-            return []
-        return self.tag_frame(img, top)
-
-    def tag_video(self, path, n=5, top=8):
-        """抽 n 帧取平均相似度（校准后），返回 [(tag, score)]"""
-        import cv2
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            return []
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
-        frames = []
-        for frac in (0.15, 0.3, 0.45, 0.6, 0.8)[:n]:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * frac))
-            ok, f = cap.read()
-            if ok:
-                frames.append(f)
-        cap.release()
-        if not frames:
-            return []
-        sims = np.zeros(len(self.tags), dtype=np.float32)
-        for f in frames:
-            emb = self._embed(f)
-            sims += emb @ self.tag_emb.T
-        sims /= len(frames)
-        return self._rank(sims, top)
-
-    # ---------- 颜色 / 亮度启发（确定性） ----------
-    @staticmethod
-    def color_brightness(bgr):
-        """返回 {'colors':[颜色词...], 'bright':None}。
-
-        ⚠ 决策 1（2026-10-05）：**废除 bright 输出**（原「明亮/昏暗/中等」）。那三个词是
-          **单帧 + HSV-V>170** 口径，实测有双重缺陷（162 素材实测仅 3 个判「明亮」，而全片
-          中位数口径下 88 个可达"亮"；两者不一致 85/162），且会与新的「暗基调/中亮度/亮基调」
-          （全片中位数口径，见 analyze_dynamic）并存造成"同一素材既昏暗又亮基调"的自相矛盾。
-          `bright` 键**保留但恒为 None**（不再产出这三个词），消费点据此跳过。
-        """
-        import cv2
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        h = hsv[:, :, 0].astype(np.float32)
-        s = hsv[:, :, 1].astype(np.float32)
-        v = hsv[:, :, 2].astype(np.float32)
-        sat_mask = s > 40
-        colors = []
-        if sat_mask.sum() > len(sat_mask) * 0.05:
-            hist, _ = np.histogram(h[sat_mask], bins=18, range=(0, 180))
-            top_bin = int(np.argmax(hist))
-            hue_c = (top_bin * 10 + 5) % 180
-            for (lo, hi), name in _HUE_COLORS:
-                if lo <= hue_c <= hi or (lo == 0 and hue_c >= 175):
-                    colors.append(name)
-                    break
-            if hist.max() > 0 and len(colors) == 0:
-                colors.append("彩色")
-        else:
-            mean_v = v.mean()
-            colors.append("白色" if mean_v > 180 else ("黑色" if mean_v < 70 else "灰色"))
-        # 决策 1：不再产出「明亮/昏暗/中等」——亮度分档改由 analyze_dynamic 的全片中位数口径给。
-        return {"colors": colors, "bright": None}
+    """素材硬指标检测（纯计算，无模型、无网络）。全部是静态方法，不需要实例。"""
 
     @staticmethod
     def coverage_score(bgr):
@@ -327,15 +101,56 @@ class Tagger:
         return float(max(cov_bright, spread))
 
     @staticmethod
-    def analyze_dynamic(path, kind):
-        """仅动态检测（不跑 CLIP，轻量）：返回 (motion, flicker, diff, med)。
+    def dynamic_score(diff, flicker=False):
+        """帧差中位数 → **0~1 连续动态分**（在低/中/高三档之内的细分）。
 
-        motion ∈ {低动态, 中动态, 高动态}；图片天然低动态；打不开返回 ('', False, -1, None)。
-        med = **全片灰度均值序列的中位数**（0~255），供「暗基调/中亮度/亮基调」分档；
-        med 为 None 表示未知（打不开 / 帧数不足 / 图片拿不到图）⇒ 消费点不落亮度词。
-        ⚠ 用**中位数**而非均值：`2018.6.23-01.mov` 均值 41.7 但中位数 0.0（大部分黑+偶尔爆亮），
-          中位数正确判「暗」。
-        供 analyze_media 复用，也供存量素材的「动态标签快速重扫」单独调用。
+        ★ 2026-10-30 用户：「能不能给素材也打分，在原来中低高动态的基础上，
+          0-1 之间的数，显示在悬浮信息窗口上，roll 素材池时优先挑选贴近的数字」。
+
+        为什么单独要一个分：三档只有 3 个值，同一档里"刚过线"和"快出档"差很多
+        （实测低动态 6.2~8.1、中动态 10.5~17.1、高动态 20.8+），换池时只能靠随机，
+        同一档内选谁全靠运气。有了连续分，就能按"离目标强度多近"来挑。
+
+        映射（分段线性，锚点就是分档阈值，保证**分数与档位永远自洽**）：
+          diff 0            → 0.00
+          diff = 中档线(10)  → 0.33
+          diff = 高档线(19)  → 0.67
+          diff = 高档线×1.8(≈34) → 1.00（再高就封顶；实测库内最高 ~30）
+        频闪素材取 `max(score, 0.75)`：它的帧差中位数可能不高（整帧亮暗交替的
+        diff 反而不大），但观感是"最炸"的一类 —— 老逻辑也把频闪当高动态用，
+        这里保持口径一致，否则换池会把频闪素材从高档池里挤掉。
+
+        :param diff: `analyze_dynamic` 的第三个返回值（帧差中位数）；`<0` = 打不开
+        :param flicker: 是否频闪
+        :return: 0.0~1.0；`diff < 0`（读不出来）返回 `None`，调用方据此跳过打分
+        """
+        try:
+            d = float(diff)
+        except (TypeError, ValueError):
+            return None
+        if d < 0:
+            return None
+        lo, hi = float(DIFF_MID_THRESHOLD), float(DIFF_HIGH_THRESHOLD)
+        top = hi * 1.8
+        if d <= 0.0:
+            v = 0.0
+        elif d < lo:
+            v = 0.333 * (d / max(1e-6, lo))
+        elif d < hi:
+            v = 0.333 + 0.334 * ((d - lo) / max(1e-6, hi - lo))
+        else:
+            v = 0.667 + 0.333 * min(1.0, (d - hi) / max(1e-6, top - hi))
+        v = max(0.0, min(1.0, v))
+        if flicker:
+            v = max(v, 0.75)
+        return round(v, 3)
+
+    @staticmethod
+    def analyze_dynamic(path, kind):
+        """动态检测（不跑任何模型，轻量）：返回 `(motion, flicker, diff)`。
+
+        motion ∈ {低动态, 中动态, 高动态}；图片天然低动态；打不开返回 `("", False, -1.0)`。
+        供 `DynTagScanThread` 复用。
 
         算法 v2（顺序读全片，替代旧的 seek 分段采样）：
         - 旧实现用 cv2 的 CAP_PROP_POS_FRAMES seek 做 3 段×8 帧采样，但 VJ 素材几乎全是
@@ -351,29 +166,26 @@ class Tagger:
           快速明暗呼吸，如 001(12)、搬运工(55)）。缓变呼吸闪（如新视觉82期(35)）亮度
           相邻差<15 抓不到，但其帧差中位已达中动态档，靠 motion 规避；不再设低频周期
           检测，避免把「亮度有周期的缓慢循环素材」（如 17.mov、001(2)）误判成频闪。
+
+        ⚠ 2026-10-30 砍掉亮度分档后，这里**不再返回 med**（全片灰度中位数）——
+          `brights` 数组只为频闪检测保留。调用方是 3 元组解包。
         """
         import cv2
         if kind == "image":
-            # 图片：单帧即全片亮度。此处不重开图（analyze_media 已读过），拿不到则 med=None。
-            # ⚠ 走 _cv_imread（非 ASCII 路径安全），否则含中文路径的图片永远 imread=None ⇒ med=None。
-            med = None
-            try:
-                img = _cv_imread(path, cv2.IMREAD_UNCHANGED)
-                if img is None:
-                    img = _cv_imread(path)
-                if img is not None:
-                    if img.ndim == 3 and img.shape[2] == 4:
-                        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                    med = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean())
-            except Exception:                                      # noqa: BLE001
-                med = None
-            return DYNAMIC_LOW, False, 0.0, med
+            # ★★ 2026-10-31（用户：「图片不要打标」）：静态图片没有"动态"可言，
+            #   给它打「低动态 / 铺满」既是噪音（用户截图里那两张黑图就顶着
+            #   「低动态·局部」），又会让它混进低动态换池。
+            #   ⇒ 返回**空 motion** —— `merge_scan_tags` 见到空 motion 会原样返回
+            #     现有标签（即一个也不加）；`dynamic_score(-1.0)` 返回 None（不打分）。
+            #   ⚠ 调用方 `DynTagScanThread` 仍会单独算 coverage —— 那个只用于
+            #     `auto_roles` 判断"前景/背景"，不进标签。
+            return "", False, -1.0
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            return "", False, -1.0, None
+            return "", False, -1.0
         # 顺序读全片（不 seek），一次采集：全程相邻帧差 + 全程亮度
         diffs = []    # 全程相邻帧差（灰度 abs diff 均值）
-        brights = []  # 全程每帧亮度
+        brights = []  # 全程每帧亮度（只给频闪检测用）
         prev = None
         read = 0
         MAX_FRAMES = 1500   # 顺序读上限（约 50s@30fps）；VJ 循环素材远短于此
@@ -389,7 +201,7 @@ class Tagger:
             read += 1
         cap.release()
         if len(diffs) < 2:
-            return "", False, -1.0, None
+            return "", False, -1.0
 
         d = np.asarray(diffs, dtype=np.float64)
         diff = float(np.median(d))
@@ -409,65 +221,12 @@ class Tagger:
             # 频闪：明显亮度跳变(>15)占比 ≥0.35。真静止素材 1~12 次(占比<0.3)、
             # 明暗呼吸/逐帧闪 19~32 次(占比 0.5+)——0.35 卡在中间。
             flicker = float((bd > 15).mean()) >= 0.35
-        # 全片亮度中位数（复用已采集的 brights，零额外 I/O）：供暗/中/亮分档。
-        med = float(np.median(brights)) if brights else None
-        return motion, flicker, diff, med
-
-    def analyze_media(self, path, kind, top=8):
-        """统一入口：图片/视频 → {'tags':[(zh,score)], 'colors':[], 'motion', 'flicker',
-        'coverage', 'brightness', 'dynamic'}。
-
-        ⚠ `bright`（旧「明亮/昏暗/中等」）已废除、恒为 None；亮度分档改由 `brightness`
-          （全片中位数 med）承载，见 analyze_dynamic。"""
-        import cv2
-        motion, flicker, _diff, med = self.analyze_dynamic(path, kind)
-        # ⚠ 显式初始化：视频分支不会赋值，以前靠 `locals().get("has_alpha", False)`
-        #   反射当前帧的局部变量 —— 重构一次就错，且读代码的人根本看不出这里有赋值。
-        has_alpha = False
-        if kind == "image":
-            # ⚠ 走 _cv_imread（非 ASCII 路径安全），否则含中文路径的图片永远 imread=None ⇒
-            #    整张图 analyze_media 直接 return None（无标签/无颜色/无铺满度）。
-            img = _cv_imread(path, cv2.IMREAD_UNCHANGED)
-            if img is None:
-                img = _cv_imread(path)
-            if img is None:
-                return None
-            has_alpha = img.ndim == 3 and img.shape[2] == 4
-            if has_alpha:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            tags = self.tag_frame(img, top)
-            frame = img
-        else:
-            cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                return None
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.7))
-            ok2, frame = cap.read()
-            cap.release()
-            tags = self.tag_video(path, top=top)
-            if frame is None:
-                frame = np.zeros((224, 224, 3), dtype=np.uint8)
-        cb = self.color_brightness(frame)
-        alpha = bool(has_alpha)
-        coverage = self.coverage_score(frame) if frame is not None else None
-        dynamic = motion in (DYNAMIC_MID, DYNAMIC_HIGH)
-        # 过滤 CLIP 误打的动态词：动态标签只应由帧差/频闪检测产出（DYNAMIC_TAGS 不进 CLIP 词表，
-        # 但「高动态」历史上在 tags.txt 里，CLIP 单帧可能误打，这里统一剔除，避免与三档词冲突）。
-        # 同样过滤铺满度词（COVERAGE_TAGS）：它只由 coverage_score 确定性产出，绝不该来自 CLIP。
-        # 以及亮度词（BRIGHTNESS_TAGS）：只由全片亮度中位数产出，绝不该来自 CLIP。
-        # 防御性过滤——即便当前 tags.txt 里没有这些词（已实测确认没有），词表将来也可能变。
-        tags = [(z, s) for z, s in tags
-                if z not in DYNAMIC_TAGS and z not in COVERAGE_TAGS
-                and z not in BRIGHTNESS_TAGS]
-        return {"tags": tags, "colors": cb["colors"], "bright": cb["bright"],
-                "alpha": alpha, "motion": motion, "flicker": flicker,
-                "coverage": coverage, "brightness": med, "dynamic": dynamic}
-
-
-def get_tagger():
-    if Tagger._instance is None:
-        with Tagger._lock:
-            if Tagger._instance is None:
-                Tagger._instance = Tagger()
-    return Tagger._instance
+        # ★★ 2026-10-30（用户「怎么会有低动态又频闪的素材呢」）：
+        #   帧差中位数只量"画面内容变化了多少"，**量不到整帧亮暗交替** ——
+        #   白闪/黑闪交替的素材，内容其实没动，中位数会很低（实测 001 (12).mov
+        #   就是「低动态 + 频闪」，tooltip 里还写着动态分 0.85，自相矛盾）。
+        #   而换池那边（`dynamic_score`）早就把频闪当"最炸的一类"（`max(v, 0.75)`），
+        #   老逻辑也是按高动态用的 ⇒ **档位必须跟上**，否则标签和分数对不上。
+        if flicker:
+            motion = DYNAMIC_HIGH
+        return motion, flicker, diff

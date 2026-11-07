@@ -16,7 +16,7 @@
 
 ## 用法
     venv\\Scripts\\python.exe tools\\build_asio.py            # 自动找 zig
-    venv\\Scripts\\python.exe tools\\build_asio.py D:\\zig\\zig.exe
+    venv\\Scripts\\python.exe tools\\build_asio.py <zig目录>\\zig.exe
 """
 
 import glob

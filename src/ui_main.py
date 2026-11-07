@@ -3,7 +3,7 @@
 
 ★ 2026-09-28 起主区拆成**两界面**（`QStackedWidget`，共用同一个引擎）：
   ① 演出台     —— 图层 + 预览 + 设置 + 输出（现场用）
-  ② 素材·曲库·曲风 —— 素材库独占整幅宽 + 音乐曲库 / 曲风映射入口（演出前准备）
+  ② 素材·音乐曲库 —— 素材库独占整幅宽 + 音乐曲库入口（演出前准备）
 
 布局：
   顶部工具条：返回/开始/黑场/冻结/暂停自动/下一素材/音源(含迷你电平)/语言/快捷键
@@ -21,7 +21,8 @@ import time
 import math
 import ctypes
 
-from PySide6.QtCore import Qt, QTimer, QSize, QThread, Signal, QPoint, QObject, QEvent
+from PySide6.QtCore import (Qt, QTimer, QSize, QThread, Signal, QPoint, QObject,
+                            QEvent, QAbstractNativeEventFilter)
 from PySide6.QtGui import (QImage, QPixmap, QAction, QKeySequence, QIcon,
                           QGuiApplication, QCursor)
 from PySide6.QtWidgets import (
@@ -43,9 +44,7 @@ import dups as D            # 曲库查重（纯函数，见 dups.py）
 from dup_ui import DuplicateDialog
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
                       DYNAMIC_TAGS, COVERAGE_FULL, COVERAGE_PART, COVERAGE_TAGS,
-                      COVERAGE_FULL_THRESHOLD,
-                      BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT, BRIGHTNESS_TAGS,
-                      BRIGHTNESS_DARK_THRESHOLD, BRIGHTNESS_BRIGHT_THRESHOLD)
+                      COVERAGE_FULL_THRESHOLD)
 from audio_engine import AudioEngine
 from media_manager import MediaItem, ThumbWorker, ThumbBackfillWorker, scan_folder
 from engine import (AutoVJEngine, Layer, MODE_LABELS, BLEND_MODES, BLEND_LABELS,
@@ -60,18 +59,33 @@ MEDIA_FILTER = "媒体素材 (*.mp4 *.mov *.webm *.avi *.mkv *.gif *.png *.jpg *
 MUSIC_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".aiff", ".aif", ".aac", ".ogg", ".opus", ".wma"}
 MUSIC_FILTER = "音频文件 (*.flac *.mp3 *.m4a *.wav *.aiff *.aif *.aac *.ogg *.opus *.wma);;All Files (*)"
 
+# 素材库两个筛选下拉的悬浮说明（「已排除 / 未扫描」是扫描状态，不是动态档，容易误会）
+_FILTER_TIP = (
+    "「已排除」= 右键设过「排除自动匹配」的素材；\n"
+    "「未扫描」= 还没有任何标签（没跑过「扫描素材」）的素材。")
+
 # 「清除分析数据」的确认文案 —— **提成模块级常量**，因为它是 i18n 的 key：
 #   中文原文即 key，与 `i18n_map.ZH2EN` 必须**逐字一致**，否则英文界面直接显示中文。
 #   以前这条文案内联在 `ask_clear_analysis` 里，改文案时忘了同步 i18n（实测发生过）。
 #   `tools/_test_clear_keep_external.py` 的 (f) 就是拿这个常量去查 ZH2EN。
 CLEAR_ANALYSIS_TIP = (
-    "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、曲风、自动段落。\n"
+    "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、自动段落。\n"
     "以下内容一律保留：\n"
     "  · 音乐文件与曲库列表\n"
     "  · 手工标注（手改的 BPM / 拍锚点 / 段落）\n"
     "  · **码表**：码表本身与它内嵌曲目的指纹（照常认歌）\n"
-    "  · **导入的曲库分析包**：曲风、节拍网格、封面、指纹"
+    "  · **导入的曲库分析包**：节拍网格、封面、指纹"
 )
+
+# ★★★ 2026-11-06：「后处理 · 手动」每行右边那个齿轮按钮的样式（**必须自带**）。
+#   全局 QSS 的 `QPushButton{padding:4px 10px; min-height:26px}` 会把 30×20 的按钮
+#   内容区挤成 10×36 ⇒ 齿轮被压成一条竖缝（用户：「logo 图标没法正常显示」）。
+#   ⚠ 抽成模块常量是为了让 `tools/_test_pp_gear_btn.py` 用**同一份**样式去验证，
+#     而不是测试里再抄一遍（抄一遍的测试等于没测）。
+#   ⚠ min/max-height 是**内容高**：20 的话连边框一共 22，会把表格行顶高 2px；
+#     设 18 ⇒ 成品正好 30×20，和同一行的复选框齐平。
+PP_GEAR_STYLE = ("QPushButton{padding:0;min-height:18px;max-height:18px;"
+                 "font-size:13px;border-radius:3px;}")
 
 # 后处理效果的配置键 → 界面中文名（配置里存的是英文 key，状态行要显示中文）
 POSTFX_CN = {
@@ -269,14 +283,23 @@ class SettingsPanel(QWidget):
         #   Kv 待机层、码表、自愈看门狗都不受影响（它们本来就不走"自动换素材"）。
         self.mode_combo.addItems(["自动（推荐）", "常规切", "快切", "逐拍交替",
                                   "手动（不自动切换）"])
+        # ★★★ 2026-11-06（用户：「演出行为这边的自动的悬浮的说明要改」）：
+        #   旧文案还写着"自动：按能量/瞬态自己挑常规切/快切"——那已经是**没有段落表时**的
+        #   兜底逻辑了。现在有段落表就跟着段落切，说明必须讲清"到底谁在决定什么时候换"。
         self.mode_combo.setToolTip(
-            "自动：按能量/瞬态自己挑「常规切 / 快切」\n"
-            "常规切 / 快切 / 逐拍交替：固定用这一种节奏\n"
+            "自动（推荐）——让软件自己决定什么时候换素材：\n"
+            "· 这首歌在曲库里标过「能量段落」⇒ 跟着段落边界切：进 drop 那一拍就换，\n"
+            "  并提前换好符合该段动态（低/中/高）的素材池，不再等 8/16 拍排期；\n"
+            "· 没有段落表 ⇒ 按能量在「常规切（16 拍）/ 快切（8 拍）」之间自动选；\n"
+            "· 一个段落再长，最多 64 拍也会换一次，不会长时间不动；\n"
+            "· 段落边界只切一次（同一次边界不会连着切两个素材）。\n\n"
+            "常规切 / 快切 / 逐拍交替：固定用这一种节奏（有段落表时，段落边界仍会先切一次）。\n"
             "手动（不自动切换）：永远不自动换素材，只在素材右键「手动切换素材」、"
             "「播放此素材」或按「下一素材」快捷键时换。Kv 待机层与码表不受影响。")
         gm.addWidget(self.mode_combo, 0, 1)
         self.lbl_cur_mode = QLabel("当前节奏: -")
         self.lbl_cur_mode.setStyleSheet("color:#7ab;")
+        self.lbl_cur_mode.setWordWrap(True)
         gm.addWidget(self.lbl_cur_mode, 1, 0, 1, 2)
         gm.addWidget(QLabel("灵敏度"), 2, 0)
         self.sens = QComboBox()
@@ -434,11 +457,20 @@ class SettingsPanel(QWidget):
         pf.setVerticalSpacing(3)
         self.chk_postfx_on = QCheckBox("启用后处理")
         pf.addWidget(self.chk_postfx_on, 0, 0)
-        pf.addWidget(QLabel("模式"), 0, 1)
+        # ★ 2026-11-06（用户：「把模式那两个字挪到手动和自动开关的下拉选项旁边，
+        #   不要放居中了」）：原来是 `QLabel("模式")` 单独占第 1 列、下拉占第 2 列，
+        #   三列均分宽度 ⇒ 「模式」两个字落在列中间，看起来和下拉框离得很远。
+        #   改成一个横向子布局紧跟在下拉框左边，并跨到最后一列。
         self.postfx_mode = QComboBox()
         self.postfx_mode.addItems(["自动（推荐）", "手动"])
-        self.postfx_mode.setToolTip("自动：根据曲风和能量自动挑选 2~3 个合适的效果并随高潮增强\n手动：自己逐个开效果、调强度")
-        pf.addWidget(self.postfx_mode, 0, 2)
+        self.postfx_mode.setToolTip("自动：根据能量自动挑选 2~3 个合适的效果并随高潮增强\n手动：自己逐个开效果、调强度")
+        _mode_row = QHBoxLayout()
+        _mode_row.setContentsMargins(0, 0, 0, 0)
+        _mode_row.setSpacing(6)
+        _mode_row.addWidget(QLabel("模式"))
+        _mode_row.addWidget(self.postfx_mode)
+        _mode_row.addStretch(1)
+        pf.addLayout(_mode_row, 0, 1, 1, 2)
 
         # --- 自动模式页 ---
         self.postfx_auto_page = QWidget()
@@ -449,8 +481,8 @@ class SettingsPanel(QWidget):
         self.postfx_global.setRange(0, 100)
         self.postfx_global.setToolTip("整体效果强度：自动挑出的效果都按这个强度为上限")
         pa.addWidget(self.postfx_global, 0, 1)
-        self.postfx_auto = QCheckBox("自动联动（随曲风/音乐触发）")
-        self.postfx_auto.setToolTip("关掉则效果只随能量变化，不跟曲风/事件")
+        self.postfx_auto = QCheckBox("自动联动（随音乐触发）")
+        self.postfx_auto.setToolTip("关掉则效果只随能量变化，不跟事件")
         pa.addWidget(self.postfx_auto, 1, 0, 1, 2)
         pa.addWidget(QLabel("效果保持"), 2, 0)
         self.postfx_hold = QComboBox()
@@ -460,7 +492,7 @@ class SettingsPanel(QWidget):
             "「实时」= 跟着能量即时变化（能量在门槛附近抖动时，效果会忽有忽无）；\n"
             "设成 8~64 拍则每组效果稳定停留一段时间，变化更有节奏感。")
         pa.addWidget(self.postfx_hold, 2, 1)
-        hint = QLabel("自动模式按当前曲风挑效果；强度 = 全局强度（上限六成）× 能量。\n"
+        hint = QLabel("自动模式按能量挑效果；强度 = 全局强度（上限六成）× 能量。\n"
                       "能量 0.15 以下休眠、0.70 以上满额 —— 缓拍几乎无效果，高潮最明显。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#999;")
@@ -494,9 +526,19 @@ class SettingsPanel(QWidget):
             sl = QSlider(Qt.Horizontal)
             sl.setRange(0, 100)
             sl.setToolTip(desc + "\n\n强度：0 无效果，100 最强")
+            # ★★★ 2026-11-06（用户：「后处理手动里面的 logo 图标没法正常显示」）：
+            #   原来是 `QPushButton("⚙")` + `setFixedSize(26,20)`。但 `theme.py` 的全局 QSS
+            #   写着 `QPushButton{padding:4px 10px; min-height:26px}` —— 26 宽减掉左右各 10px
+            #   只剩 **6px** 内容区（实测 contentsRect 26×36，比控件 20 还高）⇒ 齿轮被压成
+            #   一条竖缝，看起来就是"图标坏了"。
+            #   ⇒ 这个按钮**必须自带 padding:0 + min/max-height**（全局 min-height 会盖过
+            #     setFixedSize，见铁律「QSS min-height 盖过 setFixedSize」）。
+            #   只覆盖排版属性，颜色/边框仍旧走全局主题（切主题不会留在旧配色）。
             gear = QPushButton("⚙")
-            gear.setFixedSize(26, 20)
-            gear.setToolTip("触发方式（常驻/曲风/事件）、音频驱动等详细设置")
+            gear.setObjectName("btnPpGear")
+            gear.setFixedSize(30, 20)
+            gear.setStyleSheet(PP_GEAR_STYLE)
+            gear.setToolTip("触发方式（常驻/事件）、音频驱动等详细设置")
             pm.addWidget(cb, i, 0)
             pm.addWidget(sl, i, 1)
             pm.addWidget(gear, i, 2)
@@ -1437,101 +1479,9 @@ class AboutDialog(I18nDialog):
             QMessageBox.information(self, tr("app_name"), d)
 
 
-class TagScanThread(QThread):
-    """后台视觉打标：遍历素材库，逐条打内容 tag，progress 增量更新 UI"""
-    progress = Signal(int, int, str)   # done, total, path
-
-    def __init__(self, main, paths=None, force=False):
-        super().__init__(main)
-        self.main = main
-        self.paths = paths
-        self.force = force
-        self._cancel = False
-
-    def cancel(self):
-        """请求中止扫描（`_cancel` + `requestInterruption()` 双保险）。
-
-        ⚠ 2026-10-10 审计：`_cancel` 原来**只写 False、从不置 True** ⇒ 死标志，扫描无法中止。
-        界面目前没有取消按钮（不改界面需求），入口只有窗口关闭路径（`MainWindow.closeEvent`）。
-        线程会在每个素材的循环检查点退出。
-        """
-        self._cancel = True
-        try:
-            self.requestInterruption()
-        except Exception:                                        # noqa: BLE001
-            pass
-
-    def run(self):
-        from tagger import get_tagger
-        try:
-            tg = get_tagger()
-        except Exception:
-            return
-        items = [m for m in self.main.library.values()
-                 if m.kind in ("image", "video", "gif") and not getattr(m, "excluded", False)]
-        if self.paths:
-            want = set(self.paths)
-            items = [m for m in items if m.path in want]
-        elif not self.force:
-            # 增量/断点续扫：已打标的跳过，下次接着扫
-            items = [m for m in items if not m.tags]
-        total = len(items)
-        from tagger import auto_roles
-        for i, m in enumerate(items):
-            if self._cancel or self.isInterruptionRequested():
-                break
-            try:
-                kind = "image" if m.kind in ("image", "gif") else "video"
-                r = tg.analyze_media(m.path, kind)
-                if r:
-                    tags = [z for z, _ in r["tags"][:6]]
-                    tags += list(r.get("colors") or [])
-                    # ⚠ 不再 append r["bright"]（旧「明亮/昏暗/中等」已废除，恒 None）——
-                    #   亮度分档改由下方 brightness（全片中位数）承载。
-                    if r.get("motion"):
-                        tags.append(r["motion"])
-                    if r.get("flicker"):
-                        tags.append(DYNAMIC_FLICKER)
-                    # 铺满度标签落地（coverage 为 None 表示拿不到代表帧 → 不落词）：
-                    # 阈值与 auto_roles 共用 COVERAGE_FULL_THRESHOLD，杜绝两处阈值漂移。
-                    cov = r.get("coverage")
-                    if cov is not None:
-                        tags.append(COVERAGE_FULL if cov >= COVERAGE_FULL_THRESHOLD
-                                    else COVERAGE_PART)
-                    # 亮度分档落地（brightness=全片灰度中位数；None 表示未知 → 不落词）。
-                    # 阈值取自 tags_def 唯一常量，与验证脚本/重扫线程共用，无漂移。
-                    med = r.get("brightness")
-                    if med is not None:
-                        tags.append(BRIGHT_DARK if med < BRIGHTNESS_DARK_THRESHOLD
-                                    else (BRIGHT_LIGHT if med >= BRIGHTNESS_BRIGHT_THRESHOLD
-                                          else BRIGHT_MID))
-                    m.tags = tags
-                    self.main.cfg["clip_tags"][m.path] = tags
-                    # 扫描自动分配角色：全量重扫(force)强制重算；增量只对未设角色的分配
-                    if self.force or not any(m.roles.values()):
-                        m.roles = auto_roles(
-                            tags, kind, bool(r.get("alpha")),
-                            coverage=r.get("coverage"),
-                            dynamic=bool(r.get("dynamic")),
-                            scored=r.get("tags"))
-                        self.main.cfg["clip_roles"][m.path] = dict(m.roles)
-            except Exception:
-                pass
-            self.progress.emit(i + 1, total, m.path)
-            if (i + 1) % 20 == 0:
-                try:
-                    self.main.cfg.save()
-                except Exception:
-                    pass
-        try:
-            self.main.cfg.save()
-        except Exception:
-            pass
-
-
 def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
-                    motion, flicker, coverage, brightness):
-    """**纯函数**：把「快速重扫」检测出的动态/频闪/铺满度/亮度结果合并进自动标签。
+                    motion, flicker, coverage):
+    """**纯函数**：把「快速重扫」检测出的动态/频闪/铺满度结果合并进自动标签。
 
     从 `DynTagScanThread.run()` 里抽出来，便于单元测试（原实现与 cfg/线程/self 耦合，
     只能靠起整个 GUI 才能验证）。**无任何副作用**：
@@ -1548,7 +1498,6 @@ def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
         motion:        三档动态词之一；`""`（打不开）⇒ **原样返回**，整个列表不动。
         flicker:       是否频闪（True 时补 `DYNAMIC_FLICKER`）。
         coverage:      铺满度 0~1；None ⇒ 保留原铺满度词不动。
-        brightness:    全片亮度中位数；None ⇒ 保留原亮度词不动。
 
     Returns:
         合并后的新标签列表。
@@ -1556,10 +1505,10 @@ def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
     语义（与旧内联实现逐条等价）：
       1. `motion` 为空 → `return list(existing_tags)`（完全不变，含动态/铺满度/亮度词）。
       2. 先剔除旧动态词，按新 `motion`/`flicker` 补词（命中 `disabled_tags` 的跳过）。
-      3. `brightness is not None` → 剔除旧亮度词（含已废弃的「明亮/昏暗/中等」）再补新词；
-         `brightness is None` → 亮度词原样保留。
-      4. `coverage is not None` → 剔除旧铺满度词，`>= COVERAGE_FULL_THRESHOLD` 补「铺满」
+      3. `coverage is not None` → 剔除旧铺满度词，`>= COVERAGE_FULL_THRESHOLD` 补「铺满」
          否则补「局部」（命中 `disabled_tags` 的跳过）；`coverage is None` → 原样保留。
+      ⚠ 2026-10-30 用户「大砍刀」：亮度分档（暗基调/中亮度/亮基调）整条删除，
+         `brightness` 参数与对应分支一并移除。
     """
     # (1) 打不开：motion=""，保持原标签完全不动（含已有的铺满度/亮度词）。
     if not motion:
@@ -1574,18 +1523,7 @@ def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
     if flicker and DYNAMIC_FLICKER not in dis:
         tags.append(DYNAMIC_FLICKER)
 
-    # (3) 亮度分档：剔除旧亮度词（含已废弃的「明亮/昏暗/中等」），按全片中位数补新词。
-    #     brightness 为 None（未知）⇒ 保留原亮度词不动（不剔除、不补词）。
-    if brightness is not None:
-        _old_bright = {BRIGHT_DARK, BRIGHT_MID, BRIGHT_LIGHT, "明亮", "昏暗", "中等"}
-        tags = [t for t in tags if t not in _old_bright]
-        bword = (BRIGHT_DARK if brightness < BRIGHTNESS_DARK_THRESHOLD
-                 else (BRIGHT_LIGHT if brightness >= BRIGHTNESS_BRIGHT_THRESHOLD
-                       else BRIGHT_MID))
-        if bword not in dis:
-            tags.append(bword)
-
-    # (4) 铺满度：只有真算出 coverage 才动标签；算不出则保留原铺满度词不动。
+    # (3) 铺满度：只有真算出 coverage 才动标签；算不出则保留原铺满度词不动。
     if coverage is not None:
         tags = [t for t in tags if t not in COVERAGE_TAGS]
         word = COVERAGE_FULL if coverage >= COVERAGE_FULL_THRESHOLD else COVERAGE_PART
@@ -1595,24 +1533,100 @@ def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
     return tags
 
 
-class DynTagScanThread(QThread):
-    """动态标签快速重扫：只跑帧差/频闪检测（不跑 CLIP），给存量素材补三档动态标签，
-    并做角色单向修正（铺满场景被误判前景 → 背景）。
+def pick_unscanned(library):
+    """挑出**从未扫描过**的素材路径（= `_populate_grid` 在「全部」档会隐藏的那批）。
 
-    升级「低动态/中动态/高动态」三档 + coverage v2（分块广度）后，启动时按
-    cfg["dyn_tag_ver"] < 1 触发一次。不跑 CLIP，不碰内容标签和手动标签。"""
+    ★★ 2026-10-31（用户「素材库怎么不显示图片」「导入图片也没反应」）：
+      `_populate_grid` 里 `scanned = bool(it.all_tags())`，未扫描的素材在**任何工作档**
+      都不显示（用户 2026-10-30 要求「选择时就排除这些」）。而导入流程过去从不触发
+      扫描 ⇒ 新素材永远看不见。这个函数就是"该补扫谁"的唯一判据（纯函数，便于测试）。
+
+    条件（与 `DynTagScanThread.run()` 的增量挑选保持一致）：
+      · kind ∈ **video / gif**（图片不算：静态图本来就不打标 —— 用户 2026-10-31
+        「图片不要打标」，见 `tagger.analyze_dynamic` 的 image 分支）
+      · 未被标记「排除」（刻意不参与自动匹配的 logo 素材）
+      · `tags` 为空（= 从未扫出过结果）
+    """
+    out = []
+    for m in (library or {}).values():
+        try:
+            if m.kind not in ("video", "gif"):
+                continue
+            if getattr(m, "excluded", False):
+                continue
+            if m.tags:
+                continue
+            out.append(m.path)
+        except Exception:                                          # noqa: BLE001
+            continue
+    return out
+
+
+def passes_lib_filter(it, dyn_idx):
+    """素材库「动态」下拉的筛选判据（**纯函数**，便于测试）。
+
+    `dyn_idx`：0 全部 / 1 低 / 2 中 / 3 高 / 4 频闪 / 5 已排除 / 6 未扫描
+
+    语义（三次用户反馈后定稿）：
+      · 0「全部」 = **库里所有素材**（含已排除、含未扫描）—— 用户 2026-10-31 连续问
+        「其他图片去哪了」「我那些 dj 的 logo 去哪了」，查下来这 24 项（6 个 LOGO 循环
+        视频 + 8 张图）是他自己标过「已排除」的，但平时找不回来。
+        ⇒ 素材库是**管理界面**，必须能看到全部；「已排除」的会被 `_tint_role`
+          整体变暗 + tooltip 注明"已排除自动匹配"，一眼能分辨。
+        ⚠ 换池（`match_engine`）仍然排除它们 —— "选择时排除"落在那里，不是这里。
+      · 1~4      = 只显示匹配该动态档的（没扫过的没有标签，自然不会出现在这里）
+      · 5「已排除」/ 6「未扫描」= 专门用来批量处理的两类
+      · **图片（image）永远算"已就绪"**：静态图不打标（用户 2026-10-31「图片不要打标」），
+        若仍按标签判，它会被当成"未扫描"。
+    """
+    excluded = bool(getattr(it, "excluded", False))
+    scanned = bool(it.all_tags()) or getattr(it, "kind", "") == "image"
+    if dyn_idx == 5:
+        return excluded
+    if dyn_idx == 6:
+        return (not scanned) and (not excluded)
+    if dyn_idx == 0:
+        return True
+    if excluded or not scanned:
+        return False
+    want = {1: DYNAMIC_LOW, 2: DYNAMIC_MID,
+            3: DYNAMIC_HIGH, 4: DYNAMIC_FLICKER}.get(int(dyn_idx))
+    return (want in it.all_tags()) if want else True
+
+
+class DynTagScanThread(QThread):
+    """素材**动态/铺满度**扫描（唯一的重扫线程）。
+
+    ★★ 2026-10-30 用户「大砍刀」：CLIP 视觉打标（`TagScanThread`）、亮度分档、
+      曲风识别全部删除，这个线程从"补动态标签的辅助线程"升级成**唯一的扫描入口**：
+        · 动态三档 + 频闪  —— `tagger.analyze_dynamic`（顺序读全片帧差）
+        · 铺满 / 局部      —— `tagger.coverage_score`（取一帧算边缘+分块）
+        · 角色（前景/背景）—— `tagger.auto_roles`（alpha / 铺满度 / 高动态）
+      绝不碰 `manual_tags` / `disabled_tags`（那是用户意志）。
+
+    参数：
+      paths: 只扫这些路径（右键"重扫这个素材"）；None = 全库
+      force: True = 连已有标签/角色一起重算（全量重扫）；False = 增量（没标签的才扫）
+    """
     progress = Signal(int, int)
 
-    def __init__(self, main):
+    def __init__(self, main, paths=None, force=False):
         super().__init__(main)
         self.main = main
+        self.paths = paths
+        self.force = force
 
     def run(self):
         import cv2
-        from tagger import Tagger, SUBJECT_TAGS
+        from tagger import Tagger, auto_roles
         from media_manager import _ascii_safe_path
         items = [m for m in self.main.library.values()
                  if m.kind in ("image", "video", "gif") and not getattr(m, "excluded", False)]
+        if self.paths:
+            want = set(self.paths)
+            items = [m for m in items if m.path in want]
+        elif not self.force:
+            items = [m for m in items if not m.tags]
         total = len(items)
         for i, m in enumerate(items):
             # 支持中途中止（关闭窗口时由 closeEvent 发 requestInterruption）：
@@ -1621,20 +1635,26 @@ class DynTagScanThread(QThread):
                 break
             try:
                 kind = "image" if m.kind in ("image", "gif") else "video"
-                motion, flicker, diff, med = Tagger.analyze_dynamic(m.path, kind)
-                # ---- 铺满度：本线程**确实**能算 cov（开图/取帧算一次），供合并与角色修正共用。
-                #   只有「需要重算铺满度」时才算，避免对已带铺满度词且有明确角色定位的素材白开图。
-                #   角色单向修正：铺满全屏(cov≥阈值)但被旧逻辑判成前景、且画面无明确主体词
-                #   （人物/舞者等）→ 改为背景。绝不反向（真前景是黑底，新 cov 必低）。
-                need_cov = (motion
-                            and (set(m.tags) & set(COVERAGE_TAGS)
-                                 or (m.roles.get("fg") and not m.roles.get("bg")
-                                     and not (set(m.tags) & SUBJECT_TAGS))))
+                motion, flicker, _diff = Tagger.analyze_dynamic(m.path, kind)
+                # ★ 2026-10-30 用户「给素材打分 0-1」：同一份帧差顺便算连续分
+                #   （零额外解码成本），换池时按"离目标强度多近"挑（match_clips）。
+                _sc = Tagger.dynamic_score(_diff, flicker)
+                # ---- 铺满度：开图/取一帧（70% 位置）算一次。
+                #   增量模式下"已有铺满度词"的素材可以跳过，省一次开图；
+                #   全量重扫（force）与单素材重扫一律重算。
+                need_cov = self.force or not (set(m.tags) & set(COVERAGE_TAGS))
                 cov = None
+                has_alpha = bool(getattr(m, "_has_alpha", False))
                 if need_cov:
                     if kind == "image":
-                        img = cv2.imread(_ascii_safe_path(m.path))
+                        # ★ 图片用 IMREAD_UNCHANGED：既是铺满度的输入，也顺手判 alpha
+                        #   （PNG 带透明 = 天然前景叠加层；`_has_alpha` 只对视频探测，
+                        #   图片如果不在这里判，透明 PNG 会被当背景）。
+                        img = cv2.imread(_ascii_safe_path(m.path), cv2.IMREAD_UNCHANGED)
                         if img is not None:
+                            if img.ndim == 3 and img.shape[2] == 4:
+                                has_alpha = True
+                                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                             cov = Tagger.coverage_score(img)
                     else:
                         cap = cv2.VideoCapture(_ascii_safe_path(m.path))
@@ -1645,19 +1665,21 @@ class DynTagScanThread(QThread):
                             cap.release()
                             if ok:
                                 cov = Tagger.coverage_score(fr)
-                # ---- 合并动态/频闪/铺满度/亮度四类词（纯函数，UI 与此处互不耦合）。
+                # ---- 合并动态/频闪/铺满度（纯函数，UI 与此处互不耦合）。
                 #   ⚠ 只写自动标签（m.tags）；绝不写 manual_tags / disabled_tags。
                 tags = merge_scan_tags(m.tags, m.manual_tags, m.disabled_tags,
-                                       motion=motion, flicker=flicker,
-                                       coverage=cov, brightness=med)
+                                       motion=motion, flicker=flicker, coverage=cov)
                 if tags != m.tags:
                     m.tags = tags
                     self.main.cfg["clip_tags"][m.path] = tags
-                # ---- 角色单向修正：仅当铺满且画面无明确主体词时（绝不反向）。
-                if (cov is not None and cov >= COVERAGE_FULL_THRESHOLD
-                        and m.roles.get("fg") and not m.roles.get("bg")
-                        and not (set(m.tags) & SUBJECT_TAGS)):
-                    m.roles = {"fg": False, "bg": True}
+                if _sc is not None:
+                    m.score = float(_sc)
+                    self.main.cfg["clip_score"][m.path] = float(_sc)
+                # ---- 角色：全量重扫一律重算；增量只补"两个角色都没勾"的。
+                #   ★ 砍掉 CLIP 内容标签后，`auto_roles` 只看 alpha / 铺满度 / 高动态。
+                if self.force or not any(m.roles.values()):
+                    m.roles = auto_roles(kind, has_alpha, coverage=cov,
+                                         dynamic=motion in (DYNAMIC_MID, DYNAMIC_HIGH))
                     self.main.cfg["clip_roles"][m.path] = dict(m.roles)
             except Exception:
                 pass
@@ -1671,7 +1693,7 @@ class DynTagScanThread(QThread):
                     self.main.cfg.save()
                 except Exception:
                     pass
-        self.main.cfg["dyn_tag_ver"] = 6
+        self.main.cfg["dyn_tag_ver"] = 7
         try:
             self.main.cfg.save()
         except Exception:
@@ -1748,6 +1770,52 @@ class _ModalDialogTopFilter(QObject):
         return False
 
 
+class _TaskbarCloseFilter(QAbstractNativeEventFilter):
+    """任务栏「关闭窗口」在有模态对话框时也要能退出。
+
+    ★★ 2026-11-02（用户：「开了二级窗口不关掉，主窗口就不能从任务栏关掉」）：
+      `QDialog.exec()` 是**应用级模态** ⇒ Qt 禁用主窗口，Windows 发来的 `WM_CLOSE`
+      被丢掉，任务栏关闭「没反应」。Qt 层的 eventFilter 拿不到这些消息（主窗口被禁用），
+      只有原生事件层能接。
+    做法：有模态对话框 ⇒ 先 `reject()` 再下一拍 `close()` 主窗口（走正常 closeEvent，
+      线程停止/配置落盘都照旧）；没有模态 ⇒ 放行。
+    ⚠ 只认主窗口自己的 hwnd；任何异常都放行（绝不因为过滤器让窗口关不掉）。
+    """
+
+    WM_CLOSE = 0x0010
+
+    def __init__(self, win):
+        super().__init__()
+        self._win = win
+
+    def nativeEventFilter(self, eventType, message):
+        try:
+            if eventType != b"windows_generic_MSG":
+                return False, 0
+            import ctypes.wintypes as _wt
+            msg = _wt.MSG.from_address(int(message))
+            if msg.message != self.WM_CLOSE:
+                return False, 0
+            try:
+                mine = int(self._win.winId())
+            except Exception:                                    # noqa: BLE001
+                return False, 0
+            if int(msg.hWnd) != mine:
+                return False, 0
+            from PySide6.QtWidgets import QApplication
+            md = QApplication.activeModalWidget()
+            if md is None:
+                return False, 0
+            try:
+                md.reject()
+            except Exception:                                    # noqa: BLE001
+                pass
+            QTimer.singleShot(0, self._win.close)
+            return True, 0
+        except Exception:                                        # noqa: BLE001
+            return False, 0
+
+
 class ErlibImportThread(QThread):
     """导入 erlib 分析包（`.eravjlib`）—— **后台跑**，大包几万条指纹别卡界面。
 
@@ -1760,9 +1828,13 @@ class ErlibImportThread(QThread):
     finished_ok = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, pkg, parent=None):
+    def __init__(self, pkg, parent=None, skip_sids=None):
         super().__init__(parent)
         self.pkg = pkg
+        # ★★ 2026-10-31（用户「导入重复的歌也没提醒」）：本机已有的那些 song_id。
+        #   由 `erlib.dupdetect` 在**界面线程**判出来（判据要读 cfg，且要弹窗问用户），
+        #   这里只负责"照着跳过"，不重复做判定（判据写两遍必然漂移）。
+        self.skip_sids = set(int(x) for x in (skip_sids or ()))
 
     def run(self):
         try:
@@ -1771,14 +1843,15 @@ class ErlibImportThread(QThread):
 
             def _p(a, b, s):
                 self.progress.emit(a, b, s)
-            st = import_into(self.pkg, app_base_dir(), on_progress=_p)
+            st = import_into(self.pkg, app_base_dir(), on_progress=_p,
+                             skip_sids=self.skip_sids)
             self.finished_ok.emit(st)
         except Exception as e:                                   # noqa: BLE001
             self.failed.emit("%s: %s" % (type(e).__name__, e))
 
 
 class MusicScanThread(QThread):
-    """后台音乐分析：逐首建指纹 + 查曲风，progress 增量更新"""
+    """后台音乐分析：逐首建指纹 + 算节拍网格 + 能量段落，progress 增量更新"""
 
     progress = Signal(int, int, str)   # done, total, path
 
@@ -1789,22 +1862,6 @@ class MusicScanThread(QThread):
         self.force = force
 
     @staticmethod
-    def _local_ai_genre(gc, sig, sr):
-        """整曲本地 AI：取 25%/50%/75% 三段各 6s 分类，投票合并（单曲级差异化）"""
-        from collections import Counter
-        seg = int(sr * 6)
-        if len(sig) < seg:
-            pts = [sig]
-        else:
-            pts = [sig[int(sr * f):int(sr * f) + seg] for f in (0.25, 0.5, 0.75)]
-        votes = []
-        for s in pts:
-            try:
-                votes.extend(gc.classify(s, sr)["tags"])
-            except Exception:
-                pass
-        return [t for t, _ in Counter(votes).most_common(4)]
-
     # ---------------------------------------------------------------- 并行扫描
     @staticmethod
     def _lower_this_thread():
@@ -1823,9 +1880,17 @@ class MusicScanThread(QThread):
             pass
 
     def _worker_count(self):
-        """扫描并发数：**演出中 2**、**空闲 min(6, 核数//3)**（16 核 → 5）。
+        """扫描并发数：**演出中 2**、**空闲 min(8, max(3, 核数//2))**（16 逻辑核 → 8）。
 
         可用 `AUTO_VJ_SCAN_THREADS` 环境变量覆盖（实测/调试用）。
+
+        ★★ 2026-10-30（用户「扫描没有曲风为什么还是这么慢」）：原来 `min(6, 核数//3)`
+          （16 核 → 5）。实测同一批 10 首（`tools/_bench_scan.py`）：
+            5 线程 3.48 秒/首 → 8 线程 **2.97 秒/首**（-15%）→ 12 线程 3.06（回退）。
+          为什么不是越多越好：每首要解码 300 秒音频、算两次 STFT、跑一次 ONNX，
+          全是**内存带宽**密集型，线程超过物理核（这台 8 物理 / 16 逻辑）后互相抢带宽
+          反而变慢。`核数//2` 正好落在物理核数上。
+        ⚠ 演出中仍然是 2（现场稳定性优先，绝不能因为扫描抢 CPU 让画面/音频抖）。
         """
         env = os.environ.get("AUTO_VJ_SCAN_THREADS")
         if env:
@@ -1841,7 +1906,7 @@ class MusicScanThread(QThread):
             busy = bool(self.main.engine.running)
         except Exception:
             busy = False
-        return 2 if busy else max(2, min(6, n // 3))
+        return 2 if busy else max(3, min(8, n // 2))
 
     def run(self):
         import hashlib
@@ -1851,11 +1916,8 @@ class MusicScanThread(QThread):
         from concurrent.futures import ThreadPoolExecutor
         import numpy as np
         import soundfile as sf
-        import genre_lookup as gl
         from fp import FingerprintDB
         import fp as fpvj          # 指纹算法本体（签名/文件 md5 也在里面）
-        from music_meta import resolve_music_genre
-        from genre_keywords import simplify_genres
         from config import app_base_dir
 
         db = FingerprintDB(_os.path.join(app_base_dir(), "fingerprints.db"))
@@ -1865,12 +1927,6 @@ class MusicScanThread(QThread):
             pass
         meta = self.main.cfg["music_meta"]
         items = list(self.paths) if self.paths else list(self.main.cfg["music_library"])
-        gc = None
-        try:
-            from audio_genre import get_genre_classifier
-            gc = get_genre_classifier()
-        except Exception:
-            gc = None
 
         n_workers = self._worker_count()
         db_lock = _th.Lock()          # SQLite 同一连接不能多线程并发写，保护写库即可
@@ -1992,6 +2048,10 @@ class MusicScanThread(QThread):
             try:
                 t0 = _tm.perf_counter()
                 data, sr = sf.read(p, dtype="float32", always_2d=True)
+                # ★ 2026-11-06：与 ERLIB 扫描统一 —— 网格算法必须拿到**真实时长**
+                # ⚠ 与 `erlib.scanner.decode()` 逐字一致：dur 取自 sf.info().duration，
+                #   不用 len(data)/sr（mp3 的编码器延迟会让两者差几毫秒 → anchor 偏移）
+                dur_full = float(sf.info(p).duration)
                 sig = np.mean(data, axis=1)
                 t1 = _tm.perf_counter()
                 song_id = int(hashlib.md5(p.encode("utf-8")).hexdigest()[:8], 16)
@@ -2020,26 +2080,9 @@ class MusicScanThread(QThread):
                     if db.pending() >= 6:
                         db.commit_batch()
                 t2 = _tm.perf_counter()
-                r = resolve_music_genre(p)      # 并行阶段联网已关 → 只走本地
-                t3 = _tm.perf_counter()
-                # track 级精准命中 → 在线结果已足够，跳过本地 AI 推理（大幅提速）
-                if gc is not None and r.get("level") != "track":
-                    ai_zh = simplify_genres(self._local_ai_genre(gc, sig, sr))
-                    r["ai_zh"] = ai_zh
-                    on = list(r.get("genres") or [])
-                    if ai_zh:
-                        seen, merged = set(), []
-                        if r.get("level") == "track":
-                            order = on[:3] + ai_zh[:2]     # 在线为主，AI 补充
-                        else:
-                            order = ai_zh[:3] + on[:2]     # 本地 AI 为主，在线为辅
-                        for z in order:
-                            if z and z not in seen:
-                                seen.add(z); merged.append(z)
-                        r["genres"] = merged
-                        if not on and ai_zh:
-                            r["source"] = "localai"
-                r["song_id"] = song_id
+                # ★ 2026-10-30 用户「大砍刀」：曲风识别（本地 AI + discogs 在线查询）整块删除。
+                #   扫描现在只做：指纹入库 / 文件 md5 / 节拍网格 / 能量分段。
+                r = {"song_id": song_id}
                 # ★ 指纹签名（码表认歌 ① 级）。空串 = 这次没算出来（下次扫描会重试），
                 #   **绝不**退化成写 `song_id`（那是「路径」哈希，与文件内容无关 ⇒ 静默永不命中）。
                 r["fp_id"] = fp_sig
@@ -2056,9 +2099,11 @@ class MusicScanThread(QThread):
                 r["file_md5"] = fmd5
                 # ★ 节拍网格（BPM / 锚点 / 八拍乐句相位）—— 离线一次入库，演出中只查表。
                 #   复用刚解码的 sig：扫描已经为指纹读过一次盘，这里不再读第二遍。
+                _feats = {}      # 网格算好的 STFT（下面能量分段直接复用，见 beatgrid 注释）
                 if _bg is not None:
                     try:
-                        g = _bg.grid_from_signal(sig, sr, vdj_idx, path=p, use_vdj=False)
+                        g = _bg.grid_from_signal(sig, sr, None, path=p, dur=dur_full,
+                                                 use_vdj=False, out_feats=_feats)
                         if g:
                             r["grid"] = g
                     except Exception:
@@ -2076,9 +2121,16 @@ class MusicScanThread(QThread):
                         #   （另一个方法内）的**局部导入**，这里拿不到 ⇒ NameError
                         #   会被下面的 `except Exception` 吞掉、静默不生效。
                         #   `sig` 本身就是 `np.mean(data, axis=1)` 的连续数组，直接传。
-                        _m22, _s22 = _bg.resample(sig, sr, _bg.SR_TARGET)
-                        _f2 = _bg.features(_m22, _s22)
-                        _d2 = len(_m22) / float(_s22)
+                        # ★ 2026-10-30（扫描提速）：网格刚刚在**同一个重采样信号**上
+                        #   算过 features ⇒ 直接复用，别再 resample + features 一遍
+                        #   （297 秒的歌省 0.45 秒/首）。拿不到才自己算。
+                        _f2 = _feats.get("f")
+                        _d2 = float(_feats.get("dur") or 0.0)
+                        _m22 = None
+                        if _f2 is None or _d2 <= 0.0:
+                            _m22, _s22 = _bg.resample(sig, sr, _bg.SR_TARGET)
+                            _f2 = _bg.features(_m22, _s22)
+                            _d2 = len(_m22) / float(_s22)
                         # ★★ 2026-10-30：用**生效网格**（`grid_manual.bpm_manual` 优先），
                         #   否则用户手改 BPM 之后分段仍按旧的自动 BPM 算 —— Extra Pain
                         #   手改成 200 但 `grid` 还是 99.95 ⇒ "2 个八拍"被当成 9.6 秒
@@ -2089,6 +2141,9 @@ class MusicScanThread(QThread):
                             "grid_manual": _oldm.get("grid_manual") or {},
                         }) or None
                         _sg = _sec.auto_segments(_f2, dur=_d2, grid=_seg_g)
+                        _af = _sec.take_folded_anchor()
+                        if _af is not None and isinstance(r.get("grid"), dict):
+                            r["grid"]["anchor"] = _af
                         # ★ 2026-10-30：`raw` 必须**同样过乐句判据**（只是不吸附位置），
                         #   否则段数和 `sections` 对不上 —— 详情页读 raw，用户看到的
                         #   就是另一套分段（"怎么还是三个八拍五个八拍"）。
@@ -2098,9 +2153,22 @@ class MusicScanThread(QThread):
                             r["sections"] = _sg
                             r["sections_raw"] = _sgr
                             r["sections_auto"] = True
-                        del _m22, _f2
+                        del _f2
+                        if _m22 is not None:
+                            del _m22
                     except Exception:
                         pass
+                # ★ 2026-10-30（用户「时长后面再加个波形图」）：扫描时顺手把**波形包络**
+                #   写进 `.wj` 缓存 —— 这时 `sig` 已经在内存里，只多花 ~30ms/首；
+                #   不然曲库一打开要 90 首挨个解码（~45 秒）才画得出波形。
+                try:
+                    import waveform as _wfm
+                    if not _wfm.waveform_load(p):
+                        _wf1 = _wfm.waveform_from_signal(sig, sr)
+                        if _wf1:
+                            _wfm.waveform_save(p, _wf1)
+                except Exception:
+                    pass
                 # ★ 歌曲封面（列表左侧那张图）：**在建库时离线取一次**入库。
                 #   演出中列表只读缓存路径，绝不为了封面去开容器/解码（实测 12~18ms/首）。
                 #   ⚠ 单独 try：取不到封面（无内嵌也无同目录图）不能影响曲风/网格入库。
@@ -2123,13 +2191,13 @@ class MusicScanThread(QThread):
                         r["sections"] = _ou["sections"]
                         r["sections_raw"] = _ou.get("sections_raw")
                         r["sections_auto"] = False
-                return p, r, (t1 - t0), (t2 - t1), (t3 - t2)
+                # ★ 2026-10-30：t3（曲风解析）删除后，第三段改成「元数据（md5/网格/分段）」
+                return p, r, (t1 - t0), (t2 - t1), (_tm.perf_counter() - t2)
             except Exception:
                 return p, None, 0.0, 0.0, 0.0
 
-        # ---- 阶段 1：**并行**做本地部分（解码 + 指纹 + 关键词/ID3/本地 AI）----
-        # 联网在这一阶段**关闭**：多线程一起打 Discogs 只会更快撞它的限流（未认证 25 次/分钟）。
-        gl.set_online_enabled(False)
+        # ---- 阶段 1：**并行**做本地部分（解码 + 指纹 + 节拍网格 + 能量段落）----
+        # ★ 2026-10-30 用户「大砍刀」：曲风查询（本地 AI + discogs）整条删除，扫描不再联网。
         _log("开始扫描：%d 首，%d 线程并行（本地阶段）%s"
              % (total, n_workers, "；演出中→限 2 线程" if n_workers <= 2 else ""))
         done, ok_n = 0, 0
@@ -2153,7 +2221,7 @@ class MusicScanThread(QThread):
                         except Exception:
                             pass
                         tot10 = sum(acc)
-                        _log("阶段1 %d/%d：平均 解码 %.2fs + 指纹 %.2fs + 曲风(本地) %.2fs "
+                        _log("阶段1 %d/%d：平均 解码 %.2fs + 指纹 %.2fs + 元数据 %.2fs "
                              "= %.2fs/首（%.1f 首/秒，%d 线程）"
                              % (done, total, acc[0] / 10.0, acc[1] / 10.0, acc[2] / 10.0,
                                 tot10 / 10.0, 10.0 / max(1e-6, tot10), n_workers))
@@ -2173,7 +2241,7 @@ class MusicScanThread(QThread):
              % (ok_n, done, el, el / max(1, done)))
 
         # ---- 阶段 1b：**只补网格**（存量歌缺网格 / grid_ver 过期）----
-        # 已有元数据的歌：跳过指纹 / 联网 / 本地 AI，只解码一次算网格并入原记录（保留曲风等字段）。
+        # 已有元数据的歌：跳过指纹 / 联网 / 本地 AI，只解码一次算网格并入原记录（保留其它字段）。
         if todo_grid:
             tg0 = _tm.perf_counter()
             okg = 0
@@ -2328,59 +2396,8 @@ class MusicScanThread(QThread):
             _log("阶段1d（补认歌字段）完成：%d 首待补，成功 %d 首，用时 %.1f 秒"
                  % (len(todo_fp), okf, _tm.perf_counter() - tf0))
 
-        # ---- 阶段 2：**串行**补在线曲风（尊重限流；网络差就提前收手）----
-        if todo and not gl.online_blocked():
-            # ★ 必须先清缓存：阶段 1 联网是关的，那些"查不到"会被缓存成 None，
-            #   不清掉的话阶段 2 每首都命中失败缓存、根本不会发请求（实测 200 首只花 0.2 秒）。
-            try:
-                import music_meta as _mm
-                _mm.clear_online_cache()
-            except Exception:
-                pass
-            gl.set_online_enabled(True)
-            fixed, t_net = 0, _tm.perf_counter()
-            n_try, slow = 0, 0
-            for p in todo:
-                if gl.online_blocked():
-                    break
-                r0 = self.main.cfg["music_meta"].get(p)
-                if not isinstance(r0, dict) or r0.get("level") == "track":
-                    continue                  # 已有 track 级在线结果，无需再查
-                _tq = _tm.perf_counter()
-                try:
-                    r2 = resolve_music_genre(p)
-                    if r2 and (r2.get("level") or r2.get("source") in ("discogs", "itunes")):
-                        # ★ 合并而非整条替换（阻塞项 F-b）：`resolve_music_genre()` 的返回值
-                        #   **不含 `grid`、也不含 `song_id`**（见 music_meta.py：只返回 artist/
-                        #   title/genre/genres/source/query）。旧实现 `= r2` 整条替换会把扫描
-                        #   阶段算好的离线节拍网格连同 song_id 一起抹掉 —— 实测真实曲库 57/66 首
-                        #   命中在线（source ∈ discogs/itunes），导致网格几乎全丢（连全量重扫都保不住）。
-                        r0 = self.main.cfg["music_meta"].get(p) or {}
-                        r0.update(r2)
-                        self.main.cfg["music_meta"][p] = r0
-                        fixed += 1
-                        if fixed % 5 == 0:
-                            try:
-                                self.main.cfg.save()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                _dq = _tm.perf_counter() - _tq
-                n_try += 1
-                # 连着 5 首单首都 >2.5 秒 ⇒ 判定网络不佳，别再耗（否则 1452 首要几小时）
-                slow = slow + 1 if _dq > 2.5 else 0
-                if slow >= 5:
-                    _log("阶段2：连续 5 首查询都超 2.5 秒，判定网络不佳 → 提前结束（已试 %d 首）" % n_try)
-                    break
-            try:
-                self.main.cfg.save()
-            except Exception:
-                pass
-            _log("阶段2（串行在线）完成：补充 %d 首，用时 %.1f 秒%s"
-                 % (fixed, _tm.perf_counter() - t_net,
-                    "（已被限流，提前结束）" if gl.online_blocked() else ""))
-        gl.set_online_enabled(True)
+        # ★ 2026-10-30 用户「大砍刀」：阶段 2「串行补在线曲风」整块删除
+        #   （discogs / iTunes 联网查询 + 限流逻辑）。扫描不再联网。
         try:
             db.end_scan()         # 落盘 + 把 synchronous 恢复回原值
         except Exception:
@@ -2486,6 +2503,52 @@ def _hud_grid_seg(us):
     return "  |  " + Tf("多锚 {}BPM · 锚{}", bpm, anc)
 
 
+# ============ 演出台 BPM 显示的「变速倍率」参数（见 `MainWindow._rate_text`） ============
+# `lib_bpm` 是**原曲** BPM；DJ 变速（keylock / SOLA）后现场听到的是 `lib_bpm × r`。
+# 这三个常量只服务于**显示**（HUD + 底部状态栏），不要拿去算网格/码表/素材速度。
+#
+# ★★★ 2026-11-03 第三轮（看了竞品 KVJ 的做法后用户定稿）：**两个数分开显示**。
+#   上一版把 `lib_bpm × r` 乘成 167.5 写进 BPM 位，被推翻 —— BPM 位永远是原曲 BPM
+#   （和 KVJ 时间轴上的「BPM 段」一致），变速倍率另挂一个后缀：
+#       `BPM 140.0 ×1.196`    （1.0× 时退化成 `BPM 140.0`，没有后缀）
+#   `_bpm_text` 只负责“原曲值 + 短时保持”，倍率全交给 `_rate_text`。
+#
+# 死区：`recognized_rate` 每 500ms 会微微变（±0.001 量级）。1.0× 正常播放时
+#   三位小数会把噪声原样抖出来（×1.001 → ×0.998 → ×1.000），现场极显眼；
+#   KVJ 的口径也是「差不到 1% 不改速度、只修位置」，所以 |r-1| 小于此值一律不显示。
+#   ⚠ 死区不能太大：DJ 推子 ±5% 是常见操作，1% 以内本来就落在 `r` 的噪声里。
+_BPM_RATE_DEADBAND = 0.01
+# 倍率可用区间（显示层的**二次兜底**）。`audio_engine` 在发布 `recognized_rate` 之前
+# 已经钳过 [0.78, 1.25]（见 `state.recognized_rate` 的注释，上界必须 ≥1.22），
+# 这里再挡一次是为了防止读到别的中间态 / 旧快照。越界当「没测到」⇒ 不显示倍率，
+# 宁少不多（显示一个假倍率比不显示更糟）。
+_BPM_RATE_MIN = 0.78
+_BPM_RATE_MAX = 1.25
+# 库内 BPM 的保持时长（秒）。真机实测（`energy_log` CSV，1.20× 相位 19:11–19:13）：
+#   `lib_bpm` 163 行里 93 行 = 140、**70 行 = 0**（约 43% 时间为 0），而且是**穿插**跳
+#   （19:12:27 掉 0 → 19:12:28 回来 → 19:12:37 又掉），不是连续成段。
+# 不保持的话同一首歌唱的同一个 BPM 会在 `140.0`（库内原曲值）/ `168`（兜底锁定）/ `--`（兜底无值）
+# 三种**形态**之间反复闪（位数都不一样），现场盯着看极明显 —— 数值都对，抖的是显示形态。
+#
+# ★ 注意：保持的是「**原曲 BPM 这个属性**」，跟有没有变速无关。第三轮改成
+#   `BPM 140.0 ×1.196` 之后，掉 0 时保持住 140.0、倍率后缀照常跟着 `recognized_rate` 走
+#   （`_rate_text` 自己不做保持，见其 docstring）。
+#
+# ★★ 为什么是 4.5 而不是 3.0、也不是随便一个大数（2026-11-03 第三轮，QA 用真机 CSV 算出来的）：
+#   · **掉落是按整数秒成段的**（真机实测段长 1 / 2 / 3 / 4 秒），而 UI 刷新是 **500ms 一次**
+#     ⇒ 窗口如果正好落在某个整数秒上（3.0），"3 秒的掉 0 段"就有**一半概率**提前丢保持
+#     （取决于这一 tick 落在段的哪半秒）。窗口必须**跨过**整数秒边界才稳。
+#   · 稳态实测**最长连续掉 0 = 4 秒**，3.0 根本盖不住。
+#   · 按 500ms tick 推演 90 秒现场：3.0 秒时形态翻转 **8 次**（140.0 ↔ 168），
+#     4.5 秒时降到 **2 次** —— 剩下的 2 次就是"开始播 / 停播"各一次，本来就该变。
+#   ⇒ 取 4.5 = 实测最长段(4.0) + 1 个 tick(0.5) 的余量，既不盖不住也不拖太久。
+#   ⚠ 不能取太大：真停播（QA 验证过 22s / 27s 两段）必须回落，不能被保持住；
+#     换歌另由 `recognized_song_id` 立即失效兜住（见 `_bpm_text`），不依赖这个窗口。
+# ⚠ 计时必须用**墙钟** `time.time()`，不能用 `perf_counter()`：后者是进程内单调时钟，
+#   语义上不是"多少秒没更新"，本项目已为此踩过坑（见 `color.manual_t` 的注释）。
+_BPM_LIB_HOLD_SEC = 4.5
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2507,7 +2570,7 @@ class MainWindow(QMainWindow):
 
         self.audio = AudioEngine()
         self.audio.energy_scale = float(self.cfg["auto"].get("energy_scale", 1.0))  # 实验性：能量伽马校正，config 里改，不占 UI
-        self._song_meta_by_id = {}     # song_id -> {path,title,artist,zh}（现场识别查表用）
+        self._song_meta_by_id = {}     # song_id -> {path,title,artist,zh}（现场识别查表 / HUD 歌名）
         self._fp_db = None
         self.library = {}
         for p in self.cfg["library"]:
@@ -2524,18 +2587,69 @@ class MainWindow(QMainWindow):
                 m.img_y = float(adj.get("y", 0.0) or 0.0)
                 m.img_rot = float(adj.get("rot", 0.0) or 0.0)
         # 恢复每个素材的 tag 与多重角色
-        for p, tags in (self.cfg["clip_tags"] or {}).items():
+        # ★★ 2026-10-30 用户「大砍刀」：老配置里的素材标签是 CLIP 打的内容词
+        #   （霓虹/激光/烟雾…）+ 亮度三档，这些词**已经没有任何地方会产出**了。
+        #   不清掉的话，素材格上还会显示「霓虹·激光·烟雾」，用户会以为没砍干净。
+        #   这里做一次**加载期迁移**：只留「动态三档 + 频闪 + 铺满/局部」，
+        #   并把清洗结果写回 cfg（顺带删掉指向已不存在素材的条目）。
+        _KEEP_TAGS = set(DYNAMIC_TAGS) | set(COVERAGE_TAGS)
+        _ct = self.cfg["clip_tags"] or {}
+        _cleaned = {}
+        _dropped = 0
+        for p, tags in _ct.items():
             m = self.library.get(p)
-            if m is not None and isinstance(tags, list):
-                m.tags = list(tags)
-        for p, tags in (self.cfg["clip_tags_manual"] or {}).items():
+            if m is None and not isinstance(tags, list):
+                continue
+            keep = [t for t in (tags or []) if t in _KEEP_TAGS] if isinstance(tags, list) else []
+            _dropped += (len(tags) if isinstance(tags, list) else 0) - len(keep)
+            if keep:
+                _cleaned[p] = keep
+            if m is not None:
+                m.tags = keep
+        if _dropped:
+            self.cfg["clip_tags"] = _cleaned
+            try:
+                self.cfg.save()
+            except Exception:                                  # noqa: BLE001
+                pass
+            print("[素材] 迁移旧标签：清掉 %d 条已废弃的内容/亮度词" % _dropped)
+        # ★★ 2026-10-31（用户：「图片不要打标」）：历史上给**静态图片**打过的
+        #   动态/铺满标签全部作废 —— 截图里那两张黑图就顶着「低动态·局部」。
+        #   静态图没有"动态"可言，留着只会让它在动态筛选/换池里乱入。
+        #   ⚠ 只动自动标签（`clip_tags`），手动标签（`clip_tags_manual`）不碰。
+        _img_cleared = 0
+        for _p, _m in self.library.items():
+            if _m.kind != "image":
+                continue
+            if _m.tags:
+                _m.tags = []
+                self.cfg["clip_tags"].pop(_p, None)
+                _img_cleared += 1
+            if _p in (self.cfg["clip_score"] or {}):
+                self.cfg["clip_score"].pop(_p, None)
+        if _img_cleared:
+            try:
+                self.cfg.save()
+            except Exception:                                  # noqa: BLE001
+                pass
+            print("[素材] 图片不打标：清掉 %d 张图的旧动态标签" % _img_cleared)
+        # ★ 2026-10-30（用户「给素材打分 0-1」）：动态分（老库没有这个键 ⇒ 全是 None，
+        #   等一次「扫描素材」补齐；不影响任何现有行为）
+        # ⚠ `Config` **没有 `.get()`**（项目铁律）—— `load()` 是 `deep_merge`，
+        #   缺键也会有默认值，所以直接下标；写成 `.get()` 会在启动时 AttributeError，
+        #   症状是「有进程没窗口 / 启动失败弹窗」（2026-10-30 实机验证抓到过一次）。
+        for p, sc in (self.cfg["clip_score"] or {}).items():
             m = self.library.get(p)
-            if m is not None and isinstance(tags, list):
-                m.manual_tags = list(tags)
+            if m is not None:
+                try:
+                    m.score = float(sc)
+                except (TypeError, ValueError):
+                    pass
+        # 手动标签（UI 已删）不再加载 —— 只读不写，避免影响老配置
         for p, tags in (self.cfg["clip_tags_disabled"] or {}).items():
             m = self.library.get(p)
             if m is not None and isinstance(tags, list):
-                m.disabled_tags = list(tags)
+                m.disabled_tags = [t for t in tags if t in _KEEP_TAGS]
         for p, roles in (self.cfg["clip_roles"] or {}).items():
             m = self.library.get(p)
             if m is not None and isinstance(roles, dict):
@@ -2551,9 +2665,8 @@ class MainWindow(QMainWindow):
                 m.excluded = True
 
         self._cur_layer = 0
-        # 加载用户自定义的曲风→画面标签映射（运行时覆盖默认）
-        from match_engine import set_custom_visual_map
-        set_custom_visual_map(self.cfg["genre_visual_map"] or {})
+        # ★ 2026-10-30 用户「大砍刀」：曲风→画面标签映射整条删除
+        #   （`match_engine.set_custom_visual_map` / cfg["genre_visual_map"] 都不再使用）。
         self.engine = AutoVJEngine(self.cfg, self.audio.state, self.library)
         # ★ 2026-10-17：把**音频引擎本体**也给引擎（第二个参数只是它的 state）。
         #   码表自动跟拍要读 `_recognizer_engine.current_song_id`（电荷条确认后稳定的 id），
@@ -2563,6 +2676,26 @@ class MainWindow(QMainWindow):
         except Exception as _e:                                  # noqa: BLE001
             print("[码表] 注入音频引擎失败：%s" % _e)
         self.engine.rebuild_from_cfg()
+        # ★★ 2026-11-02（用户「看一下今天00.00之后的日志 能量大部分时候貌似还是很低」）：
+        #   `cue_health.log` 是**环形裁剪**的（超 120KB 只留最后一段）—— 昨晚 23:50 启动、
+        #   01:14 退出，日志只剩 01:00:56 之后，**00:00–01:00 的能量曲线直接没了**，
+        #   于是"那段到底低不低"根本无法回答。
+        #   ⇒ 每次运行另落一个 `energy_YYYYMMDD.csv`（1 秒一行，不裁剪），
+        #     字段能把"能量低"拆开：`energy` 低但 `level` 正常 = 算法问题；
+        #     `level` 也是 0 = 电平被清零；`blk_delta=0` = **采集根本没喂数据**。
+        #   ⚠ 纯旁路：daemon 线程，任何异常只记在自己身上，绝不影响演出。
+        try:
+            from energy_log import EnergyCsvLogger
+            from config import app_base_dir as _abd
+            self._energy_log = EnergyCsvLogger(
+                self.audio.state, _abd(),
+                tier_fn=lambda: getattr(self.engine, "_last_energy_tier", "-"),
+                blk_fn=lambda: getattr(getattr(self.audio, "_analyzer", None), "blk", -1),
+                interval=1.0)
+            self._energy_log.start()
+        except Exception as _e:                                  # noqa: BLE001
+            self._energy_log = None
+            print("[能量日志] 启动失败（不影响演出）：%s" % _e)
         # 引擎主循环移入独立线程：合成/后处理不再与 GUI 抢线程（卡顿根因修复）。
         # frame_ready 跨线程自动变 queued 投递，GUI 只做贴图。
         from PySide6.QtCore import QThread, QMetaObject
@@ -2584,11 +2717,25 @@ class MainWindow(QMainWindow):
         self.out_win = OutputWindow(self.cfg)
         # 输出窗口与预览统一走一个 slot（帧在引擎侧，这里只收序号后各自去取）
         self._drawn_seq = -1
+        # ★ 2026-11-03：库内 BPM 的**短时保持**（见 `_bpm_text`）。
+        #   `lib_bpm` 真机会在 140 / 0 之间穿插跳（19:13 实测 163 行里 43% 为 0），
+        #   不保持的话 HUD 会在 `167.4` / `168` / `--` 三种形态间闪。
+        #   元组是 `(值, 墙钟秒, recognized_song_id)`；`(0.0, 0.0, -1)` = 还没有值。
+        self._bpm_lib_hold = (0.0, 0.0, -1)
         # 自动图层素材池被重算 → 刷新对应图层行的素材格
         self.engine.auto_layers_changed.connect(self._on_auto_layers_changed)
         # 模态对话框打开时，临时解除输出窗口置顶，避免对话框被置顶输出窗口挡住导致卡死
         self._dialog_filter = _ModalDialogTopFilter(self)
         QApplication.instance().installEventFilter(self._dialog_filter)
+        # ★ 2026-11-02：任务栏「关闭窗口」在模态对话框打开时也要能退出（见类注释）
+        try:
+            self._taskbar_close = _TaskbarCloseFilter(self)
+            from PySide6.QtCore import QAbstractEventDispatcher
+            _disp = QAbstractEventDispatcher.instance()
+            if _disp is not None:
+                _disp.installNativeEventFilter(self._taskbar_close)
+        except Exception:                                        # noqa: BLE001
+            self._taskbar_close = None
         # 全局禁用「滚轮切换」：见 MainWindow.eventFilter（下拉框/滑条/数值框吞掉 Wheel）
         QApplication.instance().installEventFilter(self)
 
@@ -2627,6 +2774,16 @@ class MainWindow(QMainWindow):
             self._dyn_scan.progress.connect(self._scan_overlay.update_progress)
             self._dyn_scan.finished.connect(self._scan_overlay.finish)
             self._dyn_scan.start()
+        else:
+            # ★★ 2026-10-31（用户「素材库怎么不显示图片」「导入图片也没反应」）：
+            #   版本已升级 ⇒ 不再全量重扫；但**从未扫过**的素材（新导入 / 早期漏掉）
+            #   在「全部」档里是看不见的（用户要求「选择时就排除未扫描的」）⇒
+            #   启动 2.5 秒后增量补一次，只扫没标签的（演出中会自动跳过）。
+            try:
+                from PySide6.QtCore import QTimer as _QT2
+                _QT2.singleShot(2500, self._auto_scan_unscanned)
+            except Exception:                                    # noqa: BLE001
+                pass
 
         # 素材缺失提醒：换了目录没拷「素材库」文件夹时，画面会全黑，明确告诉用户原因
         missing = sum(1 for p in self.library if not os.path.exists(p))
@@ -2927,8 +3084,8 @@ class MainWindow(QMainWindow):
         self._page_btns = []
         for i, (txt, tip) in enumerate((
                 ("🎬 演出台", "现场：预览 / 图层 / 效果 / 输出"),
-                ("🗂 素材库", "全屏管理素材：搜索 / 筛选 / 导入 / 打标签（演出台那份原样不动）"),
-                ("🎵 曲库 · 曲风", "演出前准备：音乐曲库（导入音乐 + 扫描分析曲风）/ 曲风映射"),
+                ("🗂 素材库", "全屏管理素材：搜索 / 筛选 / 导入 / 扫描素材（演出台那份原样不动）"),
+                ("🎵 音乐曲库", "演出前准备：导入音乐 + 扫描分析（指纹 / 节拍网格 / 能量段落）"),
                 ("🎞 码表", "演出前准备：管理 .ercue 码表（查看 / 添加 / 删除 / 定位）"))):
             b = QPushButton(T(txt))
             b.setCheckable(True)
@@ -2958,24 +3115,15 @@ class MainWindow(QMainWindow):
         l2 = QVBoxLayout(p2)
         l2.setContentsMargins(12, 12, 12, 12)
         l2.setSpacing(8)
-        # ★ 标题行：「🎵 曲库 · 曲风」在左，「曲风映射…」在**右上角**（用户要求）。
-        #   ⚠ 原来是单独一行放在**页面左下角**（row2 + 末尾 addStretch），
-        #     那个 addStretch 还会跟曲库面板**平分剩余高度** ⇒ 面板只长到一半，
-        #     下面一大片空白（用户反馈「整个 UI 的显示区域」没占满）。两个问题一起修。
+        # ★ 标题行（2026-10-30 用户「大砍刀」：右上角的「曲风映射…」按钮已删除）
         head = QHBoxLayout()
-        t2 = QLabel(T("🎵 曲库 · 曲风"))
+        t2 = QLabel(T("🎵 音乐曲库"))
         t2.setStyleSheet("font-weight:bold;font-size:15px;color:" + theme.V("text") + ";")
         head.addWidget(t2)
         head.addStretch(1)
-        self.btn_p2_gvmap = QPushButton(T("曲风映射…"))
-        self.btn_p2_gvmap.setMinimumHeight(28)
-        self.btn_p2_gvmap.setToolTip(T("编辑曲风→画面标签的绑定关系"))
-        self.btn_p2_gvmap.clicked.connect(self.open_genre_visual_editor)
-        head.addWidget(self.btn_p2_gvmap)
         l2.addLayout(head)
         self.lbl_p2_desc = QLabel(T(
-            "演出前的准备工作都在这里：导入音乐、扫描分析曲风（每首歌的曲风 + 节拍网格），"
-            "以及编辑「曲风 → 画面标签」的绑定关系。\n"
+            "演出前的准备工作都在这里：导入音乐、扫描分析（指纹 + 节拍网格 + 能量段落）。\n"
             "素材库在「🎬 演出台」上，演出中随时能取素材、直接拖进图层。"))
         self.lbl_p2_desc.setWordWrap(True)
         self.lbl_p2_desc.setStyleSheet("color:" + theme.V("muted") + ";")
@@ -3043,7 +3191,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(t)
         self.lbl_lib2_desc = QLabel(T(
             "这里是全屏版素材库，和「🎬 演出台」上那份是同一批素材（那份保持原样）。\n"
-            "搜索 / 筛选 / 导入 / 右键打标签都在这里做；双击缩略图 = 播放到当前图层。\n"
+            "搜索 / 筛选 / 导入 / 右键扫描素材都在这里做；双击缩略图 = 播放到当前图层。\n"
             "⚠ 「拖进图层」只能在演出台做（跨页面拖拽系统不允许）。"))
         self.lbl_lib2_desc.setWordWrap(True)
         self.lbl_lib2_desc.setStyleSheet("color:" + theme.V("muted") + ";")
@@ -3060,19 +3208,29 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _c=False, ii=i: self.set_kind_filter(ii))
             self.kind_group2.addButton(b, i)
             fbar.addWidget(b)
-        fbar.addWidget(QLabel("标签"))
-        self.btn_tagfilter2 = QPushButton("标签: 全部")
-        self.btn_tagfilter2.setToolTip("按标签筛选素材（可多选）")
-        self.btn_tagfilter2.clicked.connect(self.open_tag_filter)
-        fbar.addWidget(self.btn_tagfilter2, 1)
+        # ★ 2026-10-30 用户「大砍刀」：标签筛选按钮删除后，**动态筛选必须留着**
+        #   （用户第 1 时间就问「素材的动态选择过滤怎么没了」—— 动态扫描留着就是为了筛）。
+        #   这里给一个专用下拉：全部 / 低动态 / 中动态 / 高动态 / 频闪。
+        fbar.addWidget(QLabel("动态"))
+        self.dyn_combo2 = QComboBox()
+        self.dyn_combo2.addItems(["全部", DYNAMIC_LOW, DYNAMIC_MID,
+                                 DYNAMIC_HIGH, DYNAMIC_FLICKER, "已排除", "未扫描"])
+        self.dyn_combo2.setToolTip(_FILTER_TIP)
+        self.dyn_combo2.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.dyn_combo2.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.dyn_combo2.currentIndexChanged.connect(self.set_dyn_filter)
+        fbar.addWidget(self.dyn_combo2, 0)
         fbar.addWidget(QLabel("角色"))
         self.role_combo2 = QComboBox()
         self.role_combo2.addItems(["全部", "前景", "背景"])
+        self.role_combo2.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.role_combo2.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.role_combo2.currentIndexChanged.connect(self.set_role_filter)
         fbar.addWidget(self.role_combo2, 0)
         fbar.addWidget(QLabel("数量:"))
         self.lbl_lib_count2 = QLabel("0")
         fbar.addWidget(self.lbl_lib_count2)
+        fbar.addStretch(1)      # 同上：紧凑左对齐，别把下拉拉到满屏宽
         lay.addLayout(fbar)
 
         # ---- 搜索 + 导入 + 打标 ----
@@ -3088,7 +3246,7 @@ class MainWindow(QMainWindow):
         b1.clicked.connect(self.import_folder)
         b2 = QPushButton(tr("import_files"))
         b2.clicked.connect(self.import_files)
-        b3 = QPushButton("扫描打标")
+        b3 = QPushButton("扫描素材")
         b3.setToolTip("用本地视觉模型为素材自动打内容标签（后台、可续扫）")
         b3.clicked.connect(lambda: self.scan_tags())
         for b in (b1, b2, b3):
@@ -3177,14 +3335,16 @@ class MainWindow(QMainWindow):
                 if cb is None:
                     continue
                 cb.blockSignals(True)
-                cb.setCurrentIndex(max(0, min(2, rf)))
+                cb.setCurrentIndex(max(0, min(cb.count() - 1, rf)))
                 cb.blockSignals(False)
-            txt = (f"标签: 已选 {len(self.tag_selected)}" if self.tag_selected
-                   else "标签: 全部")
-            for b in (getattr(self, "btn_tagfilter", None),
-                      getattr(self, "btn_tagfilter2", None)):
-                if b is not None:
-                    b.setText(txt)
+            # 动态筛选：两页共用同一个 `dyn_filter`（0~4 对应 全部/低/中/高/频闪）
+            df = int(getattr(self, "dyn_filter", 0) or 0)
+            for cb in (getattr(self, "dyn_combo", None), getattr(self, "dyn_combo2", None)):
+                if cb is None:
+                    continue
+                cb.blockSignals(True)
+                cb.setCurrentIndex(max(0, min(cb.count() - 1, df)))
+                cb.blockSignals(False)
             kw = getattr(self, "lib_kw", "")
             for ed in (getattr(self, "search_box", None), getattr(self, "search_box2", None)):
                 if ed is None or ed.text() == kw:
@@ -3254,24 +3414,38 @@ class MainWindow(QMainWindow):
         lay.setSpacing(3)
         self.kind_filter = 0   # 0 全部 / 1 图片 / 2 视频
         self.role_filter = 0   # 0 全部 / 1 前景 / 2 背景
+        # 动态筛选：0 全部 / 1 低动态 / 2 中动态 / 3 高动态 / 4 频闪
+        # （2026-10-30「大砍刀」后只剩动态/频闪/铺满度三组标签，动态筛选是最常用的一维）
+        self.dyn_filter = 0
         self.lib_kw = ""       # 搜索词（两页共用，见 _build_library_page）
         bar = QHBoxLayout()
         t = QLabel("素材库")
         t.setStyleSheet("color:" + theme.V("muted") + ";font-weight:bold;")
         bar.addWidget(t)
-        bar.addWidget(QLabel(tr("tag")))
-        self.tag_selected = set()
-        self.btn_tagfilter = QPushButton("标签: 全部")
-        self.btn_tagfilter.setToolTip("按标签筛选素材（可多选）")
-        self.btn_tagfilter.clicked.connect(self.open_tag_filter)
-        bar.addWidget(self.btn_tagfilter, 1)
+        # ★ 2026-10-30：标签筛选按钮删除（同上），但**动态筛选保留**
+        self.tag_selected = set()      # 保留字段：老配置/其它调用点仍会读它
+        bar.addWidget(QLabel("动态"))
+        self.dyn_combo = QComboBox()
+        self.dyn_combo.addItems(["全部", DYNAMIC_LOW, DYNAMIC_MID,
+                                DYNAMIC_HIGH, DYNAMIC_FLICKER, "已排除", "未扫描"])
+        self.dyn_combo.setToolTip(_FILTER_TIP)
+        self.dyn_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.dyn_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.dyn_combo.currentIndexChanged.connect(self.set_dyn_filter)
+        bar.addWidget(self.dyn_combo, 0)
         bar.addWidget(QLabel("角色"))
         self.role_combo = QComboBox()
         self.role_combo.addItems(["全部", "前景", "背景"])
+        self.role_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.role_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.role_combo.currentIndexChanged.connect(self.set_role_filter)
         bar.addWidget(self.role_combo, 0)
         bar.addWidget(QLabel("数量:"))
         bar.addWidget(self.lbl_lib_count)
+        # ★ 2026-10-30 用户「分的太开了」：QComboBox 默认 Expanding 会把整行撑满，
+        #   两个下拉一放就变成"标签和下拉之间隔着半个屏幕"。下拉固定宽度 + 末尾 stretch
+        #   ⇒ 一排控件紧凑左对齐，右边留白。
+        bar.addStretch(1)
         lay.addLayout(bar)
 
         # 图片/视频筛选 + 搜索 + 扫描打标
@@ -3295,7 +3469,7 @@ class MainWindow(QMainWindow):
         self.search_box.textChanged.connect(
             lambda t, s=None: self._on_search_debounced(t, self.search_box))
         fbar.addWidget(self.search_box, 1)
-        self.btn_scan = QPushButton("扫描打标")
+        self.btn_scan = QPushButton("扫描素材")
         self.btn_scan.setToolTip("用本地视觉模型为素材自动打内容标签（后台、可续扫）")
         self.btn_scan.clicked.connect(lambda: self.scan_tags())
         fbar.addWidget(self.btn_scan)
@@ -3774,9 +3948,13 @@ class MainWindow(QMainWindow):
         self.cfg.save()
 
     def open_postfx_detail(self, key):
-        """单个特效的详细设置对话框：触发模式 / 曲风绑定 / 衰减 / 音频驱动"""
+        """单个特效的详细设置对话框：触发模式 / 衰减 / 音频驱动
+
+        ★ 2026-10-30 用户「大砍刀」：曲风识别删除 ⇒ "曲风"触发方式与曲风输入框一并删。
+          老配置里 `trigger="genre"` 的会落到引擎的 `else: m = 1.0` ⇒ 退化为常驻。
+        """
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, \
-            QLineEdit, QCheckBox, QDialogButtonBox
+            QCheckBox, QDialogButtonBox
         e = self.cfg["postfx"]["effects"].get(key) or {}
         name = self.settings.postfx_checks.get(key)
         dlg = QDialog(self)
@@ -3784,13 +3962,10 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel("触发模式"))
         trig = QComboBox()
-        trig.addItems(["常驻", "曲风", "事件"])
-        trig.setCurrentIndex(["constant", "genre", "event"].index(e.get("trigger", "constant")))
+        trig.addItems(["常驻", "事件"])
+        _trig = e.get("trigger", "constant")
+        trig.setCurrentIndex(1 if _trig == "event" else 0)    # 老的 "genre" 归到"常驻"
         lay.addWidget(trig)
-        ge = QLineEdit(e.get("genres", "") or "")
-        ge.setPlaceholderText("曲风名，逗号分隔（如 Hardcore, Trance）")
-        ge.setVisible(trig.currentIndex() == 1)
-        lay.addWidget(ge)
         lay.addWidget(QLabel("事件衰减时长"))
         dc = QComboBox()
         dc.addItems(["0.5 秒", "1 秒", "1.5 秒", "2 秒", "3 秒", "4 秒"])
@@ -3798,7 +3973,7 @@ class MainWindow(QMainWindow):
             dc.setCurrentIndex([0.5, 1.0, 1.5, 2.0, 3.0, 4.0].index(float(e.get("decay", 1.5) or 1.5)))
         except ValueError:
             dc.setCurrentIndex(2)
-        dc.setVisible(trig.currentIndex() == 2)
+        dc.setVisible(trig.currentIndex() == 1)
         lay.addWidget(dc)
         lay.addWidget(QLabel("音频驱动（强度随频段能量连续缩放）"))
         dr = QComboBox()
@@ -3810,16 +3985,14 @@ class MainWindow(QMainWindow):
         lay.addWidget(dr)
 
         def on_trig(i):
-            ge.setVisible(i == 1)
-            dc.setVisible(i == 2)
+            dc.setVisible(i == 1)     # 0=常驻 / 1=事件（衰减时长只在事件模式有意义）
         trig.currentIndexChanged.connect(on_trig)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
         lay.addWidget(bb)
         if dlg.exec() == QDialog.Accepted:
-            self.set_postfx(key, "trigger", ["constant", "genre", "event"][trig.currentIndex()])
-            self.set_postfx(key, "genres", ge.text().strip())
+            self.set_postfx(key, "trigger", ["constant", "event"][trig.currentIndex()])
             self.set_postfx(key, "decay", [0.5, 1.0, 1.5, 2.0, 3.0, 4.0][dc.currentIndex()])
             self.set_postfx(key, "drive", ["off", "bass", "mid", "high", "energy"][dr.currentIndex()])
 
@@ -4489,6 +4662,23 @@ class MainWindow(QMainWindow):
             self.engine.set_song_grids(out)
         except Exception:
             pass
+        # ★★ 2026-10-31（用户「erlib 的扫描要和 eravj 一样」）：把**导入包里的能量段落**
+        #   也注入引擎。原来只有本机曲库有段落（`cfg["music_meta"][path]`），导入的歌
+        #   文件不在本机、没有 path ⇒ 没有段落色带、也不按段落切素材（"不一样"）。
+        #   ⚠ 本机优先：同一 sid 两边都有时用本机的（本机扫的是真实文件）。
+        try:
+            from config import app_base_dir as _abd
+            import imported_lib as _IL2
+            _secm = {}
+            for _sid, _t in _IL2.lookup_sections(_abd()).items():
+                if _sid in self._grid_path_by_sid:
+                    continue
+                _secm[int(_sid)] = _t
+            self.engine.set_song_sections(_secm)
+            if _secm:
+                print("[曲库] 合并导入包：+%d 条段落表" % len(_secm))
+        except Exception:                                        # noqa: BLE001
+            pass
         return len(out)
 
     def _restore_cue_sheets(self):
@@ -4536,8 +4726,39 @@ class MainWindow(QMainWindow):
                     print("[码表] 启动恢复失败：%s（%s: %s）" % (cid, type(e).__name__, e))
             if n_ok:
                 print("[码表] 启动恢复 %d 张（等认歌后自动选曲目）" % n_ok)
+                # ★★ 2026-11-06：装表是在启动 300ms 后做的，而 `layers_panel.rebuild()` 早就
+                #   跑过了 ⇒ 码表图层的素材行**还是空的**（用户看到"码表行没有缩略图"）。
+                #   装完必须重填那一行（`sync_layer` 会按 `cue_media_paths()` 建格子）。
+                try:
+                    for _i, _lay in enumerate(self.engine.layers):
+                        if getattr(_lay, "is_cuesheet", False):
+                            self.layers_panel.refresh_header(_i)
+                            self.layers_panel.sync_layer(_i)
+                except Exception:                                # noqa: BLE001
+                    pass
         except Exception:                                        # noqa: BLE001
             pass
+
+    def _merge_imported_song_meta(self):
+        """把**导入包**的歌并入 `_song_meta_by_id`（HUD 歌名用）。返回并入条数。
+
+        ★★ 2026-10-31（用户「怎么输出预览不显示我在放那首歌」）：
+          导入包的歌没有本机文件、不在 `cfg["music_meta"]` 里，只有
+          `imported_meta.db` 里那一条（按 song_id）。识别能命中（指纹在库里），
+          但 HUD 查 `_song_meta_by_id` 查不到 ⇒ 输出预览里没有 🎵 歌名。
+
+        ⚠ 只补 title/artist（曲风已下线，别再复活）；
+        ⚠ 已存在的 sid **不覆盖**（本机曲库 / 码表包的信息更全，优先保留）。
+        """
+        from config import app_base_dir
+        import imported_lib as _IL
+        added = 0
+        for sid, m in (_IL.song_meta_by_sid(app_base_dir()) or {}).items():
+            if sid in self._song_meta_by_id:
+                continue
+            self._song_meta_by_id[sid] = m
+            added += 1
+        return added
 
     def _merge_cue_song_meta(self):
         """把 `cfg["cue"]["fp_songs"]` 的曲目并入 `_song_meta_by_id`（HUD 歌名 / 曲风查表）。
@@ -4599,21 +4820,18 @@ class MainWindow(QMainWindow):
                     "artist": m.get("artist") or "",
                     "genres": m.get("genres") or [],
                 }
-        # ★★ 2026-10-08（erlib 第二步）：合并「导入的曲库分析包」的曲风。
-        #   识别到导入包里的歌时，引擎据此取**精确曲风**（而不是实时 AI 猜的），
-        #   自动配画面就能用对素材池。⚠ 本机曲库优先（同 id 以本机为准）。
+        # ★ 2026-10-30 用户「大砍刀」：原「合并导入包的曲风」整块删除
+        #   （`imported_lib.lookup_genres` 已随曲风链路一并移除）。
+        #   `_song_meta_by_id` 仍由本机曲库 + 码表包提供，HUD 歌名照常显示。
+        # ★★ 2026-10-31 修正（用户「怎么输出预览不显示我在放那首歌」）：
+        #   上面那句话对**导入包的歌**不成立 —— 它们不在 `cfg["music_meta"]` 里
+        #   （本机没文件，按 song_id 存在 `imported_meta.db`）⇒ 认出来了、HUD 却没有
+        #   「🎵 歌名」那一行（截图：在放 `(10) [天音] Fly Anima.flac`，只显示 BPM/能量）。
+        #   曲风不恢复（那刀是对的），只补 **title/artist**。
         try:
-            from config import app_base_dir
-            import imported_lib as _IL
-            _added = 0
-            for _sid, _mm in _IL.lookup_genres(app_base_dir()).items():
-                if _sid not in self._song_meta_by_id:
-                    self._song_meta_by_id[_sid] = _mm
-                    _added += 1
-            if _added:
-                print("[曲库] 合并导入包：+%d 首曲风" % _added)
-        except Exception:                                        # noqa: BLE001
-            pass
+            self._merge_imported_song_meta()
+        except Exception as _e:                                  # noqa: BLE001
+            print("[识别] 合并导入包歌名失败：%s" % _e)
         # ★ 2026-10-17：码表包带来的歌（合成 id）也并入 —— 否则认出来但 HUD 查不到歌名
         try:
             self._merge_cue_song_meta()
@@ -4621,8 +4839,6 @@ class MainWindow(QMainWindow):
             print("[码表] 合并歌名映射失败：%s" % _e)
         if not self._song_meta_by_id:
             return
-        # 注入 song_id → 曲风映射给 engine（自动匹配优先用指纹识别歌的精确曲风）
-        self.engine.set_song_genres(self._song_meta_by_id)
         try:
             from fp import FingerprintDB
             if self._fp_db is not None:      # 重建：关闭旧连接，扫描后拿最新数据
@@ -4663,7 +4879,7 @@ class MainWindow(QMainWindow):
             except Exception:                                    # noqa: BLE001
                 pass
             # ★★ 2026-10-22：**指纹 id 自愈**（后台线程，绝不卡启动）。
-            #   背景：历史扫描时若路径写法变过（`W://` vs `W:/`），同一条曲目在库里
+            #   背景：历史扫描时若路径写法变过（`<盘符>://` vs `<盘符>:/`），同一条曲目在库里
             #   会存成**旧的 song_id**；白名单只认"按当前路径算出的 id" ⇒ 该曲永远
             #   命中哈希却 0 票（局域网实测：hit=208/217、raw=0）。
             #   这里用库内文件实测一次，证据足够（票数≥100 且 offset≈取样点）才改挂。
@@ -4720,17 +4936,17 @@ class MainWindow(QMainWindow):
         except Exception:                                          # noqa: BLE001
             pass
 
-    def open_genre_visual_editor(self):
-        """曲风→画面标签 映射编辑器（保存后自动图层按新映射重匹配）"""
-        from panels import GenreVisualEditDialog
-        GenreVisualEditDialog(self).exec()
-
     def import_erlib_package(self):
         """导入 erlib 导出的曲库分析包（`.eravjlib`）——
         别的机器（DJ 机）扫好的**曲风 / 封面 / 指纹 / 离线节拍网格**。
 
         ⚠ 包**不含音频**：演出机不需要有这些歌的文件 —— 靠**指纹**认出来即可。
         ⚠ 导入是"并进本机"（幂等覆盖），**不碰**本机自己扫的曲库。
+
+        ★★ 2026-10-31（用户原话：「导入了怎么 识别不到 …… 而且 导入重复的歌也没提醒」）：
+          **导入前**先与本机曲库比对，命中就弹窗让用户选 —— 这是本次修复的核心。
+          为什么必须在"开始导入"**之前**问：一旦写进 `imported_meta.db` / `fingerprints.db`
+          再回滚，就得删用户数据（本次明确不删既有数据），所以只能提前拦。
         """
         p, _ = QFileDialog.getOpenFileName(
             self, "选择曲库分析包（.eravjlib）", "",
@@ -4740,20 +4956,99 @@ class MainWindow(QMainWindow):
         th = getattr(self, "_erlib_imp", None)
         if th is not None and th.isRunning():
             return
+        # ★ 2026-10-31：导入前检测重复（只读包 + 只读 cfg，几毫秒）。
+        skip_sids = self._ask_import_duplicates(p)
+        if skip_sids is None:
+            print("[曲库] 导入已取消（用户在重复提示里点了取消）")
+            return
         try:
             from config import app_base_dir
             import imported_lib as _IL
             n_old = _IL.count(app_base_dir())
         except Exception:                                        # noqa: BLE001
             n_old = 0
-        print("[曲库] 开始导入曲库分析包：%s（本机原有导入 %d 首）" % (p, n_old))
-        self._erlib_imp = ErlibImportThread(p, self)
+        print("[曲库] 开始导入曲库分析包：%s（本机原有导入 %d 首，跳过重复 %d 首）"
+              % (p, n_old, len(skip_sids)))
+        self._erlib_imp = ErlibImportThread(p, self, skip_sids=skip_sids)
         self._erlib_imp.progress.connect(
             lambda a, b, s: print("[曲库] 导入中：%s %d/%d" % (s, a, b or 0)))
         self._erlib_imp.finished_ok.connect(
             lambda st: self._on_erlib_imported(st, n_old))
         self._erlib_imp.failed.connect(self._on_erlib_failed)
         self._erlib_imp.start()
+
+    def _ask_import_duplicates(self, pkg_path):
+        """导入前弹窗：「跳过这些（推荐）/ 仍然全部导入 / 取消」。
+
+        返回**要跳过的 song_id 集合**（`set()` = 全部导入）；
+        用户点「取消」⇒ 返回 `None`（调用方据此中止导入）。
+
+        ⚠ 检测本身失败（包损坏/读不了）时**不挡死**，但**必须让用户看见**：
+          ★★★ 2026-11-01 18:15（用户「怎么还是正常导入了呢」）：这里原来只是
+          `print(); return set()` —— GUI 打包版**没有控制台**，print 等于扔进黑洞，
+          于是「判重因为 `Config` 没有 `.get()` 抛异常」整整一天无人知晓（见
+          `erlib.dupdetect.cfg_get` 的注释）。现在改成弹框问一句，
+          用户至少知道"这次没去重"，而不是以为程序判断过"没有重复"。
+        """
+        try:
+            from erlib.dupdetect import scan_package, dup_prompt_text
+            # ★★ 2026-11-01（QA P1/P2/P3）：把**已导入**的曲目也当"本机已有"——
+            #   反复重导入同一个包时，对照那一份只在 `imported_meta.db` 里，
+            #   不并进来的话判据③的时长护栏会瞎（剪辑版误判），同 sid 也命不中。
+            #   拿不到基准目录就传 None（scan_package 会退回指纹库所在目录）。
+            _base = ""
+            try:
+                from config import app_base_dir
+                _base = app_base_dir()
+            except Exception:                                    # noqa: BLE001
+                _base = ""
+            res = scan_package(pkg_path, self.cfg, base_dir=(_base or None))
+        except Exception as e:                                   # noqa: BLE001
+            print("[曲库] 导入前重复检测失败（不影响导入）：%s" % e)
+            _b = QMessageBox(self)
+            _b.setIcon(QMessageBox.Icon.Warning)
+            _b.setWindowTitle(T("导入曲库分析包"))
+            _b.setText(Tf("导入前的重复检测没跑起来：{}", e))
+            _b.setInformativeText(T(
+                "这次会**不去重**直接导入（本机已有的同名/同一首不会被跳过）。\n"
+                "如果是「导入了重复的歌也没提醒」，请把这行报错发给我。"))
+            _b_go = _b.addButton("继续导入（不去重）", QMessageBox.ButtonRole.AcceptRole)
+            _b.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            _b.setDefaultButton(_b_go)
+            _b.exec()
+            return set() if _b.clickedButton() is _b_go else None
+            return set()
+        dups = list(res.get("dups") or ())
+        if not dups:
+            return set()
+        print("[曲库] 导入前发现重复 %d 首：%s"
+              % (len(dups),
+                 ", ".join("%s(%s%s)" % (
+                     d.get("file_name"), d.get("how"),
+                     # ★ 2026-11-01（用户「没做指纹对比吗」）：判据③要把重合率打出来 ——
+                     #   用户反馈"判重到底凭啥"时，日志是唯一能自证的地方。
+                     (" %.0f%%" % (float(d.get("overlap") or 0.0) * 100.0))
+                     if d.get("how") == "fingerprint" else "")
+                     for d in dups[:8])))
+        # 弹窗：三个按钮，默认「跳过这些（推荐）」。
+        # ⚠ 用自定义按钮而不是 question()：三个选项里"跳过"必须**显式**是 AcceptRole，
+        #   否则回车会落到「全部导入」上（现场一按回车就把重复塞进库）。
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(T("导入曲库分析包"))
+        box.setText(T(dup_prompt_text(dups, res.get("total") or 0)))
+        btn_skip = box.addButton("跳过这些（推荐）", QMessageBox.ButtonRole.AcceptRole)
+        btn_all = box.addButton("仍然全部导入", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_skip)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_skip:
+            return set(res.get("dup_sids") or ())
+        if clicked is btn_all:
+            print("[曲库] 用户选择「仍然全部导入」（明知重复，按原样导入）")
+            return set()
+        return None
 
     def _on_erlib_imported(self, st, n_old):
         """导入完成：**立刻刷新查表 + 曲库列表**（否则要重启才生效）+ 给用户结果。"""
@@ -4775,20 +5070,51 @@ class MainWindow(QMainWindow):
             n_now = _IL.count(app_base_dir())
         except Exception:                                        # noqa: BLE001
             n_now = 0
-        QMessageBox.information(
-            self, T("导入曲库分析包"),
-            "导入完成：\n"
-            "· 本包：%d 首 / 指纹 %d 条 / 封面 %d 张\n"
-            "· 本机累计导入：%d 首\n\n"
-            "之后 DJ 放这些歌时，本机会自动认出并套用曲风、封面与离线八拍网格。"
-            % (st.get("songs", 0), st.get("fingerprints", 0),
-               st.get("covers", 0), n_now))
+        # ★ 2026-10-31（用户「导入重复的歌也没提醒」）：跳过数必须**写在结果里**，
+        #   否则用户只会看到"导入完成 19 首"却不知道为什么少了 2 首（以为丢了数据）。
+        # ⚠ 逐行拼再 join：直接把 `%` 接在"多行字符串 + 变量"后面时，
+        #   `%` 的优先级比 `+` 高，只会格式化最后一段（踩过）。
+        n_skip = int(st.get("skipped") or 0)
+        _lines = ["导入完成：",
+                  "· 本包：%d 首 / 指纹 %d 条 / 封面 %d 张"
+                  % (st.get("songs", 0), st.get("fingerprints", 0),
+                     st.get("covers", 0))]
+        if n_skip:
+            _lines.append("· 跳过重复：%d 首（本机已有，未写入 / 未写指纹）" % n_skip)
+        # ★★ 2026-11-01（用户 17:20「节拍网格（包 6 / 本机 7）导入失败」）：
+        #   网格版本不一致**不再拦死导入**，但必须让用户知道这批歌的 BPM 可能偏，
+        #   否则他会以为"导入成功 = 分析数据都对"（200BPM 扫成 132.7 就是这么发现的）。
+        #   ⚠ 只提示、不阻塞：歌能放能认，重导或手改 BPM 都能救。
+        #   ⚠⚠ 2026-11-01 QA：**绝不能把版本号写死**在文案里 —— 第一版写的是"（v6）"，
+        #     等 GRID_VER 升到 8，导 v7 的包照样提示"（v6）"，反而骗人。
+        #     版本从 `stats["grid_versions"]`（= `LibReader.grid_stale` 的 (包版本, 本机版本)）
+        #     取；取不到就退化成「来自旧算法」，**绝不出现 "vNone"**。
+        n_grid_stale = int(st.get("grid_stale") or 0)
+        if n_grid_stale:
+            _gv = st.get("grid_versions")
+            if (isinstance(_gv, (tuple, list)) and len(_gv) == 2
+                    and _gv[0] is not None and _gv[1] is not None):
+                _ver_txt = "（包 v%s / 本机 v%s）" % (_gv[0], _gv[1])
+            else:
+                _ver_txt = ""
+            _lines.append(
+                "· 节拍网格：%d 首来自旧算法%s，BPM 可能偏差 → "
+                "建议用新版 ERLIB 重新导出，或在详情页手改 BPM"
+                % (n_grid_stale, _ver_txt))
+        _lines.append("· 本机累计导入：%d 首" % n_now)
+        _lines.append("")
+        _lines.append("之后 DJ 放这些歌时，本机会自动认出并套用曲风、封面与离线八拍网格。")
+        QMessageBox.information(self, T("导入曲库分析包"), "\n".join(_lines))
 
     def _on_erlib_failed(self, msg):
         print("[曲库] 导入失败：%s" % msg)
+        # ★ 2026-11-01：文案跟着行为改 —— 网格版本（grid_ver）不一致**已不再拦导入**
+        #   （只警告，见 `erlib.format.LibReader.check_versions` / `transfer.import_into`），
+        #   所以这里再写"指纹/网格"会误导用户去纠结网格。能走到这个提示的只剩
+        #   格式版本 / 指纹版本不一致（以及包损坏等），正文只提指纹。
         QMessageBox.warning(self, T("导入曲库分析包"),
                             "导入失败：\n%s\n\n"
-                            "常见原因：包的指纹/网格算法版本与本机不一致"
+                            "常见原因：包的指纹算法版本与本机不一致"
                             "（用新版 erlib 重新导出即可）。" % msg)
 
     def import_music_dir(self):
@@ -4850,7 +5176,7 @@ class MainWindow(QMainWindow):
             if force:
                 ret = QMessageBox.question(
                     self, T("全量重扫"),
-                    "全量重扫将忽略已有结果，重新分析曲库里的全部歌曲（含指纹与曲风）。\n"
+                    "全量重扫将忽略已有结果，重新分析曲库里的全部歌曲（含指纹、节拍网格与段落）。\n"
                     "可能耗时较长，确定继续吗？",
                     QMessageBox.Yes | QMessageBox.Cancel)
                 if ret != QMessageBox.Yes:
@@ -4932,13 +5258,8 @@ class MainWindow(QMainWindow):
                 self, T("查重"),
                 T("已从曲库移除 {} 份重复条目（磁盘上的音频文件没有动）。").format(removed))
 
-    def edit_music_genre(self, path):
-        from panels import GenreEditDialog
-        m = self.cfg["music_meta"].get(path) or {}
-        GenreEditDialog(self, path, m.get("genres") or []).exec()
-
     def rescan_music(self, path):
-        """重新分析扫描单首曲目（重建指纹 + 重查曲风 + 重算节拍网格）。
+        """重新分析扫描单首曲目（重建指纹 + 重算节拍网格 + 能量段落）。
 
         段落分析已移除（见 `_music_scan` 的说明），别再写「重算段落」。"""
         if self._scan_busy():
@@ -4980,7 +5301,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, T("曲目信息"), text)
 
     def show_clear_music_analysis(self):
-        """清除全部已分析指纹与曲风（带二次确认，可选保留手动设置的曲风）"""
+        """清除全部已分析结果（指纹 / 节拍网格 / 自动段落），保留用户产物。"""
         if getattr(self, "_music_scan", None) is not None and self._music_scan.isRunning():
             QMessageBox.information(self, T("清除分析数据"), "扫描正在进行中，请稍后再清除。")
             return
@@ -4989,11 +5310,10 @@ class MainWindow(QMainWindow):
         box.setText( T(CLEAR_ANALYSIS_TIP))
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
         box.button(QMessageBox.Yes).setText( T("清除"))
-        cb = QCheckBox("保留手动设置过的曲风")
-        box.setCheckBox(cb)
+        # ★ 2026-10-30 用户「大砍刀」：曲风没了 ⇒「保留手动设置过的曲风」复选框删除。
         if box.exec() != QMessageBox.Yes:
             return
-        self.clear_music_analysis(cb.isChecked())
+        self.clear_music_analysis()
         dlg = getattr(self, "music_dialog", None)
         if dlg:
             dlg.refresh()
@@ -5090,15 +5410,15 @@ class MainWindow(QMainWindow):
             pass
         return keep
 
-    def clear_music_analysis(self, keep_manual):
-        """清除**算法分析结果**（指纹 / 曲风 / 网格 / 段落），**保留用户产物**。
+    def clear_music_analysis(self):
+        """清除**算法分析结果**（指纹 / 节拍网格 / 自动段落），**保留用户产物**。
 
         ⚠⚠ 2026-10-30 现场事故（用户：「清除分析数据 怎么把码表也清了」）：
           旧实现直接 `self.cfg["music_meta"] = {}` —— 把 `music_meta[path]` 里的
           **用户手工标注也一起清空了**（实测 91 条全没，其中 1 条是手改的 BPM/锚点/段落）。
           这个字典混着两类东西：
             · 算法产物：`grid`（BPM/网格）、自动生成的 `sections`/`sections_raw`、
-              `genres`、`cover`、`fp_id`、`file_md5`、`duration` …
+              `cover`、`fp_id`、`file_md5`、`duration` …
             · **用户产物**：`grid_manual`（手改 BPM / 拍锚点 / 段落）、
               `grid_flip`（八拍相位翻转）、`sections_auto is False`（手存过的段落）
           用户点"清除分析数据"只是想清掉算法算的，手工作品必须留着 ——
@@ -5117,9 +5437,6 @@ class MainWindow(QMainWindow):
         new_meta = {}
         for p, m in meta.items():
             if not isinstance(m, dict):
-                continue
-            if keep_manual and m.get("source") == "manual":
-                new_meta[p] = dict(m)      # 用户勾了"保留手动曲风"：整条留着
                 continue
             # ★★★ 2026-10-30 04:42 第四次报障的修法：码表 / 导入包**覆盖的曲目**，
             #   `music_meta` 整条保留 —— 它们的 BPM / 网格 / 段落是码表对齐要用的，
@@ -5490,8 +5807,8 @@ class MainWindow(QMainWindow):
 
     def _append_grid_items(self, items):
         """只插入这批素材（比整表重建快得多）。有筛选/搜索时不插，等导入结束统一重建。"""
-        if self.tag_selected or (self.search_box.text() or "").strip() or \
-                self.kind_filter or self.role_filter:
+        if ((self.search_box.text() or "").strip() or self.kind_filter
+                or self.role_filter or getattr(self, "dyn_filter", 0)):
             return
         sz = self.grid.iconSize()
         for it in items:
@@ -5520,8 +5837,21 @@ class MainWindow(QMainWindow):
         else:
             self.thumb_bar.hide()
         self.lbl_status.setText(
-            Tf("导入完成：新增 {} 个，跳过 {} 个（重复或无法识别）", new_n, skip_n)
-            + T("　记得点「扫描打标」给新素材打标签"))
+            Tf("导入完成：新增 {} 个，跳过 {} 个（重复或无法识别）", new_n, skip_n))
+        # ★★ 2026-10-31（用户：「素材库怎么不显示图片」「导入图片也没反应」）：
+        #   根因不是导入失败 —— `_populate_grid` 的「全部」档会**跳过未扫描素材**
+        #   （用户 2026-10-30 明确要求「选择时就排除这些」），而新导入的素材
+        #   从来没有任何地方触发扫描 ⇒ 它们在默认视图里**根本看不见**，
+        #   用户只能得出"导入没反应"的结论（实测库里 10 张图 + 6 个 LOGO 视频
+        #   全卡在这个状态，而 368 个视频有标签所以照常显示 ⇒ "只有图片不显示"）。
+        #   ⇒ 导入完成后**立刻自动扫这批新素材**，几秒内它们带上标签就出现在「全部」。
+        _fresh_scan = [m.path for m in new_items if not m.tags]
+        if _fresh_scan:
+            self.lbl_status.setText(
+                Tf("导入完成：新增 {} 个 —— 正在自动扫描新素材（扫完自动出现在素材库）",
+                   new_n))
+            # quiet：缩略图 worker 正在用同一条进度条，别抢
+            self.scan_tags(_fresh_scan, quiet=True)
 
     def _on_import_failed(self, msg):
         self.thumb_bar.hide()
@@ -5654,14 +5984,6 @@ class MainWindow(QMainWindow):
         """标签集合变化后刷新筛选按钮文案（**两页都要**，兼容旧调用点）"""
         self._sync_lib_controls()
 
-    def open_tag_filter(self):
-        from panels import TagFilterDialog
-        dlg = TagFilterDialog(self, self.tag_selected)
-        if dlg.exec() == QDialog.Accepted:
-            self.tag_selected = dlg.selected
-            self._fill_tag_combo()
-            self.refresh_grid()
-
     def refresh_grid(self, icons_only=False):
         """刷新素材库网格（**两页共用**：演出台那份 + 全屏素材库那份）。"""
         self._populate_grid(self.grid, self.lbl_lib_count, icons_only)
@@ -5682,22 +6004,27 @@ class MainWindow(QMainWindow):
         sz = grid.iconSize()
         if not icons_only:
             grid.clear()
-            sel = self.tag_selected
             kw = (getattr(self, "lib_kw", "") or "").strip().lower()
+            # 动态维度：0 全部 / 1 低 / 2 中 / 3 高 / 4 频闪 / 5 已排除 / 6 未扫描
+            # （判据在 `passes_lib_filter`，纯函数、可测）
+            _di = int(getattr(self, "dyn_filter", 0) or 0)
+            # 角色维度：0 全部 / 1 前景 / 2 背景 / 3 已排除 / 4 未扫描
+            _ri = int(self.role_filter or 0)
             for it in self.library.values():
-                has_tags = bool(it.all_tags())
                 has_roles = any(it.roles.values())
-                # 标签筛选：只过滤"有标签但不匹配"的；未打标/排除的（无标签）始终显示
-                if sel and has_tags and not (set(it.all_tags()) & sel):
+                # 动态/未扫描判据统一走纯函数（见 `passes_lib_filter` 的说明：
+                # 「全部」= 库里所有素材；图片不打标但算"已就绪"）
+                if not passes_lib_filter(it, _di):
                     continue
+                # --- 角色维度（只有 全部/前景/背景；「已排除/未扫描」按用户要求只放在动态栏）---
+                if _ri == 1 and has_roles and not it.roles.get("fg"):
+                    continue
+                if _ri == 2 and has_roles and not it.roles.get("bg"):
+                    continue
+                # ★ 标签筛选（多选对话框）已删；搜索框仍可按标签文字过滤（见下面 kw 分支）
                 if self.kind_filter == 1 and it.kind not in ("image", "gif"):
                     continue
                 if self.kind_filter == 2 and it.kind != "video":
-                    continue
-                # 角色筛选：只过滤"有角色但不匹配"的；未打标/排除的（无角色）始终显示
-                if self.role_filter == 1 and has_roles and not it.roles.get("fg"):
-                    continue
-                if self.role_filter == 2 and has_roles and not it.roles.get("bg"):
                     continue
                 if kw and kw not in it.name.lower() and not any(kw in t.lower() for t in it.all_tags()):
                     continue
@@ -5738,7 +6065,8 @@ class MainWindow(QMainWindow):
             return "文件丢失"
         if getattr(it, "excluded", False):
             return "⊘ " + it.name[:16]
-        tags = it.all_tags()
+        _keep = set(DYNAMIC_TAGS) | set(COVERAGE_TAGS)
+        tags = [t for t in it.all_tags() if t in _keep]
         if tags:
             return "·".join(tags[:3])
         return it.name[:18]
@@ -5748,9 +6076,22 @@ class MainWindow(QMainWindow):
         if it.roles.get("fg"): roles.append("前景")
         if it.roles.get("bg"): roles.append("背景")
         r = "/".join(roles) or "未设置"
-        excl = "\n已排除自动打标/匹配（logo 等固定素材）" if getattr(it, "excluded", False) else ""
+        excl = "\n已排除自动匹配（logo 等固定素材）" if getattr(it, "excluded", False) else ""
         miss = "\n⚠ 素材文件已丢失（磁盘上找不到）" if not self._exists_cached(it.path) else ""
-        return f"{it.name}\n标签：{'、'.join(it.all_tags()) or '未扫描（点扫描打标）'}\n角色：{r}{excl}{miss}"
+        _sc = getattr(it, "score", None)
+        if isinstance(_sc, (int, float)):
+            _sct = "动态分：%.2f（%s）" % (_sc, "越高越炸" if _sc >= 0.667
+                                           else ("中间" if _sc >= 0.333 else "越静"))
+        else:
+            # 老素材还没打过分 ⇒ 按三档给代理值（换池就用这个值排序），并说明来源
+            try:
+                from match_engine import score_of
+                _sct = "动态分：%.2f（按档位估算；跑一次「扫描素材」可得精确值）" \
+                    % score_of(it)
+            except Exception:                                  # noqa: BLE001
+                _sct = "动态分：未扫描"
+        return (f"{it.name}\n标签：{'、'.join(it.all_tags()) or '未扫描（点扫描素材）'}"
+                f"\n{_sct}\n角色：{r}{excl}{miss}")
 
     def _tint_role(self, li, it):
         from PySide6.QtGui import QColor
@@ -5774,15 +6115,21 @@ class MainWindow(QMainWindow):
         self._sync_lib_controls()
         self.refresh_grid()
 
+    def set_dyn_filter(self, i):
+        """按动态档筛素材（0 全部 / 1 低 / 2 中 / 3 高 / 4 频闪）。
+
+        ⚠ 选了某一档就**只显示这一档**（未扫描的素材不属于任何一档，会被排除）——
+          这与旧的「标签筛选对未打标素材放行」不同：筛动态的目的就是找能用的，
+          把未扫描的混进来会让"筛完还有一堆不认识的东西"。
+        """
+        self.dyn_filter = int(i or 0)
+        self._sync_lib_controls()
+        self.refresh_grid()
+
     def set_role_filter(self, i):
         self.role_filter = i
         self._sync_lib_controls()
         self.refresh_grid()
-
-    def edit_tags(self, item):
-        """分类打勾式标签编辑器（手动 tag，永不覆盖自动 tag）"""
-        from panels import TagEditDialog
-        TagEditDialog(self, item).exec()
 
     def toggle_role(self, key, items):
         for m in items:
@@ -5808,34 +6155,90 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         self.refresh_grid()
 
-    def scan_tags(self, paths=None, force=False):
+    def reveal_in_explorer(self, path):
+        """在资源管理器里**打开并选中**该素材文件（素材右键「打开文件所在位置」）。
+
+        ★ 2026-10-30 用户要求加这个入口。用 `explorer /select,<路径>` 而不是只开目录：
+          素材库动辄几百个文件，只开目录还要自己翻。
+        ⚠ `subprocess` 起 Windows 程序必须走 `_no_window_kwargs()`（项目铁律 12）——
+          否则会闪一下黑色控制台窗口。
+        """
+        try:
+            p = str(path or "")
+            if not p or not os.path.isfile(p):
+                QMessageBox.information(self, T("打开文件所在位置"),
+                                        T("文件不存在（可能已被移动或删除）。"))
+                return
+            import subprocess
+            kw = {}
+            try:
+                from lan_audio import _no_window_kwargs
+                kw = _no_window_kwargs()
+            except Exception:                                      # noqa: BLE001
+                pass
+            if os.name == "nt":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(p)], **kw)
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(p)], **kw)
+        except Exception as e:                                     # noqa: BLE001
+            QMessageBox.warning(self, T("打开文件所在位置"), str(e)[:200])
+
+    def scan_tags(self, paths=None, force=False, quiet=False):
+        """扫描素材的**动态三档 / 频闪 / 铺满度**（并据此自动分配前景/背景）。
+
+        ★ 2026-10-30 用户「大砍刀」：CLIP 视觉打标（`TagScanThread`）已删除，
+          这里改成唯一的 `DynTagScanThread`；亮度分档与曲风识别同样不再产出。
+
+        `quiet=True`：不占用底部进度条（导入/启动时的**自动**补扫用 ——
+        那时缩略图 worker 正在用同一个进度条，两边抢会一直跳）。
+        """
         if getattr(self, "_tag_scan", None) is not None and self._tag_scan.isRunning():
-            QMessageBox.information(self, T("扫描打标"), "已有扫描在进行中，请稍候。")
+            QMessageBox.information(self, T("扫描素材"), "已有扫描在进行中，请稍候。")
             return
-        self._tag_scan = TagScanThread(self, paths, force=force)
+        self._tag_scan = DynTagScanThread(self, paths, force=force)
         self._tag_scan.progress.connect(self._on_scan_progress)
         self._tag_scan.finished.connect(self._on_scan_done)
-        self.thumb_bar.setVisible(True)
-        self.thumb_bar.setRange(0, 1)
-        self.thumb_bar.setValue(0)
+        self._scan_quiet = bool(quiet)
+        if not quiet:
+            self.thumb_bar.setVisible(True)
+            self.thumb_bar.setRange(0, 1)
+            self.thumb_bar.setValue(0)
         self._tag_scan.start()
 
-    def _on_scan_progress(self, done, total, path):
+    def _on_scan_progress(self, done, total):
+        if getattr(self, "_scan_quiet", False):
+            return
         self.thumb_bar.setRange(0, max(1, total))
         self.thumb_bar.setValue(done)
-        for i in range(self.grid.count()):
-            li = self.grid.item(i)
-            m = li.data(Qt.UserRole)
-            if m and m.path == path:
-                li.setText(self._item_text(m))
-                li.setToolTip(self._item_tooltip(m))
-                self._tint_role(li, m)
-                break
 
     def _on_scan_done(self):
-        self.thumb_bar.hide()
-        self._fill_tag_combo()  # 新内容标签进下拉
+        if not getattr(self, "_scan_quiet", False):
+            self.thumb_bar.hide()
+        self._scan_quiet = False
         self.refresh_grid()
+
+    def _auto_scan_unscanned(self):
+        """启动后**增量补扫**"未扫描"素材（只扫没标签的）。
+
+        ★★ 2026-10-31（用户「素材库怎么不显示图片」）：`_populate_grid` 的「全部」档
+          会跳过未扫描素材（用户要求「选择时就排除这些」）⇒ 没扫过 = 永远看不见。
+          库里有 10 张图 + 6 个 LOGO 视频一直卡在这个状态（从来没人触发扫描）。
+          ⇒ 启动 2.5 秒后补一次，扫完它们自动出现在「全部」。
+
+        ⚠ 演出中不扫：会抢 CPU 影响画面（`ui_stall.log` 里已有停帧记录）。
+        """
+        try:
+            if bool(getattr(getattr(self, "engine", None), "running", False)):
+                return
+            if getattr(self, "_tag_scan", None) is not None and self._tag_scan.isRunning():
+                return
+            todo = pick_unscanned(self.library)
+            if not todo:
+                return
+            print("[素材] 补扫未扫描素材 %d 个（它们此前在「全部」里看不见）" % len(todo))
+            self.scan_tags(todo, quiet=True)
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _on_dyn_scan_done(self):
         self.refresh_grid()
@@ -5862,7 +6265,7 @@ class MainWindow(QMainWindow):
         self.library.pop(item.path, None)
         self.cfg["library"] = list(self.library.keys())
         self.cfg.save()
-        # 自动图层兜底：曲风重算只在曲风变化时触发，清掉 clips 里已删素材的残留
+        # 自动图层兜底：清掉 clips 里已删除素材的残留（池子空了下次 tick 会重建）
         for i, lay in enumerate(self.engine.layers):
             if not getattr(lay, "auto_mode", False):
                 continue
@@ -5923,7 +6326,7 @@ class MainWindow(QMainWindow):
             return
         lay = self.engine.layers[layer_idx]
         if getattr(lay, "auto_mode", False):
-            return  # 自动图层素材由曲风匹配自动填充，不接受手动拖入
+            return  # 自动图层素材由「角色 + 动态档」自动填充，不接受手动拖入
         for m in items:
             if m and m not in lay.clips:
                 lay.clips.append(m)
@@ -6181,7 +6584,7 @@ class MainWindow(QMainWindow):
         a_solo.setChecked(bool(getattr(lay, "solo", False)))
         m.addSeparator()
         a_auto = m.addAction("自动匹配模式")
-        a_auto.setToolTip(T("按曲风给本层自动挑素材"))
+        a_auto.setToolTip(T("按动态档给本层自动挑素材"))
         a_auto.setCheckable(True)
         a_auto.setChecked(bool(getattr(lay, "auto_mode", False)))
         role_menu = m.addMenu("图层角色")
@@ -6302,9 +6705,7 @@ class MainWindow(QMainWindow):
         if auto:
             lay.role = lay.role or "bg"
             # 立即匹配一次，让自动图层马上有画面
-            self.engine._last_genres = None
-            self.engine._auto_refresh_t = 0.0
-            self.engine._refresh_auto_layers(self.audio.state.snapshot())
+            self.engine._refresh_auto_layers(self.audio.state.snapshot(), force=True)
         self._sync_layers()
 
     def _set_layer_role(self, idx, role):
@@ -6316,9 +6717,7 @@ class MainWindow(QMainWindow):
             return    # Kv 主视觉图层无前景/背景角色
         lay.role = role
         if getattr(lay, "auto_mode", False):
-            self.engine._last_genres = None
-            self.engine._auto_refresh_t = 0.0
-            self.engine._refresh_auto_layers(self.audio.state.snapshot())
+            self.engine._refresh_auto_layers(self.audio.state.snapshot(), force=True)
         self.layers_panel.refresh_header(idx)
         self.save_layers()
 
@@ -6412,7 +6811,7 @@ class MainWindow(QMainWindow):
         is_auto = getattr(lay, "auto_mode", False)
         m = QMenu(self)
         a_play = m.addAction("播放此素材")
-        a_play.setEnabled(media is not None and not is_auto)   # 自动图层素材由曲风管理
+        a_play.setEnabled(media is not None and not is_auto)   # 自动图层素材由自动匹配管理
         # ★ 2026-10-25（用户指出重复后删掉）：这里**不再放「手动切换素材」**。
         #   素材菜单的每一项都是"对**这一格**做事"，而「播放此素材」已经能把这层切到
         #   任意一格 —— 再挂一个"顺移下一个"就是同义重复，菜单里并排两项反而让人犹豫。
@@ -6550,9 +6949,7 @@ class MainWindow(QMainWindow):
         self._enforce_kv_top()
         if auto:
             # 立即匹配一次（绕过 3s 间隔），让新建自动图层马上有画面
-            self.engine._last_genres = None
-            self.engine._auto_refresh_t = 0.0
-            self.engine._refresh_auto_layers(self.audio.state.snapshot())
+            self.engine._refresh_auto_layers(self.audio.state.snapshot(), force=True)
         try:
             self._cur_layer = self.engine.layers.index(lay)
         except ValueError:
@@ -6562,10 +6959,13 @@ class MainWindow(QMainWindow):
         if is_cue and sheet_entry is not None:
             try:
                 import cue_ui
+                _lv = []
                 _ok, msg = cue_ui.load_and_bind(
-                    self, str(sheet_entry.get("path") or ""), lay, parent=self)
+                    self, str(sheet_entry.get("path") or ""), lay, parent=self,
+                    out_level=_lv)
             except Exception as e:                                # noqa: BLE001
                 _ok, msg = False, "装载码表失败：%s: %s" % (type(e).__name__, e)
+                _lv = []
             self.layers_panel.refresh_header(self._cur_layer)
             try:
                 self.save_layers()
@@ -6579,7 +6979,11 @@ class MainWindow(QMainWindow):
                 except Exception:                                 # noqa: BLE001
                     pass
             if msg:
-                QMessageBox.warning(self, T( T("码表")), msg)
+                # ★ 2026-11-02：成功 + 补充说明用信息图标，只有真问题才用警告
+                if _lv and _lv[0] == "info":
+                    QMessageBox.information(self, T(T("码表")), msg)
+                else:
+                    QMessageBox.warning(self, T(T("码表")), msg)
 
     def layer_del(self):
         if len(self.engine.layers) <= 1 or not (0 <= self._cur_layer < len(self.engine.layers)):
@@ -6862,8 +7266,9 @@ class MainWindow(QMainWindow):
         #   ⇒ 既白烧 CPU（图层多时每轮遍历所有格子）又不可靠。别再搬回来。
 
     def _bpm_text(self, snap, prefix="BPM "):
-        """BPM 显示文案。用 bpm_display（未锁定也可有值）而不是 bpm（只有锁定值）。
+        """BPM 显示文案。**永远只显示原曲 BPM**，变速倍率另由 `_rate_text` 拼在后面。
 
+        用 bpm_display（未锁定也可有值）而不是 bpm（只有锁定值）。
         `bpm` 只在「众数 ∈ [115,185] 且足够集中」时才 >0，所以慢歌 / 极快曲 /
         被估成半速的曲子会**一直显示 0**（用户 2026-09-24 报的现象）。
         `bpm_display` 由票数≥10 且集中度≥0.40 就发布，未锁定时前面加「≈」区分。
@@ -6873,10 +7278,81 @@ class MainWindow(QMainWindow):
           实时自相关在 fps≈86 时 1 帧就有 3.6 BPM 粒度，收敛值会低 1~2 BPM
           （实测 185.00 vs 181.5，集中度 4.02 vs 1.35、命中率 52% vs 31%）。
           库内值更准且与网格一致，所以不再挂「≈」。
+
+        ★★★ 2026-11-03 第一轮（用户报「显示 140 不对呀，你肯定要按照真实来显示啊」）：
+          当时把 `lib_bpm × r` 乘出来写进 BPM 位（1.20× ⇒ 167.5）。
+          **此方案已被推翻**，见下一段。
+
+        ★★★ 2026-11-03 第三轮（用户：「记得看 KVJ 是怎么搞的」）：
+          竞品 `kumoSleeping/KVJ`（同作者的 QML + Rust 播放器）把**两个数分开**：
+            · 跟随条：`"×" + rate.toFixed(3)`        ⇒ `×1.196`
+            · 「对速」助手：`percent(rate)`          ⇒ `+19.6%`
+            · BPM 只出现在时间轴的「BPM 段」，**永远是原曲值**
+            · 文档原话：「最近 3 秒的观测拟合成一条直线，斜率就是速度；
+              差不到 1% 不改速度、只修位置」
+          用户选 A 方案 ⇒ 本函数回到**直接返回 `lib`（原曲值）**，
+          倍率后缀由 `_rate_text` 负责（两处调用点各自拼一次）。
+          这样做的好处：变速时 BPM 位不再跳小数，
+          「原曲多快」和「推了多少」两个信息都还在，且各自语义干净。
+
+        ⚠ 只有**演出台的 HUD 和底部状态栏**走这里；码表页 / 曲目页 / 素材库里的
+          BPM 是**编辑语义**，必须保持原曲值（现在天然一致了，别再去乘 r）。
+
+        健壮性（本函数挂在 500ms 的 QTimer 上，抛一次异常界面就停更）：
+          `snap` 非 dict / 缺键 / 值为 None / 非数 一律安全回落，
+          最差情况退化成「只显示兜底值」，绝不让异常冒出去。
+
+        ★★★ 2026-11-03 第二轮（真机 energy CSV 取证）：**库内 BPM 短时保持**。
+          1.20× 相位 19:11–19:13 逐秒核对：`lib_bpm` 163 行里 93 行 = 140、**70 行 = 0**
+          （43% 时间为 0），跳变是**穿插**的（19:12:27 掉 → 19:12:28 回来 → 19:12:37 又掉）。
+          后果：同一首歌同一个 BPM，显示会在 `140.0`（lib）/ `168`（兜底锁定）/
+          `--`（兜底无值）三种**形态**之间反复闪 —— 位数和小数点在跳，
+          现场盯着看很明显（用户抓的正是"闪"）。
+          做法：`lib > 0` 时把 `(值, 墙钟, song_id)` 记在实例上；`lib <= 0` 且
+          「距上次 ≤ `_BPM_LIB_HOLD_SEC` 秒」且「还是同一首歌」⇒ 沿用上次的 lib。
+          超时 / 换歌 ⇒ 立刻放弃保持，逐字走下面的原兜底分支。
+          ⚠ 保持的是「原曲 BPM」这个属性 —— 与是否变速、倍率多少**无关**。
+          ⚠ 计时用墙钟 `time.time()`；时钟回拨（`ts > now`）或 `ts <= 0` 一律**不保持**。
+          ⚠ 保持值只在 `MainWindow` 实例上、只在 GUI 线程读写 ⇒ 不加锁、不开线程。
         """
-        lib = snap.get("lib_bpm") or 0.0
+        if not isinstance(snap, dict):
+            snap = {}
+        try:
+            lib = float(snap.get("lib_bpm") or 0.0)
+        except (TypeError, ValueError):
+            lib = 0.0
+        # ---------------- 库内 BPM 短时保持（详见 docstring 第二轮） ----------------
+        # `recognized_song_id` 用于「换歌立即失效」：绝不许把上一首的 BPM 挂在新歌上。
+        sid_now = snap.get("recognized_song_id", -1)
+        try:
+            _hold = getattr(self, "_bpm_lib_hold", None)
+        except Exception:                                        # noqa: BLE001
+            _hold = None
+        now = time.time()
         if lib > 0:
-            return "%s%.1f" % (prefix, float(lib))
+            # 真值到了：直接用，并记下「值 + 墙钟 + 歌 id」
+            try:
+                self._bpm_lib_hold = (lib, now, sid_now)
+            except Exception:                                    # noqa: BLE001
+                pass
+        else:
+            # 掉 0：`_BPM_LIB_HOLD_SEC`（4.5s）内沿用上次的值。四个条件缺一不可：
+            #   h_lib > 0   —— 没有有效值就没得保持
+            #   0 < h_ts    —— ts 为 0/负数说明没有记录（也挡住时钟回拨到 0 的情况）
+            #   h_ts <= now —— 时钟回拨（记录时间在未来）⇒ 不信任，宁可不保持
+            #   h_sid == sid_now —— 换歌立即失效
+            try:
+                h_lib, h_ts, h_sid = _hold
+                if (float(h_lib) > 0 and 0.0 < float(h_ts) <= now
+                        and (now - float(h_ts)) <= _BPM_LIB_HOLD_SEC
+                        and h_sid == sid_now):
+                    lib = float(h_lib)
+            except (TypeError, ValueError):
+                pass
+        if lib > 0:
+            # ★ 第三轮：**原曲值，不乘倍率**。库内值本身准 ⇒ 不挂「≈」。
+            #   倍率后缀由调用点用 `self._rate_text(snap)` 拼上（两处，各自一次）。
+            return "%s%.1f" % (prefix, lib)
         v = snap.get("bpm_display") or snap.get("bpm") or 0.0
         if not v:
             return prefix + "--"
@@ -6884,9 +7360,50 @@ class MainWindow(QMainWindow):
             return "%s%.0f" % (prefix, v)
         return "%s≈%.0f" % (prefix, v)
 
+    def _rate_text(self, snap, prefix=" ×"):
+        """变速倍率后缀，形如 ` ×1.196`。没变速 / 没测到 ⇒ 返回空串（不占地方）。
+
+        KVJ 口径（3 位小数，与它跟随条的 `"×" + rate.toFixed(3)` 对齐）。
+        调用点形如 `self._bpm_text(snap) + self._rate_text(snap)`，所以这里**自带前导空格**，
+        空串时整段消失，不会在 BPM 后面留一个孤零零的空格。
+
+        规则（缺一不可）：
+          · `recognized_rate` 缺失 / None / 非数（含 bool、字符串）/ NaN ⇒ `""`
+          · 越界（不在 `[_BPM_RATE_MIN, _BPM_RATE_MAX]`）⇒ `""`（当没测到，不显示假值）
+          · `|r - 1.0| < _BPM_RATE_DEADBAND`（1%）⇒ `""`（和 KVJ「差不到 1% 不改速度」对齐）
+          · 否则 `" ×%.3f" % r`，例如 ` ×1.196` / ` ×0.796`
+
+        ⚠ **不做保持**：倍率是测出来的**瞬时量**，掉了就消失 —— 显示一个过期的假倍率
+          比不显示更糟（DJ 已经推回 1.0× 了，HUD 还挂着 ×1.196 会直接误导手上动作）。
+          BPM 位之所以要保持，是因为「原曲 BPM」是**歌曲属性**，没测到时它仍然为真；
+          两者语义不同，别把 `_bpm_lib_hold` 那套搬过来。
+
+        ⚠ 本函数与 `_bpm_text` 同挂 500ms QTimer ⇒ 只读快照字典，
+          **不做 IO、不循环、不加锁、不开线程**，异常一律吞掉返回空串（抛一次界面就停更）。
+        """
+        if not isinstance(snap, dict):
+            return ""
+        try:
+            r = snap.get("recognized_rate", 1.0)
+            # ⚠ 只接受**真正的数值**：快照里 `recognized_rate` 一直是 float，
+            #   出现字符串说明上游另有问题 —— 显示层不猜，一律当「没测到」。
+            #   （`bool` 也排除：`True` 当 1.0 只是碰巧对，语义上不是倍率。）
+            if isinstance(r, bool) or not isinstance(r, (int, float)):
+                return ""
+            r = float(r)
+            if r != r:                                  # NaN（非数）
+                return ""
+            if not (_BPM_RATE_MIN <= r <= _BPM_RATE_MAX):
+                return ""                               # 越界 / 中间态 / inf
+            if abs(r - 1.0) < _BPM_RATE_DEADBAND:
+                return ""                               # 1% 以内：不动
+            return "%s%.3f" % (prefix, r)
+        except (TypeError, ValueError):
+            return ""
+
     def _update_status(self):
         snap = self.audio.state.snapshot()
-        self.lbl_bpm.setText(self._bpm_text(snap))
+        self.lbl_bpm.setText(self._bpm_text(snap) + self._rate_text(snap))
         self.lbl_energy.setText(f"{tr('energy')} {snap['energy']:.2f}")
         self.lbl_cpu.setText(f"CPU {cpu_percent():.0f}%")
         self.mini_level.set_level(snap.get("level", 0.0))
@@ -6903,11 +7420,38 @@ class MainWindow(QMainWindow):
             is_manual = bool(snap_mode.get("manual"))
         except Exception:                                        # noqa: BLE001
             is_manual = False
-        # 手动切换策略下 m == "manual"：别再拼成「手动切换（手动）」那种同义反复
-        tag = (T("不自动切换") if m == SWITCH_MANUAL
-               else (T("手动") if is_manual else T("自动")))
-        self.settings.lbl_cur_mode.setText(
-            Tf("当前节奏: {}（{}）", T(MODE_LABELS.get(m, m)), tag))
+        # ★★★ 2026-11-06（用户：「这个当前节奏的显示也要改」）：
+        #   原来只写「常规切（自动）」——看不出**到底谁在决定什么时候换**：有段落表时其实是
+        #   段落边界在驱动，写"常规切"会让人以为还在按 16 拍排期。
+        #   现在按**实际驱动**写，并带上还剩几拍：
+        #     当前节奏：自动 · 跟随段落「drop 3」 · 还有 12 拍
+        #     当前节奏：自动 · 常规切 16 拍 · 还有 5 拍
+        #     当前节奏：不自动切换（手动）
+        #   ⚠ 数据一律走 `ui_snapshot()`（无锁快照，铁律 13），绝不去抢引擎锁。
+        try:
+            _ui = self.engine.ui_snapshot() or {}
+        except Exception:                                        # noqa: BLE001
+            _ui = {}
+        _kind = _ui.get("switch_kind")
+        _cd = _ui.get("switch_cd")
+        _secn = str(_ui.get("sec_name") or "")
+        if m == SWITCH_MANUAL:
+            self.settings.lbl_cur_mode.setText(T("当前节奏：不自动切换（手动）"))
+        else:
+            _parts = []
+            if not is_manual:
+                _parts.append(T("自动"))
+            if _kind == "section" and _secn:
+                _parts.append(Tf("跟随段落「{}」", _secn))
+            else:
+                _parts.append(T(MODE_LABELS.get(m, m)))
+            # 没点「开始」时拍钟不走，倒计时会恒显示 0 拍（像是在催人）⇒ 改说"未开始"
+            if not bool(getattr(self.engine, "running", False)):
+                _parts.append(T("未开始"))
+            elif _cd is not None:
+                _parts.append(Tf("还有 {} 拍", int(_cd)))
+            self.settings.lbl_cur_mode.setText(
+                Tf("当前节奏：{}", " · ".join(_parts)))
 
         # 颜色渲染状态提示（能量档 + 当前颜色 + 轮换倒计时 / 休眠原因）
         cfr = getattr(self.engine, "color_fx", None)
@@ -6951,14 +7495,20 @@ class MainWindow(QMainWindow):
         except Exception:                                        # noqa: BLE001
             _us = {}
 
-        # HUD：第一行 模式+倒计时+BPM+能量；第二行 歌名+曲风（避免单行过长显示不全）
+        # HUD：第一行 模式+倒计时+BPM+能量；第二行 歌名（避免单行过长显示不全）
         # 段落显示已移除（用户反馈：段落判断不准，预览里不再显示）
         hud = f"{T(MODE_LABELS.get(m, m))}"
         remain_n = _us.get("switch_cd")
         if remain_n is not None:
             # 倒计时从「间隔-1」开始数（刚切完显示 15 / 快切 7），数到 0 就是下一个切换点；
             # 实际间隔仍是完整 16 / 8 拍并踩小节线（计算在 engine.switch_countdown 里）。
-            hud += Tf("  |  还有 {} 拍切换", f"{remain_n}")
+            # ★ 2026-11-06（用户：「有段落的时候 HUD 那个距离下一次切换素材还有多少的文案要改」）：
+            #   段落接管时目标点是**段落边界**，说「还有 N 拍切换」会让人以为是按拍切的；
+            #   改成「距下一段 N 拍」。`switch_kind` 由引擎在排程时写死，切完/换歌会重算。
+            if _us.get("switch_kind") == "section":
+                hud += Tf("  |  距下一段 {} 拍", f"{remain_n}")
+            else:
+                hud += Tf("  |  还有 {} 拍切换", f"{remain_n}")
         # 网格模式：附带「距下一个八拍头还有几拍（几秒）」——VJ 现场据此判断八拍对齐
         # 跟音乐合不合。仅在全局开关「节拍网格」打开且认出的歌有网格时才有值
         # （phrase_countdown 内部走同一个 _grid_state 门控，关闭/无网格/未识别返回 None）。
@@ -6971,7 +7521,8 @@ class MainWindow(QMainWindow):
         # （BPM 与锚点都是引擎**当前实际生效**的那一组，不是按进度猜的）。
         # 无分段/多锚（老曲目）时 `_hud_grid_seg` 返回空串 ⇒ HUD 逐字不变。
         hud += _hud_grid_seg(_us)
-        hud += "  |  " + self._bpm_text(snap) + f"  {T('能量')} {snap['energy']:.2f}"
+        hud += ("  |  " + self._bpm_text(snap) + self._rate_text(snap)
+                + f"  {T('能量')} {snap['energy']:.2f}")
         sid_now = snap.get("recognized_song_id", -1)
         song_meta = self._song_meta_by_id.get(sid_now)
         song_line = ""
@@ -6982,7 +7533,7 @@ class MainWindow(QMainWindow):
             if genres:
                 song_line += f"  {'·'.join(genres[:3])}"
             elif song_meta.get("artist"):
-                # 码表包带来的歌没有本机曲风 ⇒ 退而显示艺人（总比空白强）
+                # 码表包带来的歌没有艺人信息 ⇒ 退而显示文件名（总比空白强）
                 song_line += f"  {song_meta['artist']}"
         else:
             genre = getattr(self.audio.state, "genre_tags", None) or []
@@ -7027,6 +7578,25 @@ class MainWindow(QMainWindow):
             self.lbl_warn.setText("")
 
     def closeEvent(self, ev):
+        # ★★ 2026-11-02（用户：「输出窗口打开了，关闭主窗口时输出窗口不会一起关闭」）：
+        #   输出窗口是**独立顶层窗口** —— `OutputWindow(self.cfg)` 创建时没传 parent，
+        #   主窗口关闭不会带走它，退出后任务栏还留着一个「Easy Reality Output」黑窗口。
+        #   这里显式关掉（它自己的 closeEvent 会保存几何，正常走）。
+        try:
+            _ow = getattr(self, "out_win", None)
+            if _ow is not None:
+                _ow.close()
+                _ow.deleteLater()
+                self.out_win = None
+        except Exception:                                        # noqa: BLE001
+            pass
+        # ★ 2026-11-02：先停能量日志线程（1Hz 写盘，退出时别让它跟 cfg.save() 撞）。
+        try:
+            _el = getattr(self, "_energy_log", None)
+            if _el is not None:
+                _el.stop()
+        except Exception:                                        # noqa: BLE001
+            pass
         # ★ 2026-10-19：合并写盘窗口里可能还有未落盘的改动 —— 退出前强制写一次。
         try:
             self.cfg.flush()

@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -123,23 +124,58 @@ class PropsPanel(QWidget):
         g.setVerticalSpacing(4)
         r = 0
 
+        # ★★ 2026-11-03：属性表改成**横排多列**（每列 ROWS_PER_COL 行，自动铺列）。
+        #   为什么：④ 从左侧竖列挪到了右块底部的横条，单列 15 行要 ~450px 高，
+        #   会把预览/时间轴压没。每列 6 行 ⇒ 3 列 ⇒ 高度降到 ~180px。
+        #   每个字段占**两个网格列**（标签 + 控件），拉伸只给控件列。
+        # ★★ 2026-11-03（用户把 ④ 挪到右上角窄栏）：列数**按宽度自适应**。
+        #   固定列数在窄栏里会被压扁、在宽条里又空一大截；
+        #   这里只登记字段，真正的行列由 `_reflow()` 按当前宽度算（`resizeEvent` 里重排）。
+        self._grid = g
+        # [(QLabel, widget, group)]，按加进来的顺序；
+        # group 只用于 **2 列**布局时的语义分列（0=时间/过渡，1=变换/合成/信息）。
+        self._fields = []
+        self._grp = 0
+        self._info_fields = []           # 只读信息行（不 enable/disable、不 commit）
+        self._media_by_id = {}           # clip_id → MediaRef（显示素材时长/alpha 用）
+        self._media_paths = {}           # clip_id → 绝对路径（显示"素材在不在"用）
+
         def add(label, wdg):
             nonlocal r
-            g.addWidget(QLabel(label), r, 0)
+            lb = QLabel(label)
+            self._fields.append((lb, wdg, self._grp))
+            g.addWidget(lb, r, 0)        # 先按单列摆；`_reflow()` 会重排
             g.addWidget(wdg, r, 1)
             r += 1
+
+        def ro(label):
+            """只读信息行（不参与 commit，也不随"未选中"灰化 —— 灰了就看不清了）。"""
+            w = QLineEdit()
+            w.setReadOnly(True)
+            w.setFocusPolicy(Qt.NoFocus)
+            w.setStyleSheet("QLineEdit{background:transparent;border:none;padding:0 2px;}")
+            self._info_fields.append(w)
+            add(label, w)
+            return w
 
         self.cb_clip = QComboBox()
         self.cb_clip.currentIndexChanged.connect(self._on_edit)
         add("素材", self.cb_clip)
 
         self.sp_at = _dspin(0, 100000, 2, 0.1, " 秒")
-        self.sp_at.valueChanged.connect(self._on_edit)
+        self.sp_at.valueChanged.connect(self._on_at_changed)
         add("起点", self.sp_at)
 
         self.sp_len = _dspin(0, 100000, 2, 0.1, " 秒", special="到下一段")
-        self.sp_len.valueChanged.connect(self._on_edit)
+        self.sp_len.valueChanged.connect(self._on_len_changed)
         add("时长", self.sp_len)
+
+        # ★ 2026-11-03：**结束**（绝对秒）。与「时长」是同一份数据的两种看法：
+        #   起点 + 时长 = 结束。两个都改得动，改一个立刻同步另一个（`_loading` 守卫防自激）。
+        self.sp_end = _dspin(0, 100000, 2, 0.1, " 秒", special="到下一段")
+        self.sp_end.setToolTip("这一段在第几秒结束（= 起点 + 时长）")
+        self.sp_end.valueChanged.connect(self._on_end_changed)
+        add("结束", self.sp_end)
 
         # ★★ 入点 / 出点（旧实现从未做出的功能）
         self.sp_src_in = _dspin(0, 100000, 2, 0.1, " 秒")
@@ -172,6 +208,7 @@ class PropsPanel(QWidget):
         self.sp_tout.valueChanged.connect(self._on_edit)
         add("出场时长", self.sp_tout)
 
+        self._grp = 1        # ↓↓↓ 以下都属"变换/合成/信息"那一列
         # ★ 需求 7：变速 = 滑条 + 输入框并排、双向同步（范围严格对照 sp_speed 的 min/max）。
         self.sp_speed = _dspin(SPEED_MIN, SPEED_MAX, 2, 0.05, prefix="×")
         self.sp_speed.setValue(1.0)                  # 初值 ×1.00（连接信号**之前**设，避免伪信号）
@@ -187,6 +224,9 @@ class PropsPanel(QWidget):
         sl = QHBoxLayout(speedw)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(4)
+        self.sld_speed.setMinimumWidth(48)       # 让整组能挤进窄列（见文件头 2026-11-03 说明）
+        self.sp_speed.setMinimumWidth(56)
+        self.sp_speed.setMaximumWidth(88)
         sl.addWidget(self.sld_speed, 1)
         sl.addWidget(self.sp_speed)
         # 双向同步 + 防自激：两处写入都包在 `_loading` 守卫内（置位在动控件之前）；
@@ -206,6 +246,13 @@ class PropsPanel(QWidget):
         for nm in ("X", "Y", "W", "H"):
             sb = _dspin(0, 1, 2, 0.02)
             sb.setToolTip(nm)
+            # ⚠ 四个框并排，必须能压缩：默认最小宽 ~95 ⇒ 4×95=380 会把整列撑爆、
+            #   右侧第二列直接被裁掉（用户 2026-11-03 看到的"东西少/被切"就是它）。
+            sb.setMinimumWidth(38)
+            sb.setMaximumWidth(66)
+            # 4 个并排时按默认（带上下箭头）会各占 ~95px ⇒ 总计 380 撑爆一列、
+            # 数字被截成「0.(」。去掉箭头省 ~18px/个，0.00 就放得下了。
+            sb.setButtonSymbols(QDoubleSpinBox.NoButtons)
             sb.valueChanged.connect(self._on_edit)
             cg.addWidget(sb)
             self.sp_crop.append(sb)
@@ -226,6 +273,9 @@ class PropsPanel(QWidget):
         sh = QHBoxLayout(scalew)
         sh.setContentsMargins(0, 0, 0, 0)
         sh.setSpacing(4)
+        self.sld_scale.setMinimumWidth(48)
+        self.sp_scale.setMinimumWidth(56)
+        self.sp_scale.setMaximumWidth(88)
         sh.addWidget(self.sld_scale, 1)
         sh.addWidget(self.sp_scale)
         # 双向同步 + 防自激：与 sp_speed **同一套 `_loading` 守卫**（置位在动控件之前）。
@@ -240,27 +290,42 @@ class PropsPanel(QWidget):
         self.sp_px = _dspin(-100, 100, 1, 1.0, "%")
         self.sp_py = _dspin(-100, 100, 1, 1.0, "%")
         for sb in (self.sp_px, self.sp_py):
+            sb.setMinimumWidth(52)
+            sb.setMaximumWidth(96)
             sb.valueChanged.connect(self._on_edit)
             pg.addWidget(sb)
         add("位移", posw)
 
+        # ★ 2026-11-03：**旋转** —— 两端（演出端 `engine._draw_layer` 的 `img_rot`、
+        #   预览 `compositor._xform_values`）都早就支持 `xform.rot`，只是从没做过 UI。
+        self.sp_rot = _dspin(-180, 180, 1, 1.0, "°")
+        self.sp_rot.setToolTip("绕素材中心旋转（正值顺时针）")
+        self.sp_rot.valueChanged.connect(self._on_edit)
+        add("旋转", self.sp_rot)
+
         # ★ 第五轮⑤：本素材混合 —— 下拉**只有具体混合模式**（已去掉「（继承本层）」入口）。
         #   片段"没设过"时按 `effective_blend` 的**实际生效值**显示（见 `refresh`）。
         self.lbl_blend = QLabel(LBL_BLEND_ITEM)
-        g.addWidget(self.lbl_blend, r, 0)
         self.cb_blend = QComboBox()
         for k, lbl in BLEND_LABELS:
             self.cb_blend.addItem(lbl, k)
         self.cb_blend.currentIndexChanged.connect(self._on_blend_changed)
+        # ★★ 必须登记进 `_fields`：否则 `_reflow()` 不重排它，行号停在构造时，
+        #   会被后加的备注**盖住**（2026-11-03 实测：面板上根本看不到"混合"这一行）。
+        self._fields.append((self.lbl_blend, self.cb_blend, self._grp))
+        g.addWidget(self.lbl_blend, r, 0)
         g.addWidget(self.cb_blend, r, 1)
         r += 1
 
         # ★ 第五轮⑤：本素材不透明度 —— **只有数值输入框**（已去掉「继承本层」勾选框）。
         #   片段"没设过"时按 `effective_opacity` 的实际生效值显示（见 `refresh`）。
         self.lbl_op = QLabel(LBL_OP_ITEM)
-        g.addWidget(self.lbl_op, r, 0)
         self.sp_op = _dspin(0, 100, 0, 1.0, "%")
+        self.sp_op.setMinimumWidth(56)
+        self.sp_op.setMaximumWidth(120)
         self.sp_op.valueChanged.connect(self._on_op_changed)
+        self._fields.append((self.lbl_op, self.sp_op, self._grp))   # 同上：不登记就会被盖住
+        g.addWidget(self.lbl_op, r, 0)
         g.addWidget(self.sp_op, r, 1)
         r += 1
 
@@ -268,7 +333,20 @@ class PropsPanel(QWidget):
         self.le_note.editingFinished.connect(self._on_edit)
         add("备注", self.le_note)
 
+        # ---- 只读信息（选中的这一段"是什么"，用来现场判断问题）----
+        self.le_med_dur = ro("素材时长")
+        self.le_med_alpha = ro("透明通道")
+        self.le_med_file = ro("素材文件")
+        self.le_layer = ro("所在层")
+        self.le_run = ro("段落")
+        self.le_item_id = ro("片段 ID")
+        self.le_run.setToolTip(
+            "相邻且**渲染设置完全相同**的片段会自动连成一段：\n"
+            "段内不淡入不淡出（硬接），只有段首淡入、段尾淡出。\n"
+            "想让两段之间真的切一次，改其中一个属性（混合/大小/变速…）即可断开。")
+
         lv.addLayout(g)
+        self._reflow(force=True)         # 初排（窗口还没显示，宽度是默认值；resize 后会再排）
         lv.addStretch(1)
 
         # 计数（B2 哨兵用：统计 commit 被真正执行的次数）
@@ -277,9 +355,14 @@ class PropsPanel(QWidget):
     # ==================================================================
     # 数据 → 控件（B2）
     # ==================================================================
-    def set_media_list(self, sheet):
-        """B1：重填素材下拉框前 blockSignals，填完按 clip_id 还原选中项。"""
+    def set_media_list(self, sheet, paths=None):
+        """B1：重填素材下拉框前 blockSignals，填完按 clip_id 还原选中项。
+
+        `paths`（可选）= `{clip_id: 绝对路径}`：给只读信息行判断"素材文件还在不在"。
+        """
         self._media_ids = [m.clip_id for m in sheet.media] if sheet is not None else []
+        self._media_by_id = {m.clip_id: m for m in (sheet.media if sheet is not None else [])}
+        self._media_paths = dict(paths or {})
         cur = self.cb_clip.currentData() or ""
         self.cb_clip.blockSignals(True)
         try:
@@ -297,13 +380,65 @@ class PropsPanel(QWidget):
         self.item = item
         self.refresh()
 
+    # ------------------------------------------------------------------ 自适应重排
+    FIELD_MIN_W = 250     # 一个字段（标签+控件）至少这么宽，宽度不够就少一列
+
+    def _reflow(self, force=False):
+        """按当前宽度把字段重排成 `ncol` 列（每列 `rows` 行）。
+
+        窄栏（右上角）会自动降到 1~2 列并竖向滚动；拉宽则铺成多列。
+        ⚠ 只 `removeWidget` + 重新 `addWidget`，**不销毁控件**（撤销/信号都还在）。
+        """
+        g = self._grid
+        fields = getattr(self, "_fields", None)
+        if not fields:
+            return
+        w = max(self.width(), 160)
+        ncol = max(1, min(4, int(w // self.FIELD_MIN_W)))
+        if not force and ncol == getattr(self, "_ncol_now", None):
+            return
+        self._ncol_now = ncol
+        for c in range(g.columnCount()):
+            g.setColumnStretch(c, 0)
+            g.setColumnMinimumWidth(c, 0)
+        for lb, wdg, _grp in fields:
+            g.removeWidget(lb)
+            g.removeWidget(wdg)
+
+        def place(c, r, lb, wdg):
+            g.addWidget(lb, r, c * 2)
+            g.addWidget(wdg, r, c * 2 + 1)
+            g.setColumnStretch(c * 2 + 1, 1)
+
+        grp0 = [f for f in fields if f[2] == 0]
+        grp1 = [f for f in fields if f[2] == 1]
+        if ncol == 2 and grp0 and grp1:
+            # ★ 语义分列：左列"这段是什么时候、怎么进出"，右列"画面怎么画、文件在哪"。
+            #   比"按行数硬切两半"好读（原写法会把"变速"和"大小"拆到两列的两端）。
+            for i, (lb, wdg, _gg) in enumerate(grp0):
+                place(0, i, lb, wdg)
+            for i, (lb, wdg, _gg) in enumerate(grp1):
+                place(1, i, lb, wdg)
+            return
+        rows = (len(fields) + ncol - 1) // ncol
+        for i, (lb, wdg, _gg) in enumerate(fields):
+            c, r = divmod(i, rows)
+            place(c, r, lb, wdg)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._reflow()
+
+    # ------------------------------------------------------------------ 回填
     def refresh(self):
         it, ly = self.item, self.layer
         on = it is not None
-        for w in (self.cb_clip, self.sp_at, self.sp_len, self.sp_src_in, self.sp_src_out,
+        for w in (self.cb_clip, self.sp_at, self.sp_len, self.sp_end,
+                  self.sp_src_in, self.sp_src_out,
                   self.cb_tin, self.sp_tin, self.cb_tout, self.sp_tout,
                   self.sld_speed, self.sp_speed,
-                  self.chk_crop, self.sld_scale, self.sp_scale, self.sp_px, self.sp_py,
+                  self.chk_crop, self.sld_scale, self.sp_scale,
+                  self.sp_px, self.sp_py, self.sp_rot,
                   self.le_note):
             w.setEnabled(on)
         for sb in self.sp_crop:
@@ -346,6 +481,7 @@ class PropsPanel(QWidget):
                 self.sp_at.setValue(float(it.at_sec))
                 self.sp_len.setValue(float(it.end_sec) - float(it.at_sec)
                                      if it.end_sec is not None else 0.0)
+                self.sp_end.setValue(float(it.end_sec) if it.end_sec is not None else 0.0)
                 self.sp_src_in.setValue(float(it.src_in_sec or 0.0))
                 self.sp_src_out.setValue(float(it.src_out_sec or 0.0))
                 self._set_combo(self.cb_tin, it.trans_in)
@@ -367,6 +503,7 @@ class PropsPanel(QWidget):
                 self.sld_scale.setValue(int(round(sc * SCALE_SLIDER_SCALE)))
                 self.sp_px.setValue(float(x.get("x", 0.0) or 0.0))
                 self.sp_py.setValue(float(x.get("y", 0.0) or 0.0))
+                self.sp_rot.setValue(float(x.get("rot", 0.0) or 0.0))
                 self.le_note.setText(it.note or "")
                 # ★ 第五轮⑤：去掉"继承"入口后，片段没设过 ⇒ 按**实际生效值**显示（读 effective_*）；
                 #   用户没动过该项则 commit 不写（保留 ""/None 继承，老数据不改坏）。
@@ -380,6 +517,85 @@ class PropsPanel(QWidget):
         finally:
             self._loading = False                            # 复位之一
         self._loading = False                                # 复位之二（防御）
+        self._update_info()
+
+    # ==================================================================
+    # 起点 / 时长 / 结束 三者联动（每一处都在 `_loading` 守卫内改控件）
+    # ==================================================================
+    def _on_at_changed(self, v):
+        """起点变了 ⇒ 结束 = 新起点 + 时长（时长不变，片段整体平移）。"""
+        if not self._loading:
+            self._loading = True
+            try:
+                ln = float(self.sp_len.value())
+                self.sp_end.setValue((float(v) + ln) if ln > 0 else 0.0)
+            finally:
+                self._loading = False
+        self._on_edit()
+
+    def _on_len_changed(self, v):
+        """时长变了 ⇒ 结束 = 起点 + 时长（时长 0 = 到下一段 ⇒ 结束也置 0）。"""
+        if not self._loading:
+            self._loading = True
+            try:
+                self.sp_end.setValue((float(self.sp_at.value()) + float(v))
+                                     if float(v) > 0 else 0.0)
+            finally:
+                self._loading = False
+        self._on_edit()
+
+    def _on_end_changed(self, v):
+        """结束变了 ⇒ 时长 = 结束 − 起点（结束 ≤ 起点 ⇒ 时长 0 = 到下一段）。"""
+        if not self._loading:
+            self._loading = True
+            try:
+                d = float(v) - float(self.sp_at.value())
+                self.sp_len.setValue(d if d > 0.01 else 0.0)
+            finally:
+                self._loading = False
+        self._on_edit()
+
+    def _update_info(self):
+        """回填只读信息行（不影响 `_loading`，也不参与 commit）。"""
+        it, ly = self.item, self.layer
+        if it is None:
+            for w in self._info_fields:
+                w.clear()
+            self.le_layer.setText(("（未选中片段）当前层 %s" % (ly.name or ly.lyr_id))
+                                  if ly is not None else "")
+            return
+        m = self._media_by_id.get(it.clip_id)
+        dur = float(getattr(m, "duration_sec", 0.0) or 0.0)
+        self.le_med_dur.setText(("%.2f 秒" % dur) if dur > 0 else "—（图片或无时长）")
+        alpha = getattr(m, "has_alpha", None)
+        self.le_med_alpha.setText("—" if alpha is None else ("有（透明可用）" if alpha else "无"))
+        p = str(self._media_paths.get(it.clip_id) or "")
+        if not p:
+            self.le_med_file.setText("★ 未指定素材文件")
+        elif os.path.isfile(p):
+            self.le_med_file.setText("已找到")
+        else:
+            self.le_med_file.setText("★ 缺失：%s" % os.path.basename(p))
+        self.le_layer.setText(("%s（z=%d）" % (ly.name or ly.lyr_id, int(ly.z)))
+                              if ly is not None else "—")
+        # 段落归组：和"相邻同设置自动连成一段"的语义对齐（模型侧 `timeline.run_flags`）
+        txt = "—"
+        try:
+            from ..model import timeline as _TL
+            fl = _TL.run_flags(list(ly.items)) if ly is not None else {}
+            a, b = fl.get(str(it.item_id), (True, True))
+            if a and b:
+                txt = "独立一段（正常淡入淡出）"
+            elif a:
+                txt = "段首（与后一段连着 ⇒ 本段不淡出）"
+            elif b:
+                txt = "段尾（与上一段连着 ⇒ 本段不淡入）"
+            else:
+                txt = "段内（不淡入、不淡出）"
+        except Exception:                                     # noqa: BLE001
+            txt = "—"
+        self.le_run.setText(txt)
+        self.le_item_id.setText(str(it.item_id or ""))
 
     @staticmethod
     def _set_combo(cb, value):
@@ -496,8 +712,16 @@ class PropsPanel(QWidget):
             it.speed = float(self.sp_speed.value())
             it.crop = ([float(sb.value()) for sb in self.sp_crop]
                        if self.chk_crop.isChecked() else None)
-            it.xform = {"scale": float(self.sp_scale.value()),
-                        "x": float(self.sp_px.value()), "y": float(self.sp_py.value())}
+            # ⚠ **不能整块重建**：旧写法 `{"scale","x","y"}` 会把 `rot`（及其它未来键）
+            #   静默抹掉 —— 加了旋转 UI 之后这就是"一改大小旋转就归零"。
+            _xf = dict(it.xform or {})
+            _xf.update({"scale": float(self.sp_scale.value()),
+                        "x": float(self.sp_px.value()),
+                        "y": float(self.sp_py.value()),
+                        "rot": float(self.sp_rot.value())})
+            if abs(float(_xf.get("rot") or 0.0)) < 1e-6:
+                _xf.pop("rot", None)          # 0 度 = 默认值 ⇒ 不落键（包体更干净、与旧文件一致）
+            it.xform = _xf
             # ★ 第五轮⑤：混合/不透明度**去掉"继承"UI 入口**后 —— 只有用户**真正动过**该项才写
             #   显式值；否则保留原值（`""`/`None` = 继承本层）⇒ 改别的字段**不会**物化继承
             #   （老码表里 `""`/`None` 的片段不被改坏；数据契约不变）。

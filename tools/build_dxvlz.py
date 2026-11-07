@@ -4,13 +4,13 @@
    发布包里只需要带上编译好的 `_dxvlz.dll`（几十 KB），用户端不需要任何编译器。
 
 zig 的获取（一次性）：
-    pip install --no-deps --target P:\\AutoVJ\\_build_tools ziglang
+    pip install --no-deps --target <项目根>\\_build_tools ziglang
     ⚠ 该 wheel 解压后有 363MB / 19565 个文件，逐个写盘要十几分钟（杀软逐文件扫描）。
       可以改用 `tools\\_extract_zig.py` 只抽 Windows 目标需要的部分。
 
 用法：
     venv\\Scripts\\python.exe tools\\build_dxvlz.py              # 自动找 zig
-    venv\\Scripts\\python.exe tools\\build_dxvlz.py D:\\zig\\zig.exe
+    venv\\Scripts\\python.exe tools\\build_dxvlz.py <zig目录>\\zig.exe
 """
 
 import glob

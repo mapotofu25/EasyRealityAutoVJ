@@ -262,3 +262,72 @@ ERAVJ工具包*.zip
 
 # 本地工作台数据（不进仓库）
 .workbuddy/
+
+# ============================================================
+#  2026-11-08（RC4 发布前清理）：把「开发期探针 / 回归截图 / 内部审计」
+#  全部挡在仓库外。判据只有一个 —— **公开仓库里只留源码 + 构建脚本 + 对外文档**。
+#  ⚠ 这一节用 `**/` 前缀：根 `tools/` 和 `EasyRealityCue/tools/` 都要覆盖
+#    （原规则 `tools/_*.py` 带斜杠 ⇒ 只锚定仓库根，嵌套那份一直漏网）。
+# ============================================================
+**/tools/_*.py
+**/tools/_*.png
+**/tools/_*.jpg
+**/tools/_*.json
+**/tools/_*.md
+**/tools/_*.txt
+**/tools/_*.log
+**/tools/_*.csv
+**/tools/_*.spec
+**/tools/_*/
+**/docs/_audit/
+
+# 运行期数据库（导入曲库的元数据索引，可由「重新导入」重建）
+imported_meta.db
+imported_meta.db-wal
+imported_meta.db-shm
+
+# 构建计数器（每台机器各自从 01 起算，不该互相覆盖）
+**/build_seq.json
+
+# 各类临时备份（`*.bak` 挡不住 `.bak_stage` / `.bak-1` 这些）
+*.bak_*
+*.bak-*
+*.orig
+*.rej
+
+# 源码目录里的临时暂存件
+src/*.bak_*
+src/*.orig
+
+# 构建时生成（每次打包递增），随包走但不入库
+_build_ver.py
+
+# ============================================================
+#  内部过程文档（2026-11-08 RC4 清理）
+#  对外仓库只留「产品文档」：README / NOTICE / LICENSE / 使用说明 / RELEASE_NOTES / 架构与设计。
+#  审计报告、验收记录、交付说明、历史发布文案都属于开发过程产物，留在本机不入库。
+# ============================================================
+docs/交付说明_*.md
+docs/实机指纹验收_*.md
+docs/回归测试报告_*.md
+docs/指纹识别精准度验证_*.md
+docs/频带特征校验实验_*.md
+docs/高BPM能量与BPM验证_*.md
+docs/网格与BPM_对比VDJ实测_*.md
+docs/CPU开销实测_*.md
+docs/颜色渲染与后处理验证_*.md
+docs/局域网音频识别排查_*.md
+docs/清理审计_*.md
+docs/GitHub安全审计_*.md
+docs/2026-*.md
+docs/码表实装_Step4_*.md
+docs/码表实装_进度看板.html
+发布说明_RC1.md
+发布说明_RC2.md
+更新说明_RC1.md
+更新说明_发群用.txt
+群公告_RC1.txt
+清理清单_*.md
+EasyRealityCue/docs/规格书_旧实现考古.md
+EasyRealityCue/docs/需求_*.md
+EasyRealityCue/docs/*_24.mermaid

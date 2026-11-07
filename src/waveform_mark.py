@@ -388,6 +388,24 @@ class WaveformMarkWidget(QWidget):
                 return float(bl)
         return 0.0
 
+    def _flip_beats(self):
+        """用户手工的「半句相位翻转」拍数（0 或 4）。
+
+        ★★ 2026-11-07（用户 `Northad - Frosty Dance`「这首歌的 8 拍的线偏移了 4 拍」）：
+          `grid_flip` 这个用户产物**一直只有引擎在读**（`ui_main.py` 注入 item 时换算成
+          `flip=4.0`），波形这边从来没读过 ⇒ 同一首歌「引擎认定的八拍头」和
+          「波形上画的八拍线」相差 4 拍（0.413793 × 4 = **1.655 s**），用户看到的就是
+          「线偏了半个乐句」。现在 `beatgrid.effective_grid()` 会把 `flip` 一起下发，
+          这里照着用：拍网等间距，整体平移 4 拍后**逐拍线位置不变**，只有八拍头换相位。
+        """
+        if not self._grid:
+            return 0.0
+        try:
+            v = float(self._grid.get("flip") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v % 8.0
+
     def _snap_to_beat(self, sec, bl=None):
         if not self._snap:
             return sec
@@ -608,6 +626,10 @@ class WaveformMarkWidget(QWidget):
             draw_beat = bl_px >= 4.0
             draw_phrase = bl_px * 8.0 >= 4.0
             a = float(self._grid.get("anchor") or 0.0) if self._grid else 0.0
+            # ★★ 2026-11-07：`flip`（用户手工的半句相位翻转）必须一起算进拍网，
+            #   否则「引擎的八拍头」和「波形上的八拍线」差 4 拍（见 `_flip_beats`）。
+            _fl = self._flip_beats()
+            a += _fl * bl
             # ★★ 2026-10-28（用户报「左边空的没有八拍划分」）：
             #   `anchor` 是**某一处八拍头**，VDJ 的 Phase 常在曲子中段
             #   （实测这首歌 anchor=66.0s）⇒ 旧代码 `t = a` 只往后画，
@@ -632,7 +654,8 @@ class WaveformMarkWidget(QWidget):
                         continue
                     if _sbl <= 0 or _s1 <= _s0:
                         continue
-                    pairs.extend(grid_times_range(_san, _sbl, _s0, _s1))
+                    pairs.extend(grid_times_range(_san + _fl * _sbl, _sbl,
+                                                  _s0, _s1))
             else:
                 pairs = grid_times(a, bl, d)
             for _k, t in pairs:

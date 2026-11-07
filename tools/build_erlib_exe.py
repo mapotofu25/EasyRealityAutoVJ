@@ -31,8 +31,9 @@ ENTRY = os.path.join(ROOT, "erlib_main.pyw")
 #   （窗口标题见 src/erlib/app.py 的 APP_TITLE；这里只管**打包产物名**）
 OUT_NAME = "ERLIB曲库分析"
 
-# 只带这两个模型（**不带 chinese_clip**）
-_MODELS = ("discogs", "beat_this")
+# ★ 2026-10-30「大砍刀」：曲风模型（discogs）已删除 ⇒ 只带节拍模型。
+#   `_model_datas()` 对不存在的目录只打警告，但留着会让每次打包都刷一行"不存在"。
+_MODELS = ("beat_this",)
 
 _HIDDEN = [
     "erlib", "erlib.format", "erlib.scanner", "erlib.app", "erlib.transfer",
@@ -41,15 +42,28 @@ _HIDDEN = [
     #   (`from erlib.detail import ErlibDetailDialog`)，静态分析看不到 ⇒ 不显式声明打包后
     #   一点右键「歌曲详情」就 ImportError。
     "erlib.detail",
+    # ★ 2026-10-31：主表新增「封面 / 波形」列（`erlib.wavecol` 是**延迟 import**，
+    #   静态分析看不到 ⇒ 不显式声明，打包后两列会静默变空）。
+    "erlib.wavecol",
     "appicon",                                     # ★ 应用图标定位（惰性 import）
-    "fp", "beatgrid", "phrase_bt", "music_meta",
+    "fp", "beatgrid", "phrase_bt",
+    # ★★ 2026-10-31：`scanner.scan_one` 里 `import sections` 是**函数内延迟导入**
+    #   （算能量段落用）⇒ 静态分析看不到 ⇒ 不显式声明的话，打包后扫描出来的歌
+    #   **sections 恒为空**（导入到演出机就没有段落色带/不按段落切素材）。
+    "sections",
     # ★ 2026-10-27：波形数据层 + 标记控件（ERALIB 经 pathex=[AutoVJ/src] 复用共享模块）。
     #   detail.py 里 `from waveform_mark import WaveformMarkWidget` 是延迟 import；
     #   scanner/format/imported_lib 里 `import waveform` 也是延迟 import ⇒ 必须显式声明。
     "waveform", "waveform_mark",
+    # ★★ 2026-10-31：详情页整份照搬 ERAVJ 后，`erlib.detail` 在**模块顶层**就
+    #   `from section_ui import EnergySectionDialog`（能量段落编辑框）。
+    #   不显式声明 ⇒ 打包后 import erlib.detail 直接失败 ⇒ 右键「歌曲详情」打不开。
+    "section_ui",
     # ★ 2026-10-27 详情页试听（sounddevice 播放，ERALIB 仍然**不引 PyAV**）
     "audio_playback", "sounddevice",
-    "audio_genre", "genre_lookup", "genre_keywords", "genre_visual_default",
+    # ★ 2026-10-31：曲风那四个模块（music_meta/audio_genre/genre_lookup/
+    #   genre_keywords/genre_visual_default）已随「大砍刀」删除 ⇒ 从 hiddenimports 移除，
+    #   否则每次打包都报 "hidden import not found"（不影响产物，但会掩盖真的缺失）。
     "config", "soundfile", "mutagen", "onnxruntime",
     # ★★ 这些是**函数内延迟 import** 的（`erlib.cover` / `music_meta` 里），
     #    PyInstaller 的静态分析**看不到** ⇒ 不显式声明就会打出一个
