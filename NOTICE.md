@@ -25,6 +25,22 @@ required by their respective licenses.
 - 出处 / Source: https://github.com/lbnandy/genre-police-autovj
 - 许可 / License: **MIT**
 
+### 3. KVJ / KDJ — kumoSleeping
+- 用途：**变速识别与「这个结果能不能作准」的整体思路参考**，具体参考了三处：
+  1. 认歌的「确认」不只看得分，还要看**最弱窗**（把查询窗分三段取最低）和**领先**
+     （得分减别处次高分）——本项目的三档判据就是照作者公开的口径实现的；
+  2. 变速场景用**白化频带相关**打分、用**互不重叠的多次印证**（而不是单点峰值）；
+  3. BPM 显示拆成「**原曲 BPM × 变速倍率**」，而不是直接显示实时估算值。
+- Usage: design reference for tempo handling and acceptance — whitened spectral-band
+  scoring, corroboration across non-overlapping windows, score/weakest-window/lead
+  verification, and showing BPM as "source BPM × rate" instead of a raw live estimate.
+- 出处 / Source: https://github.com/kumoSleeping/KVJ
+- 许可 / License: **GPL-3.0**（上游）
+- ⚠ **仅参考思路，未取用任何代码** —— 上游是 GPL-3.0，本项目为避免许可传染，
+  相关实现（`fp.py` / `bandfeat.py` / `phrase_bt.py` 的判据部分）全部独立编写。
+  This project references the **ideas only**; **no source code was taken**
+  (upstream is GPL-3.0, implemented independently here).
+
 ---
 
 ## 二、模型权重

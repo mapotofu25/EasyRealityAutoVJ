@@ -221,7 +221,17 @@ See [NOTICE.md](NOTICE.md) for full third-party attributions.
 
 ## 致谢
 
-本项目参考或改写了若干优秀的开源项目（VJVision、Genre Police AutoVJ），
-小节检测使用 Beat This! 模型。完整署名与许可见 [NOTICE.md](NOTICE.md)。
+本项目的**思路**主要来自三个开源项目：
+
+- **[VJVision](https://github.com/ichiryu0021/VJVision)**（ichiryu，MIT）——
+  音乐电池 ChargeBar 决策状态机、音频指纹峰值检测（`charge_engine.py` / `fp.py` 的来源）
+- **[KVJ / KDJ](https://github.com/kumoSleeping/KVJ)**（kumoSleeping，GPL-3.0）——
+  变速识别与「结果能不能作准」的口径：白化频带相关打分、互不重叠的多次印证、
+  认歌「得分 / 最弱窗 / 领先」三档判据、BPM 拆成「原曲 BPM × 变速倍率」。
+  **仅参考思路，未取用任何代码**（本项目独立实现）
+- **[Genre Police AutoVJ](https://github.com/lbnandy/genre-police-autovj)**（lbnandy，MIT）——
+  「演出前分析曲库 + 现场识别曲目 + Spout / NDI 输出」的整体思路
+
+小节检测使用 **Beat This!** 模型（MIT）。完整署名与许可见 [NOTICE.md](NOTICE.md)。
 
 反馈 / 交流：QQ 群 **ERAVJ测试**（543643838）

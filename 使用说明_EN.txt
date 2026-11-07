@@ -613,6 +613,23 @@ settings).
 
 
 ────────────────────────────────────────
+Credits / open-source
+The ideas in this project come mainly from three open-source projects
+(full attributions and licenses: NOTICE.md):
+
+  · VJVision (ichiryu, MIT) — the "music battery" ChargeBar decision engine
+    and the audio-fingerprint peak detection.
+  · KVJ / KDJ (kumoSleeping, GPL-3.0) — tempo handling and the criteria for
+    "can this result be trusted": whitened spectral-band scoring, corroboration
+    across non-overlapping windows, the score / weakest-window / lead
+    verification, and showing BPM as "source BPM x rate".
+    Ideas only — no source code was taken.
+  · Genre Police AutoVJ (lbnandy, MIT) — the overall approach of "analyse the
+    library before the show + identify tracks live + NDI/Spout output".
+
+Downbeat detection uses the Beat This! model (CPJKU, MIT).
+
+────────────────────────────────────────
 Beta software — still evolving. Feedback is welcome.
 
 Author: 麻婆豆腐    QQ: 1793170435

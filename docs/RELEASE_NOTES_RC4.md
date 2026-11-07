@@ -140,3 +140,22 @@
 - 导入曲库与本地文件的对账仍依赖文件名，重命名会失配。
 - 段落判定在「能量完全平坦」的段落上仍可能出现 3 小节 / 5 小节这种非标准乐句。
 - 少数歌的段落边界仍会落在奇数小节上（105 段 / 89 首）。
+
+---
+
+## 致谢与开源来源
+
+本项目的**思路**来自三个开源项目（完整署名与许可见仓库 [`NOTICE.md`](NOTICE.md)）：
+
+- **[VJVision](https://github.com/ichiryu0021/VJVision)**（ichiryu，MIT）——
+  音乐电池 ChargeBar 决策状态机、音频指纹峰值检测（`charge_engine.py` / `fp.py` 的来源）
+- **[KVJ / KDJ](https://github.com/kumoSleeping/KVJ)**（kumoSleeping，GPL-3.0）——
+  变速识别与「结果能不能作准」的口径：白化频带相关打分、互不重叠的多次印证、
+  认歌「得分 / 最弱窗 / 领先」三档判据、BPM 拆成「原曲 BPM × 变速倍率」。
+  **仅参考思路，未取用任何代码**
+- **[Genre Police AutoVJ](https://github.com/lbnandy/genre-police-autovj)**（lbnandy，MIT）——
+  「演出前分析曲库 + 现场识别曲目 + Spout / NDI 输出」的整体思路
+
+小节检测使用 **Beat This!** 模型（CPJKU，**MIT**）。
+发行包内静态打包了 **mutagen（GPL-2.0-or-later）**，因此二进制发行包整体按
+GPL-2.0-or-later 分发；**本仓库源代码仍为 MIT**。

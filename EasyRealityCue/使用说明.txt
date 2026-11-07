@@ -130,6 +130,14 @@ EasyRealityCue —— DJ 码表（Cue Sheet）编排编辑器
   第三方组件：PySide6（LGPL-3.0）/ PyAV + FFmpeg（PyAV 为 BSD-3；FFmpeg 核心 LGPL-3.0，
   随包内含 GPL 的 libx264 / libx265）/ numpy（BSD-3）/ mutagen（GPL-2.0-or-later）/
   sounddevice（MIT）/ PyInstaller（GPL-2.0-or-later WITH bootloader-exception）。
+  思路来源（**仅参考思路，未取用这些项目的代码**；`fp_core.py` / `bpm_core.py` 是从
+  演出端移植过来的同一套判据，均为本项目独立实现）：
+  · VJVision（ichiryu，MIT）—— 音频指纹峰值检测、决策状态机；
+  · KVJ / KDJ（kumoSleeping，GPL-3.0）—— 变速识别的打分方式与「结果能不能作准」的口径
+    （白化频带相关、互不重叠的多次印证、得分 / 最弱窗 / 领先三档判据、BPM 按倍率显示）；
+  · Genre Police AutoVJ（lbnandy，MIT）—— 「演出前分析曲库 + 现场识别曲目 + NDI/Spout 输出」
+    的整体思路。
+  完整署名见主仓库的 NOTICE.md。
 
 八、给维护者的打包注记
   · 版本号：由 tools\build_version.py 生成（日期 + 当日序号，如 2026.10.01.06），
