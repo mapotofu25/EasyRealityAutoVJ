@@ -3400,6 +3400,10 @@ class LayerStackPanel(QWidget):
 
     layer_pick = Signal(int)
     header_changed = Signal()                 # 任一图层属性被改（由外部保存配置）
+    #: ★ 2026-11-09（多屏 H1：每屏一个图层栈）：行高被用户改了。
+    #  N 份栈共享同一个 `cfg["ui"]["layer_row_h"]`，所以主窗收到后要**广播**给其它块，
+    #  否则在 B 块里拖行高，A 块还是老行高（看起来像"改不动"）。
+    row_height_changed = Signal(int)
 
     #: 码表下拉宽度。普通图层：右侧还有 不透明度/α/锁/混合 ⇒ 只剩 92px 可用；
     #: 码表图层：那 4 个控件隐藏（不占布局）⇒ 可以宽到 200px，长表名能看清。
@@ -3719,6 +3723,10 @@ class LayerStackPanel(QWidget):
             pass
         self._refill_rows()
         self.save_row_height()
+        try:
+            self.row_height_changed.emit(int(self.cell_h))   # 广播给其它屏的栈
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def apply_row_height(self, h, save=True):
         """改所有图层行的行高（重排格子；素材格尺寸/图标都跟着变）。
@@ -3751,6 +3759,12 @@ class LayerStackPanel(QWidget):
             try:
                 self.main.cfg["ui"]["layer_row_h"] = h
                 self.main.cfg.save()
+            except Exception:                                      # noqa: BLE001
+                pass
+            # ★ 用户手动改了行高（save=True）⇒ 广播给多屏模式下其它屏的栈；
+            #   程序内同步（save=False）不发，避免互相触发成环。
+            try:
+                self.row_height_changed.emit(int(h))
             except Exception:                                      # noqa: BLE001
                 pass
 

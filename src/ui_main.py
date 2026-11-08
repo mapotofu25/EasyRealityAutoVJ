@@ -3273,6 +3273,11 @@ class MainWindow(QMainWindow):
         #   `layers_panel` 永远是"主屏那一份"（启动即存在，其它代码都靠它）；
         #   其余屏幕的栈按需创建，存在 `_screen_panels[sid]`，退出多屏时销毁。
         self._screen_panels = {}
+        # 行高在所有屏的栈之间保持同步（在 B 块里拖行高，A 块也要变；块高跟着重算）
+        try:
+            self.layers_panel.row_height_changed.connect(self._on_panel_row_height)
+        except Exception:                                         # noqa: BLE001
+            pass
 
         # 演出台 = 图层 + 预览 + 素材库。
         # ★ 2026-09-28 用户要求把素材库**留在主界面**：「不然我怎么手动添加素材」——
@@ -3485,11 +3490,7 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(4)
         self.output_studio = _os.OutputStudio(self, compact=True)
-        left.addWidget(self.output_studio, 1)
         # 多屏模式：右侧设置的作用域跟着"选中哪块屏"走（用户第 8/11 条），
         # 下方图层块也跟着选中屏走（用户第 10 条）
         try:
@@ -3503,21 +3504,37 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
         # ★ 用户第 10 条：下方不再是"一份共享图层栈"，改成**按屏幕数量生成 N 份
-        #   图层配置块**（含主屏），每块用该屏边框色描边；横向排列、可滚动。
+        #   图层配置块**（含主屏），每块用该屏边框色描边。
+        # ★★ 2026-11-09（team-lead 定案）：改成**纵向堆叠**。
+        #   横排不成立：每块要「图层头（默认 456）+ 素材格」，横排 3 块在 1760 窗口里
+        #   每块只剩 ~580 ⇒ 块内还要横滚，变成三层滚动条套娃，现场没法用。
+        #   纵向：每块**占满容器宽度**、高度按该块图层栈的自然高度，整区纵向滚动。
         holder = QWidget()
-        self._multi_blocks_lay = QHBoxLayout(holder)
+        self._multi_blocks_lay = QVBoxLayout(holder)
         self._multi_blocks_lay.setContentsMargins(2, 2, 2, 2)
-        self._multi_blocks_lay.setSpacing(6)
+        self._multi_blocks_lay.setSpacing(8)      # 块与块之间 8px
+        self._multi_blocks_lay.addStretch(1)      # 块少时贴顶，不被拉高
         self._multi_blocks_scroll = QScrollArea()
         self._multi_blocks_scroll.setWidgetResizable(True)
+        # 块是满宽的 ⇒ 正常窗口宽度下不该出现横向滚动条（只有在窗口被拖得极窄时才需要）
         self._multi_blocks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._multi_blocks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._multi_blocks_scroll.setMinimumHeight(300)
+        self._multi_blocks_scroll.setMinimumHeight(220)
         self._multi_blocks_scroll.setWidget(holder)
         self._multi_blocks = []          # [(sid, frame, body_layout)]
         self._multi_block_sig = ()
-        left.addWidget(self._multi_blocks_scroll, 0)
-        lay.addLayout(left, 1)
+        # ★ 预览工作区 ↔ 图层块区：**可拖的纵向 QSplitter**（和原来 `_multi_bottom` 一样
+        #   的语义，块区最小高 220 不变）。默认给块区 320px，3 块时上下拖一拖就能全看到；
+        #   总高度不够时块区内部纵向滚动。
+        self._multi_bottom_split = QSplitter(Qt.Vertical)
+        self._multi_bottom_split.setObjectName("multiStageSplit")
+        self._multi_bottom_split.setChildrenCollapsible(False)
+        self._multi_bottom_split.addWidget(self.output_studio)
+        self._multi_bottom_split.addWidget(self._multi_blocks_scroll)
+        self._multi_bottom_split.setSizes([520, 320])
+        self._multi_bottom_split.setStretchFactor(0, 3)
+        self._multi_bottom_split.setStretchFactor(1, 2)
+        lay.addWidget(self._multi_bottom_split, 1)
         # 右侧：单屏那份设置分组的落脚点（`_move_panels_to_multi` 把控件搬进来）
         self._multi_right_lay = QVBoxLayout()
         self._multi_right_lay.setContentsMargins(0, 0, 0, 0)
@@ -3563,6 +3580,10 @@ class MainWindow(QMainWindow):
             p = LayerStackPanel(self, layer_ids=filt)
             self._screen_panels[sid] = p
             p.rebuild()                     # ★ 新栈必须建一次行（否则是空面板）
+            try:
+                p.row_height_changed.connect(self._on_panel_row_height)
+            except Exception:                                     # noqa: BLE001
+                pass
             # 行高/列宽跟主屏那份对齐（`__init__` 已从 cfg 读过一次，这里兜住"本次会话改过"
             # 但还没落盘的极端情况）
             try:
@@ -3592,6 +3613,27 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
+    @staticmethod
+    def _fit_block_height(blk, panel):
+        """纵向堆叠：每块高度 = 该块图层栈的**自然高度**（随行高/行数变化）。
+
+        算法：顶部工具条（标题 + 行高按钮 + ＋图层，约 34px）+ 上下边距 + 每行
+        `行高 + 2`（行间 spacing）⇒ 夹在 190~320。
+        ⚠ 用**固定高度**（不是 stretch）：这样三块各占自己需要的高度、整区纵向滚动，
+          不会像横排那样每块都被压扁。
+        """
+        try:
+            rows = len(getattr(panel, "rows", []) or []) if panel is not None else 0
+            cell = int(getattr(panel, "cell_h", 58) or 58) if panel is not None else 58
+        except Exception:                                          # noqa: BLE001
+            rows, cell = 0, 58
+        h = 36 + 8 + rows * (cell + 2)
+        h = max(190, min(320, h))
+        try:
+            blk.setFixedHeight(int(h))
+        except Exception:                                          # noqa: BLE001
+            pass
+
     def _make_screen_block(self, s, cfg, all_ids, panel):
         """一块 = 外框(该屏边框色) + 屏幕名/分辨率 + 「图层…」菜单 + 「⋯」设置 + 该屏图层栈。"""
         import output_model as _om
@@ -3599,7 +3641,8 @@ class MainWindow(QMainWindow):
         is_copy = str(s.get("type")) == "copy"
         blk = QFrame()
         blk.setObjectName("multiScreenBlock")
-        blk.setMinimumWidth(380)
+        # 纵向堆叠 ⇒ 每块**占满容器宽度**（不再需要 380 的最小宽，那会逼出横向滚动条）
+        blk.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         blk._screen_id = sid
         v = QVBoxLayout(blk)
         v.setContentsMargins(4, 4, 4, 4)
@@ -3675,6 +3718,31 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
+    def _on_panel_row_height(self, h):
+        """某块（用户手动）改了行高 ⇒ 广播给其它块 + 重算每块的固定高度。
+
+        ⚠ 用 `_rh_guard` 防环：同步时用 `save=False`，那条路径不会再 emit。
+        """
+        if getattr(self, "_rh_guard", False):
+            return
+        self._rh_guard = True
+        try:
+            h = int(h)
+            for p in self._layer_panels():
+                try:
+                    if int(getattr(p, "cell_h", h)) != h:
+                        p.apply_row_height(h, save=False)
+                except Exception:                                 # noqa: BLE001
+                    continue
+            for _sid, blk, _body in getattr(self, "_multi_blocks", []):
+                try:
+                    ps = blk.findChildren(LayerStackPanel)
+                    self._fit_block_height(blk, ps[0] if ps else None)
+                except Exception:                                 # noqa: BLE001
+                    continue
+        finally:
+            self._rh_guard = False
+
     def _rebuild_multi_blocks(self, force=False):
         """按当前配置的屏幕列表生成/刷新 N 块（屏幕数量/过滤集变了才重建控件）。"""
         st = getattr(self, "output_studio", None)
@@ -3711,7 +3779,7 @@ class MainWindow(QMainWindow):
             pass
         self._multi_blocks = []
         while lay.count():
-            it = lay.takeAt(0)
+            it = lay.takeAt(0)          # ⚠ 连末尾那个 stretch 也一起摘掉，下面统一补回
             w = it.widget()
             if w is not None:
                 w.setParent(None)
@@ -3721,7 +3789,9 @@ class MainWindow(QMainWindow):
             panel = self._panel_for_screen(s, cfg)
             blk, body = self._make_screen_block(s, cfg, all_ids, panel)
             self._multi_blocks.append((str(s.get("id")), blk, body))
-            lay.addWidget(blk, 1)
+            self._fit_block_height(blk, panel)      # ★ 纵向堆叠：高度=该块自然高度
+            lay.addWidget(blk, 0)                   # 0 = 不拉伸（高度由上面钉死）
+        lay.addStretch(1)                           # 块少时贴顶，剩余空间留在末尾
         self._refresh_block_styles(cfg)
         # 新建的栈马上把行/高亮画出来（否则要等下一次广播）
         self._layers_call("refresh_playing")
