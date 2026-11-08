@@ -3050,18 +3050,33 @@ class MainWindow(QMainWindow):
             f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;border-color:#2f6f9f;}}")
 
     def _layer_panels(self):
-        """所有活着的图层栈：主屏那份 + 多屏模式下其它屏各自的（用户第 10 条）。"""
+        """所有活着的图层栈（"N 份图层配置"的唯一列表来源）。
+
+        `self.layers_panel` = **主屏那一份**（启动即存在，几何/布局代码仍按它做锚点，
+        语义相当于"active/primary"）；多屏模式下其它屏各自的栈在 `_screen_panels`。
+        任何要"对所有块生效"的动作都必须走 `_layers_call()` / `refresh_all_layer_blocks()`，
+        不要直接调某一块的内部方法。
+        """
         out = [self.layers_panel]
         for p in list(getattr(self, "_screen_panels", {}).values()):
             if p is not None and p is not self.layers_panel:
                 out.append(p)
         return [p for p in out if p is not None]
 
+    def refresh_all_layer_blocks(self):
+        """**唯一**的重建入口：所有图层块按当前过滤集重建（加/删/换序图层后调它）。
+
+        ⚠ 各块**不要**自己连 `main` 的业务信号去 rebuild —— 一律由这里统一广播，
+          否则一次结构变化会触发 N 次重建（闪 + 重复分配）。
+        """
+        return self._layers_call("rebuild")
+
     def _layers_call(self, name, *args, **kwargs):
         """对**所有**图层栈调用同一个方法（一处改动 → 所有块同步）。
 
-        ⚠ N 份面板共享同一份 `engine.layers`，所以这里只做"广播调用"，**不**重复
-          连接信号（信号只在各自面板内部按行连接一次）⇒ 一次操作不会触发 N 次写入。
+        ⚠ N 份面板共享同一份 `engine.layers`，所以这里只做"刷新类"广播调用，**不**
+          重复连接信号（每个面板内部按行连一次 `dropped/reordered/cross_moved/menu_requested`
+          → 同一个 `main` 方法）⇒ 一次点击只写一次数据，不会触发 N 次。
         """
         res = []
         for p in self._layer_panels():
@@ -3333,7 +3348,7 @@ class MainWindow(QMainWindow):
         self._hl_timer.start(1000)
         self.engine.frame_ready.connect(self._on_engine_frame)
         self.refresh_grid()
-        self._layers_call("rebuild")
+        self.refresh_all_layer_blocks()
         self._fill_tag_combo()
         self.preview_panel.chk_hud.setChecked(bool(self.cfg["ui"].get("hud", True)))
         self.preview_panel.chk_next.setChecked(bool(self.cfg["ui"].get("next_preview", True)))
@@ -3568,7 +3583,7 @@ class MainWindow(QMainWindow):
         """兜底：面板的行数应与"该显示的图层数"一致，不一致就重建。
 
         为什么需要：`set_layer_ids` 只在**过滤集合变化**时重建，而引擎图层增删由
-        `_layers_call("rebuild")` 广播 —— 万一有代码路径直接改 `engine.layers`
+        `refresh_all_layer_blocks()` 广播 —— 万一有代码路径直接改 `engine.layers`
         没走广播，这里能自愈，不至于出现"块里少一行/多一行"。
         """
         try:
@@ -4938,7 +4953,7 @@ class MainWindow(QMainWindow):
         self.engine.rebuild_from_cfg()
         self.refresh_grid()            # 素材库网格清空，与 cfg["library"] == [] 一致
         self._fill_tag_combo()
-        self._layers_call("rebuild")
+        self.refresh_all_layer_blocks()
         self.hotkeys.apply()
         self.lbl_warn.setText("")
         QMessageBox.information(
@@ -8267,7 +8282,7 @@ class MainWindow(QMainWindow):
     def _sync_layers(self):
         self.engine.push_layers_to_cfg()
         self.cfg.save()
-        self._layers_call("rebuild")
+        self.refresh_all_layer_blocks()
         self._cur_layer = min(self._cur_layer, max(0, len(self.engine.layers) - 1))
         # Kv 设置区随 Kv 图层增删显隐
         try:
