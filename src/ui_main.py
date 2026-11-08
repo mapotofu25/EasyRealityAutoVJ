@@ -3512,7 +3512,7 @@ class MainWindow(QMainWindow):
         holder = QWidget()
         self._multi_blocks_lay = QVBoxLayout(holder)
         self._multi_blocks_lay.setContentsMargins(2, 2, 2, 2)
-        self._multi_blocks_lay.setSpacing(8)      # 块与块之间 8px
+        self._multi_blocks_lay.setSpacing(6)      # 块与块之间 6px（3 块时省下的 4px 很关键）
         self._multi_blocks_lay.addStretch(1)      # 块少时贴顶，不被拉高
         self._multi_blocks_scroll = QScrollArea()
         self._multi_blocks_scroll.setWidgetResizable(True)
@@ -3534,6 +3534,18 @@ class MainWindow(QMainWindow):
         self._multi_bottom_split.setSizes([520, 320])
         self._multi_bottom_split.setStretchFactor(0, 3)
         self._multi_bottom_split.setStretchFactor(1, 2)
+        # ★ 用户手拖过分隔条 ⇒ 之后不再自动改高度（屏幕数变化时才强制重新分配）
+        self._blocks_split_user_set = False
+        try:
+            self._multi_bottom_split.splitterMoved.connect(self._on_blocks_split_moved)
+        except Exception:                                         # noqa: BLE001
+            pass
+        # 切配置 ⇒ 手拖标记复位（尺寸保持用户拖的那个，不立刻改）
+        try:
+            self.output_studio.cfg_combo.currentIndexChanged.connect(
+                self._on_blocks_split_config_switch)
+        except Exception:                                         # noqa: BLE001
+            pass
         lay.addWidget(self._multi_bottom_split, 1)
         # 右侧：单屏那份设置分组的落脚点（`_move_panels_to_multi` 把控件搬进来）
         self._multi_right_lay = QVBoxLayout()
@@ -3718,6 +3730,80 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
+    # ---------- 块区高度：默认按块数自动分配 ----------
+    def _on_blocks_split_moved(self, *_a):
+        """用户手拖过分隔条 ⇒ 记住"别再自动改"（屏幕数变化时才会强制重排）。"""
+        self._blocks_split_user_set = True
+
+    def _on_blocks_split_config_switch(self, *_a):
+        """切输出配置：复位"用户手拖过"的标记，但**不**动当前尺寸（用户拖的就保留）。"""
+        self._blocks_split_user_set = False
+
+    def _auto_size_blocks_split(self, force=False):
+        """按块数自动分配「图层块区 : 预览工作区」的高度。
+
+        ★ 用户诉求：「有几个屏下面就有几份配置」—— 打开就得看得见，不能默认只露一块半。
+        规则（team-lead 定案 + 实测校准，页面高 902 / 分隔条 4px 时）：
+          need = Σ块高 + 间距×(n-1) + 块区边框 + 上下边距
+          · need ≤ 预算（= 页面 − 预览下限 35%）⇒ 块区 = need，**全部块完整可见、不用滚**
+          · need 略超预算且块数少 ⇒ **轻微压缩块高**（≥170）让它放得下（1~2px 级，看不出来）
+          · 再不行 ⇒ 块区 = 页面 62% 封顶，剩下的靠块区纵向滚动
+        ⚠ 用户手拖过（`_blocks_split_user_set`）就不自动改，除非 `force=True`
+          （进入多屏、屏幕数变化）。
+        """
+        sp = getattr(self, "_multi_bottom_split", None)
+        if sp is None or not getattr(self, "_multi_blocks", None):
+            return
+        if getattr(self, "_blocks_split_user_set", False) and not force:
+            return
+        total = int(sp.height() or 0)
+        if total <= 40:
+            total = int(getattr(self, "_multi_page", sp).height() or 0)
+        if total <= 40:
+            total = 800                       # 还没布局（首次构建）时的兜底
+        page_h = int(getattr(self, "_multi_page", sp).height() or total) or total
+        # QSplitter 会按「总高 − 分隔条厚度」归一化 sizes ⇒ 必须先用 avail 算
+        try:
+            avail = max(160, total - int(sp.handleWidth()))
+        except Exception:                                         # noqa: BLE001
+            avail = max(160, total - 6)
+        sa = self._multi_blocks_scroll
+        try:
+            extra = max(0, int(sa.height()) - int(sa.viewport().height())) or 2
+        except Exception:                                         # noqa: BLE001
+            extra = 2
+        gap = 6
+        n = len(self._multi_blocks)
+        # 间距 + 块区边框 + holder 的上下边距(2+2) —— 少算 4px 就会永远差一条滚动条
+        gap_total = gap * max(0, n - 1) + extra + 4
+        hh = [max(1, int(b[1].height())) for b in self._multi_blocks]
+        need = sum(hh) + gap_total
+        # 预览至少留 35% 页面高（team-lead 验收口径）
+        budget = avail - int(page_h * 0.35)
+        cap_hard = int(avail * 0.62)
+        if need > budget:
+            # 块数少时轻微压缩块高（189/188 这种，视觉无差），换取"全部可见"
+            per = (budget - gap_total) // max(1, n)
+            if 170 <= per < max(hh):
+                for (_sid, blk, _b), h0 in zip(self._multi_blocks, hh):
+                    try:
+                        blk.setFixedHeight(int(min(h0, per)))
+                    except Exception:                             # noqa: BLE001
+                        pass
+                hh = [max(1, int(b[1].height())) for b in self._multi_blocks]
+                need = sum(hh) + gap_total
+        area = need if need <= budget else cap_hard
+        # 块区最小高：1 块时就是它自己的自然高度（不硬撑 220），多块才用 220 兜底
+        try:
+            sa.setMinimumHeight(min(220, max(120, area)))
+        except Exception:                                         # noqa: BLE001
+            pass
+        area = max(min(need, 220), min(area, max(160, budget)))
+        try:
+            sp.setSizes([max(1, avail - area), area])
+        except Exception:                                         # noqa: BLE001
+            pass
+
     def _on_panel_row_height(self, h):
         """某块（用户手动）改了行高 ⇒ 广播给其它块 + 重算每块的固定高度。
 
@@ -3740,6 +3826,8 @@ class MainWindow(QMainWindow):
                     self._fit_block_height(blk, ps[0] if ps else None)
                 except Exception:                                 # noqa: BLE001
                     continue
+            # 行高变了 ⇒ 块高变了 ⇒ 块区高度重算（用户没手拖过时）
+            self._auto_size_blocks_split()
         finally:
             self._rh_guard = False
 
@@ -3758,11 +3846,19 @@ class MainWindow(QMainWindow):
              if s.get("layers") is not None else None)
             for s in screens)
         sig_all = (sig, filt_sig)
+        # 屏幕**数量**变了 ⇒ 必须重新自动分配块区高度（哪怕用户之前手动拖过）
+        _prev = self._multi_block_sig
+        _prev_n = len(_prev[0]) if (isinstance(_prev, tuple) and len(_prev) == 2) else 0
+        count_changed = (_prev_n != len(sig))
         if not force and sig_all == self._multi_block_sig and self._multi_blocks:
             # 只是选中屏变了 / 数据刷新：样式刷一下，别重建控件（避免闪烁）
             self._refresh_block_styles(cfg)
             return
         self._multi_block_sig = sig_all
+        # 不是"数量变了"（切配置 / 改某屏过滤集）⇒ 保留用户手拖的块区高度，
+        # 但把"别自动改"的标记复位（下次数量变化仍会重新自动分配）。
+        if not count_changed:
+            self._blocks_split_user_set = False
         # 已经删掉的屏幕：它的图层栈要销毁（别让 N 个栈无限堆积）
         for sid in list(self._screen_panels.keys()):
             if sid not in sig:
@@ -3795,6 +3891,8 @@ class MainWindow(QMainWindow):
         self._refresh_block_styles(cfg)
         # 新建的栈马上把行/高亮画出来（否则要等下一次广播）
         self._layers_call("refresh_playing")
+        # ★ 块区高度按块数重新分配（数量变了强制，否则遵守用户手拖）
+        self._auto_size_blocks_split(force=count_changed)
 
     def _refresh_block_styles(self, cfg):
         """每块描自己的边框色；选中的那块加粗 + 名字前打勾。"""
@@ -3834,6 +3932,7 @@ class MainWindow(QMainWindow):
                 pass
         self._screen_panels = {}
         self._multi_block_sig = ()
+        self._blocks_split_user_set = False     # 退出多屏：手拖标记复位
         try:
             self.layers_panel.set_layer_ids(None)
         except Exception:                                         # noqa: BLE001
@@ -4013,6 +4112,10 @@ class MainWindow(QMainWindow):
                 self._move_panels_to_multi()
                 self.perf_stack.setCurrentWidget(self._multi_page)
                 self._host_top_bar(True)      # ★ 控制条搬进页签行（用户第 1 条）
+                # ★ 进入多屏：块区高度按块数自动分配（此时才拿得到真实页面高度，
+                #   所以延到事件循环下一轮再做）
+                from PySide6.QtCore import QTimer as _QT
+                _QT.singleShot(0, lambda: self._auto_size_blocks_split(force=True))
                 try:
                     self.output_studio.reload()
                     self.output_studio.sync_engine()
