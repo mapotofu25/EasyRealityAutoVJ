@@ -3252,6 +3252,21 @@ class MainWindow(QMainWindow):
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(4)
+        # ★ 2026-11-09（用户第 11 条）：多屏模式下这块右侧设置要按"该屏边框色"描一圈，
+        #   所以外面套一个 QFrame（QFrame 直接支持 stylesheet 的 border/圆角）。
+        right_frame = QFrame()
+        right_frame.setObjectName("stageRightFrame")
+        right_frame.setMinimumWidth(304)
+        right_frame.setMaximumWidth(434)
+        _rf = QVBoxLayout(right_frame)
+        _rf.setContentsMargins(2, 2, 2, 2)
+        _rf.setSpacing(0)
+        # 多屏模式的作用域提示（复制屏幕时显示"请选择原屏幕 xxx"）
+        self.lbl_multi_scope = QLabel("")
+        self.lbl_multi_scope.setWordWrap(True)
+        self.lbl_multi_scope.setStyleSheet("color:#e0b050;font-size:11px;padding:2px 4px;")
+        self.lbl_multi_scope.hide()
+        rv.addWidget(self.lbl_multi_scope)
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         self.settings = SettingsPanel(self)                # 白：行为模式/效果/逐拍
@@ -3259,8 +3274,13 @@ class MainWindow(QMainWindow):
         rv.addWidget(right_scroll, 1)
         self.output_panel = OutputPanel(self)              # 右下角：输出设置
         rv.addWidget(self.output_panel, 0)
-        main_split.addWidget(right)
+        _rf.addWidget(right)
+        main_split.addWidget(right_frame)
         main_split.setSizes([1150, 360])
+        # 记住这两块：多屏模式下要把它们搬进多屏页（同一个对象，不复制）
+        self._stage_right = right
+        self._stage_right_frame = right_frame
+        self._stage_main_split = main_split
         self._build_pages(main_split)
         mv.addWidget(self.pages, 1)
 
@@ -3408,19 +3428,30 @@ class MainWindow(QMainWindow):
         """惰性构建“多屏输出”演出台布局。
 
         正常演出台 = 图层 + (预览+素材库) + 右侧设置，原样不动。
-        多屏输出   = 上方输出工作区 + 下方【同一个图层栈 + 同一个素材库】。
-        图层/素材库是**同一个对象**，只是在两个布局之间 reparent，所以编辑行为完全一致。
+        多屏输出   = 【左】输出工作区 + 下方每屏一块图层配置块
+                     【右】和单屏**同一份**设置分组（图层属性/画面效果/性能 + 输出设置）
+                           —— 用户第 8 条：多屏下不再显示"名称/类型/源屏幕/分辨率/边框
+                           颜色/使用的图层"那张屏幕参数表。
+        图层栈是**同一个对象**，只是在两个布局之间 reparent，所以编辑行为完全一致。
         """
         if getattr(self, "_multi_page", None) is not None:
             return
         import output_studio as _os
         page = QWidget()
-        lay = QVBoxLayout(page)
+        lay = QHBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
+        left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(4)
         self.output_studio = _os.OutputStudio(self, compact=True)
-        lay.addWidget(self.output_studio, 1)
-        # ★ 用户第 5 条：多屏模式下**不再内嵌素材库**（下方只留图层），
+        left.addWidget(self.output_studio, 1)
+        # 多屏模式：右侧设置的作用域跟着"选中哪块屏"走（用户第 8/11 条）
+        try:
+            self.output_studio.selection_changed.connect(self._sync_multi_right)
+        except Exception:                                         # noqa: BLE001
+            pass
+        # ★ 用户第 5 条：多屏模式下**不再内嵌素材库**，
         #   素材库改成独立窗口（同一个 `library_panel` 实例 reparent 过去）。
         try:
             self.output_studio.open_library.connect(self.toggle_library_float)
@@ -3429,19 +3460,25 @@ class MainWindow(QMainWindow):
         bottom = QSplitter(Qt.Horizontal)
         bottom.setObjectName("multiStageBottom")
         # 从正常演出台里把图层栈取出来（setParent(None) 会自动从 QSplitter 移除）
-        # ⚠ 素材库**不取**：它留在原演出台的 QSplitter 里不动（只是那块区域不显示），
+        # ⚠ 素材库**不取**：它留在原演出台的 QSplitter 里不动（那块页面此刻隐藏），
         #   打开素材库窗口时才 reparent 出去，关掉（或退出多屏）再还回去。
         self.layers_panel.setParent(None)
         bottom.addWidget(self.layers_panel)
         bottom.setSizes([780, 520])
         bottom.setMinimumHeight(220)
         self._multi_bottom = bottom
-        lay.addWidget(bottom, 0)
+        left.addWidget(bottom, 0)
+        lay.addLayout(left, 1)
+        # 右侧：单屏那份设置分组的落脚点（`_move_panels_to_multi` 把控件搬进来）
+        self._multi_right_lay = QVBoxLayout()
+        self._multi_right_lay.setContentsMargins(0, 0, 0, 0)
+        self._multi_right_lay.setSpacing(0)
+        lay.addLayout(self._multi_right_lay, 0)
         self._multi_page = page
         self.perf_stack.addWidget(page)
 
     def _restore_stage_panels(self):
-        """把图层栈/素材库放回正常演出台的原始位置。"""
+        """把图层栈/素材库/右侧设置放回正常演出台的原始位置。"""
         # ★ 用户第 5 条：素材库可能正躺在浮动窗口里 ⇒ 先从那个布局里摘出来，
         #   否则它会被"加到第二个布局"而残留在浮动窗口（关窗后素材库就没了）。
         self._detach_library_from_float()
@@ -3450,18 +3487,31 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.library_panel.setParent(None)
-        except Exception:
-            pass
-        try:
             self._stage_left_split.insertWidget(0, self.layers_panel)
             self._stage_left_split.setSizes([430, 380])
         except Exception:
             pass
         try:
+            self.library_panel.setParent(None)
             self._stage_bottom.addWidget(self.library_panel)
             self._stage_bottom.setSizes([560, 520])
         except Exception:
+            pass
+        # ★ 用户第 8 条：右侧设置搬回单屏那一列（同一个对象），并清掉描边/置灰
+        try:
+            rf = self._stage_right_frame
+            rf.setParent(None)
+            self._stage_main_split.insertWidget(1, rf)
+            self._stage_main_split.setSizes([1150, 360])
+            rf.setStyleSheet("")
+            self._stage_right.setEnabled(True)
+            self.lbl_multi_scope.hide()
+        except Exception:                                         # noqa: BLE001
+            pass
+        # 多屏专属的屏幕参数面板重新打开（它是 OutputStudio 内部的）
+        try:
+            self.output_studio.settings.show()
+        except Exception:                                         # noqa: BLE001
             pass
 
     def _detach_library_from_float(self):
@@ -3486,7 +3536,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _move_panels_to_multi(self):
-        """切到多屏布局：只搬图层栈（素材库按用户第 5 条走独立窗口）。
+        """切到多屏布局：图层栈 + 右侧设置分组搬进多屏页（素材库走独立窗口）。
 
         ⚠ 素材库**留在原处**（普通演出台那个 QSplitter 里，那块页面此刻是隐藏的），
           点「打开素材库」时才 reparent 到浮动窗口 ⇒ 这里绝不能把它 setParent(None)，
@@ -3496,8 +3546,69 @@ class MainWindow(QMainWindow):
             self.layers_panel.setParent(None)
             self._multi_bottom.addWidget(self.layers_panel)
             self._multi_bottom.setSizes([780, 520])
-        except Exception:
+        except Exception:                                         # noqa: BLE001
             pass
+        # ★ 用户第 8 条：右侧改成"和单屏一样的设置分组" ⇒ 把单屏那列搬过来，
+        #   同时藏掉多屏自己的屏幕参数表（名称/类型/源屏幕/分辨率/边框颜色/使用的图层）。
+        try:
+            self.output_studio.settings.hide()
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            rf = self._stage_right_frame
+            rf.setParent(None)
+            self._multi_right_lay.addWidget(rf)
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            self._sync_multi_right(getattr(self.output_studio, "selected_id", ""))
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _sync_multi_right(self, *_a):
+        """用户第 8/11 条：多屏模式右侧设置的作用域 = 当前选中的屏幕。
+
+        · 主屏 / 独立屏 ⇒ 可编辑，外框描**该屏的边框色**
+        · 复制屏       ⇒ 整组置灰，并提示"选择原屏幕 xxx 后再修改"
+        · 没选中屏幕   ⇒ 不描色、整组置灰
+        """
+        rc = getattr(self, "_stage_right", None)
+        rf = getattr(self, "_stage_right_frame", None)
+        lbl = getattr(self, "lbl_multi_scope", None)
+        st = getattr(self, "output_studio", None)
+        if rc is None or rf is None or lbl is None or st is None:
+            return
+        try:
+            import output_model as _om
+        except Exception:                                         # noqa: BLE001
+            return
+        cfg = st.active_config()
+        sid = str(getattr(st, "selected_id", "") or "")
+        s = _om.screen_by_id(cfg, sid) if (cfg and sid) else None
+        if s is None:
+            rf.setStyleSheet("")
+            rc.setEnabled(False)
+            lbl.setText("未选中屏幕：设置不可修改（先在预览里点一块屏）")
+            lbl.show()
+            return
+        t = s.get("type")
+        col = _om.effective_color(cfg, s)
+        rf.setStyleSheet(
+            "QFrame#stageRightFrame{border:2px solid %s;border-radius:5px;}" % col)
+        lbl.show()
+        if t == "copy":
+            src = _om.source_screen(cfg, s) or _om.main_screen(cfg) or {}
+            rc.setEnabled(False)
+            lbl.setText("「%s」是复制屏幕：请选择原屏幕「%s」后再修改"
+                        % (s.get("name") or "复制屏幕", src.get("name") or "主屏幕"))
+        elif t == "split":
+            src = _om.source_screen(cfg, s) or {}
+            rc.setEnabled(False)
+            lbl.setText("「%s」是切分屏幕：请选择源屏幕「%s」后再修改"
+                        % (s.get("name") or "切分屏幕", src.get("name") or "主屏幕"))
+        else:
+            rc.setEnabled(True)
+            lbl.setText("以下设置作用于当前屏幕「%s」" % (s.get("name") or "主屏幕"))
 
     def _host_top_bar(self, on):
         """把多屏控制条搬进页签行 / 搬回输出页（用户第 1 条）。

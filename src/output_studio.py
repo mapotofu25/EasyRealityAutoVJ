@@ -1256,6 +1256,7 @@ class OutputStudio(QWidget):
     """
 
     open_library = Signal()          # 请求打开独立素材库窗口（ui_main 接）
+    selection_changed = Signal(str)  # 选中的屏幕变了（多屏模式下右侧设置要跟着换作用域）
 
     def __init__(self, main, parent=None, compact=False):
         super().__init__(parent)
@@ -1768,6 +1769,10 @@ class OutputStudio(QWidget):
             pass
         self.settings.set_screen(s, cfg, cfg.get("mode", "multi"))
         self._refresh_screen_badge(cfg)
+        try:
+            self.selection_changed.emit(self.selected_id)
+        except Exception:                                          # noqa: BLE001
+            pass
         self._sync_main_output_route()
         for i in range(self.cards_layout.count()):
             w = self.cards_layout.itemAt(i).widget()
