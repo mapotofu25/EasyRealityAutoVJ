@@ -3049,6 +3049,31 @@ class MainWindow(QMainWindow):
             f"background:{v('btn')};color:{v('text')};}}"
             f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;border-color:#2f6f9f;}}")
 
+    def _layer_panels(self):
+        """所有活着的图层栈：主屏那份 + 多屏模式下其它屏各自的（用户第 10 条）。"""
+        out = [self.layers_panel]
+        for p in list(getattr(self, "_screen_panels", {}).values()):
+            if p is not None and p is not self.layers_panel:
+                out.append(p)
+        return [p for p in out if p is not None]
+
+    def _layers_call(self, name, *args, **kwargs):
+        """对**所有**图层栈调用同一个方法（一处改动 → 所有块同步）。
+
+        ⚠ N 份面板共享同一份 `engine.layers`，所以这里只做"广播调用"，**不**重复
+          连接信号（信号只在各自面板内部按行连接一次）⇒ 一次操作不会触发 N 次写入。
+        """
+        res = []
+        for p in self._layer_panels():
+            fn = getattr(p, name, None)
+            if not callable(fn):
+                continue
+            try:
+                res.append(fn(*args, **kwargs))
+            except Exception:                                     # noqa: BLE001
+                continue
+        return res
+
     def _style_multi_out_button(self):
         """工具条上的「多屏输出」开关：**与 `btn_gpu` 完全同一套配色**（用户第 7 条）。
 
@@ -3229,6 +3254,10 @@ class MainWindow(QMainWindow):
 
         self.layers_panel = LayerStackPanel(self)          # 红 + 黄
         left_split.addWidget(self.layers_panel)
+        # ★ 2026-11-09（用户第 10 条）：多屏模式下**每块屏一个图层栈**。
+        #   `layers_panel` 永远是"主屏那一份"（启动即存在，其它代码都靠它）；
+        #   其余屏幕的栈按需创建，存在 `_screen_panels[sid]`，退出多屏时销毁。
+        self._screen_panels = {}
 
         # 演出台 = 图层 + 预览 + 素材库。
         # ★ 2026-09-28 用户要求把素材库**留在主界面**：「不然我怎么手动添加素材」——
@@ -3300,11 +3329,11 @@ class MainWindow(QMainWindow):
         #   以前它挂在 _update_preview 里（每 6 帧一次），而那条路只在**预览帧到达**时跑 ——
         #   换页 / 关预览 / 引擎不产帧时高亮就整个不动了（用户反馈过）。
         self._hl_timer = QTimer(self)
-        self._hl_timer.timeout.connect(self.layers_panel.refresh_playing)
+        self._hl_timer.timeout.connect(lambda: self._layers_call("refresh_playing"))
         self._hl_timer.start(1000)
         self.engine.frame_ready.connect(self._on_engine_frame)
         self.refresh_grid()
-        self.layers_panel.rebuild()
+        self._layers_call("rebuild")
         self._fill_tag_combo()
         self.preview_panel.chk_hud.setChecked(bool(self.cfg["ui"].get("hud", True)))
         self.preview_panel.chk_next.setChecked(bool(self.cfg["ui"].get("next_preview", True)))
@@ -3468,7 +3497,7 @@ class MainWindow(QMainWindow):
         self._multi_blocks_scroll.setWidgetResizable(True)
         self._multi_blocks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._multi_blocks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._multi_blocks_scroll.setMinimumHeight(230)
+        self._multi_blocks_scroll.setMinimumHeight(300)
         self._multi_blocks_scroll.setWidget(holder)
         self._multi_blocks = []          # [(sid, frame, body_layout)]
         self._multi_block_sig = ()
@@ -3494,10 +3523,65 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------- 用户第 10 条：每屏一块图层配置块 ----------
-    def _make_screen_block(self, s, cfg, all_ids):
-        """一块 = 外框(该屏边框色) + 屏幕名/分辨率 + 「图层…」菜单 + 图层区。"""
+    def _panel_for_screen(self, s, cfg):
+        """取/建这块屏幕**自己的**图层栈（主屏复用 `self.layers_panel`）。
+
+        ★ 用户第 10 条原意：「有几个独立屏幕，下面就会有几个单独的图层配置」⇒
+          每块屏一个**真实**的 `LayerStackPanel`，用 `layer_ids` 过滤出该屏使用的图层。
+          它们绑的是同一份 `engine.layers`：在任意一块里改可见性/透明度/混合/拖素材，
+          改的都是同一个图层对象，所以各块天然一致（见 `_layers_call` 的广播刷新）。
+        """
         import output_model as _om
         sid = str(s.get("id") or "")
+        all_ids = [str(l.lid) for l in self.engine.layers]
+        used = [str(x) for x in _om.effective_layers(cfg, s, all_ids)]
+        # 用满全部图层时不必过滤（None 更快、也不会因 lid 类型差异漏行）
+        filt = None if len(used) >= len(all_ids) else used
+        main = _om.main_screen(cfg)
+        if main is not None and sid == str(main.get("id")):
+            p = self.layers_panel
+            p.set_layer_ids(filt)          # 内部会按需 rebuild
+            self._ensure_panel_rows(p)     # 兜底：引擎图层数变了但没人重建过
+            return p
+        p = self._screen_panels.get(sid)
+        if p is None:
+            p = LayerStackPanel(self, layer_ids=filt)
+            self._screen_panels[sid] = p
+            p.rebuild()                     # ★ 新栈必须建一次行（否则是空面板）
+            # 行高/列宽跟主屏那份对齐（`__init__` 已从 cfg 读过一次，这里兜住"本次会话改过"
+            # 但还没落盘的极端情况）
+            try:
+                p.apply_row_height(self.layers_panel.cell_h, save=False)
+            except Exception:                                     # noqa: BLE001
+                pass
+            try:
+                p.set_header_width(self.layers_panel.header_w)
+            except Exception:                                     # noqa: BLE001
+                pass
+        else:
+            p.set_layer_ids(filt)
+            self._ensure_panel_rows(p)
+        return p
+
+    @staticmethod
+    def _ensure_panel_rows(p):
+        """兜底：面板的行数应与"该显示的图层数"一致，不一致就重建。
+
+        为什么需要：`set_layer_ids` 只在**过滤集合变化**时重建，而引擎图层增删由
+        `_layers_call("rebuild")` 广播 —— 万一有代码路径直接改 `engine.layers`
+        没走广播，这里能自愈，不至于出现"块里少一行/多一行"。
+        """
+        try:
+            if len(p.rows) != len(p._visible_layers()):
+                p.rebuild()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _make_screen_block(self, s, cfg, all_ids, panel):
+        """一块 = 外框(该屏边框色) + 屏幕名/分辨率 + 「图层…」菜单 + 「⋯」设置 + 该屏图层栈。"""
+        import output_model as _om
+        sid = str(s.get("id") or "")
+        is_copy = str(s.get("type")) == "copy"
         blk = QFrame()
         blk.setObjectName("multiScreenBlock")
         blk.setMinimumWidth(380)
@@ -3528,8 +3612,20 @@ class MainWindow(QMainWindow):
         btn_layers.setMenu(menu)
         blk._btn_layers = btn_layers
         head.addWidget(btn_layers)
+        # ★ 用户第 8 条的补偿：`ScreenSettingsPanel` 在多屏模式下藏了，屏幕名/边框色
+        #   只剩右键菜单能改 —— 这里给一个显眼的「⋯」，点开就是那个屏幕设置对话框。
+        btn_edit = QPushButton("⋯")
+        btn_edit.setFixedWidth(26)
+        btn_edit.setToolTip("屏幕设置：名称 / 分辨率 / 边框颜色")
+        btn_edit.setEnabled(not is_copy)
+        if is_copy:
+            btn_edit.setToolTip("复制屏幕跟随主屏，不能单独改；请选择原屏幕后再修改")
+        btn_edit.clicked.connect(
+            lambda _c=False, x=sid: self.output_studio.edit_screen(x))
+        blk._btn_edit = btn_edit
+        head.addWidget(btn_edit)
         btn_pick = QPushButton("选中此屏")
-        btn_pick.setToolTip("把右侧设置与图层编辑切到这块屏幕")
+        btn_pick.setToolTip("把右侧设置的作用域切到这块屏幕")
         btn_pick.clicked.connect(
             lambda _c=False, x=sid: self.output_studio.select_screen(x))
         head.addWidget(btn_pick)
@@ -3537,11 +3633,14 @@ class MainWindow(QMainWindow):
         body = QVBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
-        ph = QLabel("点「选中此屏」后，这块里就是该屏的图层（可直接把素材拖进图层行添加）")
-        ph.setWordWrap(True)
-        ph.setStyleSheet("color:#888;font-size:11px;")
-        body.addWidget(ph)
-        blk._placeholder = ph
+        if panel is not None:
+            body.addWidget(panel, 1)
+        else:
+            ph = QLabel("该屏没有可显示的图层（在「图层…」里勾选）")
+            ph.setWordWrap(True)
+            ph.setStyleSheet("color:#888;font-size:11px;")
+            body.addWidget(ph)
+        blk._placeholder = None
         v.addLayout(body, 1)
         return blk, body
 
@@ -3562,20 +3661,35 @@ class MainWindow(QMainWindow):
             pass
 
     def _rebuild_multi_blocks(self, force=False):
-        """按当前配置的屏幕列表生成/刷新 N 块（屏幕数量变了才重建控件）。"""
+        """按当前配置的屏幕列表生成/刷新 N 块（屏幕数量/过滤集变了才重建控件）。"""
         st = getattr(self, "output_studio", None)
         lay = getattr(self, "_multi_blocks_lay", None)
         if st is None or lay is None:
             return
-        import output_model as _om
         cfg = st.active_config()
         screens = list((cfg or {}).get("screens") or [])
         sig = tuple(str(s.get("id")) for s in screens)
-        if not force and sig == self._multi_block_sig and self._multi_blocks:
-            self._place_layer_stack_in_block()
+        # 过滤集也进签名：某屏"使用的图层"勾选变了 ⇒ 必须重建它那块
+        filt_sig = tuple(
+            (str(s.get("id")), tuple(sorted(str(x) for x in (s.get("layers") or [])))
+             if s.get("layers") is not None else None)
+            for s in screens)
+        sig_all = (sig, filt_sig)
+        if not force and sig_all == self._multi_block_sig and self._multi_blocks:
+            # 只是选中屏变了 / 数据刷新：样式刷一下，别重建控件（避免闪烁）
             self._refresh_block_styles(cfg)
             return
-        self._multi_block_sig = sig
+        self._multi_block_sig = sig_all
+        # 已经删掉的屏幕：它的图层栈要销毁（别让 N 个栈无限堆积）
+        for sid in list(self._screen_panels.keys()):
+            if sid not in sig:
+                p = self._screen_panels.pop(sid, None)
+                if p is not None:
+                    try:
+                        p.setParent(None)
+                        p.deleteLater()
+                    except Exception:                             # noqa: BLE001
+                        pass
         try:
             self.layers_panel.setParent(None)      # 先摘出来，别被下面的删除带走
         except Exception:                                         # noqa: BLE001
@@ -3589,37 +3703,13 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
         all_ids = [l.lid for l in self.engine.layers]
         for s in screens:
-            blk, body = self._make_screen_block(s, cfg, all_ids)
+            panel = self._panel_for_screen(s, cfg)
+            blk, body = self._make_screen_block(s, cfg, all_ids, panel)
             self._multi_blocks.append((str(s.get("id")), blk, body))
             lay.addWidget(blk, 1)
-        self._place_layer_stack_in_block()
         self._refresh_block_styles(cfg)
-
-    def _place_layer_stack_in_block(self):
-        """把**同一个**图层栈放进"当前选中屏幕"那块（其余块显示提示）。
-
-        ⚠ 只用一个图层栈实例：这样"把素材拖进图层"才只有一条路径、一份状态；
-          换屏时只是 reparent，行高/列宽/筛选状态全部保留。
-        """
-        st = getattr(self, "output_studio", None)
-        if st is None or not self._multi_blocks:
-            return
-        sid = str(getattr(st, "selected_id", "") or "")
-        target = None
-        for bid, _blk, body in self._multi_blocks:
-            if bid != sid:
-                try:
-                    body.removeWidget(self.layers_panel)
-                except Exception:                                 # noqa: BLE001
-                    pass
-            else:
-                target = body
-        if target is None:
-            return
-        try:
-            target.addWidget(self.layers_panel, 1)
-        except Exception:                                         # noqa: BLE001
-            pass
+        # 新建的栈马上把行/高亮画出来（否则要等下一次广播）
+        self._layers_call("refresh_playing")
 
     def _refresh_block_styles(self, cfg):
         """每块描自己的边框色；选中的那块加粗 + 名字前打勾。"""
@@ -3641,9 +3731,6 @@ class MainWindow(QMainWindow):
                 nm = str(s.get("name") or s.get("id") or "")
                 t = _om.TYPE_LABELS.get(s.get("type"), "")
                 blk._label.setText(("✔ " if sel else "") + "%s · %s · %dx%d" % (nm, t, w, h))
-                ph = getattr(blk, "_placeholder", None)
-                if ph is not None:
-                    ph.setVisible(not sel)
             except Exception:                                     # noqa: BLE001
                 pass
 
@@ -3652,7 +3739,27 @@ class MainWindow(QMainWindow):
         # ★ 用户第 5 条：素材库可能正躺在浮动窗口里 ⇒ 先从那个布局里摘出来，
         #   否则它会被"加到第二个布局"而残留在浮动窗口（关窗后素材库就没了）。
         self._detach_library_from_float()
+        # ★ 用户第 10 条：多屏模式下每块屏各有一个图层栈 ⇒ 退出时把**额外**的栈销毁，
+        #   并把主屏那份的过滤清掉（单屏演出台必须显示**全部**图层）。
+        for sid, p in list(getattr(self, "_screen_panels", {}).items()):
+            try:
+                p.setParent(None)
+                p.deleteLater()
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._screen_panels = {}
+        self._multi_block_sig = ()
         try:
+            self.layers_panel.set_layer_ids(None)
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            # 图层栈可能正躺在某块图层配置块的布局里 ⇒ 先从所有块里摘掉再搬走
+            for _bid, _blk, body in getattr(self, "_multi_blocks", []):
+                try:
+                    body.removeWidget(self.layers_panel)
+                except Exception:                                 # noqa: BLE001
+                    pass
             self.layers_panel.setParent(None)
         except Exception:
             pass
@@ -4831,7 +4938,7 @@ class MainWindow(QMainWindow):
         self.engine.rebuild_from_cfg()
         self.refresh_grid()            # 素材库网格清空，与 cfg["library"] == [] 一致
         self._fill_tag_combo()
-        self.layers_panel.rebuild()
+        self._layers_call("rebuild")
         self.hotkeys.apply()
         self.lbl_warn.setText("")
         QMessageBox.information(
@@ -4979,13 +5086,21 @@ class MainWindow(QMainWindow):
             return
         for i, lay in enumerate(self.engine.layers):
             lay.solo = bool(on) if i == idx else False
-        self.layers_panel.refresh_header()
+        self._layers_call("refresh_header")
         self.save_layers()
 
     def save_layers(self):
         """图层属性变化后持久化"""
         self.engine.push_layers_to_cfg()
         self.cfg.save()
+        # ★ 用户第 10 条：多屏模式下有 N 个图层栈（每屏一个）⇒ 任何一处改了图层属性
+        #   （可见性/透明度/混合/名称/Solo…）都要**广播**刷新，不能只刷当前那块。
+        #   这里是最集中的收口（`_set` / `_set_opacity` / `_set_blend` / 改名都走它）。
+        try:
+            self._layers_call("refresh_header")
+            self._layers_call("refresh_playing")
+        except Exception:                                         # noqa: BLE001
+            pass
         try:
             os_obj = getattr(self, "output_studio", None)
             if os_obj is not None and os_obj.isVisible():
@@ -5863,8 +5978,8 @@ class MainWindow(QMainWindow):
                 try:
                     for _i, _lay in enumerate(self.engine.layers):
                         if getattr(_lay, "is_cuesheet", False):
-                            self.layers_panel.refresh_header(_i)
-                            self.layers_panel.sync_layer(_i)
+                            self._layers_call("refresh_header", _i)
+                            self._layers_call("sync_layer", _i)
                 except Exception:                                # noqa: BLE001
                     pass
         except Exception:                                        # noqa: BLE001
@@ -6814,7 +6929,7 @@ class MainWindow(QMainWindow):
                     if lay.cur >= len(lay.clips):
                         lay.cur = -1
                         lay.prev_idx = -1
-                    self.layers_panel.sync_layer(i)
+                    self._layers_call("sync_layer", i)
         if not delete_file:                     # ★ 默认不删（见 docstring 说明）
             return
         lib = os.path.abspath(self.library_dir())
@@ -7410,7 +7525,7 @@ class MainWindow(QMainWindow):
                 if lay.cur >= len(lay.clips):
                     lay.cur = -1
                     lay.prev_idx = -1
-                self.layers_panel.sync_layer(i)
+                self._layers_call("sync_layer", i)
         self.refresh_grid()
         self._fill_tag_combo()
 
@@ -7468,7 +7583,7 @@ class MainWindow(QMainWindow):
         if lay.cur < 0 and lay.clips and lay.fixed < 0:
             self.engine._switch_layer_to(lay, 0, instant=True)
         self.save_layers()
-        self.layers_panel.sync_layer(layer_idx)
+        self._layers_call("sync_layer", layer_idx)
 
     def play_to_layer(self, layer_idx, items):
         """加入图层并立即切到该素材"""
@@ -7481,7 +7596,7 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
         self.engine._switch_layer_to(lay, idx)
-        self.layers_panel.refresh_playing()
+        self._layers_call("refresh_playing")
 
     def _drop_from_layer(self, layer_idx, item):
         """把素材从指定图层移除（同一素材在别的图层里不受影响）"""
@@ -7501,7 +7616,7 @@ class MainWindow(QMainWindow):
             pp = lay.cache.pop(item.path, None)
             if pp is not None and pp is not lay.player and pp is not lay.prev_player:
                 pp.close()
-        self.layers_panel.sync_layer(layer_idx)
+        self._layers_call("sync_layer", layer_idx)
 
     def remove_from_layer(self, layer_idx, item):
         """从指定图层移除（素材格右键 / 素材库菜单带图层时使用）"""
@@ -7557,7 +7672,7 @@ class MainWindow(QMainWindow):
                     src.clips.remove(m)
                     items.append(m)
                     break
-        self.layers_panel.sync_layer(from_idx)
+        self._layers_call("sync_layer", from_idx)
         if items:
             self.add_to_layer(to_idx, items)
         else:
@@ -7579,7 +7694,7 @@ class MainWindow(QMainWindow):
         if cur_item is not None:
             lay.cur = lay.clips.index(cur_item)
         self.save_layers()
-        self.layers_panel.sync_layer(layer_idx)
+        self._layers_call("sync_layer", layer_idx)
 
     def clips_reordered(self, layer_idx, order):
         if not (0 <= layer_idx < len(self.engine.layers)):
@@ -7651,7 +7766,7 @@ class MainWindow(QMainWindow):
             self.layer_rename()
         elif act == a_sil:
             lay.hide_silent = not lay.hide_silent
-            self.layers_panel.refresh_header(idx)
+            self._layers_call("refresh_header", idx)
             self.save_layers()
         elif act == a_solo:
             self.set_solo(idx, not bool(lay.solo))
@@ -7668,7 +7783,7 @@ class MainWindow(QMainWindow):
                 unbind_layer(self, lay)
             except Exception as e:                               # noqa: BLE001
                 print("[码表] 卸下失败：%s: %s" % (type(e).__name__, e))
-            self.layers_panel.refresh_header(idx)
+            self._layers_call("refresh_header", idx)
         elif act == a_del:
             self._cur_layer = idx
             self.layer_del()
@@ -7769,11 +7884,11 @@ class MainWindow(QMainWindow):
             return
         if act == a_lock:
             lay.lock_motion = not bool(getattr(lay, "lock_motion", False))
-            self.layers_panel.refresh_header(idx)
+            self._layers_call("refresh_header", idx)
             self.save_layers()
         elif act == a_alpha:
             lay.use_alpha = not bool(getattr(lay, "use_alpha", True))
-            self.layers_panel.refresh_header(idx)
+            self._layers_call("refresh_header", idx)
             self.save_layers()
         elif act == a_ren:
             self._cur_layer = idx
@@ -7787,7 +7902,7 @@ class MainWindow(QMainWindow):
         elif act == a_step:
             try:
                 self.engine.manual_switch_layer(idx)
-                self.layers_panel.refresh_playing()
+                self._layers_call("refresh_playing")
             except Exception:                                    # noqa: BLE001
                 pass
         elif act == a_sil:
@@ -7808,7 +7923,7 @@ class MainWindow(QMainWindow):
             for a, v in sp_acts:
                 if a is act:
                     lay.speed = v
-            self.layers_panel.refresh_header(idx)
+            self._layers_call("refresh_header", idx)
             self.save_layers()
         elif act == a_up:
             self.refresh_layer_row(idx, idx - 1)
@@ -7823,7 +7938,7 @@ class MainWindow(QMainWindow):
             lay.use_alpha = True
             lay.lock_motion = False
             lay.visible = True
-            self.layers_panel.refresh_header(idx)
+            self._layers_call("refresh_header", idx)
             self.save_layers()
         elif act == a_del:
             self._cur_layer = idx
@@ -7853,7 +7968,7 @@ class MainWindow(QMainWindow):
         lay.role = role
         if getattr(lay, "auto_mode", False):
             self.engine._refresh_auto_layers(self.audio.state.snapshot(), force=True)
-        self.layers_panel.refresh_header(idx)
+        self._layers_call("refresh_header", idx)
         self.save_layers()
 
     def toggle_layer_role(self, idx):
@@ -7989,7 +8104,7 @@ class MainWindow(QMainWindow):
         elif act == a_play and media is not None:
             try:
                 self.engine._switch_layer_to(lay, lay.clips.index(media))
-                self.layers_panel.refresh_playing()
+                self._layers_call("refresh_playing")
             except ValueError:
                 pass
         elif act == a_fix and media is not None:
@@ -8009,7 +8124,7 @@ class MainWindow(QMainWindow):
                     if media in lay.clips:
                         lay.clips.remove(media)
                     self.add_to_layer(i, [media])
-                    self.layers_panel.sync_layer(layer_idx)
+                    self._layers_call("sync_layer", layer_idx)
                     break
 
     def _next_layer_name(self):
@@ -8101,7 +8216,7 @@ class MainWindow(QMainWindow):
             except Exception as e:                                # noqa: BLE001
                 _ok, msg = False, "装载码表失败：%s: %s" % (type(e).__name__, e)
                 _lv = []
-            self.layers_panel.refresh_header(self._cur_layer)
+            self._layers_call("refresh_header", self._cur_layer)
             try:
                 self.save_layers()
             except Exception:                                     # noqa: BLE001
@@ -8139,7 +8254,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, T("重命名图层"), tr("layer_name"), text=lay.name)
         if ok and name.strip():
             lay.name = name.strip()
-            self.layers_panel.refresh_header(self._cur_layer)
+            self._layers_call("refresh_header", self._cur_layer)
             self.save_layers()
 
     def quick_mode(self):
@@ -8152,7 +8267,7 @@ class MainWindow(QMainWindow):
     def _sync_layers(self):
         self.engine.push_layers_to_cfg()
         self.cfg.save()
-        self.layers_panel.rebuild()
+        self._layers_call("rebuild")
         self._cur_layer = min(self._cur_layer, max(0, len(self.engine.layers) - 1))
         # Kv 设置区随 Kv 图层增删显隐
         try:
@@ -8163,9 +8278,8 @@ class MainWindow(QMainWindow):
     def _on_auto_layers_changed(self, idxs):
         """自动图层素材池被重算：刷新对应行素材格 + 播放高亮"""
         for i in (idxs or []):
-            if 0 <= i < len(self.layers_panel.rows):
-                self.layers_panel.sync_layer(i)
-        self.layers_panel.refresh_playing()
+            self._layers_call("sync_layer", i)
+        self._layers_call("refresh_playing")
 
     # ================= 输出/语言 =================
     def show_output(self):
@@ -8328,7 +8442,7 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(tr("running") if running
                                 else tr("stopped") + T("（自动切换已停，画面实时）"))
         try:
-            self.layers_panel.refresh_header()      # 图层名 tooltip / 不透明度 / 角色按钮
+            self._layers_call("refresh_header")      # 图层名 tooltip / 不透明度 / 角色按钮
         except Exception:
             pass
         try:

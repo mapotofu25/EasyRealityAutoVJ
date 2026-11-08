@@ -3431,11 +3431,19 @@ class LayerStackPanel(QWidget):
         "tog_w": 46,
     }
 
-    def __init__(self, main):
+    def __init__(self, main, layer_ids=None):
         super().__init__()
         self.main = main
-        self.rows = []            # [(header_frame, ClipRow)]
+        self.rows = []            # [(header_frame, ClipRow)]，**已按 `layer_ids` 过滤**
         self._sig_guard = False
+        # ★★ 2026-11-09（用户第 10 条：「有几个独立屏幕，下面就有几个单独的图层配置」）：
+        #   `layer_ids` 是**可选过滤**：只显示这些图层 id 的行；`None` = 全部（默认，
+        #   行为与改动前完全一致）。多屏模式下每块屏幕各建一个栈，传入该屏
+        #   `screen["layers"]`，就能"N 份图层配置同时显示、各自可编辑"。
+        #   ⚠ 过滤只影响**显示哪些行**：`self.rows` 的位置 ≠ 引擎图层索引，
+        #     所以下面所有"行位置 ↔ 引擎索引"的换算都走 `_pos_of` / `_idx_of`。
+        self.layer_ids = (None if layer_ids is None
+                          else set(str(x) for x in layer_ids))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -3660,10 +3668,46 @@ class LayerStackPanel(QWidget):
             pop.set_value(h)
         self._refill_timer.start()      # 合并：一次拖动只重建一次
 
+    # ---- 图层过滤（多屏 H1：每块屏一个栈）----
+    def _visible_layers(self):
+        """要显示的 `(引擎索引, 图层)` 列表（按 `layer_ids` 过滤；None = 全部）。"""
+        out = []
+        try:
+            layers = list(self.main.engine.layers or [])
+        except Exception:                                          # noqa: BLE001
+            return out
+        for i, lay in enumerate(layers):
+            if self.layer_ids is not None and str(getattr(lay, "lid", "")) not in self.layer_ids:
+                continue
+            out.append((i, lay))
+        return out
+
+    def set_layer_ids(self, layer_ids):
+        """改过滤集合（屏幕的"使用的图层"变了）⇒ 重建这棵栈。"""
+        new = None if layer_ids is None else set(str(x) for x in layer_ids)
+        if new == self.layer_ids:
+            return
+        self.layer_ids = new
+        self.rebuild()
+
+    def _pos_of(self, idx):
+        """引擎图层索引 → `self.rows` 里的位置（本栈不显示该图层时返回 None）。"""
+        for pos, (hdr, _grid) in enumerate(self.rows):
+            if int(getattr(hdr, "_layer_idx", -1)) == int(idx):
+                return pos
+        return None
+
+    def _idx_of(self, pos):
+        """`self.rows` 位置 → 引擎图层索引。"""
+        if 0 <= pos < len(self.rows):
+            return int(getattr(self.rows[pos][0], "_layer_idx", pos))
+        return pos
+
     def _refill_rows(self):
         """按当前 `cell_h` 重填每一行的素材格（`_fill_row` 会重建 item/图标）。"""
-        for i, _row in enumerate(self.rows):
-            if i < len(self.main.engine.layers):
+        for pos in range(len(self.rows)):
+            i = self._idx_of(pos)          # ★ 行位置 → 引擎索引（可能是过滤后的子集）
+            if 0 <= i < len(self.main.engine.layers):
                 self._fill_row(i, self.main.engine.layers[i])
         self.refresh_playing()
 
@@ -3795,7 +3839,7 @@ class LayerStackPanel(QWidget):
 
     def _refill_cue_rows(self):
         for i, lay in enumerate(self.main.engine.layers):
-            if getattr(lay, "is_cuesheet", False) and i < len(self.rows):
+            if getattr(lay, "is_cuesheet", False) and self._pos_of(i) is not None:
                 self._fill_row(i, lay)
         self.refresh_playing()
 
@@ -3840,17 +3884,17 @@ class LayerStackPanel(QWidget):
         return True
 
     def _row_index_at(self, y_global_pos):
-        """按落点 y 找最近的图层行（拖到空白处也能落到最近的行）"""
+        """按落点 y 找最近的图层行，返回**引擎图层索引**（拖到空白处也能落到最近的行）"""
         best, best_d = None, None
-        for i, (hdr, _grid) in enumerate(self.rows):
+        for pos, (hdr, _grid) in enumerate(self.rows):
             top = hdr.mapToGlobal(QPoint(0, 0)).y()
             h = hdr.height()
             if top <= y_global_pos <= top + h:
-                return i
+                return self._idx_of(pos)
             d = min(abs(y_global_pos - top), abs(y_global_pos - (top + h)))
             if best_d is None or d < best_d:
-                best, best_d = i, d
-        return best
+                best, best_d = pos, d
+        return None if best is None else self._idx_of(best)
 
     def eventFilter(self, obj, ev):
         from PySide6.QtCore import QEvent
@@ -3900,7 +3944,7 @@ class LayerStackPanel(QWidget):
             if w:
                 w.deleteLater()
         self.rows = []
-        for i, lay in enumerate(self.main.engine.layers):
+        for i, lay in self._visible_layers():      # ★ 只建**该显示**的行（过滤见 `layer_ids`）
             row = QWidget()
             rl = QHBoxLayout(row)
             rl.setContentsMargins(0, 0, 0, 0)
@@ -4409,7 +4453,9 @@ class LayerStackPanel(QWidget):
         if not (0 <= idx < len(lays)):
             return
         lay = lays[idx]
-        cmb = getattr(self.rows[idx][0], "_cmb_cue", None) if 0 <= idx < len(self.rows) else None
+        _pos = self._pos_of(idx)
+        cmb = (getattr(self.rows[_pos][0], "_cmb_cue", None)
+               if _pos is not None else None)
         if cmb is None:
             return
         data = str(cmb.currentData() or "")
@@ -4500,7 +4546,8 @@ class LayerStackPanel(QWidget):
         act_open = m.addAction(T("换表 / 导入码表…"))
         act_off = m.addAction(T("从这个图层卸下码表"))
         act_off.setEnabled(bool(getattr(lay, "is_cuesheet", False)))
-        btn = self.rows[idx][0] if 0 <= idx < len(self.rows) else self
+        _pos = self._pos_of(idx)
+        btn = self.rows[_pos][0] if _pos is not None else self
         chosen = m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
         if chosen is act_open:
             fn = getattr(self.main, "open_cuesheet", None)
@@ -4547,7 +4594,10 @@ class LayerStackPanel(QWidget):
         self.main.save_layers()
 
     def _fill_row(self, idx, lay):
-        grid = self.rows[idx][1]
+        pos = self._pos_of(idx)
+        if pos is None:
+            return                         # 本栈不显示这个图层（过滤掉了）
+        grid = self.rows[pos][1]
         grid.clear()
         h = self.cell_h
         # ★ 格子宽度跟着行高走（见 `ClipRow.set_cell_height`）——这里必须用**这一行**
@@ -4606,16 +4656,21 @@ class LayerStackPanel(QWidget):
 
     def sync_layer(self, idx):
         """仅刷新指定行的素材格（不重建控件）"""
-        if 0 <= idx < len(self.main.engine.layers) and idx < len(self.rows):
+        if (0 <= idx < len(self.main.engine.layers)
+                and self._pos_of(idx) is not None):
             self._fill_row(idx, self.main.engine.layers[idx])
 
     def refresh_header(self, idx=None):
         """刷新图层头控件显示（可见/Solo/不透明度/混合模式/名称）"""
-        rng = range(len(self.rows)) if idx is None else [idx]
+        if idx is None:
+            rng = [self._idx_of(p) for p in range(len(self.rows))]
+        else:
+            rng = [idx]
         for i in rng:
-            if not (0 <= i < len(self.rows)):
+            pos = self._pos_of(i)
+            if pos is None or not (0 <= i < len(self.main.engine.layers)):
                 continue
-            f, _ = self.rows[i]
+            f, _ = self.rows[pos]
             lay = self.main.engine.layers[i]
             for w in (f._btn_vis, f._btn_solo, f._op, f._blend, f._btn_alpha, f._btn_lock):
                 w.blockSignals(True)
@@ -4668,7 +4723,8 @@ class LayerStackPanel(QWidget):
         def _key(p):
             return os.path.normcase(str(p or ""))
 
-        for i, (_, grid) in enumerate(self.rows):
+        for pos, (_, grid) in enumerate(self.rows):
+            i = self._idx_of(pos)          # ★ 行位置 → 引擎索引（过滤后两者不等）
             if i >= len(self.main.engine.layers):
                 continue
             lay = self.main.engine.layers[i]

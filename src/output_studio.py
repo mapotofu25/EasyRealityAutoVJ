@@ -827,11 +827,13 @@ class ScreenDialog(QDialog):
       ③ **分辨率对独立屏可手改**（以前跟着"跟随主屏"联动，看起来像只读）。
     """
 
-    def __init__(self, studio, source_screen=None, forced_type=None, parent=None):
+    def __init__(self, studio, source_screen=None, forced_type=None, parent=None,
+                 edit_screen=None):
         super().__init__(parent or studio)
         self.studio = studio
         self.cfg = studio.active_config()
-        self.setWindowTitle("新建屏幕")
+        self.edit_screen = edit_screen
+        self.setWindowTitle("屏幕设置" if edit_screen is not None else "新建屏幕")
         self.setMinimumWidth(420)
         form = QFormLayout(self)
         self.name = QLineEdit()
@@ -882,10 +884,41 @@ class ScreenDialog(QDialog):
         if forced_type:
             idx = self.type.findData(forced_type)
             if idx >= 0: self.type.setCurrentIndex(idx)
+        # ★ 用户第 8 条的补偿入口：多屏模式下「⋯」按钮打开本对话框**编辑已有屏幕**
+        #   （名称 / 分辨率 / 边框颜色）。类型不给改：改类型会破坏 source/uv/mapping 关系。
+        if edit_screen is not None:
+            _s = edit_screen
+            self.name.setText(str(_s.get("name") or ""))
+            _ti = self.type.findData(str(_s.get("type") or "independent"))
+            if _ti >= 0:
+                self.type.setCurrentIndex(_ti)
+            self.type.setEnabled(False)
+            try:
+                _w, _h = OM.effective_size(self.cfg, _s)
+                self.w.setValue(int(_w))
+                self.h.setValue(int(_h))
+            except Exception:                                      # noqa: BLE001
+                pass
+            self._color = _color(OM.effective_color(self.cfg, _s))
+            self._sync_color_btn()
         self.type.currentIndexChanged.connect(self._sync_fields)
         self.source.currentIndexChanged.connect(self._sync_fields)
         self.w.valueChanged.connect(self._sync_fields)
         self._sync_fields()
+
+    def apply_to(self, screen):
+        """把对话框里的值写回**已有**屏幕（`⋯` 编辑模式）。返回该屏字典。"""
+        v = self.values()
+        t = str(screen.get("type") or "")
+        if v["name"]:
+            screen["name"] = v["name"]
+        if t in ("main", "independent"):
+            screen["width"] = max(16, int(v["width"]))
+            screen["height"] = max(16, int(v["height"]))
+            if t == "independent":
+                screen["follow_main"] = False     # 手填过尺寸 ⇒ 不再跟随主屏
+            screen["color"] = v["color"]
+        return screen
 
     def _fill_sources(self):
         self.source.clear()
@@ -2098,6 +2131,28 @@ class OutputStudio(QWidget):
         s["preview_fit"] = fit if fit in ("fit", "fill", "1:1") else "fit"
         self.cfg.save()
         self.preview.update()
+
+    # ---------- 屏幕编辑（用户第 8 条的补偿入口） ----------
+    def edit_screen(self, sid):
+        """编辑某块屏幕：名称 / 分辨率 / 边框颜色（复制屏不可单独改）。
+
+        ★ 背景：多屏模式下按用户第 8 条把 `ScreenSettingsPanel`（名称/类型/源屏幕/
+          分辨率/边框颜色/使用的图层）藏掉了，改名的入口只剩预览右键菜单。
+          这里给图层块头一个显眼的「⋯」按钮，点开就是这个对话框。
+        """
+        cfg = self.active_config()
+        s = OM.screen_by_id(cfg, sid) if cfg else None
+        if s is None or s.get("type") == "copy":
+            return
+        dlg = ScreenDialog(self, parent=self, edit_screen=s)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        dlg.apply_to(s)
+        self.apply()
+        try:
+            self.settings.set_screen(s, cfg, cfg.get("mode", "multi"))
+        except Exception:                                          # noqa: BLE001
+            pass
 
     # ---------- 输出画布窗口（用户第 11 条）----------
     def open_output_canvas(self):
