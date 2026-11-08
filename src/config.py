@@ -129,12 +129,9 @@ DEFAULTS = {
         # （BC 纹理），CPU 只做 LZ 解包 + 回读。对 DXT5/大尺寸 DXT1 有明显收益；
         # 失败一律回退软解，不影响播放。2026-11-08 优化版默认开启（自动回退）。
         "gpu_decode": True,
-        # ★ 2026-11-08（v25 闪退：cv2.pyd 0xc0000005）：安全视频解码。
-        #   开启后普通视频用 PyAV 解码，不再走 OpenCV VideoCapture；
-        #   OpenCV 的 native access violation 会直接带走整个进程，PyAV 则是普通异常。
-        #   代价：3 路视频约 +1.8 核 CPU。默认开；如果机器性能够、想省 CPU，可在
-        #   「性能」里关闭（关闭后恢复 OpenCV，速度快但仍有极小概率闪退）。
-        "safe_decode": True,
+        # ★ 2026-11-09 用户要求：**去掉 `safe_decode` 开关**（原来默认让普通视频走 PyAV
+        #   以规避 cv2 的 0xc0000005，代价 3 路约 +1.8 核）。现在普通视频固定走 OpenCV；
+        #   老配置里残留的 `safe_decode` 键会被忽略，不需要迁移。
     },
     "audio": {
         "source_type": "system",      # system / mic / linein

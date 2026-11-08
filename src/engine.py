@@ -853,13 +853,8 @@ class AutoVJEngine(QObject):
         # 未注入时为 None ⇒ 调用方必须能退化成"只读 `self.audio` 的公开状态"。
         self._audio_engine = None
         self.library = media_library
-        # ★ 安全视频解码：必须在创建任何播放器之前设置（配置默认开）。
-        #   普通视频走 PyAV，避开 OpenCV cv2.pyd 的 native 闪退。
-        try:
-            import media_manager as _mm
-            _mm.set_safe_decode(bool((self.cfg["perf"] or {}).get("safe_decode", True)))
-        except Exception:
-            pass
+        # ★ 2026-11-09：`safe_decode`（普通视频改走 PyAV）已被用户要求去掉，
+        #   普通视频固定走 OpenCV；带 alpha 的素材仍然走 PyAV（见 media_manager.make_player）。
         self.layers = []
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
         self._cue_sheet = None      # 当前码表（cuesheet.CueSheet）

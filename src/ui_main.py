@@ -346,18 +346,13 @@ class SettingsPanel(QWidget):
         self.chk_gpu = QCheckBox("GPU 解码（DXV 硬件解压）")
         self.chk_gpu.setToolTip("让显卡硬件解压 DXV 素材（帧内 DXT 压缩块直传显存），降低解码 CPU 占用：DXT5 素材约省一半以上、超宽素材约省七成；解压失败或显卡不支持时自动回退软解，不影响播放")
         gp.addWidget(self.chk_gpu, 1, 0, 1, 2)
-        self.chk_safe_decode = QCheckBox("安全视频解码（推荐，防 cv2 闪退）")
-        self.chk_safe_decode.setToolTip(
-            "开启后普通视频用 PyAV 解码，不再走 OpenCV；OpenCV 的 native 崩溃会直接带走整个进程，"
-            "PyAV 只会报普通异常。代价是 3 路视频约多 1.8 核 CPU。\n"
-            "如果机器性能够、想省 CPU，可以关闭；关闭后恢复 OpenCV 路径（更快，但仍有极小概率闪退）。"
-            "\n⚠ 修改后只影响新打开的素材/图层；已在播的素材要等下次切换才换解码器。")
-        gp.addWidget(self.chk_safe_decode, 2, 0, 1, 2)
+        # ★ 2026-11-09 用户要求：去掉「安全视频解码」开关（普通视频固定走 OpenCV，省 CPU）。
+        #   原来这一行是 chk_safe_decode（2, 0），删掉后 chk_fps_follow 上移到第 2 行。
         self.chk_fps_follow = QCheckBox("跟随素材帧率（省 CPU，推荐）")
         self.chk_fps_follow.setToolTip("素材 25~30fps 时不再按 60fps 重复合成同一帧；有 60fps 素材时自动回到 60。手动选 60 但此项开启时，仍会按素材帧率封顶。")
-        gp.addWidget(self.chk_fps_follow, 3, 0, 1, 2)
+        gp.addWidget(self.chk_fps_follow, 2, 0, 1, 2)
         ga.setRowStretch(4, 1)
-        gp.setRowStretch(3, 1)
+        gp.setRowStretch(2, 1)
         # 同上：注册统一在下面做
 
         # ---- 颜色渲染（一键调色：让同一批素材看起来不一样）----
@@ -673,7 +668,6 @@ class SettingsPanel(QWidget):
         self.chk_fps_follow.stateChanged.connect(
             lambda s: main.engine.set_fps_follow_source(bool(s)))
         self.chk_gpu.stateChanged.connect(main.set_gpu_decode)
-        self.chk_safe_decode.stateChanged.connect(main.set_safe_decode)
         self.transition.currentIndexChanged.connect(main.set_transition)
         self.energy_map.stateChanged.connect(lambda s: main.engine_cfg("auto", "energy_map", bool(s)))
         self.bpm_sync.stateChanged.connect(lambda s: main.engine_cfg("auto", "bpm_speed_sync", bool(s)))
@@ -2937,11 +2931,6 @@ class MainWindow(QMainWindow):
         # 实测占主窗口构造时间的四成以上。用批量模式合并成一次写。
         with self.cfg.batch():
             self._build_ui()
-            # 安全视频解码开关（SettingsPanel 此时才存在）
-            try:
-                self.set_safe_decode(bool((self.cfg["perf"] or {}).get("safe_decode", True)))
-            except Exception:
-                pass
             # 多屏输出开关：上次关闭前进过多屏模式，启动时直接恢复
             try:
                 if bool((self.cfg["output"] or {}).get("multi_enabled", False)):
@@ -4699,32 +4688,6 @@ class MainWindow(QMainWindow):
                     self, T( T("GPU 解码")),
                     Tf("这台机器暂时用不了 GPU 解码，已自动回退软解：\n{}", msg))
 
-    def set_safe_decode(self, s):
-        """安全视频解码开关：普通视频用 PyAV 而不是 OpenCV。
-
-        ⚠ 只影响**新打开**的播放器；正在播的素材保持原解码器，等下次切换才换。
-        """
-        import media_manager as mm
-        on = bool(s)
-        try:
-            self.cfg.set("perf", "safe_decode", on)
-            self.cfg.save()
-        except Exception:
-            pass
-        try:
-            mm.set_safe_decode(on)
-        except Exception:
-            pass
-        # 同步设置面板（程序化设置时）
-        try:
-            cb = getattr(getattr(self, "settings", None), "chk_safe_decode", None)
-            if cb is not None and cb.isChecked() != on:
-                cb.blockSignals(True)
-                cb.setChecked(on)
-                cb.blockSignals(False)
-        except Exception:
-            pass
-
     def set_mode_selection(self, i):
         if i == 0:
             self.engine_cfg("mode", "auto", True)
@@ -5187,18 +5150,6 @@ class MainWindow(QMainWindow):
             if _gd:
                 import glctx
                 glctx.preinit()      # 主线程先 init glfw（解码线程只建窗口）
-        except Exception:
-            pass
-        # 安全视频解码（PyAV）——默认开；防止 cv2 native 崩溃带走进程
-        try:
-            import media_manager as mm
-            _sd = bool((self.cfg["perf"] or {}).get("safe_decode", True))
-            mm.set_safe_decode(_sd)
-            cb = getattr(getattr(self, "settings", None), "chk_safe_decode", None)
-            if cb is not None:
-                cb.blockSignals(True)
-                cb.setChecked(_sd)
-                cb.blockSignals(False)
         except Exception:
             pass
         # 能量校正滑条已无 UI（2026-10-18）；配置值在 __init__ 里直接写进 audio.energy_scale。

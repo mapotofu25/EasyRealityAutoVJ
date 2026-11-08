@@ -31,19 +31,11 @@ except Exception:
     pass
 
 # ★ 2026-11-08（v25 闪退：cv2.pyd 0xc0000005）：安全视频解码模式。
-#   开启后普通视频用 PyAV（AvAlphaPlayer）而不是 OpenCV VideoCapture。
-#   PyAV 的异常是 Python 异常，不会像 cv2 那样把整个进程带走；
-#   代价是 CPU 略高（实测 3 路视频约 +1.8 核）。默认开，设置里可关。
-_SAFE_DECODE = (os.environ.get("AUTO_VJ_SAFE_DECODE", "0") or "0").strip() in ("1", "true", "True")
+#   ★ 2026-11-09 用户要求：**去掉「安全视频解码」开关**。
+#   原实现（v26）让普通视频默认走 PyAV 以规避 cv2 的 native 崩溃，代价 3 路约 +1.8 核；
+#   用户选择用 CPU 换速度 ⇒ 普通视频恢复 OpenCV `VideoCapture`（下面 make_player 的分支）。
+#   ⚠ 带 alpha 的视频仍然必须走 PyAV（OpenCV 会丢 alpha），那条分支保留。
 
-
-def set_safe_decode(on):
-    global _SAFE_DECODE
-    _SAFE_DECODE = bool(on)
-
-
-def safe_decode_enabled():
-    return bool(_SAFE_DECODE)
 
 VIDEO_EXT = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 GIF_EXT = (".gif",)
@@ -2582,8 +2574,6 @@ def create_video_player(item, cue=False):
             _probe_codec_async(item)
         elif dxv:
             return GpuDxvPlayer(item.path, avmod, out_alpha=bool(has))
-    if _SAFE_DECODE and avmod is not None:
-        return AvAlphaPlayer(item.path, avmod, out_alpha=bool(has))
     if has and avmod is not None:
         return AvAlphaPlayer(item.path, avmod)          # 构造不再阻塞（容器在解码线程开）
     return VideoPlayer(item.path)
