@@ -3338,17 +3338,22 @@ class _RowHeightPopup(QWidget):
 
 
 class _ColDivider(QWidget):
-    """图层头与素材格之间的**可拖动**竖条（用户 2026-11-06：「中间那条竖，鼠标放下可以调宽窄」）。
+    """图层头与素材格之间的**可拖动空隙**（用户 2026-11-06：「中间那条竖，鼠标放下可以调宽窄」）。
 
     为什么不是 `QSplitter`：每一行是各自独立的 QWidget（头 + 格子），
     用 N 个 splitter 就得让它们互相同步（拖动时 N 个布局各自重算 = 卡 + 抖）。
     这里只维护**一个全局 `panel.header_w`**，拖动时把它套到所有图层头的 `setFixedWidth`。
 
-    · 6px 宽，悬停/拖动时竖线变亮 + `SplitHCursor`（让人看出这里能拖）
+    ★★ 2026-11-09（用户第 6 条：「把中间那条竖线去掉，改成按在空隙上就能拖」）：
+      **不再画任何东西**（原来画一条 1px 竖线 + hover 变亮）——现在它就是"两列之间的空白"。
+      为了让"按在空隙上"真的按得到，这里把**热区加宽到 18px**（原来只有 6px），
+      同时把行的 `spacing` 改成 0：`图层头 |←— 18px 空白 —→| 素材格`，
+      与改动前的 `6 间距 + 6 热区 + 6 间距` **总宽完全一样** ⇒ 视觉/几何零变化，
+      但可拖区域从 6px 变成 18px（鼠标一进这块空白就是左右箭头光标）。
     · 松手才落盘（`ui.layer_header_w`），拖动过程不写盘
     """
 
-    W = 6
+    W = 18
 
     def __init__(self, panel):
         super().__init__()
@@ -3358,32 +3363,11 @@ class _ColDivider(QWidget):
         self.setToolTip("拖动调整左列宽度（图层头 ↔ 素材格）")
         self.setMouseTracking(True)
         self._grab = None
-        self._hover = False
 
     def paintEvent(self, e):                                     # noqa: N802
-        try:
-            p = QPainter(self)
-            p.fillRect(self.rect(), QColor(theme.V("panel")))
-            c = QColor(theme.V("border"))
-            if self._hover or self._grab is not None:
-                c = QColor(theme.V("text"))
-                c.setAlpha(160)
-            p.setPen(c)
-            x = self.width() // 2
-            p.drawLine(x, 3, x, max(4, self.height() - 3))
-            p.end()
-        except Exception:                                        # noqa: BLE001
-            pass
-
-    def enterEvent(self, e):                                     # noqa: N802
-        self._hover = True
-        self.update()
-        super().enterEvent(e)
-
-    def leaveEvent(self, e):                                     # noqa: N802
-        self._hover = False
-        self.update()
-        super().leaveEvent(e)
+        # ★ 用户第 6 条：这里**什么都不画**（以前画的竖线已删除）。
+        #   留着空实现是为了不让 Qt 走默认绘制。
+        pass
 
     def mousePressEvent(self, e):                                # noqa: N802
         if e.button() == Qt.LeftButton:
@@ -3392,7 +3376,6 @@ class _ColDivider(QWidget):
             except AttributeError:                               # Qt5 兜底
                 gx = e.globalPos().x()
             self._grab = (float(gx), int(self.panel.header_w))
-            self.update()
             e.accept()
 
     def mouseMoveEvent(self, e):                                 # noqa: N802
@@ -3921,7 +3904,9 @@ class LayerStackPanel(QWidget):
             row = QWidget()
             rl = QHBoxLayout(row)
             rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(6)
+            # ★ 2026-11-09（用户第 6 条）：原来是 6 ⇒ 两列间总宽 = 6+6(竖条)+6 = 18。
+            #   现在竖条改宽 18（热区）且不再画线，间距必须改 0，总宽仍是 18 ⇒ 几何零变化。
+            rl.setSpacing(0)
             hdr = self._build_header(i, lay)
             hdr._layer_idx = i
             hdr.setAcceptDrops(True)
