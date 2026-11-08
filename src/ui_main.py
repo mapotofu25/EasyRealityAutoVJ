@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QStatusBar, QDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QApplication, QProgressBar, QAbstractItemView, QInputDialog,
     QToolBox, QScrollArea, QMenu, QFrame, QSizePolicy, QLineEdit, QButtonGroup,
-    QRadioButton, QTabWidget, QAbstractSpinBox,
+    QRadioButton, QTabWidget, QAbstractSpinBox, QToolButton,
 )
 
 import i18n
@@ -3446,9 +3446,10 @@ class MainWindow(QMainWindow):
         left.setSpacing(4)
         self.output_studio = _os.OutputStudio(self, compact=True)
         left.addWidget(self.output_studio, 1)
-        # 多屏模式：右侧设置的作用域跟着"选中哪块屏"走（用户第 8/11 条）
+        # 多屏模式：右侧设置的作用域跟着"选中哪块屏"走（用户第 8/11 条），
+        # 下方图层块也跟着选中屏走（用户第 10 条）
         try:
-            self.output_studio.selection_changed.connect(self._sync_multi_right)
+            self.output_studio.selection_changed.connect(self._on_studio_selection)
         except Exception:                                         # noqa: BLE001
             pass
         # ★ 用户第 5 条：多屏模式下**不再内嵌素材库**，
@@ -3457,17 +3458,21 @@ class MainWindow(QMainWindow):
             self.output_studio.open_library.connect(self.toggle_library_float)
         except Exception:                                         # noqa: BLE001
             pass
-        bottom = QSplitter(Qt.Horizontal)
-        bottom.setObjectName("multiStageBottom")
-        # 从正常演出台里把图层栈取出来（setParent(None) 会自动从 QSplitter 移除）
-        # ⚠ 素材库**不取**：它留在原演出台的 QSplitter 里不动（那块页面此刻隐藏），
-        #   打开素材库窗口时才 reparent 出去，关掉（或退出多屏）再还回去。
-        self.layers_panel.setParent(None)
-        bottom.addWidget(self.layers_panel)
-        bottom.setSizes([780, 520])
-        bottom.setMinimumHeight(220)
-        self._multi_bottom = bottom
-        left.addWidget(bottom, 0)
+        # ★ 用户第 10 条：下方不再是"一份共享图层栈"，改成**按屏幕数量生成 N 份
+        #   图层配置块**（含主屏），每块用该屏边框色描边；横向排列、可滚动。
+        holder = QWidget()
+        self._multi_blocks_lay = QHBoxLayout(holder)
+        self._multi_blocks_lay.setContentsMargins(2, 2, 2, 2)
+        self._multi_blocks_lay.setSpacing(6)
+        self._multi_blocks_scroll = QScrollArea()
+        self._multi_blocks_scroll.setWidgetResizable(True)
+        self._multi_blocks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._multi_blocks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._multi_blocks_scroll.setMinimumHeight(230)
+        self._multi_blocks_scroll.setWidget(holder)
+        self._multi_blocks = []          # [(sid, frame, body_layout)]
+        self._multi_block_sig = ()
+        left.addWidget(self._multi_blocks_scroll, 0)
         lay.addLayout(left, 1)
         # 右侧：单屏那份设置分组的落脚点（`_move_panels_to_multi` 把控件搬进来）
         self._multi_right_lay = QVBoxLayout()
@@ -3476,6 +3481,171 @@ class MainWindow(QMainWindow):
         lay.addLayout(self._multi_right_lay, 0)
         self._multi_page = page
         self.perf_stack.addWidget(page)
+
+    def _on_studio_selection(self, sid=""):
+        """选中屏幕变了：右侧设置换作用域 + 下方图层块重排（用户第 8/10/11 条）。"""
+        try:
+            self._rebuild_multi_blocks()
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            self._sync_multi_right(sid)
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    # ---------- 用户第 10 条：每屏一块图层配置块 ----------
+    def _make_screen_block(self, s, cfg, all_ids):
+        """一块 = 外框(该屏边框色) + 屏幕名/分辨率 + 「图层…」菜单 + 图层区。"""
+        import output_model as _om
+        sid = str(s.get("id") or "")
+        blk = QFrame()
+        blk.setObjectName("multiScreenBlock")
+        blk.setMinimumWidth(380)
+        blk._screen_id = sid
+        v = QVBoxLayout(blk)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        lab = QLabel("")
+        lab.setStyleSheet("font-weight:bold;")
+        blk._label = lab
+        head.addWidget(lab)
+        head.addStretch(1)
+        btn_layers = QToolButton()
+        btn_layers.setText("图层…")
+        btn_layers.setPopupMode(QToolButton.InstantPopup)
+        btn_layers.setToolTip("选择这块屏幕使用哪些图层（主屏/复制屏固定使用全部图层）")
+        menu = QMenu(btn_layers)
+        used = set(_om.effective_layers(cfg, s, all_ids))
+        for lay in self.engine.layers:
+            act = menu.addAction(lay.name)
+            act.setCheckable(True)
+            act.setChecked(lay.lid in used)
+            act.setEnabled(str(s.get("type")) in ("independent",))
+            act.triggered.connect(
+                lambda on, lid=lay.lid, sc=s: self._toggle_screen_layer(sc, lid, bool(on)))
+        btn_layers.setMenu(menu)
+        blk._btn_layers = btn_layers
+        head.addWidget(btn_layers)
+        btn_pick = QPushButton("选中此屏")
+        btn_pick.setToolTip("把右侧设置与图层编辑切到这块屏幕")
+        btn_pick.clicked.connect(
+            lambda _c=False, x=sid: self.output_studio.select_screen(x))
+        head.addWidget(btn_pick)
+        v.addLayout(head)
+        body = QVBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        ph = QLabel("点「选中此屏」后，这块里就是该屏的图层（可直接把素材拖进图层行添加）")
+        ph.setWordWrap(True)
+        ph.setStyleSheet("color:#888;font-size:11px;")
+        body.addWidget(ph)
+        blk._placeholder = ph
+        v.addLayout(body, 1)
+        return blk, body
+
+    def _toggle_screen_layer(self, screen, lid, on):
+        """独立屏的"使用的图层"勾选（用户第 10 条：块内就能改，不是只读列表）。"""
+        try:
+            import output_model as _om
+            cfg = self.output_studio.active_config()
+            all_ids = [l.lid for l in self.engine.layers]
+            cur = set(_om.effective_layers(cfg, screen, all_ids))
+            if on:
+                cur.add(lid)
+            else:
+                cur.discard(lid)
+            screen["layers"] = [x for x in all_ids if x in cur]
+            self.output_studio.apply()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _rebuild_multi_blocks(self, force=False):
+        """按当前配置的屏幕列表生成/刷新 N 块（屏幕数量变了才重建控件）。"""
+        st = getattr(self, "output_studio", None)
+        lay = getattr(self, "_multi_blocks_lay", None)
+        if st is None or lay is None:
+            return
+        import output_model as _om
+        cfg = st.active_config()
+        screens = list((cfg or {}).get("screens") or [])
+        sig = tuple(str(s.get("id")) for s in screens)
+        if not force and sig == self._multi_block_sig and self._multi_blocks:
+            self._place_layer_stack_in_block()
+            self._refresh_block_styles(cfg)
+            return
+        self._multi_block_sig = sig
+        try:
+            self.layers_panel.setParent(None)      # 先摘出来，别被下面的删除带走
+        except Exception:                                         # noqa: BLE001
+            pass
+        self._multi_blocks = []
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        all_ids = [l.lid for l in self.engine.layers]
+        for s in screens:
+            blk, body = self._make_screen_block(s, cfg, all_ids)
+            self._multi_blocks.append((str(s.get("id")), blk, body))
+            lay.addWidget(blk, 1)
+        self._place_layer_stack_in_block()
+        self._refresh_block_styles(cfg)
+
+    def _place_layer_stack_in_block(self):
+        """把**同一个**图层栈放进"当前选中屏幕"那块（其余块显示提示）。
+
+        ⚠ 只用一个图层栈实例：这样"把素材拖进图层"才只有一条路径、一份状态；
+          换屏时只是 reparent，行高/列宽/筛选状态全部保留。
+        """
+        st = getattr(self, "output_studio", None)
+        if st is None or not self._multi_blocks:
+            return
+        sid = str(getattr(st, "selected_id", "") or "")
+        target = None
+        for bid, _blk, body in self._multi_blocks:
+            if bid != sid:
+                try:
+                    body.removeWidget(self.layers_panel)
+                except Exception:                                 # noqa: BLE001
+                    pass
+            else:
+                target = body
+        if target is None:
+            return
+        try:
+            target.addWidget(self.layers_panel, 1)
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    def _refresh_block_styles(self, cfg):
+        """每块描自己的边框色；选中的那块加粗 + 名字前打勾。"""
+        import output_model as _om
+        st = getattr(self, "output_studio", None)
+        sid = str(getattr(st, "selected_id", "") or "") if st is not None else ""
+        for bid, blk, _body in getattr(self, "_multi_blocks", []):
+            s = _om.screen_by_id(cfg, bid) or {}
+            col = _om.effective_color(cfg, s)
+            sel = (bid == sid)
+            try:
+                blk.setStyleSheet(
+                    "QFrame#multiScreenBlock{border:%dpx solid %s;border-radius:5px;"
+                    "background:%s;}" % (3 if sel else 1, col, theme.V("panel")))
+            except Exception:                                     # noqa: BLE001
+                pass
+            try:
+                w, h = _om.effective_size(cfg, s)
+                nm = str(s.get("name") or s.get("id") or "")
+                t = _om.TYPE_LABELS.get(s.get("type"), "")
+                blk._label.setText(("✔ " if sel else "") + "%s · %s · %dx%d" % (nm, t, w, h))
+                ph = getattr(blk, "_placeholder", None)
+                if ph is not None:
+                    ph.setVisible(not sel)
+            except Exception:                                     # noqa: BLE001
+                pass
 
     def _restore_stage_panels(self):
         """把图层栈/素材库/右侧设置放回正常演出台的原始位置。"""
@@ -3544,8 +3714,7 @@ class MainWindow(QMainWindow):
         """
         try:
             self.layers_panel.setParent(None)
-            self._multi_bottom.addWidget(self.layers_panel)
-            self._multi_bottom.setSizes([780, 520])
+            self._rebuild_multi_blocks(force=True)
         except Exception:                                         # noqa: BLE001
             pass
         # ★ 用户第 8 条：右侧改成"和单屏一样的设置分组" ⇒ 把单屏那列搬过来，

@@ -1596,6 +1596,11 @@ class OutputStudio(QWidget):
             "单路：多屏拼成一张大画布，只发一路；上方布局会影响 mapping/最终输出。")
         self._loading = False
         self._refresh_screen_badge(cfg)     # ★ 预览区左上角胶囊（选中屏幕 + 颜色）
+        try:
+            # ★ 屏幕增删（apply→refresh_all）也要让 ui_main 重排下方图层块（用户第 10 条）
+            self.selection_changed.emit(self.selected_id)
+        except Exception:                                          # noqa: BLE001
+            pass
         self.preview.update()
 
     def _rebuild_cards(self):
