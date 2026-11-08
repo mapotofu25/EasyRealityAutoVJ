@@ -3049,6 +3049,22 @@ class MainWindow(QMainWindow):
             f"background:{v('btn')};color:{v('text')};}}"
             f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;border-color:#2f6f9f;}}")
 
+    def _style_multi_out_button(self):
+        """工具条上的「多屏输出」开关：**与 `btn_gpu` 完全同一套配色**（用户第 7 条）。
+
+        亮着 = 多屏输出已开启（蓝底 + 蓝描边 + 浅蓝字），关掉 = 普通按钮。
+        ⚠ 不要自创配色：用户要求"和左边 GPU 解码一样的蓝色描边+蓝底"。
+        """
+        v = theme.V
+        try:
+            self.btn_multi_out.setStyleSheet(
+                f"QPushButton{{padding:2px 10px;border:1px solid {v('border')};"
+                f"background:{v('btn')};color:{v('text')};}}"
+                f"QPushButton:checked{{background:{v('sel')};color:#9fdcff;"
+                f"border-color:#2f6f9f;font-weight:bold;}}")
+        except Exception:                                         # noqa: BLE001
+            pass
+
     def _style_kind_buttons(self):
         """主题感知的筛选按钮样式（注册进 theme，切换亮暗时重设；**两页都覆盖**）"""
         v = theme.V
@@ -3138,6 +3154,10 @@ class MainWindow(QMainWindow):
         self.btn_multi_out.setToolTip("打开多屏输出：上方棋盘格预览，下方保留演出台图层和素材库")
         self.btn_multi_out.toggled.connect(self.toggle_multi_output)
         tb.addWidget(self.btn_multi_out)
+        # ★ 2026-11-09（用户第 7 条）：开启态要和左边「GPU 解码」一个样（蓝底蓝描边），
+        #   别再靠文字后面的 "✓" 表示状态。
+        self._style_multi_out_button()
+        theme.register(self, self._style_multi_out_button)
 
         # 音源（按钮 + 迷你电平）
         self._audio_sep = QFrame()
@@ -3312,6 +3332,15 @@ class MainWindow(QMainWindow):
             self._page_group.addButton(b, i)
             self._page_btns.append(b)
             bar.addWidget(b)
+        # ★ 2026-11-09（用户第 1 条）：多屏控制条的**落脚点**。
+        #   页签行是常显的 ⇒ 这里平时是空容器（`hide()` + 零尺寸，看不见也点不到），
+        #   打开多屏输出时把 `OutputStudio.top_bar` 这一个控件搬进来（stretch 之前）。
+        self._top_bar_host = QWidget()
+        _host = QHBoxLayout(self._top_bar_host)
+        _host.setContentsMargins(10, 0, 0, 0)
+        _host.setSpacing(6)
+        self._top_bar_host.hide()
+        bar.addWidget(self._top_bar_host, 0)
         bar.addStretch(1)
         self._style_page_buttons()
         theme.register(self, self._style_page_buttons)
@@ -3436,6 +3465,25 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _host_top_bar(self, on):
+        """把多屏控制条搬进页签行 / 搬回输出页（用户第 1 条）。
+
+        页签行是**常显**的 ⇒ 普通演出台模式下这个容器必须是空的（不能冒出多屏控件）。
+        """
+        studio = getattr(self, "output_studio", None)
+        host = getattr(self, "_top_bar_host", None)
+        if studio is None or host is None:
+            return
+        try:
+            if on:
+                studio.attach_top_bar(host.layout())
+                host.show()
+            else:
+                studio.detach_top_bar()
+                host.hide()
+        except Exception:                                         # noqa: BLE001
+            pass
+
     def toggle_multi_output(self, on, startup=False):
         """打开/关闭多屏输出：整个演出台切换布局，输出引擎也切换单路/多路。"""
         on = bool(on)
@@ -3458,6 +3506,7 @@ class MainWindow(QMainWindow):
                 self._build_multi_stage()
                 self._move_panels_to_multi()
                 self.perf_stack.setCurrentWidget(self._multi_page)
+                self._host_top_bar(True)      # ★ 控制条搬进页签行（用户第 1 条）
                 try:
                     self.output_studio.reload()
                     self.output_studio.sync_engine()
@@ -3470,6 +3519,7 @@ class MainWindow(QMainWindow):
                     pass
                 self.lbl_status.setText(T("多屏输出已开启"))
             else:
+                self._host_top_bar(False)      # ★ 控制条搬回输出页（普通演出台不显示多屏控件）
                 self._restore_stage_panels()
                 try:
                     self.perf_stack.setCurrentIndex(0)
@@ -3501,7 +3551,7 @@ class MainWindow(QMainWindow):
                     self.btn_multi_out.blockSignals(True)
                     self.btn_multi_out.setChecked(on)
                     self.btn_multi_out.blockSignals(False)
-                self.btn_multi_out.setText("多屏输出" + (" ✓" if on else ""))
+                self.btn_multi_out.setText("多屏输出")
                 self.btn_multi_out.setToolTip(
                     "关闭：普通演出台（原图层/预览/素材库）\n"
                     "打开：多屏输出工作区 + 同一套图层和素材库")

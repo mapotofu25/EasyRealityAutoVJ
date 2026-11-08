@@ -23,9 +23,10 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QScrollArea, QFrame, QListWidget, QListWidgetItem,
                                QColorDialog, QInputDialog, QFileDialog, QMessageBox,
                                QSizePolicy, QDialog, QDialogButtonBox, QGroupBox,
-                               QAbstractItemView)
+                               QAbstractItemView, QMenu, QToolButton)
 
 import output_model as OM
+import theme
 
 
 # ---------------------------------------------------------------- 通用小工具
@@ -49,19 +50,39 @@ def _dash_pen(color, width=2, dash=Qt.DashLine):
 
 
 class _CheckerTile:
-    """灰白棋盘格贴图（32×32，两个 16px 格）——只生成一次，按屏幕空间平铺。"""
+    """棋盘格贴图（32×32，两个 16px 格）——只生成一次，按屏幕空间平铺。
+
+    ★ 2026-11-09（用户第 4 条：「暗色主题下棋盘格底太亮」）：
+      原来写死 `#f3f3f3 / #d7d7d7`（接近纯白）⇒ 暗色主题里整块预览区泛白，
+      比周围面板亮一大截，很刺眼。现在按**当前主题**取两档：
+        · 暗色主题 ⇒ 黑灰（`#2b2b2b / #232323`），只比 #151515 的底色亮一点点，
+          既能看出"这是透明格子"，又不抢画面；
+        · 亮色主题 ⇒ 保持原来的浅灰白，观感不变。
+      ⚠ 主题切换后必须重画（缓存按主题名区分，见 `pixmap()`）。
+    """
+
     _pm = None
+    _key = ""
+    #: (亮格, 暗格)
+    PALETTE = {"dark": ("#2b2b2b", "#232323"),
+               "light": ("#f3f3f3", "#d7d7d7")}
 
     @classmethod
     def pixmap(cls):
-        if cls._pm is None:
+        try:
+            key = "dark" if str(theme.current()) == "dark" else "light"
+        except Exception:                                          # noqa: BLE001
+            key = "light"
+        if cls._pm is None or cls._key != key:
+            a, b = cls.PALETTE.get(key, cls.PALETTE["light"])
             pm = QPixmap(32, 32)
-            pm.fill(QColor("#f3f3f3"))
+            pm.fill(QColor(a))
             p = QPainter(pm)
-            p.fillRect(0, 0, 16, 16, QColor("#d7d7d7"))
-            p.fillRect(16, 16, 16, 16, QColor("#d7d7d7"))
+            p.fillRect(0, 0, 16, 16, QColor(b))
+            p.fillRect(16, 16, 16, 16, QColor(b))
             p.end()
             cls._pm = pm
+            cls._key = key
         return cls._pm
 
 
@@ -469,6 +490,13 @@ class OutputPreview(QWidget):
             self.fit_screen(s.get("id"))
         else:
             self.fit_all()
+
+    def resizeEvent(self, ev):                                   # noqa: N802
+        super().resizeEvent(ev)
+        # 左上角那颗「当前屏幕」胶囊是 preview 的子控件，窗口一变就得重新贴角
+        fn = getattr(self.studio, "layout_screen_badge", None)
+        if callable(fn):
+            fn()
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_0:
@@ -1197,17 +1225,42 @@ class OutputStudio(QWidget):
         outer.setSpacing(4)
 
         # ---- 顶部条 ----
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("配置"))
+        # ★ 2026-11-09（用户第 1 条：「把这条多屏控制条挪到页签行去」）：
+        #   整条控制条包进一个 **QWidget**（`self.top_bar`）而不是直接 addLayout。
+        #   理由：多屏模式下 `ui_main` 要把这一个**控件**插进页签行（`QHBoxLayout` 只能
+        #   addWidget），关掉多屏时再摘回去 —— 布局不能跨父窗口移动，只有控件能
+        #   reparent（见 `attach_top_bar` / `detach_top_bar`）。
+        self.top_bar = QWidget()
+        self.top_bar.setObjectName("studioTopBar")
+        bar = QHBoxLayout(self.top_bar)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(6)
+        # 配置下拉（当前配置）+ 配置管理菜单
+        # ★ 用户第 2 条：原来「＋新建 / 复制 / 重命名 / 删除」四个按钮各占一格，
+        #   在页签行里根本放不下 ⇒ 合并成一个「配置 ▾」菜单按钮（原来那个「配置」
+        #   文字标签也去掉了：下拉框本身就显示了当前配置名，重复）。
         self.cfg_combo = QComboBox()
         self.cfg_combo.setMinimumWidth(130)
+        self.cfg_combo.setToolTip("输出配置：一整套屏幕 + mapping 设置")
         self.cfg_combo.currentIndexChanged.connect(self._on_config_combo)
         bar.addWidget(self.cfg_combo)
-        for text, cb in (("＋ 新建", self.add_config),
-                         ("复制", self.duplicate_config),
-                         ("重命名", self.rename_config),
-                         ("删除", self.delete_config)):
-            b = QPushButton(text); b.clicked.connect(cb); bar.addWidget(b)
+        self.btn_cfg_menu = QToolButton()
+        self.btn_cfg_menu.setObjectName("btnCfgMenu")
+        self.btn_cfg_menu.setText("配置 ▾")
+        self.btn_cfg_menu.setToolTip("配置管理：新建 / 复制当前 / 重命名 / 删除当前")
+        self.btn_cfg_menu.setPopupMode(QToolButton.InstantPopup)
+        self._cfg_menu = QMenu(self.btn_cfg_menu)
+        self.act_cfg_new = self._cfg_menu.addAction("新建配置…")
+        self.act_cfg_new.triggered.connect(lambda _c=False: self.add_config())
+        self.act_cfg_dup = self._cfg_menu.addAction("复制当前配置")
+        self.act_cfg_dup.triggered.connect(lambda _c=False: self.duplicate_config())
+        self.act_cfg_ren = self._cfg_menu.addAction("重命名…")
+        self.act_cfg_ren.triggered.connect(lambda _c=False: self.rename_config())
+        self._cfg_menu.addSeparator()
+        self.act_cfg_del = self._cfg_menu.addAction("删除当前配置")
+        self.act_cfg_del.triggered.connect(lambda _c=False: self.delete_config())
+        self.btn_cfg_menu.setMenu(self._cfg_menu)
+        bar.addWidget(self.btn_cfg_menu)
         bar.addSpacing(12)
         bar.addWidget(QLabel("模式"))
         self.mode_combo = QComboBox()
@@ -1222,7 +1275,11 @@ class OutputStudio(QWidget):
         self.comb_w.valueChanged.connect(self._on_combined)
         self.comb_h.valueChanged.connect(self._on_combined)
         bar.addWidget(self.comb_w)
-        bar.addWidget(QLabel("×"))
+        # ★ 用户第 3 条：「多路模式下孤零零剩一个 ×」——这个 × 原来是**匿名局部变量**，
+        #   1360 行附近那组 setVisible(single) 里没人管它 ⇒ 多路模式下 comb_w/comb_h
+        #   都藏了，只剩它挂在工具条上，谁都不知道是什么。存成 `self.lbl_x` 并一起藏。
+        self.lbl_x = QLabel("×")
+        bar.addWidget(self.lbl_x)
         bar.addWidget(self.comb_h)
         bar.addSpacing(8)
         self.btn_auto_layout = QPushButton("自动排列")
@@ -1230,13 +1287,8 @@ class OutputStudio(QWidget):
         self.btn_auto_layout.clicked.connect(self._auto_layout)
         bar.addWidget(self.btn_auto_layout)
         bar.addSpacing(8)
-        bar.addWidget(QLabel("当前屏幕"))
-        self.screen_combo = QComboBox()
-        self.screen_combo.setMinimumWidth(110)
-        self.screen_combo.currentIndexChanged.connect(self._on_screen_combo)
-        bar.addWidget(self.screen_combo)
         self.btn_add_screen = QPushButton("＋屏幕")
-        self.btn_add_screen.setToolTip("新建屏幕（独立/复制/切分）")
+        self.btn_add_screen.setToolTip("新建屏幕（独立 / 复制）")
         self.btn_add_screen.clicked.connect(self.add_screen)
         bar.addWidget(self.btn_add_screen)
         bar.addSpacing(8)
@@ -1247,14 +1299,20 @@ class OutputStudio(QWidget):
         self.btn_fit = QPushButton("适应窗口")
         self.btn_fit.clicked.connect(lambda: self.preview.fit_all())
         bar.addWidget(self.btn_fit)
-        self.btn_mapping = QPushButton("导出 mapping")
-        self.btn_mapping.clicked.connect(self.export_mapping)
-        bar.addWidget(self.btn_mapping)
         bar.addStretch(1)
         self.lbl_mode_hint = QLabel("")
         self.lbl_mode_hint.setStyleSheet("color:#888;")
         bar.addWidget(self.lbl_mode_hint)
-        outer.addLayout(bar)
+        outer.addWidget(self.top_bar)
+        self._style_top_bar()
+        theme.register(self, self._style_top_bar)
+
+        # ★ 用户第 12 条：原来工具条里的「当前屏幕」下拉框已挪到预览区左上角，
+        #   做成彩色半透明胶囊（见 `_build_screen_badge`）。
+        #   ⚠ 控件本体**保留**（只是不放进布局）：`_sync_screen_combo` /
+        #     `select_screen` 一直靠它做"程序侧同步"，删了要改一堆调用点。
+        self.screen_combo = QComboBox()
+        self.screen_combo.currentIndexChanged.connect(self._on_screen_combo)
 
         # ---- 中间：预览 + 右侧设置 ----
         mid = QHBoxLayout()
@@ -1264,6 +1322,7 @@ class OutputStudio(QWidget):
         self.preview.geometry_changed.connect(self._on_preview_geometry)
         self.preview.view_changed.connect(self._save_view_state)
         left.addWidget(self.preview, 1)
+        self._build_screen_badge()          # ★ 左上角「当前屏幕」胶囊（用户第 12 条）
         # 底部卡片
         cardbox = QWidget()
         cardbox.setMinimumHeight(180)
@@ -1293,6 +1352,120 @@ class OutputStudio(QWidget):
         # ---- 配置 ----
         self._configs = []
         self.reload()
+
+    # ---------- 顶部条（可搬进页签行）----------
+    def _style_top_bar(self):
+        """顶部条的控件级样式（主题感知；`btn_cfg_menu` 是 QToolButton，吃不到
+        `QPushButton` 的全局 QSS，必须自己写一遍，否则在页签行里像个裸文字）。"""
+        v = theme.V
+        try:
+            self.btn_cfg_menu.setStyleSheet(
+                "QToolButton{background:%s;color:%s;border:1px solid %s;"
+                "border-radius:4px;padding:2px 8px;min-height:18px;}"
+                "QToolButton:hover{background:%s;}"
+                "QToolButton::menu-indicator{image:none;width:0px;}" % (
+                    v("btn"), v("text"), v("border"), v("btn_hov")))
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def attach_top_bar(self, host_layout):
+        """把顶部控制条**搬进**另一个布局（多屏模式下 = 页签行的 stretch 之前）。
+
+        ⚠ 布局不能跨控件移动，只有**控件**能 reparent ⇒ 顶部条必须是一个 QWidget
+          （`self.top_bar`），不能是裸 QHBoxLayout。搬之前先从原布局摘掉，
+          否则会留下一个指向"已无父控件"的 layout item。
+        """
+        if host_layout is None:
+            return
+        try:
+            old = self.top_bar.parentWidget()
+            if old is not None and old is not self:
+                lay = old.layout()
+                if lay is not None:
+                    lay.removeWidget(self.top_bar)
+            self.top_bar.setParent(None)
+            host_layout.addWidget(self.top_bar, 0)
+            self.top_bar.setVisible(True)
+            self.layout_screen_badge()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def detach_top_bar(self):
+        """把顶部控制条搬回本控件自己的布局顶部（关掉多屏时用）。"""
+        try:
+            old = self.top_bar.parentWidget()
+            if old is not None and old is not self:
+                lay = old.layout()
+                if lay is not None:
+                    lay.removeWidget(self.top_bar)
+            self.top_bar.setParent(None)
+            lay = self.layout()
+            if lay is not None:
+                lay.insertWidget(0, self.top_bar)
+            self.top_bar.setVisible(True)
+            self.layout_screen_badge()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    # ---------- 预览区左上角的「当前屏幕」胶囊 ----------
+    def _build_screen_badge(self):
+        """★ 用户第 12 条：「当前屏幕」不要放在工具条上，放预览区左上角，
+        做成一条**该屏边框色**的半透明胶囊。
+
+        点它是下拉菜单（列出所有屏幕）⇒ 保留了原来那个下拉框的"切屏"能力，
+        但不再占工具条宽度（工具条现在要和页签挤在同一行）。
+        """
+        self.btn_screen_badge = QToolButton(self.preview)
+        self.btn_screen_badge.setObjectName("screenBadge")
+        self.btn_screen_badge.setPopupMode(QToolButton.InstantPopup)
+        self.btn_screen_badge.setCursor(Qt.PointingHandCursor)
+        self.btn_screen_badge.setToolTip("当前选中的屏幕（点击切换）")
+        self._badge_menu = QMenu(self.btn_screen_badge)
+        self.btn_screen_badge.setMenu(self._badge_menu)
+        self.btn_screen_badge.hide()
+
+    def layout_screen_badge(self):
+        b = getattr(self, "btn_screen_badge", None)
+        if b is None or not b.isVisible():
+            return
+        try:
+            b.adjustSize()
+            b.move(10, 10)
+            b.raise_()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _refresh_screen_badge(self, cfg):
+        b = getattr(self, "btn_screen_badge", None)
+        if b is None:
+            return
+        multi = (cfg or {}).get("mode", "multi") != "single"
+        b.setVisible(multi)          # 单路模式没有"当前屏幕"的概念
+        if not multi:
+            return
+        s = OM.screen_by_id(cfg, self.selected_id) or OM.main_screen(cfg)
+        name = str((s or {}).get("name") or "-")
+        col = _color(OM.effective_color(cfg, s)) if s else _color("#7B2FF7")
+        bg = QColor(col)
+        bg.setAlpha(165)
+        b.setText("当前选择屏幕 · %s  ▾" % name)
+        b.setStyleSheet(
+            "#screenBadge{background:rgba(%d,%d,%d,%d);color:%s;"
+            "border:1px solid %s;border-radius:9px;padding:2px 10px;font-size:11px;}"
+            "#screenBadge::menu-indicator{image:none;width:0px;}"
+            "#screenBadge:hover{border-color:#ffffff;}" % (
+                bg.red(), bg.green(), bg.blue(), bg.alpha(),
+                _text_color(bg).name(), col.name()))
+        self._badge_menu.clear()
+        for s2 in (cfg or {}).get("screens") or []:
+            nm = str(s2.get("name") or s2.get("id"))
+            if s2.get("type") != "main":
+                nm += "  [%s]" % OM.TYPE_LABELS.get(s2.get("type"), s2.get("type"))
+            a = self._badge_menu.addAction(nm)
+            a.setCheckable(True)
+            a.setChecked(s2.get("id") == self.selected_id)
+            a.triggered.connect(lambda _c=False, sid=s2.get("id"): self.select_screen(sid))
+        self.layout_screen_badge()
 
     # ---------- 配置/刷新 ----------
     def active_config(self):
@@ -1351,16 +1524,16 @@ class OutputStudio(QWidget):
         self.preview.set_context(cfg.get("mode", "multi"), cfg.get("screens") or [],
                                  cfg, self.selected_id)
         single = cfg.get("mode") == "single"
-        self.btn_mapping.setVisible(single)
         try:
             self.comb_w.blockSignals(True); self.comb_h.blockSignals(True)
             cw, ch = OM.combined_size(cfg)
             self.comb_w.setValue(int(cw)); self.comb_h.setValue(int(ch))
             self.comb_w.blockSignals(False); self.comb_h.blockSignals(False)
-            self.lbl_combined.setVisible(single)
-            self.comb_w.setVisible(single); self.comb_h.setVisible(single)
-            self.comb_h.setVisible(single)
-            self.btn_auto_layout.setVisible(single)
+            # ★ 用户第 3 条：「整合画布 1920 × 1080」这一组（含中间那个 ×）只在
+            #   单路模式有意义；多路模式下必须**整组**藏掉，否则工具条上孤零零剩一个 ×。
+            for w in (self.lbl_combined, self.comb_w, self.lbl_x, self.comb_h,
+                      self.btn_auto_layout):
+                w.setVisible(single)
         except Exception:
             pass
         self.lbl_mode_hint.setText(
@@ -1368,6 +1541,7 @@ class OutputStudio(QWidget):
             if not single else
             "单路：多屏拼成一张大画布，只发一路；上方布局会影响 mapping/最终输出。")
         self._loading = False
+        self._refresh_screen_badge(cfg)     # ★ 预览区左上角胶囊（选中屏幕 + 颜色）
         self.preview.update()
 
     def _rebuild_cards(self):
@@ -1540,6 +1714,7 @@ class OutputStudio(QWidget):
         except Exception:
             pass
         self.settings.set_screen(s, cfg, cfg.get("mode", "multi"))
+        self._refresh_screen_badge(cfg)
         self._sync_main_output_route()
         for i in range(self.cards_layout.count()):
             w = self.cards_layout.itemAt(i).widget()
