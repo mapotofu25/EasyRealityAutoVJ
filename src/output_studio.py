@@ -15,8 +15,8 @@ import os
 import time
 
 from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap,
-                           QLinearGradient)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter,
+                           QPen, QPixmap, QLinearGradient)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QFormLayout, QLabel, QPushButton, QComboBox,
                                QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit,
@@ -1346,6 +1346,11 @@ class OutputStudio(QWidget):
         self.btn_fit = QPushButton("适应窗口")
         self.btn_fit.clicked.connect(lambda: self.preview.fit_all())
         bar.addWidget(self.btn_fit)
+        # ★ 用户第 11 条：「输出画布…」独立窗口（分辨率 + 拖放排布 + 导出 mapping）
+        self.btn_canvas = QPushButton("输出画布…")
+        self.btn_canvas.setToolTip("打开发送用的输出画布：设分辨率、拖动摆放每块屏幕、导出 mapping")
+        self.btn_canvas.clicked.connect(lambda: self.open_output_canvas())
+        bar.addWidget(self.btn_canvas)
         # ★ 用户第 5 条：多屏模式下不再内嵌素材库 ⇒ 控制条上给一个「打开素材库」，
         #   点开的是**同一个** `library_panel` 实例（reparent 到浮动窗口，不是复制）。
         self.btn_open_lib = QPushButton("📚 打开素材库")
@@ -2094,11 +2099,25 @@ class OutputStudio(QWidget):
         self.cfg.save()
         self.preview.update()
 
+    # ---------- 输出画布窗口（用户第 11 条）----------
+    def open_output_canvas(self):
+        """打开「输出画布」窗口（单例：再点一次只是前置 + 刷新）。"""
+        win = getattr(self, "_canvas_win", None)
+        if win is None:
+            win = OutputCanvasWindow(self)
+            self._canvas_win = win
+        try:
+            win.reload()
+            win.show()
+            win.raise_()
+            win.activateWindow()
+        except Exception:                                          # noqa: BLE001
+            pass
+
     # ---------- mapping ----------
     def export_mapping(self):
         cfg = self.active_config()
-        if not cfg or cfg.get("mode") != "single":
-            QMessageBox.information(self, "mapping", "mapping 只在多屏整合单路模式下可用。")
+        if not cfg:
             return
         d = QFileDialog.getExistingDirectory(self, "选择 mapping 导出目录")
         if not d:
@@ -2116,7 +2135,7 @@ class OutputStudio(QWidget):
         data = {
             "version": 1,
             "config": cfg.get("name"),
-            "mode": "single",
+            "mode": str(cfg.get("mode") or "single"),
             "combined_size": [cw, ch],
             "screens": [],
         }
@@ -2139,25 +2158,299 @@ class OutputStudio(QWidget):
         img.fill(QColor("#1a1a1a"))
         p = QPainter(img)
         p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
         p.setPen(QPen(QColor("#777"), 1))
         p.drawRect(QRectF(0.5, 0.5, iw - 1, ih - 1))
         for s in cfg.get("screens") or []:
             x, y, w, h = OM.screen_rect(cfg, s)
             r = QRectF(x * sc, y * sc, w * sc, h * sc)
             c = _color(OM.effective_color(cfg, s))
-            fill = QColor(c); fill.setAlpha(70)
+            fill = QColor(c)
+            fill.setAlpha(70)
             p.fillRect(r, fill)
             p.setPen(QPen(c, 2))
             p.drawRect(r)
-            p.setFont(QFont("Microsoft YaHei", max(7, int(11 * min(1.0, sc + 0.3))), QFont.Bold))
-            p.setPen(QColor("#fff"))
+            # ★ 用户第 12 条（I2）：字号**明显放大**，并且把 名字 / 分辨率 / UV 三行
+            #   **整体居中**画在格子中间（原来是左上角 11px，缩到 4096 宽后基本看不清）。
+            #   ⚠ 两行用两种字号 ⇒ 先量高度再整体居中，否则 UV 行会往下漂、小格里被裁。
+            pw, ph = OM.effective_size(cfg, s)
             uv = OM.screen_uv(cfg, s)
-            line = "%s  %dx%d" % (s.get("name") or "", w, h)
-            uvline = "UV %.4f,%.4f → %.4f,%.4f" % tuple(uv)
-            p.drawText(r.adjusted(6, 4, -4, -4), Qt.AlignLeft | Qt.AlignTop,
-                       line + "\n" + uvline)
+            fs = int(max(12, min(40, min(max(24.0, r.width()), max(24.0, r.height())) / 6.5)))
+            f_head = QFont("Microsoft YaHei", fs, QFont.Bold)
+            f_uv = QFont("Consolas", max(10, int(fs * 0.62)))
+            head = "%s\n%d × %d" % (s.get("name") or "", pw, ph)
+            uvline = "UV %.4f,%.4f → %.4f,%.4f" % (uv[0], uv[1], uv[2], uv[3])
+            fm1 = QFontMetrics(f_head)
+            fm2 = QFontMetrics(f_uv)
+            h1 = fm1.lineSpacing() * 2
+            h2 = fm2.lineSpacing()
+            top = r.center().y() - (h1 + h2 + 4) / 2.0
+            p.setFont(f_head)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRectF(r.x(), top, r.width(), h1), Qt.AlignCenter, head)
+            p.setFont(f_uv)
+            p.setPen(QColor(235, 235, 235, 235))
+            p.drawText(QRectF(r.x(), top + h1 + 2, r.width(), h2), Qt.AlignCenter, uvline)
         p.end()
         img.save(os.path.join(folder, base + ".png"))
+
+
+# ---------------------------------------------------------------- 输出画布（mapping）
+class _CanvasBoard(QWidget):
+    """输出画布：把每块屏幕按 mapping 坐标摆在一张画布上，**拖动即可排布**。
+
+    ★ 用户第 11 条：多屏单路输出要有一个"输出画布"窗口，在里面设分辨率、拖放排布
+      每块屏幕、导出 mapping。坐标就是配置里的 `screen["layout"]`（画布像素），
+      所以拖完直接写回配置 → 输出/mapping/预览用的是同一份数据。
+    ⚠ 这个画布只是"排布工具"，**不参与预览渲染**（左边预览仍走多屏多路那套）。
+    """
+
+    moved = Signal()          # 拖动结束（写回配置后由 studio.apply 落盘）
+
+    def __init__(self, studio, parent=None):
+        super().__init__(parent)
+        self.studio = studio
+        self.cfg = None
+        self.setMinimumSize(520, 320)
+        self.setMouseTracking(True)
+        self.zoom = 1.0
+        self.pan = QPointF(0.0, 0.0)
+        self._drag = None
+        self._fit_pending = True
+
+    # ---- 坐标换算 ----
+    def set_config(self, cfg):
+        self.cfg = cfg
+        self._fit_pending = True
+        self.update()
+
+    def _to_screen(self, x, y):
+        return QPointF(self.pan.x() + x * self.zoom, self.pan.y() + y * self.zoom)
+
+    def _to_world(self, p):
+        if self.zoom <= 0:
+            return QPointF(0.0, 0.0)
+        return QPointF((p.x() - self.pan.x()) / self.zoom,
+                       (p.y() - self.pan.y()) / self.zoom)
+
+    def _rect_screen(self, x, y, w, h):
+        a = self._to_screen(x, y)
+        return QRectF(a.x(), a.y(), max(1.0, w * self.zoom), max(1.0, h * self.zoom))
+
+    def fit(self):
+        if not self.cfg or self.width() <= 4 or self.height() <= 4:
+            return
+        cw, ch = OM.combined_size(self.cfg)
+        self.zoom = max(0.02, min(1.0, min((self.width() - 40) / max(1, cw),
+                                          (self.height() - 40) / max(1, ch))))
+        self.pan = QPointF((self.width() - cw * self.zoom) / 2.0,
+                           (self.height() - ch * self.zoom) / 2.0)
+        self._fit_pending = False
+        self.update()
+
+    def _frames(self):
+        """能摆到画布上的屏：主屏 + 独立屏（复制/切分跟随源屏，不单独摆放）。"""
+        return OM.layout_sources(self.cfg) if self.cfg else []
+
+    def _hit(self, pos):
+        for s in reversed(self._frames()):
+            x, y, w, h = OM.screen_rect(self.cfg, s)
+            r = self._rect_screen(x, y, w, h)
+            if r.contains(pos):
+                return s, r
+        return None, None
+
+    # ---- 交互 ----
+    def wheelEvent(self, ev):
+        d = ev.angleDelta().y()
+        if d == 0:
+            return
+        old = self._to_world(ev.position())
+        self.zoom = max(0.02, min(4.0, self.zoom * (1.12 ** (d / 120.0))))
+        self.pan = QPointF(ev.position().x() - old.x() * self.zoom,
+                           ev.position().y() - old.y() * self.zoom)
+        self._fit_pending = False
+        self.update()
+        ev.accept()
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton or not self.cfg:
+            return
+        s, r = self._hit(ev.position())
+        if s is not None:
+            x, y, _w, _h = OM.screen_rect(self.cfg, s)
+            self._drag = {"sid": s.get("id"), "start": ev.position(),
+                          "orig": [x, y]}
+            self.setCursor(Qt.ClosedHandCursor)
+        else:
+            self._drag = {"sid": None, "start": ev.position(),
+                          "orig": [self.pan.x(), self.pan.y()]}
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, ev):
+        d = self._drag
+        if d is None:
+            s, _r = self._hit(ev.position())
+            self.setCursor(Qt.SizeAllCursor if s is not None else Qt.ArrowCursor)
+            return
+        dx = (ev.position().x() - d["start"].x()) / max(0.001, self.zoom)
+        dy = (ev.position().y() - d["start"].y()) / max(0.001, self.zoom)
+        if d["sid"] is None:
+            self.pan = QPointF(d["orig"][0] + dx, d["orig"][1] + dy)
+        else:
+            s = OM.screen_by_id(self.cfg, d["sid"])
+            if s is not None:
+                # 写回的是**画布像素坐标**（和单路模式的 layout 同一套坐标系）
+                s["layout"] = [int(round(d["orig"][0] + dx)),
+                               int(round(d["orig"][1] + dy))]
+        self.update()
+
+    def mouseReleaseEvent(self, ev):
+        d = self._drag
+        self._drag = None
+        self.setCursor(Qt.ArrowCursor)
+        if d is not None and d.get("sid") is not None:
+            self.moved.emit()
+
+    def mouseDoubleClickEvent(self, ev):
+        self.fit()
+
+    # ---- 绘制 ----
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor("#151515"))
+        if self._fit_pending:
+            self._fit_pending = False
+            QTimer.singleShot(0, self.fit)
+        if not self.cfg:
+            p.end()
+            return
+        cw, ch = OM.combined_size(self.cfg)
+        canvas = self._rect_screen(0, 0, cw, ch)
+        p.fillRect(canvas, QColor("#000000"))
+        p.setPen(QPen(QColor("#666666"), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(canvas)
+        for s in self._frames():
+            x, y, w, h = OM.screen_rect(self.cfg, s)
+            r = self._rect_screen(x, y, w, h)
+            col = _color(OM.effective_color(self.cfg, s))
+            fill = QColor(col)
+            fill.setAlpha(200)
+            p.fillRect(r, fill)
+            p.setPen(QPen(col.lighter(140), 2))
+            p.drawRect(r)
+            pw, ph = OM.effective_size(self.cfg, s)
+            uv = OM.screen_uv(self.cfg, s)
+            fs = int(max(9, min(22, min(r.width(), r.height()) / 8.0)))
+            p.setFont(QFont("Microsoft YaHei", fs, QFont.Bold))
+            p.setPen(_text_color(col))
+            p.drawText(r, Qt.AlignCenter, "%s\n%d × %d\nUV %.4f,%.4f → %.4f,%.4f"
+                       % (s.get("name") or "", pw, ph, uv[0], uv[1], uv[2], uv[3]))
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(255, 255, 255, 200))
+            p.drawText(r.adjusted(4, 2, -4, -2), Qt.AlignLeft | Qt.AlignTop,
+                       "%d,%d" % (x, y))
+        p.setPen(QColor(220, 220, 220, 180))
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(8, self.height() - 8,
+                   "画布 %d×%d · %d%%" % (cw, ch, int(round(self.zoom * 100))))
+        p.end()
+
+
+class OutputCanvasWindow(QDialog):
+    """用户第 11 条：「输出画布…」独立窗口（多屏**单路**输出的 mapping 工具）。
+
+    · 输出分辨率：自定义，上限 **16384（2^14）**
+    · 在画布里**拖动**排布每块屏幕（不要求所有屏幕都摆上去，重叠也行）
+    · 「导出 Mapping」也在这里（工具条上原来那个按钮已删除）
+    ⚠ 只改 mapping / 布局数据，**不影响左边的多屏预览**。
+    """
+
+    MAX_SIDE = 16384          # 2^14
+
+    def __init__(self, studio, parent=None):
+        super().__init__(parent or studio)
+        self.studio = studio
+        self.setWindowTitle("输出画布（Mapping）")
+        self.resize(940, 640)
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("输出分辨率"))
+        self.sp_w = QSpinBox()
+        self.sp_h = QSpinBox()
+        for sp in (self.sp_w, self.sp_h):
+            sp.setRange(16, self.MAX_SIDE)
+            sp.setToolTip("输出画布尺寸，最大 %d（2^14）" % self.MAX_SIDE)
+            sp.valueChanged.connect(self._on_size)
+        bar.addWidget(self.sp_w)
+        bar.addWidget(QLabel("×"))
+        bar.addWidget(self.sp_h)
+        bar.addSpacing(10)
+        self.btn_auto = QPushButton("自动排列")
+        self.btn_auto.setToolTip("把主屏/独立屏边对边横向排开")
+        self.btn_auto.clicked.connect(self._auto)
+        bar.addWidget(self.btn_auto)
+        self.btn_fit = QPushButton("适应窗口")
+        self.btn_fit.clicked.connect(self._fit)
+        bar.addWidget(self.btn_fit)
+        bar.addStretch(1)
+        self.btn_export = QPushButton("导出 Mapping…")
+        self.btn_export.setToolTip("导出 mapping JSON + PNG 到指定目录")
+        self.btn_export.clicked.connect(self._export)
+        bar.addWidget(self.btn_export)
+        lay.addLayout(bar)
+        self.board = _CanvasBoard(studio)
+        self.board.moved.connect(self._on_moved)
+        lay.addWidget(self.board, 1)
+        self.hint = QLabel(
+            "拖动屏幕摆位置；显示的是**输出坐标**（写回配置的 layout），"
+            "画布尺寸不够时会自动放大，绝不裁屏。不要求每块屏幕都摆上来。")
+        self.hint.setStyleSheet("color:#888;")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+
+    def reload(self):
+        cfg = self.studio.active_config()
+        self.board.set_config(cfg)
+        if cfg:
+            cw, ch = OM.combined_size(cfg)
+            for sp, v in ((self.sp_w, cw), (self.sp_h, ch)):
+                sp.blockSignals(True)
+                sp.setValue(int(max(16, min(self.MAX_SIDE, v))))
+                sp.blockSignals(False)
+        self.board.fit()
+
+    def _fit(self):
+        self.board.fit()
+
+    def _on_size(self, *_):
+        cfg = self.studio.active_config()
+        if not cfg:
+            return
+        cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(self.sp_w.value()))),
+                                max(16, min(self.MAX_SIDE, int(self.sp_h.value())))]
+        self.studio.apply()          # apply 里会把超出的布局自动撑大，绝裁屏
+        self.board.set_config(cfg)
+        self.board.fit()
+
+    def _auto(self):
+        cfg = self.studio.active_config()
+        if not cfg:
+            return
+        OM.auto_layout(cfg, "h")
+        self.studio.apply()
+        self.board.set_config(cfg)
+        self.board.fit()
+
+    def _on_moved(self):
+        self.studio.apply()
+        self.board.set_config(self.studio.active_config())
+        self.board.update()
+
+    def _export(self):
+        self.studio.export_mapping()
 
 
 # ---------------------------------------------------------------- 浮动素材库占位
