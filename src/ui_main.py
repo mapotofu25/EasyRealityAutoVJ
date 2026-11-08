@@ -3420,13 +3420,19 @@ class MainWindow(QMainWindow):
         lay.setSpacing(4)
         self.output_studio = _os.OutputStudio(self, compact=True)
         lay.addWidget(self.output_studio, 1)
+        # ★ 用户第 5 条：多屏模式下**不再内嵌素材库**（下方只留图层），
+        #   素材库改成独立窗口（同一个 `library_panel` 实例 reparent 过去）。
+        try:
+            self.output_studio.open_library.connect(self.toggle_library_float)
+        except Exception:                                         # noqa: BLE001
+            pass
         bottom = QSplitter(Qt.Horizontal)
         bottom.setObjectName("multiStageBottom")
-        # 从正常演出台里把图层栈/素材库取出来（setParent(None) 会自动从 QSplitter 移除）
+        # 从正常演出台里把图层栈取出来（setParent(None) 会自动从 QSplitter 移除）
+        # ⚠ 素材库**不取**：它留在原演出台的 QSplitter 里不动（只是那块区域不显示），
+        #   打开素材库窗口时才 reparent 出去，关掉（或退出多屏）再还回去。
         self.layers_panel.setParent(None)
-        self.library_panel.setParent(None)
         bottom.addWidget(self.layers_panel)
-        bottom.addWidget(self.library_panel)
         bottom.setSizes([780, 520])
         bottom.setMinimumHeight(220)
         self._multi_bottom = bottom
@@ -3436,6 +3442,9 @@ class MainWindow(QMainWindow):
 
     def _restore_stage_panels(self):
         """把图层栈/素材库放回正常演出台的原始位置。"""
+        # ★ 用户第 5 条：素材库可能正躺在浮动窗口里 ⇒ 先从那个布局里摘出来，
+        #   否则它会被"加到第二个布局"而残留在浮动窗口（关窗后素材库就没了）。
+        self._detach_library_from_float()
         try:
             self.layers_panel.setParent(None)
         except Exception:
@@ -3455,12 +3464,37 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _detach_library_from_float(self):
+        """把素材库面板从浮动窗口的布局里摘掉（不销毁、不隐藏）。"""
+        win = getattr(self, "_lib_float", None)
+        if win is None:
+            return
+        try:
+            lay = win.layout()
+            if lay is not None:
+                lay.removeWidget(self.library_panel)
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            self.library_panel.setMinimumSize(0, 0)
+            self.library_panel.setParent(None)
+        except Exception:                                         # noqa: BLE001
+            pass
+        try:
+            win.hide()
+        except Exception:                                         # noqa: BLE001
+            pass
+
     def _move_panels_to_multi(self):
+        """切到多屏布局：只搬图层栈（素材库按用户第 5 条走独立窗口）。
+
+        ⚠ 素材库**留在原处**（普通演出台那个 QSplitter 里，那块页面此刻是隐藏的），
+          点「打开素材库」时才 reparent 到浮动窗口 ⇒ 这里绝不能把它 setParent(None)，
+          否则它会变成一个没有父控件的顶层窗口，关窗后就"丢了"。
+        """
         try:
             self.layers_panel.setParent(None)
-            self.library_panel.setParent(None)
             self._multi_bottom.addWidget(self.layers_panel)
-            self._multi_bottom.addWidget(self.library_panel)
             self._multi_bottom.setSizes([780, 520])
         except Exception:
             pass

@@ -1248,6 +1248,15 @@ class ScreenSettingsPanel(QWidget):
 
 # ---------------------------------------------------------------- 输出页
 class OutputStudio(QWidget):
+    """多屏输出页：预览工作区 + 顶部控制条 + 右侧屏幕设置。
+
+    ★ 2026-11-09：顶部控制条被包成 `self.top_bar`（一个 QWidget），多屏模式下由
+      `ui_main` 搬进页签行；`open_library` 信号用于「打开素材库」独立窗口
+      （多屏模式下不再内嵌素材库，用户第 5 条）。
+    """
+
+    open_library = Signal()          # 请求打开独立素材库窗口（ui_main 接）
+
     def __init__(self, main, parent=None, compact=False):
         super().__init__(parent)
         self.main = main
@@ -1336,6 +1345,13 @@ class OutputStudio(QWidget):
         self.btn_fit = QPushButton("适应窗口")
         self.btn_fit.clicked.connect(lambda: self.preview.fit_all())
         bar.addWidget(self.btn_fit)
+        # ★ 用户第 5 条：多屏模式下不再内嵌素材库 ⇒ 控制条上给一个「打开素材库」，
+        #   点开的是**同一个** `library_panel` 实例（reparent 到浮动窗口，不是复制）。
+        self.btn_open_lib = QPushButton("📚 打开素材库")
+        self.btn_open_lib.setToolTip(
+            "打开素材库窗口（和演出台那份是同一个面板）：可以把素材拖进下面任意图层的色块里添加")
+        self.btn_open_lib.clicked.connect(lambda: self.open_library.emit())
+        bar.addWidget(self.btn_open_lib)
         bar.addStretch(1)
         self.lbl_mode_hint = QLabel("")
         self.lbl_mode_hint.setStyleSheet("color:#888;")
