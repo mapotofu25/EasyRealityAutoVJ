@@ -112,12 +112,29 @@ DEFAULTS = {
         #   30 = 省掉约一半渲染 CPU，画面仍跟得上 25/30fps 的素材
         #   20 = 极省，观感会明显变卡，只在机器实在带不动时用
         "render_fps": 60,
-        # GPU 解码（实验，默认关）：把 DXV3 帧内的 DXT 压缩块直接交给显卡硬件解压
-        # （BC 纹理），CPU 只做 LZ 解包 + 回读。实测 DXT5-1080p 省 58% 解码 CPU、
-        # DXT5 超宽省 73%；**DXT1-1080p 反而略亏**（回读成本 > 解压收益）所以只有
-        # 大尺寸 DXT1 才启用。失败一律回退软解，不影响播放。
-        # ⚠ 只作用于普通图层，不影响 Kv 待机层（铁律）。
-        "gpu_decode": False,
+        # ★ 优化版：素材 25~30fps 时不要按 60fps 重复合成同一帧。开启后引擎每 2 秒
+        #   看一次可见视频源的最高帧率，把有效合成帧率压到源帧率（最低 24fps）。
+        #   用户仍可在「渲染帧率」里设更低的上限；关闭此项则完全按 render_fps 跑。
+        "fps_follow_source": True,
+        # GPU 合成（QPainter on QOpenGLPaintDevice）：像素已验证与 CPU 一致。
+        # ⚠ 默认关闭：实测引擎定时器下只能跑 ~24fps（GPU 回读/上下文同步），
+        #   而 CPU 路径可稳定 30fps。需要“省 CPU 优先于帧率”的静态图场景可手动开。
+        "gpu_compose": False,
+        # 视频图层是否也走 GPU 合成。实测 720p 下 Qt GL 的逐帧纹理上传比 CPU
+        # QPainter 慢，默认只让静态图/GIF 走 GPU；4K 或特殊素材可自行打开。
+        "gpu_compose_video": False,
+        # GPU 后处理（预留；当前 CPU 后处理已做专项优化，未启用时为 False）
+        "gpu_postfx": False,
+        # GPU 解码：把 DXV3 帧内的 DXT 压缩块直接交给显卡硬件解压
+        # （BC 纹理），CPU 只做 LZ 解包 + 回读。对 DXT5/大尺寸 DXT1 有明显收益；
+        # 失败一律回退软解，不影响播放。2026-11-08 优化版默认开启（自动回退）。
+        "gpu_decode": True,
+        # ★ 2026-11-08（v25 闪退：cv2.pyd 0xc0000005）：安全视频解码。
+        #   开启后普通视频用 PyAV 解码，不再走 OpenCV VideoCapture；
+        #   OpenCV 的 native access violation 会直接带走整个进程，PyAV 则是普通异常。
+        #   代价：3 路视频约 +1.8 核 CPU。默认开；如果机器性能够、想省 CPU，可在
+        #   「性能」里关闭（关闭后恢复 OpenCV，速度快但仍有极小概率闪退）。
+        "safe_decode": True,
     },
     "audio": {
         "source_type": "system",      # system / mic / linein
@@ -136,7 +153,7 @@ DEFAULTS = {
         "asio_ch1": 1,
     },
     "auto": {
-        "intensity": 1,               # 0 低 / 1 中 / 2 高 / 3 极高（画面振幅强度，影响脉冲缩放）
+        "intensity": 1,               # -1 关闭 / 0 低 / 1 中 / 2 高 / 3 极高（画面振幅强度，影响脉冲缩放）
         "energy_map": True,
         "energy_scale": 1.0,          # 能量伽马校正（>1 压低人声段、鼓点段基本不动）：现场系统低频增强时用
         "bpm_speed_sync": True,
@@ -224,18 +241,30 @@ DEFAULTS = {
         # 主界面预览画面（**只影响主界面**，输出窗口 / Spout / NDI 完全不受影响）
         # on=False 时跳过每帧的 fromImage+缩放（约 1.5ms/帧 ≈ 0.09 个核 @60fps）
         "preview": {"on": True, "res": 1.0, "fit": "keep", "fps": 60},
+        # ★ 2026-11-08 多屏输出：素材库浮动窗口 + 收藏夹 + 输出预览工作区状态
+        "library_float": None,        # [x, y, w, h]；None=默认位置
+        "library_float_visible": False,
+        "favorites": [],              # [{"id","name","clips":[...]}]
+        "active_favorite": "",
+        "output_preview": {},         # 每个配置的预览工作区缩放/平移/屏幕框位置
     },
     "output": {
         "screen": -1,                 # 输出到显示器：-1 窗口模式 / 0..n 显示器序号
         "width": 1280,
         "height": 720,
         "aspect_lock": True,
+        # 输出窗口优先用 QOpenGLWidget 做 GPU 缩放（4K 屏上 CPU 放大 720p/1080p
+        # 单帧可达 13ms/34ms，是输出卡顿的主因）。失败自动回退 CPU。
+        "gpu_display": True,
         "borderless": False,
         "always_top": False,
         "geometry": None,             # [x, y, w, h]
         "library_dir": "",            # 素材库目录：空=exe 同级/素材库；否则用此路径
         "import_strategy": "",        # 记住的导入策略：copy/move/link；空=每次询问
         "spout_enabled": False,       # Spout 输出：把画面发给本机 OBS/Resolume 等
+        # Spout/NDI 是否发送 Alpha（透明通道）。默认关＝原来的不透明 BGRA；
+        # 开启后画布改用 ARGB32（直通 alpha），显示器窗口仍按黑底显示。
+        "alpha_enabled": False,
         # ★★ 2026-10-30（用户要求）：两个输出的默认名**固定**，并各自带括号说明。
         #   原来两个都叫 `EasyRealityAutoVJ` —— 在 OBS 的源列表里**完全分不出来**，
         #   用户不知道该选哪个。它们的本质差异就一条：
@@ -245,6 +274,13 @@ DEFAULTS = {
         "ndi_enabled": False,         # NDI 输出（音画同步；运行时随包自带，用户无需安装）
         "ndi_name": DEFAULT_NDI_NAME,
         "ndi_audio": False,           # NDI 是否随画面一起发声音（默认关：怕双声/回声）
+        # ★ 2026-11-08 多屏输出：每套配置独立保存模式/屏幕/布局/UV。
+        #   老配置第一次打开时由 output_model.ensure_output_configs() 自动生成配置1。
+        "configs": [],
+        "active_config": "",
+        # ★ 2026-11-08：演出台的「多屏输出」总开关。关闭时完全走原来的
+        #   单画布/单路输出逻辑，演出台 UI 与旧版一字不差。
+        "multi_enabled": False,
     },
     "hotkeys": DEFAULT_HOTKEYS,
     "library": [],
@@ -299,6 +335,17 @@ class Config:
 
     def _migrate(self):
         """一次性迁移：只在缺标记位时改，**不覆盖用户手动改过的值**。"""
+        # ★ 2026-11-08 优化版：旧配置里 gpu_decode 默认是 False；迁移一次到 True。
+        #   用户之后在界面里手动关掉，会写入 _gpu_decode_auto 标记，不再覆盖。
+        try:
+            if not self.data.get("_gpu_decode_auto"):
+                perf = self.data.setdefault("perf", {})
+                if perf.get("gpu_decode") is False:
+                    perf["gpu_decode"] = True
+                self.data["_gpu_decode_auto"] = True
+                self.save()
+        except Exception:
+            pass
         hk = self.data.setdefault("hotkeys", {})
         # 「下一素材」默认值升级（2026-10-18 用户要求）：Right/仅窗口 → Ctrl+Right/全局。
         # ⚠ **只改仍是旧默认值的配置**（key 恰好是 "Right" 且 global 为 False）：
@@ -311,6 +358,17 @@ class Config:
                 spec["global"] = True
             self.data["_hk_next_ctrl_right"] = True
             self.save()
+        # ★ 2026-11-08 多屏输出：图层稳定 id + 输出配置迁移。
+        #   只做一次；之后用户增删屏幕/配置不再被覆盖。
+        try:
+            if not self.data.get("_output_configs_v1"):
+                import output_model
+                output_model.ensure_layer_ids(self.data)
+                output_model.ensure_output_configs(self.data)
+                self.data["_output_configs_v1"] = True
+                self.save()
+        except Exception:
+            pass
 
     # ---------- IO ----------
     def load(self):

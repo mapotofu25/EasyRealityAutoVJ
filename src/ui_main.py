@@ -316,8 +316,10 @@ class SettingsPanel(QWidget):
         gp = QGridLayout(p_perf)
         ga.addWidget(QLabel("画面振幅强度"), 0, 0)
         self.intensity = QComboBox()
-        self.intensity.addItems([tr("intensity_low"), tr("intensity_mid"),
-                                 tr("intensity_high"), tr("intensity_xhigh")])
+        self.intensity.addItems([tr("intensity_off"), tr("intensity_low"),
+                                 tr("intensity_mid"), tr("intensity_high"),
+                                 tr("intensity_xhigh")])
+        self.intensity.setToolTip(T("关闭：画面不随低频能量脉冲缩放（其余效果不受影响）"))
         ga.addWidget(self.intensity, 0, 1)
         ga.addWidget(QLabel("过渡方式"), 1, 0)
         self.transition = QComboBox()
@@ -341,11 +343,21 @@ class SettingsPanel(QWidget):
         self.render_fps.addItems(["60", "30", "20"])
         self.render_fps.setToolTip("引擎每秒合成多少次画面；素材多为 25 到 30fps，选 60 时约有一半是把同一帧重复合成 —— 机器吃紧（同时开 VDJ、直播、录制）就选 30，能省约一半渲染 CPU，画面仍跟得上素材")
         gp.addWidget(self.render_fps, 0, 1)
-        self.chk_gpu = QCheckBox("GPU 解码（实验）")
-        self.chk_gpu.setToolTip("让显卡硬件解压 DXV 素材（帧内 DXT 压缩块直传显存），降低解码 CPU 占用：DXT5 素材约省一半以上、超宽素材约省七成；解压失败或显卡不支持时自动回退软解，不影响播放。默认关闭，建议先试播一轮再上台")
+        self.chk_gpu = QCheckBox("GPU 解码（DXV 硬件解压）")
+        self.chk_gpu.setToolTip("让显卡硬件解压 DXV 素材（帧内 DXT 压缩块直传显存），降低解码 CPU 占用：DXT5 素材约省一半以上、超宽素材约省七成；解压失败或显卡不支持时自动回退软解，不影响播放")
         gp.addWidget(self.chk_gpu, 1, 0, 1, 2)
+        self.chk_safe_decode = QCheckBox("安全视频解码（推荐，防 cv2 闪退）")
+        self.chk_safe_decode.setToolTip(
+            "开启后普通视频用 PyAV 解码，不再走 OpenCV；OpenCV 的 native 崩溃会直接带走整个进程，"
+            "PyAV 只会报普通异常。代价是 3 路视频约多 1.8 核 CPU。\n"
+            "如果机器性能够、想省 CPU，可以关闭；关闭后恢复 OpenCV 路径（更快，但仍有极小概率闪退）。"
+            "\n⚠ 修改后只影响新打开的素材/图层；已在播的素材要等下次切换才换解码器。")
+        gp.addWidget(self.chk_safe_decode, 2, 0, 1, 2)
+        self.chk_fps_follow = QCheckBox("跟随素材帧率（省 CPU，推荐）")
+        self.chk_fps_follow.setToolTip("素材 25~30fps 时不再按 60fps 重复合成同一帧；有 60fps 素材时自动回到 60。手动选 60 但此项开启时，仍会按素材帧率封顶。")
+        gp.addWidget(self.chk_fps_follow, 3, 0, 1, 2)
         ga.setRowStretch(4, 1)
-        gp.setRowStretch(2, 1)
+        gp.setRowStretch(3, 1)
         # 同上：注册统一在下面做
 
         # ---- 颜色渲染（一键调色：让同一批素材看起来不一样）----
@@ -658,7 +670,10 @@ class SettingsPanel(QWidget):
         self.sens.currentIndexChanged.connect(lambda i: main.engine_cfg("mode", "sensitivity", i))
         self.intensity.currentIndexChanged.connect(main.set_intensity)
         self.render_fps.currentIndexChanged.connect(main.set_render_fps)
+        self.chk_fps_follow.stateChanged.connect(
+            lambda s: main.engine.set_fps_follow_source(bool(s)))
         self.chk_gpu.stateChanged.connect(main.set_gpu_decode)
+        self.chk_safe_decode.stateChanged.connect(main.set_safe_decode)
         self.transition.currentIndexChanged.connect(main.set_transition)
         self.energy_map.stateChanged.connect(lambda s: main.engine_cfg("auto", "energy_map", bool(s)))
         self.bpm_sync.stateChanged.connect(lambda s: main.engine_cfg("auto", "bpm_speed_sync", bool(s)))
@@ -937,6 +952,18 @@ class OutputPanel(QWidget):
         self._ndi_stacked = False
         self._ndi_flow_busy = False
         go.addLayout(self._ndi_grid, 6, 0, 1, 2)
+        # ---- Spout/NDI Alpha ----
+        # ★ 2026-11-08（用户要求）：输出设置里加 Alpha 开关，只作用于 Spout/NDI；
+        #   显示器窗口仍按黑底显示（物理显示器/HDMI 没有 alpha 通道）。
+        self.chk_alpha = QCheckBox(T("Spout/NDI 输出 Alpha（透明通道）"))
+        self.chk_alpha.setToolTip(T(
+            "开启后，Spout 和 NDI 发送带透明通道（直通 Alpha）的画面。\n"
+            "• 只影响 Spout / NDI；显示器窗口仍按不透明黑底显示（物理显示器没有 Alpha）。\n"
+            "• 需要素材本身带 Alpha，且背景图层没有把整幅画面盖住；否则 Alpha 仍会是 255。\n"
+            "• NDI 接收端必须支持 Alpha；OBS 用 Spout2 源时需在源属性里启用 Alpha/透明度。\n"
+            "• 开启会增加少量合成开销：720p 约 +2~3ms/帧，1080p 约 +1ms/帧。\n"
+            "• 关闭时保持原来的不透明输出，零额外开销。"))
+        go.addWidget(self.chk_alpha, 7, 0, 1, 2)
         # ★ 2026-10-30（用户：「把下面多余的那行文字去掉」）：完整名已经直接显示在
         #   NDI 那一行上了，再补一行小字是重复 ⇒ 只保留 label 的 tooltip 做解释。
         # ★ 2026-10-18 用户要求：**「NDI 传输音频」这一行从界面删除**（复选框 + 提示）。
@@ -951,6 +978,7 @@ class OutputPanel(QWidget):
         self.screen_combo.currentIndexChanged.connect(main.set_output_screen)
         self.chk_spout.stateChanged.connect(main.set_spout_enabled)
         self.chk_ndi.stateChanged.connect(main.set_ndi_enabled)
+        self.chk_alpha.stateChanged.connect(main.set_output_alpha)
         self._update_ndi_full()   # NDI 完整接收名（机器名 + 源名）
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
 
@@ -1770,6 +1798,105 @@ class _ModalDialogTopFilter(QObject):
         return False
 
 
+class _SmoothWindowDragFilter(QAbstractNativeEventFilter):
+    """用**普通鼠标消息**移动窗口，替代 Windows 标题栏的模态移动循环。
+
+    ★★ 2026-11-08（用户：刚开始拖动任何窗口的一秒仍掉帧）：
+      实测系统标题栏拖动会进入 `DefWindowProc` 的模态移动循环，`processEvents()`
+      单次可阻塞 **1063ms**；这期间 Qt 的帧/定时器事件不派发 ⇒ 预览和输出一起掉帧。
+      这里拦截 `WM_NCLBUTTONDOWN(HTCAPTION)`，自己 `SetCapture` + 跟随鼠标
+      `SetWindowPos`；事件循环保持运行，帧继续派发。
+
+    范围：本进程所有顶层窗口的**标题栏拖动**（主窗口/输出窗口/对话框）。
+    * 最大化窗口不拦截（保留系统还原/拖动行为）；
+    * 双击标题栏不拦截（保留系统最大化）；
+    * 边缘缩放仍走系统原生（本轮只修“拖动”）。
+    """
+
+    WM_NCLBUTTONDOWN = 0x00A1
+    WM_NCLBUTTONUP = 0x00A2
+    WM_NCLBUTTONDBLCLK = 0x00A3
+    WM_MOUSEMOVE = 0x0200
+    WM_LBUTTONUP = 0x0202
+    WM_CAPTURECHANGED = 0x0215
+    HTCAPTION = 2
+    SWP_FLAGS = 0x0001 | 0x0004 | 0x0010   # NOSIZE | NOZORDER | NOACTIVATE
+
+    def __init__(self):
+        super().__init__()
+        self._drag = None   # (hwnd, cursor_x, cursor_y, win_left, win_top)
+
+    def _release(self):
+        if self._drag is not None:
+            try:
+                import ctypes
+                ctypes.windll.user32.ReleaseCapture()
+            except Exception:                                  # noqa: BLE001
+                pass
+            self._drag = None
+
+    def nativeEventFilter(self, eventType, message):
+        if eventType != b"windows_generic_MSG":
+            return False, 0
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            user32 = ctypes.windll.user32
+            msg = wt.MSG.from_address(int(message))
+            # 只处理本进程窗口；原生过滤器也会收到其它进程的消息（极少）
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(int(msg.hWnd), ctypes.byref(pid))
+            if pid.value != ctypes.windll.kernel32.GetCurrentProcessId():
+                return False, 0
+
+            if msg.message == self.WM_NCLBUTTONDBLCLK and int(msg.wParam) == self.HTCAPTION:
+                # 双击标题栏：交回系统做最大化；若上一拍已经进入自绘拖动，先释放
+                self._release()
+                return False, 0
+
+            if self._drag is None:
+                if (msg.message == self.WM_NCLBUTTONDOWN
+                        and int(msg.wParam) == self.HTCAPTION):
+                    hwnd = int(msg.hWnd)
+                    # 最大化/最小化窗口交给系统；普通窗口才接管
+                    if user32.IsZoomed(hwnd) or user32.IsIconic(hwnd):
+                        return False, 0
+                    # 只接顶层窗口（防止误接子控件）
+                    user32.GetAncestor.restype = ctypes.c_void_p
+                    root = user32.GetAncestor(hwnd, 2)   # GA_ROOT
+                    if root and int(root) != hwnd:
+                        return False, 0
+                    rect = wt.RECT()
+                    point = wt.POINT()
+                    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        return False, 0
+                    user32.GetCursorPos(ctypes.byref(point))
+                    self._drag = (hwnd, point.x, point.y, rect.left, rect.top)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetCapture(hwnd)
+                    return True, 0
+                return False, 0
+
+            hwnd, cx, cy, wx, wy = self._drag
+            if msg.message == self.WM_MOUSEMOVE:
+                if user32.GetAsyncKeyState(0x01) & 0x8000:
+                    point = wt.POINT()
+                    user32.GetCursorPos(ctypes.byref(point))
+                    user32.SetWindowPos(hwnd, 0,
+                                        wx + point.x - cx, wy + point.y - cy,
+                                        0, 0, self.SWP_FLAGS)
+                    return True, 0
+                self._release()
+                return True, 0
+            if msg.message in (self.WM_LBUTTONUP, self.WM_NCLBUTTONUP,
+                               self.WM_CAPTURECHANGED):
+                self._release()
+                return True, 0
+        except Exception:                                        # noqa: BLE001
+            self._release()
+        return False, 0
+
+
 class _TaskbarCloseFilter(QAbstractNativeEventFilter):
     """任务栏「关闭窗口」在有模态对话框时也要能退出。
 
@@ -2549,6 +2676,39 @@ _BPM_RATE_MAX = 1.25
 _BPM_LIB_HOLD_SEC = 4.5
 
 
+class _FloatingLibraryWindow(QWidget):
+    """素材库浮动窗口：可拖动、可缩放，关闭=隐藏（不销毁）。"""
+
+    def __init__(self, main):
+        super().__init__(None, Qt.Tool | Qt.Window)
+        self.main = main
+        self.setWindowTitle("素材库")
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setMinimumSize(420, 260)
+
+    def closeEvent(self, ev):
+        ev.ignore()
+        self.hide()
+        try:
+            self.main._save_library_float(False)
+        except Exception:
+            pass
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        try:
+            self.main._save_library_float(True)
+        except Exception:
+            pass
+
+    def hideEvent(self, ev):
+        super().hideEvent(ev)
+        try:
+            self.main._save_library_float(False)
+        except Exception:
+            pass
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2702,7 +2862,14 @@ class MainWindow(QMainWindow):
         self.engine_thread = QThread(self)
         self.engine_thread.setObjectName("engineThread")
         self.engine.moveToThread(self.engine_thread)
-        self.engine_thread.start()
+        try:
+            # ★ 2026-11-08：**不要**给渲染线程提系统优先级。
+            #   曾试过 QThread.Priority.HighPriority，但本机实测 tick 抖动的主因是
+            #   显示器绘制被 0ms 定时器饿死（见 `_on_engine_frame`），不是解码线程抢 CPU。
+            #   提高引擎线程优先级反而会让 GUI 重绘更容易被挤，现场更卡。
+            self.engine_thread.start()
+        except Exception:
+            pass
         # ⚠⚠ 主循环的启动**必须确保在引擎线程里执行**：QTimer 只能在它所属线程里启动，
         # 跨线程调 `timer.start()` 会**静默失败**（只在 stderr 留一条 Qt 警告）——
         # 结果是主循环完全不跑：不合成、不切素材、不解码，画面全黑而 CPU 近乎为零。
@@ -2715,8 +2882,26 @@ class MainWindow(QMainWindow):
         self.audio.state.ndi_feed = self._ndi_audio_feed
 
         self.out_win = OutputWindow(self.cfg)
+        try:
+            self.out_win.visibility_changed.connect(self._sync_frame_consumers)
+        except Exception:
+            pass
         # 输出窗口与预览统一走一个 slot（帧在引擎侧，这里只收序号后各自去取）
         self._drawn_seq = -1
+        # ★ 2026-11-08 二修：帧回调改为**直接绘制**（见 `_on_engine_frame`）。
+        #   旧注释保留在这里作历史：以前用 0ms 单发合并，反而被重绘事件饿死。
+        self._pending_seq = -1
+        self._draw_scheduled = False
+        self._last_draw_t = 0.0
+        self._out_gap_log_t = 0.0
+        self._out_gap_max = 0.0
+        self._out_gap_n = 0
+        # 输出窗口是否完全盖住主窗（全屏同屏时预览/状态刷新纯属浪费）
+        self._cover_main = False
+        self._cover_check_t = 0.0
+        # 预览面板中心是否被输出窗盖住（比"整窗盖住"更宽松，二屏/窗口化也适用）
+        self._preview_cover = False
+        self._preview_cover_t = 0.0
         # ★ 2026-11-03：库内 BPM 的**短时保持**（见 `_bpm_text`）。
         #   `lib_bpm` 真机会在 140 / 0 之间穿插跳（19:13 实测 163 行里 43% 为 0），
         #   不保持的话 HUD 会在 `167.4` / `168` / `--` 三种形态间闪。
@@ -2736,6 +2921,15 @@ class MainWindow(QMainWindow):
                 _disp.installNativeEventFilter(self._taskbar_close)
         except Exception:                                        # noqa: BLE001
             self._taskbar_close = None
+        # ★ 2026-11-08：标题栏拖动改为普通鼠标消息（避免 Windows 模态移动循环卡住帧派发）
+        try:
+            from PySide6.QtCore import QAbstractEventDispatcher
+            self._smooth_drag = _SmoothWindowDragFilter()
+            _disp = QAbstractEventDispatcher.instance()
+            if _disp is not None:
+                _disp.installNativeEventFilter(self._smooth_drag)
+        except Exception:                                        # noqa: BLE001
+            self._smooth_drag = None
         # 全局禁用「滚轮切换」：见 MainWindow.eventFilter（下拉框/滑条/数值框吞掉 Wheel）
         QApplication.instance().installEventFilter(self)
 
@@ -2743,6 +2937,17 @@ class MainWindow(QMainWindow):
         # 实测占主窗口构造时间的四成以上。用批量模式合并成一次写。
         with self.cfg.batch():
             self._build_ui()
+            # 安全视频解码开关（SettingsPanel 此时才存在）
+            try:
+                self.set_safe_decode(bool((self.cfg["perf"] or {}).get("safe_decode", True)))
+            except Exception:
+                pass
+            # 多屏输出开关：上次关闭前进过多屏模式，启动时直接恢复
+            try:
+                if bool((self.cfg["output"] or {}).get("multi_enabled", False)):
+                    self.toggle_multi_output(True, startup=True)
+            except Exception:
+                pass
             self._enforce_kv_top()      # ★ 读档顺序可能把 KV 挤下去 ⇒ 启动先纠正一次
             self._build_hotkeys()
             self._load_settings_to_ui()
@@ -2811,14 +3016,25 @@ class MainWindow(QMainWindow):
         # 下次不用靠猜。详见 src/stallwatch.py。
         self._hb = {"t": time.perf_counter()}
         self._hb_timer = QTimer(self)
-        self._hb_timer.setInterval(500)
+        # ★ 2026-11-08 二修：心跳从 500ms 提到 100ms，供 150ms 级掉帧取证使用。
+        #   只是写一个 float，开销可忽略；3 秒级看门狗的逻辑完全不变。
+        self._hb_timer.setInterval(100)
         self._hb_timer.timeout.connect(self._heartbeat)
         self._hb_timer.start()
         self._watchdog = None
+        self._lag_watch = None
         try:
             import stallwatch
             self._watchdog = stallwatch.StallWatchdog(self._hb)
             self._watchdog.start()
+            # ★ 2026-11-08：用户报「码表演出还是掉帧」。加一个轻量取证：
+            #   主线程停顿 >150ms 时记一行「毫秒 + 引擎阶段 + 主线程栈」，
+            #   下次日志能直接指出是重绘、锁、还是引擎阶段。
+            self._lag_watch = stallwatch.UiLagWatchdog(
+                self._hb,
+                phase_fn=lambda: getattr(self.engine, "_phase", "?"),
+                running_fn=lambda: bool(getattr(self.engine, "running", False)))
+            self._lag_watch.start()
         except Exception:
             pass
 
@@ -2925,6 +3141,15 @@ class MainWindow(QMainWindow):
         self._style_gpu_button()
         theme.register(self, self._style_gpu_button)
 
+        # ★ 2026-11-08（用户要求）：多屏输出总开关。关闭时演出台保持原样；
+        #   打开后整个演出台切到多屏输出布局（预览工作区 + 图层 + 素材库）。
+        self.btn_multi_out = QPushButton("多屏输出")
+        self.btn_multi_out.setCheckable(True)
+        self.btn_multi_out.setMinimumHeight(32)
+        self.btn_multi_out.setToolTip("打开多屏输出：上方棋盘格预览，下方保留演出台图层和素材库")
+        self.btn_multi_out.toggled.connect(self.toggle_multi_output)
+        tb.addWidget(self.btn_multi_out)
+
         # 音源（按钮 + 迷你电平）
         self._audio_sep = QFrame()
         self._audio_sep.setFrameShape(QFrame.VLine)
@@ -3007,6 +3232,9 @@ class MainWindow(QMainWindow):
         bottom.setSizes([560, 520])
         left_split.addWidget(bottom)
         left_split.setSizes([430, 380])
+        # 保存演出台原始布局控件：多屏输出开关关闭时原样恢复
+        self._stage_left_split = left_split
+        self._stage_bottom = bottom
         main_split.addWidget(left_split)
 
         right = QWidget()
@@ -3104,7 +3332,10 @@ class MainWindow(QMainWindow):
         p1 = QWidget()
         l1 = QVBoxLayout(p1)
         l1.setContentsMargins(0, 0, 0, 0)
-        l1.addWidget(show_split)
+        # 演出台内部再用一个 QStackedWidget：正常布局 / 多屏输出布局
+        self.perf_stack = QStackedWidget()
+        self.perf_stack.addWidget(show_split)
+        l1.addWidget(self.perf_stack)
         self.pages.addWidget(p1)
 
         # ---- 第 2 页：素材库（**全屏副本**；演出台那份原样不动）----
@@ -3148,9 +3379,152 @@ class MainWindow(QMainWindow):
             idx = int(self.cfg["ui"].get("page", 0) or 0)
         except Exception:                                         # noqa: BLE001
             idx = 0
+        if idx == 4:
+            idx = 0            # v24 的输出页已合并成演出台开关，旧页码回演出台
         # ⚠ 上界是 3（四页：演出台 / 素材库 / 曲库·曲风 / 码表）。老配置里的值一律钳回合法范围，
         #   否则 setCurrentIndex 会切到不存在的页，界面一片空白。
         self.switch_page(idx if 0 <= idx <= 3 else 0, save=False)
+
+    # ================= 多屏输出总开关（2026-11-08 用户要求） =================
+    def _build_multi_stage(self):
+        """惰性构建“多屏输出”演出台布局。
+
+        正常演出台 = 图层 + (预览+素材库) + 右侧设置，原样不动。
+        多屏输出   = 上方输出工作区 + 下方【同一个图层栈 + 同一个素材库】。
+        图层/素材库是**同一个对象**，只是在两个布局之间 reparent，所以编辑行为完全一致。
+        """
+        if getattr(self, "_multi_page", None) is not None:
+            return
+        import output_studio as _os
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.output_studio = _os.OutputStudio(self, compact=True)
+        lay.addWidget(self.output_studio, 1)
+        bottom = QSplitter(Qt.Horizontal)
+        bottom.setObjectName("multiStageBottom")
+        # 从正常演出台里把图层栈/素材库取出来（setParent(None) 会自动从 QSplitter 移除）
+        self.layers_panel.setParent(None)
+        self.library_panel.setParent(None)
+        bottom.addWidget(self.layers_panel)
+        bottom.addWidget(self.library_panel)
+        bottom.setSizes([780, 520])
+        bottom.setMinimumHeight(220)
+        self._multi_bottom = bottom
+        lay.addWidget(bottom, 0)
+        self._multi_page = page
+        self.perf_stack.addWidget(page)
+
+    def _restore_stage_panels(self):
+        """把图层栈/素材库放回正常演出台的原始位置。"""
+        try:
+            self.layers_panel.setParent(None)
+        except Exception:
+            pass
+        try:
+            self.library_panel.setParent(None)
+        except Exception:
+            pass
+        try:
+            self._stage_left_split.insertWidget(0, self.layers_panel)
+            self._stage_left_split.setSizes([430, 380])
+        except Exception:
+            pass
+        try:
+            self._stage_bottom.addWidget(self.library_panel)
+            self._stage_bottom.setSizes([560, 520])
+        except Exception:
+            pass
+
+    def _move_panels_to_multi(self):
+        try:
+            self.layers_panel.setParent(None)
+            self.library_panel.setParent(None)
+            self._multi_bottom.addWidget(self.layers_panel)
+            self._multi_bottom.addWidget(self.library_panel)
+            self._multi_bottom.setSizes([780, 520])
+        except Exception:
+            pass
+
+    def toggle_multi_output(self, on, startup=False):
+        """打开/关闭多屏输出：整个演出台切换布局，输出引擎也切换单路/多路。"""
+        on = bool(on)
+        try:
+            if on:
+                # 首次从普通演出台进入：把旧输出设置同步到主屏幕，避免主屏输出开关/分辨率被旧值覆盖
+                try:
+                    import output_model as _om
+                    _cfg = _om.active_config(self.cfg.data)
+                    _main = _om.main_screen(_cfg) if _cfg else None
+                    if _main is not None:
+                        _o = self.cfg.data.setdefault("output", {})
+                        _main["spout"] = bool(_o.get("spout_enabled", False))
+                        _main["ndi"] = bool(_o.get("ndi_enabled", False))
+                        _main["width"] = max(16, int(_o.get("width", _main.get("width", 1280)) or 1280))
+                        _main["height"] = max(16, int(_o.get("height", _main.get("height", 720)) or 720))
+                        _om.sync_legacy_output(self.cfg.data)
+                except Exception:
+                    pass
+                self._build_multi_stage()
+                self._move_panels_to_multi()
+                self.perf_stack.setCurrentWidget(self._multi_page)
+                try:
+                    self.output_studio.reload()
+                    self.output_studio.sync_engine()
+                except Exception:
+                    pass
+                self.cfg.data.setdefault("output", {})["multi_enabled"] = True
+                try:
+                    self.engine.set_frame_consumers(True)
+                except Exception:                                 # noqa: BLE001
+                    pass
+                self.lbl_status.setText(T("多屏输出已开启"))
+            else:
+                self._restore_stage_panels()
+                try:
+                    self.perf_stack.setCurrentIndex(0)
+                except Exception:
+                    pass
+                self.cfg.data.setdefault("output", {})["multi_enabled"] = False
+                # 关闭多屏 → 回到原来的单画布/单路输出逻辑
+                try:
+                    self.engine.set_output_config(None)
+                except Exception:                                 # noqa: BLE001
+                    pass
+                try:
+                    import output_model as _om
+                    _om.sync_legacy_output(self.cfg.data)
+                except Exception:                                 # noqa: BLE001
+                    pass
+                try:
+                    self._sync_frame_consumers()
+                except Exception:                                 # noqa: BLE001
+                    pass
+                self.lbl_status.setText(T("已切换到普通演出台"))
+            try:
+                self.cfg.save()
+            except Exception:                                     # noqa: BLE001
+                pass
+            # 同步按钮勾选状态（startup/程序化切换时避免递归）
+            try:
+                if self.btn_multi_out.isChecked() != on:
+                    self.btn_multi_out.blockSignals(True)
+                    self.btn_multi_out.setChecked(on)
+                    self.btn_multi_out.blockSignals(False)
+                self.btn_multi_out.setText("多屏输出" + (" ✓" if on else ""))
+                self.btn_multi_out.setToolTip(
+                    "关闭：普通演出台（原图层/预览/素材库）\n"
+                    "打开：多屏输出工作区 + 同一套图层和素材库")
+            except Exception:
+                pass
+        except Exception as e:                                    # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            try:
+                QMessageBox.warning(self, "多屏输出", "切换失败：%s" % e)
+            except Exception:
+                pass
 
     def _build_cue_page(self):
         """第 4 页：码表管理（列表 + 添加/删除/定位/刷新 + 双击详情 + 右键绑图层）。
@@ -3255,6 +3629,7 @@ class MainWindow(QMainWindow):
 
         # ---- 大网格 ----
         self.grid_full = LibraryGrid(self)
+        self.grid_full.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.grid_full.remove_from_layer.connect(self.remove_from_all_layers)
         self.grid_full.files_dropped.connect(self._import_paths)
         self.grid_full.apply_thumb_size(int(self.cfg["ui"].get("thumb_size", 1)))
@@ -3370,7 +3745,7 @@ class MainWindow(QMainWindow):
             pass
 
     def switch_page(self, i, save=True):
-        """切到四界面之一（页签条走这里；码表页也支持外部跳转）。"""
+        """切到页面之一（页签条走这里；码表页也支持外部跳转）。"""
         try:
             i = max(0, min(3, int(i)))
         except Exception:                                         # noqa: BLE001
@@ -3395,6 +3770,11 @@ class MainWindow(QMainWindow):
                         fn()
                     except Exception:                             # noqa: BLE001
                         pass
+        # ★ 离开输出页（不再有独立输出页）时按预览/输出窗口实际可见性恢复帧消费者
+        try:
+            self._sync_frame_consumers()
+        except Exception:                                         # noqa: BLE001
+            pass
         for k, b in enumerate(getattr(self, "_page_btns", [])):
             b.setChecked(k == i)
         if save:
@@ -3404,6 +3784,243 @@ class MainWindow(QMainWindow):
                     self.cfg.save()
             except Exception:                                     # noqa: BLE001
                 pass
+
+    # ================= 浮动素材库 + 收藏夹（2026-11-08） =================
+    def _setup_library_float(self):
+        """把演出台底部的素材库搬进一个可拖动浮动窗口，并在顶部加收藏夹栏。"""
+        if getattr(self, "_lib_float", None) is not None:
+            return
+        win = _FloatingLibraryWindow(self)
+        lay = QVBoxLayout(win)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        bar.addWidget(QLabel("收藏夹"))
+        self.fav_combo = QComboBox()
+        self.fav_combo.setMinimumWidth(130)
+        self.fav_combo.currentIndexChanged.connect(self._on_favorite_changed)
+        bar.addWidget(self.fav_combo, 1)
+        for text, cb, tip in (
+                ("＋新建", self.new_favorite, "新建收藏夹"),
+                ("重命名", self.rename_favorite, "重命名当前收藏夹"),
+                ("删除", self.delete_favorite, "删除当前收藏夹（不删素材）"),
+                ("加入选中", self.add_to_favorite, "把素材库中选中的素材加入当前收藏夹"),
+                ("移除", self.remove_from_favorite, "把选中素材从当前收藏夹移除")):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(cb)
+            bar.addWidget(b)
+        self.chk_fav_only = QCheckBox("只看收藏夹")
+        self.chk_fav_only.setToolTip("开启后素材库只显示当前收藏夹里的素材；按演出切换收藏夹即可换一套素材")
+        self.chk_fav_only.toggled.connect(self._apply_favorite_filter)
+        bar.addWidget(self.chk_fav_only)
+        lay.addLayout(bar)
+        # 把演出台底部那份素材库面板搬进来（同一个对象，筛选状态/拖拽都保留）
+        try:
+            self.library_panel.setParent(None)
+        except Exception:
+            pass
+        self.library_panel.setMinimumSize(380, 200)
+        lay.addWidget(self.library_panel, 1)
+        self._lib_float = win
+        geo = (self.cfg["ui"] or {}).get("library_float")
+        try:
+            if isinstance(geo, (list, tuple)) and len(geo) == 4:
+                win.setGeometry(int(geo[0]), int(geo[1]), max(420, int(geo[2])),
+                                max(260, int(geo[3])))
+            else:
+                win.resize(620, 460)
+        except Exception:
+            win.resize(620, 460)
+        self._refresh_favorites_ui()
+        try:
+            self.btn_library_float.setCheckable(True)
+        except Exception:
+            pass
+        vis = bool((self.cfg["ui"] or {}).get("library_float_visible", False))
+        if vis:
+            win.show()
+        self._sync_library_float_btn()
+
+    def _sync_library_float_btn(self):
+        try:
+            win = getattr(self, "_lib_float", None)
+            vis = bool(win is not None and win.isVisible())
+            self.btn_library_float.blockSignals(True)
+            self.btn_library_float.setChecked(vis)
+            self.btn_library_float.blockSignals(False)
+            self.btn_library_float.setText("📚 素材库" if not vis else "📚 隐藏素材库")
+        except Exception:
+            pass
+
+    def toggle_library_float(self):
+        try:
+            if getattr(self, "_lib_float", None) is None:
+                self._setup_library_float()
+            win = self._lib_float
+            if win.isVisible():
+                win.hide()
+            else:
+                win.show()
+                win.raise_()
+                win.activateWindow()
+            self._sync_library_float_btn()
+        except Exception:
+            pass
+
+    def _save_library_float(self, visible=None):
+        try:
+            win = getattr(self, "_lib_float", None)
+            if win is None:
+                return
+            ui = self.cfg.data.setdefault("ui", {})
+            g = win.geometry()
+            ui["library_float"] = [int(g.x()), int(g.y()), int(g.width()), int(g.height())]
+            ui["library_float_visible"] = bool(win.isVisible() if visible is None else visible)
+            self.cfg.save()
+            self._sync_library_float_btn()
+        except Exception:
+            pass
+
+    def _favorites(self):
+        ui = self.cfg.data.setdefault("ui", {})
+        favs = ui.setdefault("favorites", [])
+        if not isinstance(favs, list):
+            favs = ui["favorites"] = []
+        return favs
+
+    def _active_favorite(self):
+        favs = self._favorites()
+        aid = str(((self.cfg.data.get("ui") or {}).get("active_favorite") or ""))
+        for f in favs:
+            if f.get("id") == aid:
+                return f
+        return None
+
+    def _refresh_favorites_ui(self):
+        try:
+            favs = self._favorites()
+            aid = str(((self.cfg.data.get("ui") or {}).get("active_favorite") or ""))
+            self.fav_combo.blockSignals(True)
+            self.fav_combo.clear()
+            if not favs:
+                self.fav_combo.addItem("（还没有收藏夹）", "")
+            for f in favs:
+                self.fav_combo.addItem(f.get("name") or "收藏夹", f.get("id"))
+            idx = self.fav_combo.findData(aid)
+            self.fav_combo.setCurrentIndex(max(0, idx))
+            self.fav_combo.blockSignals(False)
+            self.chk_fav_only.blockSignals(True)
+            self.chk_fav_only.setChecked(bool((self.cfg.data.get("ui") or {}).get("favorite_filter", False)))
+            self.chk_fav_only.blockSignals(False)
+            self._apply_favorite_filter()
+        except Exception:
+            pass
+
+    def new_favorite(self):
+        name, ok = QInputDialog.getText(self, "新建收藏夹", "名称：", text="演出")
+        if not ok or not name.strip():
+            return
+        favs = self._favorites()
+        fid = "fav_%d" % (int(time.time() * 1000) & 0x7fffffff)
+        favs.append({"id": fid, "name": name.strip(), "clips": []})
+        self.cfg.data.setdefault("ui", {})["active_favorite"] = fid
+        self.cfg.save()
+        self._refresh_favorites_ui()
+
+    def rename_favorite(self):
+        f = self._active_favorite()
+        if not f:
+            return
+        name, ok = QInputDialog.getText(self, "重命名收藏夹", "名称：", text=f.get("name") or "")
+        if ok and name.strip():
+            f["name"] = name.strip()
+            self.cfg.save()
+            self._refresh_favorites_ui()
+
+    def delete_favorite(self):
+        f = self._active_favorite()
+        if not f:
+            return
+        if QMessageBox.question(self, "删除收藏夹",
+                                "确定删除「%s」？只删收藏夹，不删素材。" % f.get("name")) != QMessageBox.Yes:
+            return
+        ui = self.cfg.data.setdefault("ui", {})
+        ui["favorites"] = [x for x in self._favorites() if x.get("id") != f.get("id")]
+        ui["active_favorite"] = ""
+        self.cfg.save()
+        self._refresh_favorites_ui()
+
+    def _selected_clip_paths(self):
+        paths = []
+        for grid in (getattr(self, "grid", None), getattr(self, "grid_full", None)):
+            if grid is None:
+                continue
+            for li in grid.selectedItems():
+                it = li.data(Qt.UserRole)
+                p = getattr(it, "path", "")
+                if p and p not in paths:
+                    paths.append(p)
+        if not paths:
+            # 没有多选时，取当前素材格
+            grid = getattr(self, "grid", None)
+            li = grid.currentItem() if grid is not None else None
+            if li is not None:
+                it = li.data(Qt.UserRole)
+                p = getattr(it, "path", "")
+                if p:
+                    paths.append(p)
+        return paths
+
+    def add_to_favorite(self):
+        f = self._active_favorite()
+        if not f:
+            self.new_favorite()
+            f = self._active_favorite()
+        if not f:
+            return
+        paths = self._selected_clip_paths()
+        if not paths:
+            QMessageBox.information(self, "加入收藏夹", "先在素材库里选中素材，再点「加入选中」。")
+            return
+        clips = set(f.get("clips") or [])
+        clips.update(paths)
+        f["clips"] = list(clips)
+        self.cfg.save()
+        self._apply_favorite_filter()
+        self.statusBar().showMessage("已加入收藏夹「%s」：%d 个素材" % (f.get("name"), len(paths)), 4000)
+
+    def remove_from_favorite(self):
+        f = self._active_favorite()
+        if not f:
+            return
+        paths = set(self._selected_clip_paths())
+        if not paths:
+            return
+        f["clips"] = [p for p in (f.get("clips") or []) if p not in paths]
+        self.cfg.save()
+        self._apply_favorite_filter()
+
+    def _on_favorite_changed(self, idx):
+        try:
+            fid = self.fav_combo.itemData(idx) or ""
+            self.cfg.data.setdefault("ui", {})["active_favorite"] = fid
+            self.cfg.save()
+            self._apply_favorite_filter()
+        except Exception:
+            pass
+
+    def _apply_favorite_filter(self, *_):
+        try:
+            f = self._active_favorite()
+            only = bool(self.chk_fav_only.isChecked()) if hasattr(self, "chk_fav_only") else False
+            self.cfg.data.setdefault("ui", {})["favorite_filter"] = bool(only)
+            self.lib_favorite_paths = set(f.get("clips") or []) if (only and f) else None
+            self.cfg.save()
+            self.refresh_grid()
+        except Exception:
+            pass
 
     def _build_library(self):
         """蓝色区：素材库（标签 + 导入 + 网格）"""
@@ -3484,6 +4101,7 @@ class MainWindow(QMainWindow):
         row.addWidget(b2)
         lay.addLayout(row)
         self.grid = LibraryGrid(self)
+        self.grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
         # 背景比缩略图纯黑底亮一档，黑底素材缩略图才有轮廓（不能写 ::item，否则背景高亮失效）
         self._style_grid()
         theme.register(self, self._style_grid)
@@ -3773,6 +4391,11 @@ class MainWindow(QMainWindow):
         else:
             if self.out_win.isVisible():
                 self.out_win.hide()         # 停止：自动关闭输出窗口（主界面预览仍在实时显示）
+            try:
+                self.engine.set_frame_consumers(
+                    bool(self.preview_panel.preview_on()) or self.out_win.isVisible())
+            except Exception:
+                pass
 
     def toggle_blackout(self):
         self.engine.set_blackout(not self.engine.blackout)
@@ -3812,9 +4435,10 @@ class MainWindow(QMainWindow):
             self.settings.mode_combo.setCurrentIndex(3)
 
     def _nudge_intensity(self, d):
-        # 4 档（低/中/高/极高）；setCurrentIndex 会触发 currentIndexChanged → 写回配置
-        v = max(0, min(3, self.cfg["auto"]["intensity"] + d))
-        self.settings.intensity.setCurrentIndex(v)
+        # 5 档（关闭/低/中/高/极高）；配置里 -1=关闭、0~3=低~极高；
+        # 下拉索引 = 配置值 + 1。setCurrentIndex 会触发 currentIndexChanged → 写回配置
+        v = max(-1, min(3, int(self.cfg["auto"]["intensity"]) + int(d)))
+        self.settings.intensity.setCurrentIndex(v + 1)
 
     def toggle_lock(self):
         self.engine.lock_clip()
@@ -4009,9 +4633,20 @@ class MainWindow(QMainWindow):
         """图层属性变化后持久化"""
         self.engine.push_layers_to_cfg()
         self.cfg.save()
+        try:
+            os_obj = getattr(self, "output_studio", None)
+            if os_obj is not None and os_obj.isVisible():
+                os_obj.refresh_all()
+        except Exception:
+            pass
 
     def set_intensity(self, i):
-        self.engine_cfg("auto", "intensity", i)
+        # 下拉索引 0=关闭 / 1~4=低~极高；配置存 -1 / 0~3
+        try:
+            v = max(-1, min(3, int(i) - 1))
+        except (TypeError, ValueError):
+            v = 1
+        self.engine_cfg("auto", "intensity", v)
 
     def set_render_fps(self, i):
         """渲染帧率下拉（0 = 60fps / 1 = 30 / 2 = 20）—— 立即生效，不用重启。
@@ -4064,6 +4699,32 @@ class MainWindow(QMainWindow):
                     self, T( T("GPU 解码")),
                     Tf("这台机器暂时用不了 GPU 解码，已自动回退软解：\n{}", msg))
 
+    def set_safe_decode(self, s):
+        """安全视频解码开关：普通视频用 PyAV 而不是 OpenCV。
+
+        ⚠ 只影响**新打开**的播放器；正在播的素材保持原解码器，等下次切换才换。
+        """
+        import media_manager as mm
+        on = bool(s)
+        try:
+            self.cfg.set("perf", "safe_decode", on)
+            self.cfg.save()
+        except Exception:
+            pass
+        try:
+            mm.set_safe_decode(on)
+        except Exception:
+            pass
+        # 同步设置面板（程序化设置时）
+        try:
+            cb = getattr(getattr(self, "settings", None), "chk_safe_decode", None)
+            if cb is not None and cb.isChecked() != on:
+                cb.blockSignals(True)
+                cb.setChecked(on)
+                cb.blockSignals(False)
+        except Exception:
+            pass
+
     def set_mode_selection(self, i):
         if i == 0:
             self.engine_cfg("mode", "auto", True)
@@ -4114,6 +4775,27 @@ class MainWindow(QMainWindow):
     def set_custom_resolution(self, w, h):
         w = max(160, min(7680, int(w)))
         h = max(120, min(4320, int(h)))
+        # ★ 多屏输出：分辨率属于“主屏幕”，同步到活动配置后再让引擎重建画布。
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            main = _om.main_screen(cfg) if cfg else None
+            if main is not None:
+                main["width"], main["height"] = w, h
+                _om.sync_legacy_output(self.cfg.data)
+                self.cfg.save()
+                multi_on = bool((self.cfg.data.get("output") or {}).get("multi_enabled", False))
+                if multi_on:
+                    self.engine.set_output_config(cfg)
+                    try:
+                        self.output_studio.refresh_all()
+                    except Exception:
+                        pass
+                    if int(self.cfg["output"].get("screen", -1)) < 0 and self.out_win.isVisible():
+                        self.out_win.apply_window_size()
+                    return
+        except Exception:
+            pass
         self.cfg["output"]["width"], self.cfg["output"]["height"] = w, h
         self.cfg.save()
         # 线程安全：画布尺寸经 engine.set_canvas_size（锁内重建），不再 GUI 直接赋值
@@ -4123,8 +4805,12 @@ class MainWindow(QMainWindow):
             self.out_win.apply_window_size()
 
     def set_aspect_lock(self, s):
-        self.out_win.aspect_lock = bool(s)
-        self.cfg["output"]["aspect_lock"] = bool(s)
+        on = bool(s)
+        try:
+            self.out_win.set_aspect_lock(on)
+        except Exception:
+            self.out_win.aspect_lock = on
+        self.cfg["output"]["aspect_lock"] = on
         self.cfg.save()
 
     def set_borderless(self, s):
@@ -4156,6 +4842,35 @@ class MainWindow(QMainWindow):
 
     def set_spout_enabled(self, s):
         s = bool(s)
+        # ★ 多屏输出：这个旧开关只代表“主屏幕”的 Spout，写入活动配置后由引擎路由表统一重建。
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            main = _om.main_screen(cfg) if cfg else None
+            if main is not None and bool((self.cfg.data.get("output") or {}).get("multi_enabled", False)):
+                if s:
+                    ok, err = _probe_spout_once()
+                    if not ok:
+                        QMessageBox.warning(
+                            self, T("Spout 不可用"),
+                            "无法启用 Spout 输出。\n\n%s\n\n"
+                            "常见原因：显卡驱动不支持共享纹理（GL/DX 互操作）。\n"
+                            "（NDI 输出不依赖这个，可改用 NDI）" % err)
+                        s = False
+                main["spout"] = s
+                _om.sync_legacy_output(self.cfg.data)
+                self.cfg.save()
+                self.engine.set_output_config(cfg)
+                try:
+                    self.output_panel.chk_spout.blockSignals(True)
+                    self.output_panel.chk_spout.setChecked(s)
+                    self.output_panel.chk_spout.blockSignals(False)
+                    self.output_studio.refresh_all()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         if s:
             # 勾选时立即探测一次（与 NDI 一致）：Spout 失败以前是完全静默的 ——
             # 界面上勾着、其实一帧都没发出去，用户只会以为「勾了没用」。
@@ -4193,6 +4908,40 @@ class MainWindow(QMainWindow):
 
     def set_ndi_enabled(self, s):
         s = bool(s)
+        # ★ 多屏输出：旧开关只代表主屏幕 NDI；运行时探测保留，发送端由引擎路由表创建。
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            main = _om.main_screen(cfg) if cfg else None
+            if main is not None and bool((self.cfg.data.get("output") or {}).get("multi_enabled", False)):
+                if s:
+                    from ndi_out import probe_runtime
+                    ok, detail = probe_runtime()
+                    if not ok:
+                        QMessageBox.warning(
+                            self, T(T("NDI 不可用")),
+                            T("NDI 运行时加载失败，无法启用 NDI 输出。") + "\n\n" +
+                            T("运行时是随软件一起提供的，不需要单独安装。"
+                              "常见原因是杀毒软件隔离了软件目录里的 Processing.NDI.Lib.x64.dll，"
+                              "请把它加入白名单；或者重新解压一次安装包再试。") +
+                            "\n\n" + T("错误详情：") + "\n" + detail)
+                        s = False
+                main["ndi"] = s
+                _om.sync_legacy_output(self.cfg.data)
+                self.cfg.save()
+                self.engine.set_output_config(cfg)
+                try:
+                    self.output_panel.chk_ndi.blockSignals(True)
+                    self.output_panel.chk_ndi.setChecked(s)
+                    self.output_panel.chk_ndi.blockSignals(False)
+                    self.audio.state.ndi_audio_on = bool(
+                        s and self.cfg["output"].get("ndi_audio", False))
+                    self.output_studio.refresh_all()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         if s:
             # 勾选时立即探测 NDI 运行时。**运行时是随 cyndilib 一起打包在软件里的**
             # （实测本机从未安装过 NDI，但 get_ndi_version() 能报出 6.1.1.0 ——
@@ -4244,6 +4993,21 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+
+    def set_output_alpha(self, s):
+        """Spout/NDI 的 Alpha 输出开关。
+
+        ★ 只切画布格式：开启后引擎用 ARGB32（透明底/直通 alpha），Spout/NDI
+          原样发送 BGRA+A；显示器输出仍由输出窗口铺黑底，物理显示器没有 alpha。
+        ★ 运行中切换会重建一次画布（可能闪一帧），但不需要重启 Spout/NDI。
+        """
+        on = bool(s)
+        self.cfg["output"]["alpha_enabled"] = on
+        try:
+            self.engine.set_alpha_output(on)
+        except Exception:
+            pass
+        self.cfg.save()
 
     def _ndi_audio_feed(self, pcm, sr):
         """把采集到的 PCM 投递给 NDI 发送端（运行在**音频转发线程**里）。
@@ -4324,6 +5088,24 @@ class MainWindow(QMainWindow):
             except Exception:                                  # noqa: BLE001
                 pass
 
+    def _sync_frame_consumers(self, *_):
+        try:
+            multi_visible = False
+            try:
+                mp = getattr(self, "_multi_page", None)
+                multi_visible = bool(
+                    mp is not None
+                    and getattr(self, "perf_stack", None) is not None
+                    and self.perf_stack.currentWidget() is mp
+                    and self.pages.currentIndex() == 0)
+            except Exception:
+                multi_visible = False
+            on = bool(self.preview_panel.preview_on()) or bool(
+                self.out_win is not None and self.out_win.isVisible()) or multi_visible
+            self.engine.set_frame_consumers(on)
+        except Exception:
+            pass
+
     def apply_output_screen(self):
         idx = int(self.cfg["output"].get("screen", -1))
         screens = QGuiApplication.screens()
@@ -4332,6 +5114,11 @@ class MainWindow(QMainWindow):
             self.out_win.show_fullscreen_on(screens[idx])
         else:
             self.out_win.show_windowed()
+        try:
+            self.engine.set_frame_consumers(
+                bool(self.preview_panel.preview_on()) or self.out_win.isVisible())
+        except Exception:
+            pass
 
     def reset_window_size(self):
         """手动重置输出窗口大小（输出设置里的按钮）"""
@@ -4339,8 +5126,13 @@ class MainWindow(QMainWindow):
 
     def _load_settings_to_ui(self):
         a = self.cfg["auto"]
-        # 钳到有效档位（0~3）：脏配置越界时 setCurrentIndex 会被 Qt 忽略 → 界面与配置对不上
-        self.settings.intensity.setCurrentIndex(max(0, min(3, int(a.get("intensity", 1) or 0))))
+        # 配置 -1=关闭、0~3=低~极高；下拉索引 = 配置值 + 1（0=关闭）。
+        # 钳到有效档位，脏配置越界时 setCurrentIndex 会被 Qt 忽略 → 界面与配置对不上
+        try:
+            _iv = int(a.get("intensity", 1))
+        except (TypeError, ValueError):
+            _iv = 1
+        self.settings.intensity.setCurrentIndex(max(0, min(4, _iv + 1)))
         tr_ov = a.get("transition") if isinstance(a.get("transition"), str) else ""
         tr_ov = (self.cfg["mode"].get("transition") or tr_ov or "")
         try:
@@ -4358,6 +5150,13 @@ class MainWindow(QMainWindow):
         except Exception:
             _rf = 60
         self.settings.render_fps.setCurrentIndex({60: 0, 30: 1, 20: 2}.get(_rf, 0))
+        try:
+            _ff = bool((self.cfg["perf"] or {}).get("fps_follow_source", True))
+            self.settings.chk_fps_follow.blockSignals(True)
+            self.settings.chk_fps_follow.setChecked(_ff)
+            self.settings.chk_fps_follow.blockSignals(False)
+        except Exception:
+            pass
         # GPU 解码（实验）：配置 → 复选框 + 模块总闸（复选框 setChecked 会触发 stateChanged
         # → set_gpu_decode 再写一遍配置，值相同无副作用）
         try:
@@ -4388,6 +5187,18 @@ class MainWindow(QMainWindow):
             if _gd:
                 import glctx
                 glctx.preinit()      # 主线程先 init glfw（解码线程只建窗口）
+        except Exception:
+            pass
+        # 安全视频解码（PyAV）——默认开；防止 cv2 native 崩溃带走进程
+        try:
+            import media_manager as mm
+            _sd = bool((self.cfg["perf"] or {}).get("safe_decode", True))
+            mm.set_safe_decode(_sd)
+            cb = getattr(getattr(self, "settings", None), "chk_safe_decode", None)
+            if cb is not None:
+                cb.blockSignals(True)
+                cb.setChecked(_sd)
+                cb.blockSignals(False)
         except Exception:
             pass
         # 能量校正滑条已无 UI（2026-10-18）；配置值在 __init__ 里直接写进 audio.energy_scale。
@@ -4496,6 +5307,11 @@ class MainWindow(QMainWindow):
         except Exception:
             self.output_panel.screen_combo.setCurrentIndex(0)
         self.output_panel.chk_spout.setChecked(o.get("spout_enabled", False))
+        # Alpha 开关：只回填，不触发 set_output_alpha（引擎已按配置初始化画布格式）
+        _wa = self.output_panel.chk_alpha
+        _wa.blockSignals(True)
+        _wa.setChecked(bool(o.get("alpha_enabled", False)))
+        _wa.blockSignals(False)
         # ★ 2026-10-30（用户：「不要输入框 把名字写死」）：界面已无输入框，
         #   这里把配置里的旧值**统一成常量**，保证 engine 实际用的名字与界面显示一致
         #   （否则旧配置里残留的自定义名会让 OBS 里看到的和界面对不上）。
@@ -6028,6 +6844,10 @@ class MainWindow(QMainWindow):
                     continue
                 if kw and kw not in it.name.lower() and not any(kw in t.lower() for t in it.all_tags()):
                     continue
+                # ★ 收藏夹过滤（2026-11-08）：只在“只看收藏夹”开启时生效
+                _fav = getattr(self, "lib_favorite_paths", None)
+                if _fav is not None and it.path not in _fav:
+                    continue
                 li = QListWidgetItem(it.icon_cached(sz.width(), sz.height()), self._item_text(it))
                 li.setData(Qt.UserRole, it)
                 li.setToolTip(self._item_tooltip(it))
@@ -7037,6 +7857,11 @@ class MainWindow(QMainWindow):
         self.out_win.show()
         self.out_win.raise_()
         self.apply_output_screen()
+        try:
+            self.engine.set_frame_consumers(
+                bool(self.preview_panel.preview_on()) or self.out_win.isVisible())
+        except Exception:
+            pass
 
     def open_hotkeys(self):
         HotkeyDialog(self).exec()
@@ -7227,13 +8052,13 @@ class MainWindow(QMainWindow):
 
     # ================= 预览/状态 =================
     def moveEvent(self, e):
-        # 拖动窗口期间跳过 60fps 预览重绘（SmoothTransformation 缩放很重，
-        # 与移动消息叠加会拖到卡顿）；0.25s 无移动自动恢复
-        self._drag_pause_until = time.perf_counter() + 0.25
+        # ★ 2026-11-08：拖动窗口不再暂停预览。旧实现每次 moveEvent 都把
+        # `_drag_pause_until` 推到 0.25s 后，连续拖动 = 预览一直不刷新（看起来卡死）。
+        # 预览 0.25 分辨率下每帧只有约 1ms，正常跟着画即可。
         super().moveEvent(e)
 
     def resizeEvent(self, e):
-        self._drag_pause_until = time.perf_counter() + 0.25
+        # 缩放窗口同样不再暂停预览；重活（布局/缩略图）由各自的定时器节流。
         super().resizeEvent(e)
 
     def _on_engine_frame(self, seq=-1):
@@ -7242,9 +8067,107 @@ class MainWindow(QMainWindow):
         为什么这么改（2026-09-26 内存雪崩）：旧写法每帧把一个 8MB 的 QImage 投进主线程队列，
         主线程一卡就积压（实测 30 秒 +3.2GB，涨到 15GB 把整机拖垮）。
         现在队列里只有 int；重复序号（队列积压时会有很多）直接跳过，不重复绘制。
+
+        ★★ 2026-11-08 二修（用户："显示器输出码表演出还是掉帧"）：
+        旧实现把绘制丢给 `QTimer.singleShot(0, ...)`，原意是合并同一轮的多条通知。
+        实测 1920×1080 输出窗口时，**零毫秒定时器会被连续的重绘事件饿死**：
+        30fps 的引擎只画出 20fps，`[OUT]` 间隙 p95 112ms、max 269ms。
+        改为在信号回调里**直接画**：信号本身已经排队到 GUI 线程，天然串行；
+        积压时第一个回调画最新帧，后面的回调按 `seq <= _drawn_seq` 直接跳过，
+        合并效果不变，但不再多经一层定时器。实测同一场景：30.0 draws/s、
+        间隙 p95 48ms、max 84ms（无 >100ms）。
         """
+        try:
+            seq = int(seq)
+        except Exception:
+            seq = -1
+        if seq <= self._drawn_seq:
+            return
+        # 防御：万一将来从非 GUI 线程发来，仍然编组回 GUI 线程，绝不跨线程画控件。
+        try:
+            if QThread.currentThread() is not self.thread():
+                if not self._draw_scheduled:
+                    self._draw_scheduled = True
+                    QTimer.singleShot(0, self._draw_latest_frame)
+                return
+        except Exception:
+            pass
+        self._pending_seq = seq
+        self._draw_latest_frame()
+
+    def _covered_by_output(self):
+        """输出窗口是否**完全盖住主窗**（全屏同屏 / 无边窗口包住主窗）。
+
+        ★ 2026-11-08 二修：主窗被盖住时，预览缩放和 500ms 状态刷新全是白烧
+          GUI 线程（预览 4~9ms/帧、状态 7ms/次），而用户根本看不见。
+          缓存 0.4s，窗口拖动/切换全屏后最多 0.4s 自动跟上。
+        """
+        now = time.perf_counter()
+        if now - float(getattr(self, "_cover_check_t", 0.0) or 0.0) < 0.4:
+            return bool(getattr(self, "_cover_main", False))
+        self._cover_check_t = now
+        cover = False
+        try:
+            ow = getattr(self, "out_win", None)
+            if ow is not None and ow.isVisible() and self.isVisible() and not self.isMinimized():
+                same_screen = False
+                try:
+                    s1, s2 = ow.screen(), self.screen()
+                    same_screen = bool(s1 is not None and s2 is not None
+                                       and s1.geometry() == s2.geometry())
+                except Exception:
+                    same_screen = False
+                # 几何上盖住还不够：主窗可能被 Alt+Tab 提到输出窗上面（输出未置顶时）。
+                # 取主窗中心点，看实际最上层窗口是不是输出窗 —— 只做一次，缓存 0.4s。
+                on_top = False
+                try:
+                    pt = self.mapToGlobal(self.rect().center())
+                    wgt = QApplication.widgetAt(pt)
+                    on_top = (wgt is not None and wgt.window() is ow)
+                except Exception:
+                    on_top = False
+                if on_top:
+                    if ow.isFullScreen():
+                        cover = same_screen
+                    else:
+                        cover = ow.frameGeometry().contains(self.frameGeometry())
+        except Exception:
+            cover = False
+        self._cover_main = cover
+        return cover
+
+    def _preview_covered(self):
+        """预览面板中心点是否被输出窗盖住（输出窗窗口化/二屏也能正确判断）。
+
+        用 `QApplication.widgetAt` 做真实 Z 序点测试：比整窗几何包含宽松，
+        也不会把"主窗被 Alt+Tab 提到输出窗上面"误判成被盖住。缓存 0.4s。
+        """
+        now = time.perf_counter()
+        if now - float(getattr(self, "_preview_cover_t", 0.0) or 0.0) < 0.4:
+            return bool(getattr(self, "_preview_cover", False))
+        self._preview_cover_t = now
+        got = False
+        try:
+            ow = getattr(self, "out_win", None)
+            pv = getattr(getattr(self, "preview_panel", None), "view", None)
+            if (ow is not None and pv is not None and ow.isVisible()
+                    and pv.isVisible() and pv.width() > 1 and pv.height() > 1):
+                pt = pv.mapToGlobal(pv.rect().center())
+                wgt = QApplication.widgetAt(pt)
+                got = bool(wgt is not None and wgt.window() is ow)
+        except Exception:
+            got = False
+        self._preview_cover = got
+        return got
+
+    def _draw_latest_frame(self):
+        self._draw_scheduled = False
+        seq = self._pending_seq
         if seq == self._drawn_seq:
-            return                       # 同一帧已经画过（积压时的去重）
+            return
+        now = time.perf_counter()
+        gap = (now - self._last_draw_t) if self._last_draw_t else 0.0
+        backlog = seq - self._drawn_seq if self._drawn_seq >= 0 else 0
         self._drawn_seq = seq
         img = self.engine.latest_frame()
         if img is None:
@@ -7255,12 +8178,51 @@ class MainWindow(QMainWindow):
                 ow.set_frame(img)
             except Exception:
                 pass
-        self._update_preview(img)
+        self._update_preview(img, allow=not self._preview_covered())
+        try:
+            os_obj = getattr(self, "output_studio", None)
+            if os_obj is not None:
+                os_obj.on_frame()
+        except Exception:
+            pass
+        self._last_draw_t = time.perf_counter()
 
-    def _update_preview(self, img):
-        if time.perf_counter() < getattr(self, "_drag_pause_until", 0.0):
-            return   # 拖动/缩放窗口中：只存帧不重绘，松手后自然恢复
-        self.preview_panel.set_frame(img)
+        # 真实的「显示帧间隔」取证：短于 120ms 的抖动不记；每 2 秒最多记一行，
+        # 行内带这一窗口内的最差值 / 次数 / backlog / 视图后端 / 引擎 tick 间隔。
+        try:
+            if gap > 0.12 and bool(getattr(self.engine, "running", False)):
+                self._out_gap_max = max(self._out_gap_max, gap)
+                self._out_gap_n += 1
+                if now - self._out_gap_log_t >= 2.0:
+                    snap = {}
+                    try:
+                        snap = self.engine.ui_snapshot() or {}
+                    except Exception:
+                        pass
+                    view = "?"
+                    w = h = 0
+                    if ow is not None:
+                        try:
+                            view = ow.debug_backend()
+                            w, h = ow.width(), ow.height()
+                        except Exception:
+                            pass
+                    import stallwatch
+                    stallwatch.log_line(
+                        "[OUT] 显示帧间隔 %.0fms（2s 最差 %.0fms，>120ms 共 %d 次）"
+                        " backlog=%d 视图=%s 窗口=%dx%d tick=%.0fms tick_gap=%.0fms"
+                        % (gap * 1000.0, self._out_gap_max * 1000.0, self._out_gap_n,
+                           max(0, backlog), view, w, h,
+                           float(snap.get("tick_ms", -1) or -1),
+                           float(snap.get("tick_gap_ms", -1) or -1)))
+                    self._out_gap_log_t = now
+                    self._out_gap_max = 0.0
+                    self._out_gap_n = 0
+        except Exception:
+            pass
+
+    def _update_preview(self, img, allow=True):
+        self.preview_panel.set_frame(img, allow=allow)
         # ⚠ 播放高亮**不在这里刷**：已交给独立的 1 秒定时器（`self._hl_timer`）。
         #   这条旧通路是"每 6 帧 ≈10fps 重建整张高亮表"，而预览帧在换页/隐藏时根本不来
         #   ⇒ 既白烧 CPU（图层多时每轮遍历所有格子）又不可靠。别再搬回来。
@@ -7402,6 +8364,11 @@ class MainWindow(QMainWindow):
             return ""
 
     def _update_status(self):
+        # ★ 2026-11-08 二修：主窗被全屏输出完全盖住时，这里的标签/HUD 更新
+        #   一个像素都看不见，却每 500ms 在 GUI 线程花约 7ms（含布局）——
+        #   正好会拖慢输出窗口的重绘。盖住时直接跳过；露出后下一个 500ms 周期自动补上。
+        if self._covered_by_output():
+            return
         snap = self.audio.state.snapshot()
         self.lbl_bpm.setText(self._bpm_text(snap) + self._rate_text(snap))
         self.lbl_energy.setText(f"{tr('energy')} {snap['energy']:.2f}")
@@ -7590,6 +8557,16 @@ class MainWindow(QMainWindow):
                 self.out_win = None
         except Exception:                                        # noqa: BLE001
             pass
+        # ★ 浮动素材库也是独立顶层窗口：先保存几何再隐藏/销毁
+        try:
+            _lf = getattr(self, "_lib_float", None)
+            if _lf is not None:
+                self._save_library_float(False)
+                _lf.hide()
+                _lf.deleteLater()
+                self._lib_float = None
+        except Exception:                                        # noqa: BLE001
+            pass
         # ★ 2026-11-02：先停能量日志线程（1Hz 写盘，退出时别让它跟 cfg.save() 撞）。
         try:
             _el = getattr(self, "_energy_log", None)
@@ -7644,6 +8621,12 @@ class MainWindow(QMainWindow):
             wd = getattr(self, "_watchdog", None)
             if wd is not None and hasattr(wd, "stop"):
                 wd.stop()
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            lw = getattr(self, "_lag_watch", None)
+            if lw is not None and hasattr(lw, "stop"):
+                lw.stop()
         except Exception:                                        # noqa: BLE001
             pass
         # 4) 线程都停了，再落盘（此时后台线程已不会再并发写 config）

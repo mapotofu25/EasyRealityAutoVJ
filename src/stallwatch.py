@@ -292,3 +292,69 @@ class StallWatchdog(threading.Thread):
                 n_chg = len(cur) - n_same
                 tail = "  ⇒ 所有线程都冻住了（连解码线程都不动）" if n_chg <= 1 else ""
                 self._write("      小结：%d 个线程位置未变、%d 个在动%s" % (n_same, n_chg, tail))
+
+
+class UiLagWatchdog(threading.Thread):
+    """轻量级「主线程 150ms 级停顿」取证。
+
+    和 `StallWatchdog` 的区别：
+      · `StallWatchdog` 管的是 **3 秒级"未响应"**，会给所有线程的完整栈；
+      · 本类管的是演出中 **100~300ms 的掉帧级停顿**（用户能看见但还没到"未响应"），
+        只写一行：停顿毫秒数 + 引擎当前阶段 + 主线程栈顶 14 帧，每 2 秒最多一行。
+    开销：20Hz 读一个 float；只有真的停顿时才 `sys._current_frames()`。
+    """
+
+    def __init__(self, hb, phase_fn=None, running_fn=None, stall_secs=0.15,
+                 poll=0.05, min_interval=2.0, max_reports=200, write=None):
+        super().__init__(name="ui-lag-watch", daemon=True)
+        self.hb = hb
+        self.phase_fn = phase_fn
+        self.running_fn = running_fn
+        self.stall_secs = float(stall_secs)
+        self.poll = float(poll)
+        self.min_interval = float(min_interval)
+        self.max_reports = int(max_reports)
+        self._write = write or log_line
+        self._stop = threading.Event()
+        self._last_report = 0.0
+        self.reports = 0
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        main_tid = threading.main_thread().ident
+        while not self._stop.wait(self.poll):
+            try:
+                if self.running_fn is not None and not self.running_fn():
+                    continue
+                gap = time.perf_counter() - float(self.hb.get("t", 0.0))
+            except Exception:                                    # noqa: BLE001
+                continue
+            if gap < self.stall_secs:
+                continue
+            now = time.perf_counter()
+            if now - self._last_report < self.min_interval:
+                continue
+            self._last_report = now
+            try:
+                phase = self.phase_fn() if self.phase_fn is not None else "?"
+            except Exception:                                    # noqa: BLE001
+                phase = "?"
+            stack = []
+            try:
+                fr = sys._current_frames().get(main_tid)
+                n = 0
+                while fr is not None and n < 14:
+                    stack.append("%s:%d %s" % (
+                        os.path.basename(fr.f_code.co_filename), fr.f_lineno,
+                        fr.f_code.co_name))
+                    fr = fr.f_back
+                    n += 1
+            except Exception:                                    # noqa: BLE001
+                pass
+            self._write("[UI] 主线程停顿 %.0fms 引擎阶段=%s | %s"
+                        % (gap * 1000.0, phase, " <- ".join(stack or ["?"])))
+            self.reports += 1
+            if self.reports >= self.max_reports:
+                break

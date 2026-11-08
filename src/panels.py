@@ -2706,6 +2706,11 @@ class LibraryGrid(MediaGrid):
     def __init__(self, main, parent=None):
         super().__init__(parent)
         self.main = main
+        # ★ 2026-11-08：拖拽状态必须先初始化。以前只在 mousePressEvent 里创建，
+        #   某些鼠标进入/重排后直接收到 mouseMoveEvent（没有 press）⇒
+        #   `AttributeError: 'LibraryGrid' object has no attribute '_press_item'`。
+        self._press_pos = None
+        self._press_item = None
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
@@ -2756,7 +2761,8 @@ class LibraryGrid(MediaGrid):
 
     def mouseMoveEvent(self, e):
         # 自己启动拖动：不依赖 QAbstractItemView 内部条件，保证一定能拖
-        if (self._press_item is not None and (e.buttons() & Qt.LeftButton)
+        if (getattr(self, "_press_item", None) is not None
+                and (e.buttons() & Qt.LeftButton)
                 and (e.position().toPoint() - self._press_pos).manhattanLength()
                 >= QApplication.startDragDistance()):
             it = self._press_item
@@ -5009,6 +5015,12 @@ class PreviewPanel(QWidget):
         ⚠ 只影响**主界面预览**：引擎照常合成，输出窗口、Spout、NDI 都照常发。
         """
         on = self.preview_on()
+        try:
+            ow = getattr(self.main, "out_win", None)
+            self.main.engine.set_frame_consumers(
+                bool(on) or bool(ow is not None and ow.isVisible()))
+        except Exception:
+            pass
         if self.chk_preview.isChecked() != on:
             self.chk_preview.blockSignals(True)
             self.chk_preview.setChecked(on)
@@ -5026,28 +5038,44 @@ class PreviewPanel(QWidget):
             self._img = None
         self._sync_overlays()
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        # 隐藏期间 set_frame 只存最新帧不缩放；重新显示时立刻补画，避免空白到下一帧。
+        try:
+            if self._img is not None:
+                self._rescale()
+        except Exception:
+            pass
+
     def _rescale(self):
         if self._img is None or not self.preview_on():
             return
         p = self.pic_cfg()
         fit = p.get("fit", "keep")
-        pm = QPixmap.fromImage(self._img)
         res = float(p.get("res", 1.0))
-        if res < 0.999:
-            # 预览分辨率降采样：先缩到较小尺寸再适配，省 CPU（只影响预览）
-            pm = pm.scaled(max(1, int(pm.width() * res)), max(1, int(pm.height() * res)),
-                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
         tgt = self.view.size()
+        if tgt.width() <= 1 or tgt.height() <= 1:
+            return
+        # ★ 2026-11-08（码表演出掉帧）：先缩到预览尺寸，再 QPixmap.fromImage；
+        #   旧顺序是「整张 1080p QImage → QPixmap（实测 3~4ms）→ 再缩两次」，
+        #   每帧白烧 5~10ms GUI 线程，和输出窗口抢主线程。
+        img = self._img
+        if res < 0.999:
+            img = img.scaled(max(1, int(img.width() * res)),
+                             max(1, int(img.height() * res)),
+                             Qt.KeepAspectRatio, Qt.SmoothTransformation)
         if fit == "stretch":
-            pm = pm.scaled(tgt, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            img = img.scaled(tgt, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         elif fit == "cover":
-            pm = pm.scaled(tgt, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            x = max(0, (pm.width() - tgt.width()) // 2)
-            y = max(0, (pm.height() - tgt.height()) // 2)
-            pm = pm.copy(x, y, min(tgt.width(), pm.width()), min(tgt.height(), pm.height()))
+            img = img.scaled(tgt, Qt.KeepAspectRatioByExpanding,
+                             Qt.SmoothTransformation)
+            x = max(0, (img.width() - tgt.width()) // 2)
+            y = max(0, (img.height() - tgt.height()) // 2)
+            img = img.copy(x, y, min(tgt.width(), img.width()),
+                           min(tgt.height(), img.height()))
         else:
-            pm = pm.scaled(tgt, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.view.setPixmap(pm)
+            img = img.scaled(tgt, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.view.setPixmap(QPixmap.fromImage(img))
 
     _img = None
 
@@ -5061,13 +5089,32 @@ class PreviewPanel(QWidget):
     def open_pic_settings(self):
         PreviewSettingsDialog(self.main, self).exec()
 
-    def set_frame(self, img):
+    def set_frame(self, img, allow=True):
         import time as _t
         if not self.preview_on():
             return                        # 预览已关闭：跳过 fromImage + 缩放（省 CPU）
         self._img = img
+        # ★ 2026-11-08（码表演出掉帧）：预览在别的页签/被隐藏/被全屏输出盖住时
+        #   只存最新帧，不做缩放和贴图。旧实现只要配置里 preview.on=True 就每帧
+        #   fromImage+两次 Smooth 缩放 —— 白占 GUI 线程 4~9ms/帧。
+        if not allow:
+            return
+        try:
+            if not self.isVisible() or not self.view.isVisible():
+                return
+        except Exception:
+            pass
         p = self.pic_cfg()
         fps = max(1, int(p.get("fps", 60)))
+        # ★ 2026-11-08 二修：演出中且独立输出窗口在显示时，预览封顶 15fps。
+        #   输出窗口要的是 30fps 的稳定；预览只是监看，15fps 足够，能省下
+        #   约一半 GUI 线程时间（实测预览缩放 4~9ms/帧，直接抬高引擎 tick）。
+        try:
+            ow = getattr(self.main, "out_win", None)
+            if bool(getattr(self.main.engine, "running", False)) and ow is not None and ow.isVisible():
+                fps = min(fps, 15)
+        except Exception:
+            pass
         now = _t.perf_counter()
         if fps < 60 and (now - getattr(self, "_last_t", 0.0)) < 1.0 / fps:
             return                        # 按设定帧率节流（省 CPU）

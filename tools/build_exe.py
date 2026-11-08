@@ -56,6 +56,10 @@ cmd = [
     "--hidden-import", "_build_ver",
     # ★ 应用图标定位（main.py 在 try 里惰性 `import appicon`，静态分析可能漏 ⇒ 显式给出）
     "--hidden-import", "appicon",
+    # 多屏输出：output_studio 是在 _build_pages 里懒加载的，PyInstaller 动态扫描
+    # 可能漏掉；这两个模块必须显式列出来，否则 exe 打开会白页/ImportError。
+    "--hidden-import", "output_model",
+    "--hidden-import", "output_studio",
     "--hidden-import", "ndi_out",
     # ★ Spout 发送（2026-10-29 新增）：engine 里是 `import spout_out` 的**运行时**导入
     #   （和 ndi_out 一样包在 try 里），PyInstaller 静态分析扫不到 ⇒ 必须显式列出，
@@ -112,8 +116,10 @@ cmd = [
     "--exclude-module", "PySide6.QtPdf",
     "--exclude-module", "PySide6.QtSvg",
     "--exclude-module", "PySide6.QtNetwork",
-    "--exclude-module", "PySide6.QtOpenGL",
-    "--exclude-module", "PySide6.QtOpenGLWidgets",
+    #  ★ 2026-11-08：**不再排除 QtOpenGL / QtOpenGLWidgets** —— 优化版新增可选
+    #    GPU 合成（gpu_compose.py），需要 PySide6.QtOpenGL。默认关闭，但打包后
+    #    用户手动把 perf.gpu_compose 设为 true 时也能用。
+    #    QtQuick/Qml/Pdf/Svg/Network 仍然排除。
     # ★ 2026-10-27：librosa / numba / llvmlite 是**离线验收脚本**用的（time-stretch 造变速样本），
     #   产品运行期零引用。不排除的话 numba 会把 llvmlite 整套（115MB）拖进包
     #   （实测包从 827M 涨到 947M）。--exclude-module 拦得住，因为没人 import 它们。

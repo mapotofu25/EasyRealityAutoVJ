@@ -14,9 +14,11 @@
 import ctypes
 import os
 import sys
+import threading
 
 _DLL = None
 _TRIED = False
+_LOCK = threading.Lock()
 LAST_ERROR = ""
 
 
@@ -41,24 +43,28 @@ def _load():
     global _DLL, _TRIED, LAST_ERROR
     if _TRIED:
         return _DLL
-    _TRIED = True
-    p = dll_path()
-    if not os.path.exists(p):
-        LAST_ERROR = "找不到 %s（请先跑 tools/build_dxvlz.py 编译）" % p
-        return None
-    try:
-        d = ctypes.CDLL(p)
-        ip = ctypes.POINTER(ctypes.c_int)
-        d.dxv_header.argtypes = [ctypes.c_char_p, ctypes.c_int, ip, ip, ip, ip]
-        d.dxv_header.restype = ctypes.c_int
-        d.dxv_unpack.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
-                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        d.dxv_unpack.restype = ctypes.c_int
-        _DLL = d
-    except Exception as e:                                     # noqa: BLE001
-        LAST_ERROR = "加载 DLL 失败：%s" % e
-        _DLL = None
-    return _DLL
+    with _LOCK:
+        if _TRIED:
+            return _DLL
+        p = dll_path()
+        if not os.path.exists(p):
+            LAST_ERROR = "找不到 %s（请先跑 tools/build_dxvlz.py 编译）" % p
+            _TRIED = True
+            return None
+        try:
+            d = ctypes.CDLL(p)
+            ip = ctypes.POINTER(ctypes.c_int)
+            d.dxv_header.argtypes = [ctypes.c_char_p, ctypes.c_int, ip, ip, ip, ip]
+            d.dxv_header.restype = ctypes.c_int
+            d.dxv_unpack.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            d.dxv_unpack.restype = ctypes.c_int
+            _DLL = d
+        except Exception as e:                                     # noqa: BLE001
+            LAST_ERROR = "加载 DLL 失败：%s" % e
+            _DLL = None
+        _TRIED = True
+        return _DLL
 
 
 def available():

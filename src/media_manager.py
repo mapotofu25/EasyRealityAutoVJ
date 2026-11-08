@@ -16,16 +16,34 @@ import cv2
 # ⚠ OpenCV 默认按 **CPU 核数** 开内部线程池（本机 16 / 4 核机器 4）。
 # 解码后的 resize / cvtColor / 导入缩略图 都会用它，于是它会把 CPU 铺满 ——
 # 在 4 核机器上就是「VJ 软件把 CPU 吃光、跟 VDJ 抢核」的直接原因之一。
-# 实测（tools/cpu_profile.py）：OpenCV 线程池独占约 1.6 个核；限制成 2 之后
-# 那部分几乎消失，而单帧解码吞吐没有可测量的下降（解 DXV 的 DXT 解压主要在
-# FFmpeg 自己的解码器里，不靠 OpenCV 的线程池）。
+# 实测（tools/cpu_profile.py）：OpenCV 线程池独占约 1.6 个核；限制线程后那部分
+# 几乎消失，而单帧解码吞吐没有可测量的下降（解 DXV 的 DXT 解压主要在 FFmpeg
+# 自己的解码器里，不靠 OpenCV 的线程池）。
+# ★ 2026-11-08：默认从 2 降到 **1**。3 路 1080p 视频并发实测：
+#   1/2/4 线程 = 162% / 173% / 196% 单核，帧率均 30fps；后处理单线程略慢
+#   （10.45ms vs 10.15ms/帧），但总 CPU 更低。想改回去：AUTO_VJ_CV_THREADS=2。
 # 想改回去：环境变量 AUTO_VJ_CV_THREADS=0 表示恢复 OpenCV 默认。
 try:
-    _want = int(os.environ.get("AUTO_VJ_CV_THREADS", "2"))
+    _want = int(os.environ.get("AUTO_VJ_CV_THREADS", "1"))
     if _want > 0:
         cv2.setNumThreads(_want)
 except Exception:
     pass
+
+# ★ 2026-11-08（v25 闪退：cv2.pyd 0xc0000005）：安全视频解码模式。
+#   开启后普通视频用 PyAV（AvAlphaPlayer）而不是 OpenCV VideoCapture。
+#   PyAV 的异常是 Python 异常，不会像 cv2 那样把整个进程带走；
+#   代价是 CPU 略高（实测 3 路视频约 +1.8 核）。默认开，设置里可关。
+_SAFE_DECODE = (os.environ.get("AUTO_VJ_SAFE_DECODE", "0") or "0").strip() in ("1", "true", "True")
+
+
+def set_safe_decode(on):
+    global _SAFE_DECODE
+    _SAFE_DECODE = bool(on)
+
+
+def safe_decode_enabled():
+    return bool(_SAFE_DECODE)
 
 VIDEO_EXT = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 GIF_EXT = (".gif",)
@@ -1097,9 +1115,18 @@ class VideoPlayer(_DecoderHealth):
                                 frame = cv2.resize(
                                     frame, (max(1, int(fw * sc)), max(1, int(fh * sc))),
                                     interpolation=cv2.INTER_AREA)
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
                         h, w, _ = rgb.shape
-                        img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+                        # ★ 2026-11-08：输出 BGRA/RGB32，而不是 RGB888。
+                        #   QPainter 对 RGB888 源每帧都要在合成时做一次格式转换：
+                        #   实测 1080p 3 层 14.2ms vs RGB32 4.2ms（3.4 倍）。
+                        #   解码线程多做一次 BGR→BGRA（本来就要 BGR→RGB）几乎免费，
+                        #   却把每帧的合成成本砍掉一大截。
+                        if os.environ.get("AUTO_VJ_RGB888") == "1":
+                            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGRA2RGB)
+                            img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+                        else:
+                            img = QImage(rgb.data, w, h, 4 * w, QImage.Format_RGB32)
                         self._img = img.copy()
                         # ★ pts 与 _img 同源（position() 只读它；取不到就给 None）
                         try:
@@ -1218,9 +1245,11 @@ class AvAlphaPlayer(_DecoderHealth):
     构造立即返回，不做任何 I/O。
     """
 
-    def __init__(self, path, avmod):
+    def __init__(self, path, avmod, out_alpha=True):
         self.path = path
         self._av = avmod
+        self.out_alpha = bool(out_alpha)
+        self._qfmt = QImage.Format_ARGB32 if self.out_alpha else QImage.Format_RGB32
         self.c = None          # 由解码线程打开
         self.st = None
         self.fps = 30.0
@@ -1421,7 +1450,7 @@ class AvAlphaPlayer(_DecoderHealth):
                                 arr, (max(1, int(w * sc)), max(1, int(h * sc))),
                                 interpolation=cv2.INTER_AREA)
                             h, w = arr.shape[:2]
-                    img = QImage(arr.data, w, h, 4 * w, QImage.Format_ARGB32)
+                    img = QImage(arr.data, w, h, 4 * w, self._qfmt)
                     self._img = img.copy()
                     self._pts = fsec                      # ★ 与 _img 同源（可 None）
                     ok = True
@@ -1846,6 +1875,11 @@ class GpuDxvPlayer(_DecoderHealth):
         self._src_w = 0
         self._src_h = 0
         self._fmt = 0
+        # cue（码表）需要与其它播放器一致的定位/读数接口。GPU 路径直接从
+        # demux 包的 pts 取时间；软解路径从解码帧的 pts 取。
+        self._pts = None
+        self._seek_req = None
+        self._skip_until = None
         self.gpu = False           # 诊断：**当前**是否真的走 GPU
         self.gpu_want = False      # ★ 素材允许走 GPU（即使此刻工作线程没就绪）
                                    #   ⇒ 用 `_gpu_frames()` 进自愈路径，别用 `_soft_frames`
@@ -1874,6 +1908,41 @@ class GpuDxvPlayer(_DecoderHealth):
     def warm_up(self):
         """预热：提前在解码线程里开容器 + 判路径 + 解出首帧（切到时立即有画面）。"""
         self._warm = 1
+
+    def seek(self, sec) -> bool:
+        """Request a seek for the next demux step (cue / external control).
+
+        DXV is intra-frame only, so a container seek lands on the requested
+        frame; the demux loop still guards with ``_skip_until`` for safety.
+        """
+        try:
+            t = float(sec)
+        except (TypeError, ValueError):
+            return False
+        if t < 0.0 or t != t:
+            return False
+        self._seek_req = t
+        return True
+
+    def position(self):
+        """素材内秒数 of the last published frame (None until first frame)."""
+        return self._pts
+
+    def _consume_seek(self):
+        """Apply a pending seek to the PyAV container. False = no request."""
+        req = self._seek_req
+        if req is None:
+            return False
+        self._seek_req = None
+        try:
+            tb = float(self.st.time_base)
+            self.c.seek(int(float(req) / tb), backward=True)
+            self._skip_until = float(req)
+        except Exception:
+            # Container seek may fail / land at 0 for some DXV files; the
+            # demux loop still discards until the requested pts.
+            self._skip_until = float(req)
+        return True
 
     def current(self) -> QImage:
         return self._img
@@ -1970,7 +2039,9 @@ class GpuDxvPlayer(_DecoderHealth):
             #   → 撞上 NVIDIA 驱动偶发挂死）。改为向**进程唯一**的 GL 工作线程申请：
             #   它只建 1 个上下文且**永不销毁**，所有解码排队串行执行。
             worker = glctx.GLWorker.get()
-            if not worker.ensure():
+            # 解码线程里最多等 3 秒；超时就先软解，`_gpu_frames()` 的周期重探
+            # 会在工作线程就绪后自动切回 GPU（绝不把首帧拖 12 秒）。
+            if not worker.ensure(3.0):
                 err = worker.last_error or "未知"
                 # ⚠ 「配额达上限」只是**这一个素材**的事（走软解就行），
                 #   不能把整条 GPU 路径全局关掉 —— 否则一次瞬时超限会永久禁用 GPU 解码。
@@ -2055,26 +2126,48 @@ class GpuDxvPlayer(_DecoderHealth):
                 continue
             gone = False
             produced = 0
+            # cue / external seek request (demux thread only)
+            self._consume_seek()
+            seeked = False
             try:
                 for pkt in self.c.demux(self.st):
+                    if self._seek_req is not None:
+                        self._consume_seek()
+                        seeked = True
+                        break
                     if not pkt.size:
                         continue
+                    pts = None
+                    try:
+                        if pkt.pts is not None:
+                            pts = float(pkt.pts) * float(self.st.time_base)
+                    except Exception:
+                        pts = None
+                    if (self._skip_until is not None and pts is not None
+                            and pts < self._skip_until - 1e-6):
+                        continue
+                    if self._skip_until is not None and pts is not None:
+                        self._skip_until = None
                     r = dxvnative.frame_blocks(bytes(pkt), self._src_w, self._src_h)
                     if r is None:
                         continue
                     fmt, blk = r
                     dw, dh = self._dst_size()
                     arr = worker.decode(blk, self._src_w, self._src_h, fmt, dw, dh,
-                                        bgra=True)
+                                        bgra=True,
+                                        priority=(int(getattr(self, "_frames", 0) or 0) == 0))
                     if arr is None:
                         if not worker.available():
                             gone = True
                             break
                         continue
                     produced += 1
+                    self._pts = pts
                     yield QImage(arr.data, dw, dh, 4 * dw, self._qfmt).copy()
             except Exception:                                          # noqa: BLE001
                 pass
+            if seeked:
+                continue                  # re-enter with new container position
             if gone:
                 continue                  # 回顶部：降级 → 软解 + 周期重探（worker 恢复即回 GPU）
             # ⚠ 空转退避：整趟 demux 一个帧都没解出来（全是坏包 / 不是真 DXV）时，
@@ -2127,8 +2220,13 @@ class GpuDxvPlayer(_DecoderHealth):
                     return False
                 continue
             got = 0
+            seeked = False
             try:
                 for frame in self.c.decode(video=0):
+                    if self._seek_req is not None:
+                        self._consume_seek()
+                        seeked = True
+                        break
                     try:
                         arr = frame.to_ndarray(format="bgra")
                     except Exception:
@@ -2143,6 +2241,12 @@ class GpuDxvPlayer(_DecoderHealth):
                             arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))),
                                              interpolation=cv2.INTER_AREA)
                             h, w = arr.shape[:2]
+                    try:
+                        _pts = getattr(frame, "pts", None)
+                        self._pts = (float(_pts) * float(self.st.time_base)
+                                     if _pts is not None else None)
+                    except Exception:
+                        self._pts = None
                     yield QImage(arr.data, w, h, 4 * w, self._qfmt).copy()
                     now = time.perf_counter()
                     if now >= next_probe:
@@ -2151,6 +2255,8 @@ class GpuDxvPlayer(_DecoderHealth):
                             return True       # ★ 恢复：切回 GPU 路径
             except Exception:                                      # noqa: BLE001
                 pass
+            if seeked:
+                continue
             # ⚠ 空转退避：理由同 `_soft_frames`（解不出来的素材不能占着一个核空转）
             empty = 0 if got else empty + 1
             if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
@@ -2179,8 +2285,13 @@ class GpuDxvPlayer(_DecoderHealth):
         while True:
             got = 0
             conv_fail = 0
+            seeked = False
             try:
                 for frame in self.c.decode(video=0):
+                    if self._seek_req is not None:
+                        self._consume_seek()
+                        seeked = True
+                        break
                     try:
                         arr = frame.to_ndarray(format="bgra")
                     except Exception:                              # noqa: BLE001
@@ -2199,9 +2310,17 @@ class GpuDxvPlayer(_DecoderHealth):
                                              interpolation=cv2.INTER_AREA)
                             h, w = arr.shape[:2]
                     got += 1                       # ★ 只有真正要 yield 一帧才算"出帧"
+                    try:
+                        _pts = getattr(frame, "pts", None)
+                        self._pts = (float(_pts) * float(self.st.time_base)
+                                     if _pts is not None else None)
+                    except Exception:
+                        self._pts = None
                     yield QImage(arr.data, w, h, 4 * w, self._qfmt).copy()
             except Exception:                                      # noqa: BLE001
                 pass
+            if seeked:
+                continue
             empty = 0 if got else empty + 1
             if empty >= _SOFT_EMPTY_BACKOFF_AFTER:
                 time.sleep(min(0.2, 0.02 * empty))
@@ -2251,6 +2370,14 @@ class GpuDxvPlayer(_DecoderHealth):
                 self._cap = cap
             got = 0
             while not self._dead:
+                req = self._seek_req
+                if req is not None:
+                    self._seek_req = None
+                    try:
+                        self._cap.set(cv2.CAP_PROP_POS_MSEC, float(req) * 1000.0)
+                        self._skip_until = float(req)
+                    except Exception:
+                        self._skip_until = None
                 try:
                     ok, bgr = self._cap.read()
                 except Exception:                                  # noqa: BLE001
@@ -2258,6 +2385,16 @@ class GpuDxvPlayer(_DecoderHealth):
                 if not ok or bgr is None:
                     break
                 h, w = bgr.shape[:2]
+                try:
+                    _ms = float(self._cap.get(cv2.CAP_PROP_POS_MSEC))
+                    pts = _ms / 1000.0 if _ms >= 0 else None
+                except Exception:
+                    pts = None
+                if (self._skip_until is not None and pts is not None
+                        and pts < self._skip_until - 1e-6):
+                    continue
+                if self._skip_until is not None and pts is not None:
+                    self._skip_until = None
                 if self._max_w and self._max_h:
                     s = min(self._max_w / w, self._max_h / h)
                     if s < 1.0:
@@ -2267,6 +2404,7 @@ class GpuDxvPlayer(_DecoderHealth):
                 # cv2 给的是 BGR；QImage 的 Format_ARGB32/RGB32 在内存里都是 BGRA 字节序 ⇒ 补 alpha
                 bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
                 got += 1
+                self._pts = pts
                 yield QImage(bgra.data, w, h, 4 * w, self._qfmt).copy()
             if self._dead:
                 return
@@ -2389,12 +2527,9 @@ def create_video_player(item, cue=False):
     """视频播放器工厂：带 alpha 的视频用 PyAV 解码（保留透明），其余走 OpenCV。
 
     `cue`（**关键字，默认 False**）：这是不是**码表（cue）场景**的播放器。
-      · `cue=True` 且素材是 DXV ⇒ **跳过 GPU 解码**（`GpuDxvPlayer`），落到 PyAV 软解路径。
-        原因：`GpuDxvPlayer` 的帧生成器（`_gpu_frames()/_soft_gen()`）**不暴露 pts**，
-        而码表要靠 `position()` 做漂移校正（否则 `src_in`/漂移/出点冻结全都做不到）。
-        实测软解 DXV 定位 **39ms / 落点误差 0**，够用。
-      · `cue=False`（普通图层/预览）⇒ **与原逻辑逐值一致**，一行不变。
-    ⚠ 不加全局开关、不改环境变量：**只有显式传 `cue=True` 才生效**。
+      · DXV 现在两条路径都支持 `position()` / `seek()`（GpuDxvPlayer 也补了），
+        所以 cue=True 不再强制跳过 GPU；GPU 不可用时自动回退软解。
+      · `cue=False`（普通图层/预览）⇒ 与原逻辑一致。
 
     **这里绝不能打开容器做探测**：`_av_probe_alpha` 会 `av.open(path)`，对 4K/DXV 要几十
     到两百毫秒，而本函数是在渲染线程里调的（切素材那一下）→ 直接卡几帧。
@@ -2435,20 +2570,20 @@ def create_video_player(item, cue=False):
         import av as avmod                              # 模块导入期已预热，这里几乎零成本
     except Exception:
         avmod = None
-    # GPU 解码（实验）：**只接管 DXV 素材**（普查 144/164，见 tools/_dxv_inventory.py）。
+    # GPU 解码：**只接管 DXV 素材**（普查 144/164，见 tools/_dxv_inventory.py）。
     # 「是不是 DXV」由后台编码普查填进 item._is_dxv —— 没填好时不接管（走原路径），
     # 后台补完下一次切到它就能用，绝不在这里 av.open。
     # `out_alpha` 传「按现状这个素材会不会输出 alpha 通道」，保证画面与改动前一致。
+    # ★ 2026-11-08：GpuDxvPlayer 已补 position()/seek()（demux pts + 容器 seek），
+    #   码表图层也能走 GPU 解码；不再对 cue 强行回退软解。
     if gpu_decode_enabled() and avmod is not None:
         dxv = getattr(item, "_is_dxv", None)
         if dxv is None:
             _probe_codec_async(item)
         elif dxv:
-            if cue:
-                # 码表场景：GPU 播放器没有 pts ⇒ 无法 seek/position（见函数 docstring）
-                _log_cue_gpu_skip(item.path)
-            else:
-                return GpuDxvPlayer(item.path, avmod, out_alpha=bool(has))
+            return GpuDxvPlayer(item.path, avmod, out_alpha=bool(has))
+    if _SAFE_DECODE and avmod is not None:
+        return AvAlphaPlayer(item.path, avmod, out_alpha=bool(has))
     if has and avmod is not None:
         return AvAlphaPlayer(item.path, avmod)          # 构造不再阻塞（容器在解码线程开）
     return VideoPlayer(item.path)

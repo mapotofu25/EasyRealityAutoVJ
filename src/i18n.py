@@ -79,6 +79,7 @@ STRINGS = {
     "pause_auto": {"zh": "暂停自动", "en": "Pause Auto"},
     "next_scene": {"zh": "下一素材", "en": "Next Clip"},
     "intensity": {"zh": "自动强度", "en": "Intensity"},
+    "intensity_off": {"zh": "关闭", "en": "Off"},
     "intensity_low": {"zh": "低", "en": "Low"},
     "intensity_mid": {"zh": "中", "en": "Medium"},
     "intensity_high": {"zh": "高", "en": "High"},

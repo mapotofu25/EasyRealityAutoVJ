@@ -46,6 +46,12 @@ class SpoutOut:
         self._sent = 0              # 成功提交帧数（诊断用）
         self._longest_ms = 0.0      # 单帧 sendImage 最长耗时（诊断用）
         self._size = (0, 0)
+        # ★ 2026-11-08（输出偶发卡顿）：**复用发送缓冲**，不再每帧分配 3.7MB bytearray。
+        #   每帧新建大 buffer 会持续推高 Python GC/分配压力；Spout 发送线程拿到 GIL 时
+        #   偶发一次长时间停顿，渲染线程和执行输出一起卡住。缓冲在渲染线程/发送线程
+        #   之间通过队列交接，任意时刻只属于一方，无需加长锁。
+        self._free = []
+        self._buf_max = 4
 
     # ---------------------------------------------------------------- 生命周期
     def start(self):
@@ -60,7 +66,10 @@ class SpoutOut:
         self._dead = True
         try:
             while True:
-                self._q.get_nowait()
+                item = self._q.get_nowait()
+                if item is not None:
+                    with self._lock:
+                        self._free.append(item[0])
         except queue.Empty:
             pass
         try:
@@ -70,6 +79,8 @@ class SpoutOut:
         if self._thr is not None:
             self._thr.join(timeout=1.0)
             self._thr = None
+        with self._lock:
+            self._free.clear()
 
     # ---------------------------------------------------------------- 渲染线程侧
     def send(self, bits, w, h, bpl=0):
@@ -100,28 +111,44 @@ class SpoutOut:
             pass
         if len(mv) < total:
             return False
-        # ★ 拷贝：`bits` 是画布的活动视图，渲染线程下一帧就会覆写（同 NDI 的坑）
-        if bpl and bpl != need:
+        # ★ 复用缓冲（见 __init__ 说明）：优先从 free 池取，池空才分配。
+        buf = None
+        with self._lock:
+            while self._free:
+                b = self._free.pop()
+                if len(b) == total:
+                    buf = b
+                    break
+                if len(b) > total:
+                    buf = b
+                    break
+        if buf is None:
             buf = bytearray(total)
+        # 拷贝：`bits` 是画布的活动视图，渲染线程下一帧就会覆写（同 NDI 的坑）
+        if bpl and bpl != need:
             for y in range(h):
                 s = y * bpl
                 buf[y * need:(y + 1) * need] = mv[s:s + need]
         else:
-            buf = bytearray(mv[:total])
+            buf[:total] = mv[:total]
         self._size = (w, h)
         self.start()
-        # 只保留最新帧：满了就丢掉旧的
+        # 只保留最新帧：满了就丢掉旧的（旧缓冲立即回收，绝不泄漏）
         try:
             self._q.put_nowait((buf, w, h))
         except queue.Full:
             try:
-                self._q.get_nowait()
+                old = self._q.get_nowait()
+                if old is not None:
+                    with self._lock:
+                        self._free.append(old[0])
             except queue.Empty:
                 pass
             try:
                 self._q.put_nowait((buf, w, h))
             except queue.Full:
-                pass
+                with self._lock:
+                    self._free.append(buf)
         return True
 
     def last_error(self):
@@ -160,7 +187,13 @@ class SpoutOut:
                     break
                 buf, w, h = item
                 t0 = time.perf_counter()
-                s.sendImage(buf, w, h, GL_BGRA_EXT, False, 0)
+                try:
+                    s.sendImage(buf, w, h, GL_BGRA_EXT, False, 0)
+                finally:
+                    # 缓冲交还给渲染线程复用（限制上限，分辨率切换时旧尺寸自然淘汰）
+                    with self._lock:
+                        if len(self._free) < self._buf_max:
+                            self._free.append(buf)
                 dt = (time.perf_counter() - t0) * 1000
                 with self._lock:
                     self._sent += 1

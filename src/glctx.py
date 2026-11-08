@@ -649,9 +649,9 @@ class GLDecoder:
 class _GLReq:
     """一次解码请求（投给 GL 工作线程，等它把 result 填好并 set event）。"""
     __slots__ = ("blocks", "src_w", "src_h", "fmt", "dst_w", "dst_h", "bgra",
-                 "result", "cancelled", "event")
+                 "result", "cancelled", "event", "priority")
 
-    def __init__(self, blocks, src_w, src_h, fmt, dst_w, dst_h, bgra):
+    def __init__(self, blocks, src_w, src_h, fmt, dst_w, dst_h, bgra, priority=False):
         self.blocks = blocks
         self.src_w = int(src_w)
         self.src_h = int(src_h)
@@ -659,6 +659,7 @@ class _GLReq:
         self.dst_w = int(dst_w)
         self.dst_h = int(dst_h)
         self.bgra = bool(bgra)
+        self.priority = bool(priority)   # 新素材首帧：插队，避免排在老素材后面等超时
         self.result = None; self.cancelled = False    # cancelled：被超时清理唤醒（=失败，非探测成功）
         self.event = threading.Event()
 
@@ -878,7 +879,8 @@ class GLWorker:
     _degrade_until = 0.0        # 冷却截止时刻（perf_counter）
 
     # ---------------------------------------------------------------- 请求
-    def decode(self, blocks, src_w, src_h, fmt, dst_w, dst_h, bgra=True, timeout=None):
+    def decode(self, blocks, src_w, src_h, fmt, dst_w, dst_h, bgra=True, timeout=None,
+               priority=False):
         """把一次 GPU 解码派给工作线程，带超时。返回 (dst_h,dst_w,4) uint8 或 `None`。
 
         R2 降级/自恢复（详见类属性处说明）：
@@ -897,7 +899,7 @@ class GLWorker:
         if dec is not None and not getattr(dec, "ok", False):
             return None               # 解码器已自降级（如回读连续过慢）→ 立即失败，上层转软解
         to = self.decode_timeout if timeout is None else float(timeout)
-        req = _GLReq(blocks, src_w, src_h, fmt, dst_w, dst_h, bgra)
+        req = _GLReq(blocks, src_w, src_h, fmt, dst_w, dst_h, bgra, priority=priority)
         # ---- 临界区：状态判定 + 入队，一次原子完成（复用请求条件变量的锁）----
         with self._cv:
             if self._dead or not self._ready_evt.is_set():
@@ -908,7 +910,10 @@ class GLWorker:
             was_degraded = self._degraded
             if was_degraded:          # 冷却已过 → 本次即“唯一探测”：立刻重新武装冷却，
                 self._degrade_until = now + float(self.RECOVER_AFTER)   # 其他线程随即零等待
-            self._req.append(req)
+            if priority:
+                self._req.appendleft(req)
+            else:
+                self._req.append(req)
             self._cv.notify()
         if req.event.wait(to):
             if req.cancelled or req.result is None:

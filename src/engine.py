@@ -11,12 +11,15 @@
 段落标签/能量趋势/人声占比 每秒打分，选最高分模式；手动模式可强制固定。
 """
 import collections
+import copy
 import hashlib
 import math
 import os
+import queue
 import random
 import threading
 import time
+import uuid
 
 import cv2
 import numpy as np
@@ -28,6 +31,7 @@ from media_manager import make_player, _STALL_SECS
 from match_engine import match_clips
 from beatgrid import GridClock
 import sections                     # 能量段落表（曲库预设，见 src/sections.py）
+import output_model                 # 多屏输出配置（纯数据模型）
 from fp import hint_window_frames
 from cue_position import CuePositionTracker, choose_sheet   # 位置层（指纹→拍位，带回滞）
 from cue_seek_policy import CueSeekPolicy      # 码表 seek 策略（纯逻辑，见 tools/cue_should_seek_test.py）
@@ -237,7 +241,14 @@ class _LayerHealthLog:
         self.lines = collections.deque(maxlen=self.max_lines)
         self.fh = None
         self.n = 0          # 文件中当前行数
+        self._q = queue.Queue(maxsize=256)
+        self._closing = False
+        self._thr = None
         self._open()
+        if self.fh is not None:
+            self._thr = threading.Thread(target=self._writer, name="autovj-health-log",
+                                         daemon=True)
+            self._thr.start()
 
     def _open(self):
         try:
@@ -279,19 +290,52 @@ class _LayerHealthLog:
             pass
 
     def write(self, line):
-        if self.fh is None:
+        """渲染线程只入队；真正的 write/flush 在后台线程。
+
+        ★ 2026-11-08（码表演出掉帧）：真机 cProfile 里 6 次
+          `TextIOWrapper.write` 累计 **1.29s**（单次可达 200ms+），而它原来跑在
+          引擎渲染线程上（每秒一次）⇒ 每次写健康日志都可能直接吃掉好几帧。
+          现在渲染线程只 `put_nowait`（微秒级），磁盘再慢也只卡后台线程。
+        """
+        if self.fh is None or self._closing:
             return
         try:
-            self.fh.write(line + "\n")
-            self.fh.flush()          # 每秒才一次，flush 成本可忽略；好处是崩溃也不丢证据
-            self.lines.append(line)
-            self.n += 1
-            if self.n >= self.max_lines:
-                self._rewrite(self.keep)
-        except Exception:                                              # noqa: BLE001
-            pass
+            self._q.put_nowait(line)
+        except queue.Full:
+            pass                     # 诊断日志：宁可丢一行，绝不阻塞演出
+
+    def _writer(self):
+        while True:
+            try:
+                line = self._q.get(timeout=0.5)
+            except queue.Empty:
+                if self._closing:
+                    break
+                continue
+            if line is None:
+                break
+            try:
+                self.fh.write(line + "\n")
+                self.fh.flush()      # 后台线程 flush，崩溃也不丢证据；不再影响渲染
+                self.lines.append(line)
+                self.n += 1
+                if self.n >= self.max_lines:
+                    self._rewrite(self.keep)
+            except Exception:                                          # noqa: BLE001
+                pass
 
     def close(self):
+        self._closing = True
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            if self._thr is not None:
+                self._thr.join(timeout=1.0)
+        except Exception:                                              # noqa: BLE001
+            pass
+        self._thr = None
         try:
             if self.fh is not None:
                 self.fh.flush()
@@ -532,6 +576,7 @@ class Layer:
     def __init__(self, name):
         Layer._uid += 1
         self.name = name
+        self.lid = "lay_" + uuid.uuid4().hex[:12]   # 多屏输出用的稳定 id（写进配置）
         self.visible = True
         self.opacity = 1.0
         self.blend = "normal"    # 混合模式
@@ -583,6 +628,7 @@ class Layer:
         self.prev_player = None
         self.trans_start = 0.0
         self.trans_active = False
+        self._trans_prev_item = None   # 过渡中旧素材的 transform（换池后 lay.clips 已变）
         self.trans_ms = None     # 切换时的过渡时长（None=用当前模式的）
         self.last_switch_t = 0.0
         self.recent = []         # 防重复队列
@@ -610,6 +656,7 @@ class Layer:
         self.pre_idx = -1        # 预选的下一个素材索引
         self.warm_pend = False   # 是否已安排预热
         self.warm_at = 0.0       # 预热执行时刻（错开切换瞬间，避免和正在解码的素材抢 CPU）
+        self._presec_path = None # 段落边界前专门预热的素材 path（见 engine._presec_tick）
         # 逐拍交替状态
         self.pair = None         # (idx_a, idx_b)
         self.pair_turn = 0
@@ -654,7 +701,8 @@ class Layer:
         self.cs_states = []
 
     def to_dict(self):
-        return {"name": self.name, "visible": self.visible, "opacity": self.opacity,
+        return {"lid": self.lid,
+                "name": self.name, "visible": self.visible, "opacity": self.opacity,
                 "blend": self.blend, "solo": self.solo,
                 "speed": self.speed, "pause_silent": self.pause_silent,
                 "use_alpha": self.use_alpha, "lock_motion": self.lock_motion,
@@ -805,6 +853,13 @@ class AutoVJEngine(QObject):
         # 未注入时为 None ⇒ 调用方必须能退化成"只读 `self.audio` 的公开状态"。
         self._audio_engine = None
         self.library = media_library
+        # ★ 安全视频解码：必须在创建任何播放器之前设置（配置默认开）。
+        #   普通视频走 PyAV，避开 OpenCV cv2.pyd 的 native 闪退。
+        try:
+            import media_manager as _mm
+            _mm.set_safe_decode(bool((self.cfg["perf"] or {}).get("safe_decode", True)))
+        except Exception:
+            pass
         self.layers = []
         # ---- 码表（cue）引擎级状态（S3 数据面；S4 起由 _cuesheet_tick 消费）----
         self._cue_sheet = None      # 当前码表（cuesheet.CueSheet）
@@ -886,6 +941,24 @@ class AutoVJEngine(QObject):
         # Spout 输出（懒加载，运行在引擎线程）
         self._latest_frame = None      # 最新合成帧（frame_ready 只投序号，帧放这）
         self._frame_seq = 0            # 帧序号（绘制端用来去重）
+        # ---- 多屏输出（2026-11-08）----
+        #   `_out_cfg` 是活动配置的深拷贝；None = 还没启用多屏，走旧单路逻辑。
+        #   `_screen_canvases` 只保存**独立屏幕**的画布；主屏用 self.canvas。
+        #   `_route_thumbs` 是给上方预览工作区的降采样帧（全屏 1080p 不进 GUI）。
+        self._out_cfg = None
+        self._out_mode = "multi"
+        self._screen_canvases = {}
+        self._combined_canvas = None
+        self._route_thumbs = {}
+        self._route_frames = {}        # 发送端用（全分辨率，引用/裁切缓存）
+        self._preview_route_id = ""
+        self._route_senders = {}       # sid -> {"spout":..., "ndi":..., ...}
+        self._route_state = {}         # sid -> 失败退避/日志状态
+        self._plan_rev = 0             # 配置变更代数（发送端重建用）
+        self._plan_rev_ready = -1      # 已重建到的代数
+        self._thumb_tick = 0
+        self._thumb_every = 2          # 30fps 时预览缩略图 15fps
+        self._combined_key = None
         self._spout = None
         self._spout_fail = False       # True=当前处于"失败退避"态（ui_main 置 False ⇒ 立即重试）
         # Spout 退避重试状态（见 `_spout_send` / `_output_fail`）：1→2→4→8→…→30s，成功清零
@@ -967,8 +1040,33 @@ class AutoVJEngine(QObject):
         self._sec_switch_n = 0           # 段落触发的切换次数（取证）
         self._sec_reset_n = 0            # 段落状态被重置的次数（换歌/无表，取证用）
         self._sec_why = ""               # 最近一次切换/重置的原因（取证用）
-        self.canvas = QImage(1280, 720, QImage.Format_RGB32)
-        self.canvas.fill(Qt.black)
+        # ★ 2026-11-08（素材掉帧）：下一段**提前预热**状态。
+        #   段落边界换池时若选中一个全新解码器，首帧要现开容器（大 DXV/机械盘
+        #   实测可到 1~2 秒）。这里在边界前 `_PRESEC_LEAD_SEC` 秒，按下一段的
+        #   档位预先 `match_clips` + 随机选一个 + `warm_up()`；边界切换时优先
+        #   用这个已预热的素材（仍然随机选，不偏向近期用过的素材）。
+        self._presec_key = None          # (sid, 下一段索引)；同一段只预热一次
+        self._presec_lead = 4.0          # 提前多少秒开始预热
+        # Spout/NDI Alpha：开启时画布用 ARGB32（直通 alpha，非预乘），
+        # 这样 Spout/NDI 可以原样发 BGRA+A；显示器窗口仍按黑底画。
+        self._alpha_out = bool(self.cfg["output"].get("alpha_enabled", False))
+        self.canvas = QImage(1280, 720, self._canvas_format())
+        self._clear_canvas(self.canvas)
+        # ---- optional GPU composition (QPainter on QOpenGLPaintDevice) ----
+        # Deliberately optional: a failed context / unsupported blend set must
+        # fall back to the existing CPU path without affecting playback.
+        self._gpu_comp = None
+        self._gpu_mode = "cpu"
+        self._gpu_dead = False
+        self._gpu_premul = {}          # QImage.cacheKey -> premultiplied image
+        self._gpu_premul_order = []
+        self._gpu_premul_max = 24
+        self._gpu_frame_consumers = True   # skip GUI copy when no preview/output
+        self._gpu_last_reason = ""
+        self._gpu_active = False
+        # adaptive render cadence: never compose faster than the source material
+        self._effective_fps = None
+        self._fps_next_t = 0.0
         # 颜色渲染器（一键调色）。状态机在 colorfx.ColorRenderer 里，每帧 tick 一次；
         # 它只在「颜色/强度」变化时重建 LUT，每帧只做一次查表（~1.7ms @1080p）。
         try:
@@ -996,6 +1094,12 @@ class AutoVJEngine(QObject):
         # 每层健康快照日志（懒创建；见 `_health_tick` / `_LayerHealthLog`）
         self._health_log = None
         self._health_next_t = 0.0
+        # 引擎 tick 间隔 / 单次处理耗时（供 GUI 输出卡顿日志关联；见 `_tick`）
+        self._last_tick_t = 0.0
+        self._tick_gap_ms = 0.0
+        self._tick_ms = 0.0
+        self._tick_log_t = 0.0
+        self._phase = "init"
         # GPU 可用性状态（-1=未知 / 0=否 / 1=是）；状态变化时在 `_health_tick` 写醒目日志
         self._gpu_state = -1
         # ★ GUI 无锁状态快照（见 `ui_snapshot` / `_tick_locked` 尾部）：
@@ -1009,6 +1113,36 @@ class AutoVJEngine(QObject):
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self._tick)
 
+    def _canvas_format(self):
+        """输出画布格式：Alpha 输出用 ARGB32（直通 alpha，Spout/NDI 可直接发），
+        否则保持原来的 RGB32（不透明，零额外开销）。"""
+        return QImage.Format_ARGB32 if self._alpha_out else QImage.Format_RGB32
+
+    def _clear_canvas(self, img):
+        """按当前 Alpha 模式清画布：透明底 or 黑底。"""
+        img.fill(Qt.transparent if self._alpha_out else Qt.black)
+
+    @_locked
+    def set_alpha_output(self, on):
+        """运行中切换 Spout/NDI 的 Alpha 输出：立即按当前分辨率重建画布。
+
+        关闭 → RGB32 黑底（原行为）；开启 → ARGB32 透明底。显示器窗口仍然
+        黑底显示（物理显示器没有 alpha），只有 Spout/NDI 发送透明通道。
+        """
+        on = bool(on)
+        if on == self._alpha_out:
+            return
+        with self._tick_lock:
+            self._alpha_out = on
+            w = max(160, min(7680, int(self.canvas.width())))
+            h = max(120, min(4320, int(self.canvas.height())))
+            self.canvas = QImage(w, h, self._canvas_format())
+            self._clear_canvas(self.canvas)
+            self._latest_frame = None
+            # 多屏：独立屏幕画布也要按新格式重建
+            self._plan_rev = int(getattr(self, "_plan_rev", 0)) + 1
+            self._plan_rev_ready = -1
+
     @_locked
     def set_canvas_size(self, w, h):
         """画布尺寸（输出分辨率）。GUI 线程直接调用，锁内重建，与 worker 的合成串行化。
@@ -1016,8 +1150,8 @@ class AutoVJEngine(QObject):
         w = max(160, min(7680, int(w)))
         h = max(120, min(4320, int(h)))
         with self._tick_lock:
-            self.canvas = QImage(w, h, QImage.Format_RGB32)
-            self.canvas.fill(Qt.black)
+            self.canvas = QImage(w, h, self._canvas_format())
+            self._clear_canvas(self.canvas)
 
     # ---- 线程（由 ui_main 把引擎 moveToThread 到独立线程后调用） ----
     def frame_interval_ms(self):
@@ -1025,11 +1159,15 @@ class AutoVJEngine(QObject):
 
         为什么做成可配：素材大多是 25~30fps，而按 60fps 合成时**有一半左右是把同一帧
         重复合成一遍** —— 在 4 核老机器上是纯浪费（用户目标是把 CPU 让给 VDJ / 直播）。
+        若 `perf.fps_follow_source` 为真，`_auto_fps_tick` 会把有效帧率压到素材帧率，
+        避免对 30fps 素材做 60fps 的重复合成。
         """
         try:
             fps = int((self.cfg["perf"] or {}).get("render_fps", 60) or 60)
         except Exception:
             fps = 60
+        if self._effective_fps:
+            fps = min(fps, int(self._effective_fps))
         fps = max(15, min(120, fps))
         return max(1, int(round(1000.0 / fps)))
 
@@ -1066,9 +1204,33 @@ class AutoVJEngine(QObject):
         except Exception:
             pass
 
+    @_locked
+    def set_fps_follow_source(self, on):
+        """Toggle adaptive cadence and re-apply the timer immediately."""
+        try:
+            if hasattr(self.cfg, "set"):
+                self.cfg.set("perf", "fps_follow_source", bool(on))
+            else:
+                self.cfg.data.setdefault("perf", {})["fps_follow_source"] = bool(on)
+            if hasattr(self.cfg, "save"):
+                self.cfg.save()
+        except Exception:
+            pass
+        self._effective_fps = None
+        try:
+            QMetaObject.invokeMethod(self, "_apply_render_fps", Qt.QueuedConnection)
+        except Exception:
+            pass
+
     @Slot()
     def start(self):
         """在引擎所属线程里启动主循环（QTimer 必须在所属线程启动）"""
+        # Create the optional GPU context here: this slot runs in the engine
+        # thread, which is where every QOpenGLContext call must happen.
+        try:
+            self._init_gpu_backend()
+        except Exception:
+            pass
         if not self.timer.isActive():
             self.timer.start(self.frame_interval_ms())
 
@@ -1085,6 +1247,7 @@ class AutoVJEngine(QObject):
         self.layers = []
         for ld in self.cfg["layers"]:
             lay = Layer(ld.get("name", "Layer"))
+            lay.lid = str(ld.get("lid") or lay.lid)
             lay.visible = ld.get("visible", True)
             lay.opacity = float(ld.get("opacity", 1.0))
             lay.blend = ld.get("blend", "normal") or "normal"
@@ -1433,7 +1596,8 @@ class AutoVJEngine(QObject):
         return info
 
     @_locked
-    def _refresh_auto_layers(self, snap, force_tier=None, force=False):
+    def _refresh_auto_layers(self, snap, force_tier=None, force=False, instant=True,
+                             presec=False):
         """用 `match_clips` 重新挑自动图层的素材池并立即切换。
 
         ★★ 2026-10-30 用户「大砍刀」：**曲风没了**，所以这里不再有"曲风变化才重算"
@@ -1443,8 +1607,11 @@ class AutoVJEngine(QObject):
             · `force=True`（换库、重扫素材、手动重排角色后由 UI 调用）；
             · 否则（每帧 tick 调进来）**只在某层池子为空时补一次**，绝不每帧重 roll
               （那会让随机序列每帧变化 ⇒ 画面狂切）。
-        force_tier: None / "low" / "mid" / "high" —— 池子按动态档过滤/前置。"""
+        force_tier: None / "low" / "mid" / "high" —— 池子按动态档过滤/前置。
+        instant: True = 立即硬切（旧行为）；False = 有旧画面时走当前过渡（段落/能量
+                 跨档用 False，避免用户选了淡入淡出却被 instant 硬切）。"""
         # ★ 段落接管时用目标能量（见 `_energy_for_switch`）
+        self._phase = "refresh_pool"
         energy = self._energy_for_switch(snap)   # 注意：0.0 就是 0.0，不能当成 0.5
         changed = []
         for lay in self.layers:
@@ -1454,6 +1621,8 @@ class AutoVJEngine(QObject):
                 continue                      # 池子非空且非强制 ⇒ 保持现状（不 churn）
             # 记住当前正在播的素材：换池时保留画面，等切换点（小节线）再切
             cur_path = lay.clips[lay.cur].path if (0 <= lay.cur < len(lay.clips)) else None
+            old_item = (lay.clips[lay.cur]
+                        if (0 <= lay.cur < len(lay.clips)) else None)
             picked = list(match_clips(energy, self.library, role=lay.role, n=8,
                                       tier=force_tier))
             lay.clips = list(picked)
@@ -1487,16 +1656,39 @@ class AutoVJEngine(QObject):
                 #   于是整首歌反复看到的就是同样那一两个素材。
                 #   ⇒ 在池里**随机挑一个、且尽量避开当前正在播的**。
                 _k = 0
+                # ★ 段落边界前 `_presec_tick` 已按下一段档位随机选好并预热一个素材；
+                #   这里只要它仍在新池里就直接用它（首帧现成），否则退回纯随机。
+                #   只影响“段落边界”这一刀，不对普通按拍切换或缓存素材做任何偏向。
+                _presec_path = getattr(lay, "_presec_path", None) if presec else None
+                if presec:
+                    lay._presec_path = None
                 try:
                     if len(picked) > 1:
                         _cand = [i for i, _c in enumerate(picked)
                                  if getattr(_c, "path", None) != cur_path]
-                        _k = random.choice(_cand or list(range(len(picked))))
+                        _pre = -1
+                        if _presec_path:
+                            for _idx in _cand:
+                                if getattr(picked[_idx], "path", None) == _presec_path:
+                                    _pre = _idx
+                                    break
+                        _k = _pre if _pre >= 0 else random.choice(
+                            _cand or list(range(len(picked))))
                 except Exception:                                # noqa: BLE001
                     _k = 0
                 lay.cur = -1
                 lay.prev_idx = -1
-                self._switch_layer_to(lay, _k, instant=True)
+                lay.pre_idx = -1
+                if (not instant) and lay.player is not None:
+                    self._switch_layer_to(lay, _k, instant=False)
+                    if old_item is not None:
+                        lay._trans_prev_item = old_item
+                else:
+                    self._switch_layer_to(lay, _k, instant=True)
+                try:
+                    self._schedule_warm(lay, delay=0.8)      # 提前暖下一个候选
+                except Exception:                            # noqa: BLE001
+                    pass
             else:
                 # 当前素材仍在新池 → 保持索引（画面不断）；已不在新池 → -1（画面暂留旧 player，
                 # 由 _auto_switch_tick 的下一个小节线切换点换成新池素材）
@@ -1685,6 +1877,9 @@ class AutoVJEngine(QObject):
             self._sec_idx = -1
             self._sec_energy = None
             self._sec_tier = None
+            self._presec_key = None
+            for _lay in self.layers:
+                _lay._presec_path = None
             self._sec_reset_n += 1
             self._sec_why = "no-table"
             self._sec_info = {"state": "本曲无段落表"}
@@ -1698,15 +1893,18 @@ class AutoVJEngine(QObject):
             self._sec_seen_path = self._sec_path
             self._sec_idx = -1
             self._sec_applied_idx = -1
+            self._presec_key = None
+            for _lay in self.layers:
+                _lay._presec_path = None
             self._sec_reset_n += 1
             self._sec_why = "song-change"
 
         self._sec_list = secs
         self._sec_lost_t = 0.0          # 位置回来了 ⇒ 掉锁计时复位（见掉锁冻结分支）
-        # ★★★ 2026-11-06（用户：「按段落切换加一个」）：按**提前一拍**的位置判段，
-        #   等价于在段落边界前 1 拍就切过去（听感上正好对上）。
-        #   ⚠ 只影响"什么时候认为进了新段"，`_sec_info["sec"]` 仍记真实秒数。
-        _adv_beats = float(getattr(self, "SECTION_ADVANCE_BEATS", 1.0))
+        # ★ 2026-11-08：段落判定**不再提前一拍**（SECTION_ADVANCE_BEATS=0）。
+        #   历史 2026-11-06 曾加 1 拍提前量；用户实测要求去掉，段落边界按真实秒数判。
+        #   `_adv_beats` 保留为常量入口，未来如需微调只改类常量。
+        _adv_beats = float(getattr(self, "SECTION_ADVANCE_BEATS", 0.0))
         # ⚠ `trk` 在**本函数更后面**才赋值（`_trk = self._cue_pos_tracker`），
         #   这里直接用会 NameError ⇒ 整个 `_section_tick` 每帧抛异常 ⇒
         #   段落切换**一次都不执行**（用户 2026-11-07：素材固定不动）。
@@ -1726,6 +1924,13 @@ class AutoVJEngine(QObject):
                           "sec": round(float(sec), 2),
                           "tier": cur["tier"], "e": cur["energy"],
                           "name": cur["name"]}
+        # ★ 下一段提前预热（见 `_presec_tick` / `__init__` 注释）：
+        #   必须在 `i != _sec_applied_idx` 判段**之前**执行，边界那一帧
+        #   `_apply_section_switch` 才能用上已预热的播放器。
+        try:
+            self._presec_tick(sid, secs, i, sec)
+        except Exception:                                      # noqa: BLE001
+            pass
         # ★★ 只认**段索引变化**（2026-10-28 真机验收修复）：
         #   原来还带了 `or prev_tier != cur["tier"]`，而 `_sec_tier` 会在「位置短暂失效」
         #   分支被清成 None ⇒ 位置一恢复 `None != "mid"` 就再切一次 ⇒ 实测 150 秒内
@@ -1751,6 +1956,79 @@ class AutoVJEngine(QObject):
                 pass
             self._apply_section_switch(snap, cur)
 
+    def _presec_tick(self, sid, secs, i, sec):
+        """段落边界前 `lead` 秒，按**下一段**的档位预热一个素材。
+
+        为什么要做（2026-11-08 现场「素材掉帧」）：
+          段落切换会 `_refresh_auto_layers(force_tier=...)` 重建 8 个候选并立即
+          选一个切过去。若选中的是全新解码器，首帧要现开容器 + 等 GPU/软解
+          （大 DXV、机械盘实测 1~2 秒）；这 1~2 秒里旧素材继续显示/冻结，
+          看起来就是「素材掉帧」。提前 4 秒预热，边界那一下新播放器已经有首帧。
+
+        随机性：这里仍然 `random.choice` 选候选，和边界原来的纯随机同分布；
+        只是把“选”提前了 4 秒，不会偏向近期用过的素材。
+        """
+        if not getattr(self, "running", False) or getattr(self, "locked", False):
+            return
+        try:
+            n = len(secs)
+            if i < 0 or i + 1 >= n:
+                return
+            nxt = secs[i + 1] or {}
+            t0 = float(nxt.get("t0") or 0.0)
+            lead = t0 - float(sec)
+            if lead <= 0.0 or lead > float(getattr(self, "_presec_lead", 4.0)):
+                return
+            key = (int(sid), int(i + 1))
+            if key == getattr(self, "_presec_key", None):
+                return
+            # 换目标段：清掉上一轮（不必关闭播放器，缓存会按 LRU 复用/淘汰）
+            for lay in self.layers:
+                try:
+                    lay._presec_path = None
+                except Exception:                              # noqa: BLE001
+                    pass
+            self._presec_key = key
+
+            tier = nxt.get("tier") or "mid"
+            energy = float(nxt.get("energy") or 0.0)
+            try:
+                seed = int(self.cfg["auto"].get("seed") or 0)
+            except Exception:                                  # noqa: BLE001
+                seed = 0
+            rng = random.Random(seed) if seed else self.rng
+            warmed = 0
+            for lay in self.layers:
+                if not getattr(lay, "auto_mode", False):
+                    continue
+                if getattr(lay, "fixed", -1) >= 0 or not getattr(lay, "clips", None):
+                    continue
+                if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
+                    continue
+                try:
+                    picked = list(match_clips(energy, self.library, role=lay.role,
+                                              n=8, tier=tier))
+                except Exception:                              # noqa: BLE001
+                    continue
+                if not picked:
+                    continue
+                cur_path = (lay.clips[lay.cur].path
+                            if 0 <= lay.cur < len(lay.clips) else None)
+                cands = [c for c in picked if getattr(c, "path", None) != cur_path]
+                clip = rng.choice(cands or picked)
+                try:
+                    p = self._get_player(lay, clip)
+                    if hasattr(p, "warm_up"):
+                        p.warm_up()
+                    lay._presec_path = getattr(clip, "path", None)
+                    warmed += 1
+                except Exception:                              # noqa: BLE001
+                    lay._presec_path = None
+            self._section_log("预热点 下一段%d/%s 提前%.1fs 预热%d层"
+                              % (i + 2, tier, lead, warmed))
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _apply_section_switch(self, snap, cur):
         """段落切换的**立即执行**：换池 + 换素材 + 过渡时长，全都不等拍位排期。
 
@@ -1759,23 +2037,30 @@ class AutoVJEngine(QObject):
             段落边界是预置的确定事件，没有抖动可防（175 BPM 下 2 秒 = 5.8 拍，
             正是用户说的"等 5~8 拍"）；
           · 不等 `_next_switch_due` 的 8/16 拍排期；
-          · 过渡时长取段落里写的 `trans_ms`（默认 0 = 硬切）。
+          · 过渡时长取段落里写的 `trans_ms`；`0/None` = 跟随全局/模式过渡（不再硬切）。
 
         不动的图层（与 `_auto_switch_tick` 同口径，别自作主张放宽）：
         固定(`fixed>=0`)、空池、全局锁定、Kv 待机层、码表容器层。
         """
         if not getattr(self, "running", False):
             return                        # 没点「开始」：只记状态，不动画面
+        self._phase = "section_switch"
         tier = cur.get("tier") or "mid"
         tms = cur.get("trans_ms", None)
-        # ★★★ 2026-11-07（用户：「两段连续的 JUMP 都是 0.9 能量，切换段落素材不换」）：
-        #   同档位的两段（high → high），`_refresh_auto_layers(force_tier=tier)` 重 roll 出来的
-        #   仍是同一档素材池，自动层往往**保持 index 不变** ⇒ 段落切了、画面没变。
-        #   记下上一档，同档时下面**主动**给自动层换一条。
-        _prev_tier = getattr(self, "_last_energy_tier", None)
-        # ① 重 roll 素材池（★ 2026-10-30 起 mid 也按档位过滤 —— 用户要求中动态也强制换池）
         try:
-            self._refresh_auto_layers(snap, force_tier=tier)
+            _tms_pos = (tms is not None and int(tms) > 0)
+        except (TypeError, ValueError):
+            _tms_pos = False
+        # 段落表里的 trans_ms=0 表示"跟随全局/模式过渡"，不是硬切。
+        # 旧实现把 0 写进 lay.trans_ms ⇒ 用户选了淡入淡出也会被强行硬切。
+        for _lay in self.layers:
+            if getattr(_lay, "is_kv", False) or getattr(_lay, "is_cuesheet", False):
+                continue
+            _lay.trans_ms = int(tms) if _tms_pos else None
+        # ① 重 roll 素材池（★ 2026-10-30 起 mid 也按档位过滤 —— 用户要求中动态也强制换池）
+        #    ★ 2026-11-08：自动图层也要走用户选的过渡，不能在这里 instant 硬切。
+        try:
+            self._refresh_auto_layers(snap, force_tier=tier, instant=False, presec=True)
         except Exception:                                     # noqa: BLE001
             pass
         # ② 把档位状态机直接推到目标档，避免下一帧 _energy_tier_switch 又按实测能量改回去
@@ -1797,24 +2082,14 @@ class AutoVJEngine(QObject):
                 continue
             if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
                 continue
-            # ★★★ 2026-11-06（连切两个素材的第二条成因）：
-            #   上面 `_refresh_auto_layers(force_tier=…)` 对**自动图层**已经 instant 切到新池了
-            #   （见它内部 `_switch_layer_to(lay, 0, instant=True)`）⇒ 这里再切一刀就是同一帧内
-            #   两次换素材：解码器白开一次，带过渡时还会闪一下。
-            #   `_energy_tier_switch` 一直是这么跳过的（它写着"自动图层上面已重 roll + instant 切"），
-            #   这里漏了，补上，两条路径口径一致。
+            # ★★★ 2026-11-08（用户：「段落切换时两个素材之间会有一拍切入第三个素材」）：
+            #   上面 `_refresh_auto_layers(force_tier=…)` 已经**切过一次**（并带过渡）。
+            #   这里原来在「同档位段落」（如连续两段 high）又调 `_switch_layer_random`
+            #   ⇒ 同一帧切第二刀：第一刀选中的素材变成 prev_player，淡入时就会在
+            #   旧素材与新素材之间露出第三个素材一拍。现在自动层只由上面切一次。
             if getattr(lay, "auto_mode", False):
-                # 同档位（如连续两段都 high）：池没换，但段落变了 ⇒ 也要换一条素材
-                if _prev_tier == tier:
-                    try:
-                        self._switch_layer_random(lay, snap)
-                        _n_sw += 1
-                    except Exception:                          # noqa: BLE001
-                        pass
                 continue
             try:
-                if tms is not None:
-                    lay.trans_ms = int(tms)
                 self._switch_layer_random(lay, snap)
                 _n_sw += 1
             except Exception:                                 # noqa: BLE001
@@ -1884,7 +2159,7 @@ class AutoVJEngine(QObject):
         # 立即切换），而不是在旧池子里挑——否则池里大部分不符合新档，几个素材来回切
         # ★ 2026-10-30 用户：「中动态 0.4到0.8 稳定了就强制切素材池，和之前一样逻辑」
         #   ⇒ mid 也重 roll（以前只有 low/high 才 roll，中能量段一直在旧池子里挑）。
-        self._refresh_auto_layers(snap, force_tier=tier)
+        self._refresh_auto_layers(snap, force_tier=tier, instant=False)
         # 手动图层：在现有池里按动态档挑一个
         for lay in self.layers:
             if lay.fixed >= 0 or not lay.clips or self.locked:
@@ -1942,6 +2217,11 @@ class AutoVJEngine(QObject):
 
     def _tick(self):
         # 主循环已移入独立线程；与 GUI 线程的入口调用（rebuild/切换等）用锁串行化
+        t_start = time.perf_counter()
+        gap = (t_start - self._last_tick_t) if self._last_tick_t else 0.0
+        self._last_tick_t = t_start
+        if gap > 0:
+            self._tick_gap_ms = gap * 1000.0
         try:
             with self._tick_lock:
                 self._tick_locked()
@@ -1965,9 +2245,28 @@ class AutoVJEngine(QObject):
                                    AutoVJEngine._err_log_n, traceback.format_exc()))
                 except Exception:
                     pass
+        self._tick_ms = (time.perf_counter() - t_start) * 1000.0
+        # 引擎线程的 tick 间隔/处理耗时取证：输出侧 `[OUT]` 日志会带上这两个值。
+        # 只有明显异常才写（30fps 下 150ms ≈ 4~5 帧），每 2 秒最多一行，绝不影响演出。
+        try:
+            if bool(getattr(self, "running", False)) and (
+                    self._tick_gap_ms > 100.0 or self._tick_ms > 100.0):
+                now = time.perf_counter()
+                if now - self._tick_log_t >= 2.0:
+                    self._tick_log_t = now
+                    import stallwatch
+                    stallwatch.log_line(
+                        "[ENG] tick 间隔 %.0fms / 处理 %.0fms 阶段=%s 图层=%d fps=%s"
+                        % (self._tick_gap_ms, self._tick_ms,
+                           getattr(self, "_phase", "?"), len(self.layers),
+                           getattr(self, "_effective_fps", "?")))
+        except Exception:
+            pass
 
     def _tick_locked(self):
+        self._phase = "tick"
         snap = self.audio.snapshot()
+        self._auto_fps_tick()
         if self.freeze:
             return  # 冻结：画面完全不变
         # ★ 「无声音时隐藏本层」0.5s 防抖：**必须在本帧任何读取 silent 的代码之前**算一次，
@@ -2093,34 +2392,64 @@ class AutoVJEngine(QObject):
         # ★ 2026-10-28（能量段落）：按曲库预设的段落表推进档位。
         #   必须放在 `_cue_auto_position()` **之后** —— 它要先有可信的原曲秒。
         #   改到前面会让段落判定永远晚 0.2s（用的是上一次的位置）。
+        self._phase = "section"
         self._section_tick(snap)
         self._cuesheet_tick(snap)
 
         # 合成
+        self._phase = "compose"
+        # ★ 多屏输出：配置变更必须先重建画布/发送端，再合成主屏（主屏分辨率可能变了）
+        if self._out_cfg is not None and self._plan_rev != getattr(self, "_plan_rev_ready", -1):
+            self._phase = "output_plan"
+            self._rebuild_output_plan()
+            self._phase = "compose"
         self._compose(snap)
         # 颜色渲染 + 后处理特效链（合成后、输出前）。
         # ★ 2026-10-28（性能）：合并成一个入口，**整帧只读回/写回一次**。
         #   原来两段各做一次 `_np_view_bgr` + `write_back_bgr`（1280×720 共 3.7 MB），
         #   实测每帧白搬 1.43 ms ≈ 4.3% 单核（用户报 5800X 30%）。
         #   顺序不变：颜色先、后处理后 —— 辉光/色差等仍吃到调色后的画面。
+        self._phase = "postfx"
         self._apply_color_postfx(snap)
-        # 深拷贝一帧再发射：GUI 只读这份独立数据，worker 不再碰它，彻底消除跨线程抢画布竞态
-        w, h = self.canvas.width(), self.canvas.height()
-        frame = QImage(w, h, QImage.Format_RGB32)
-        # ★ 2026-10-19 性能：**删掉整幅清零**。下面紧接着就对整幅做 copy，
-        #   这次 fill(0) 是纯浪费 —— 实测 1080p 3.33ms/帧、4K 18.03ms/帧（同内容 memcpy 仅 0.64ms）。
-        #   这里故意不清零，别以为漏了又加回来。
-        try:
-            np.copyto(np.frombuffer(frame.bits(), np.uint8, frame.sizeInBytes()),
-                      np.frombuffer(self.canvas.constBits(), np.uint8, self.canvas.sizeInBytes()))
-        except Exception:
-            frame = self.canvas.copy()
-        # ★ 只保留最新帧 + 投递一个轻量序号：队列里再也不会堆 8MB 的图
-        self._latest_frame = frame
-        self._frame_seq += 1
-        self.frame_ready.emit(self._frame_seq)
-        self._spout_send()
-        self._ndi_send()
+        self._phase = "copy"
+        if self._out_cfg is not None:
+            # ---- 多屏输出 ----
+            mode = str(self._out_cfg.get("mode") or "multi")
+            if mode == "single":
+                self._build_combined(snap)
+            else:
+                self._compose_independent(snap)
+            self._publish_multi_frame()
+            self._phase = "routes"
+            self._send_multi_routes()
+        else:
+            # ---- 旧的单路输出（没有配置时保持原逻辑）----
+            # 深拷贝一帧再发射：GUI 只读这份独立数据，worker 不再碰它，彻底消除跨线程抢画布竞态
+            # ★ 没有 GUI/输出窗口消费者时（预览关闭且独立输出窗口隐藏），这次整帧拷贝
+            #   和跨线程信号是纯浪费；Spout/NDI 直接读 canvas，不需要它。
+            if self._gpu_frame_consumers:
+                w, h = self.canvas.width(), self.canvas.height()
+                frame = QImage(w, h, self.canvas.format())
+                # ★ 2026-10-19 性能：**删掉整幅清零**。下面紧接着就对整幅做 copy，
+                #   这次 fill(0) 是纯浪费 —— 实测 1080p 3.33ms/帧、4K 18.03ms/帧（同内容 memcpy 仅 0.64ms）。
+                #   这里故意不清零，别以为漏了又加回来。
+                try:
+                    np.copyto(np.frombuffer(frame.bits(), np.uint8, frame.sizeInBytes()),
+                              np.frombuffer(self.canvas.constBits(), np.uint8, self.canvas.sizeInBytes()))
+                except Exception:
+                    frame = self.canvas.copy()
+                # ★ 只保留最新帧 + 投递一个轻量序号：队列里再也不会堆 8MB 的图
+                self._latest_frame = frame
+                self._frame_seq += 1
+                self.frame_ready.emit(self._frame_seq)
+            # ★ 2026-11-08（用户：显示器输出码表演出仍掉帧）：把 "copy" 拆开记录。
+            #   `copy` 同时覆盖帧拷贝 / Spout 入队 / NDI 发送，现场 `阶段=copy` 无法定位；
+            #   Spout 发送线程的 sendImage 有可能偶发持 GIL ⇒ 单独标成 spout/ndi 便于取证。
+            self._phase = "spout"
+            self._spout_send()
+            self._phase = "ndi"
+            self._ndi_send()
+        self._phase = "ui_snap"
         # ★ 算好「GUI 状态快照」放 `self._ui_snap`，供 GUI 无锁读取（`ui_snapshot`）。
         #   见 FINAL_REPORT P1-1：GUI 的 `_update_status`（500ms）原先把 4 个 @_locked 方法全调
         #   一遍 ⇒ 每 500ms 抢一次渲染锁，慢帧时会等满超时、界面一秒一顿。现改为引擎线程算好、
@@ -2128,6 +2457,9 @@ class AutoVJEngine(QObject):
         #   @_locked 方法不会死锁；`_beat_pos` 按时间戳重算且幂等（见其注释），额外调用不改行为。
         try:
             _ui = {"switch_cd": self.switch_countdown(snap),
+                   # 引擎 tick 实测（供输出侧 [OUT] 卡顿日志关联）
+                   "tick_ms": round(float(getattr(self, "_tick_ms", 0.0) or 0.0), 1),
+                   "tick_gap_ms": round(float(getattr(self, "_tick_gap_ms", 0.0) or 0.0), 1),
                    # ★ 2026-11-06：告诉 HUD 这次是"段落接管"（用段落措辞）还是"按拍"
                    "switch_kind": getattr(self, "_due_kind", None),
                    # ★ 2026-11-06：当前段落名（设置页「当前节奏」直接显示"跟随段落「X」"）
@@ -2837,10 +3169,10 @@ class AutoVJEngine(QObject):
     #   段落可能很长（20 个八拍 = 160 拍），不做上限的话现场会出现"十几秒不换画面"。
     #   64 拍 ≈ 4 个八拍乐句，也是常规切（16 拍）的 4 倍，够宽松又不会闷。
     AUTO_SWITCH_MAX_BEATS = 64.0
-    #: **段落切换**提前多少拍触发（用户 2026-11-06：「按段落切换加一个」）。
-    #: ⚠ 按拍切换**不加**（用户明确「按拍切换不要加」）；段落边界实测准到 0.01s，
-    #:   但听感上整体慢一拍，所以只给段落这一条加提前量。
-    SECTION_ADVANCE_BEATS = 1.0
+    #: **段落切换**提前多少拍触发。
+    #: 2026-11-08 用户要求：识别到歌曲后按段落切换有一拍提前量，去掉 ⇒ 0.0。
+    #: ⚠ 按拍切换的 `SWITCH_ADVANCE_BEATS` 是另一条路径，不要一起改。
+    SECTION_ADVANCE_BEATS = 0.0
 
     def _next_switch_due(self, snap):
         """下一次切换的目标拍位：**就近对齐到栅格线**（网格模式=八拍头，否则=4 拍小节线）。
@@ -3579,7 +3911,13 @@ class AutoVJEngine(QObject):
             if log is None:
                 log = _LayerHealthLog()
                 self._health_log = log
-            log.write("[%s] %s" % (time.strftime("%H:%M:%S"), self._health_snapshot(now)))
+            try:
+                line = self._health_snapshot(now)
+            except Exception as _e:                                # noqa: BLE001
+                # 以前整行异常被外层吞掉 ⇒ layer_health.log 一直是 0 字节，
+                # 现场失去唯一的每秒状态留痕。现在至少写一行错误原因。
+                line = "health snapshot error: %s: %s" % (type(_e).__name__, _e)
+            log.write("[%s] %s" % (time.strftime("%H:%M:%S"), line))
         except Exception:                                          # noqa: BLE001
             pass
         try:
@@ -3588,7 +3926,7 @@ class AutoVJEngine(QObject):
             pass
 
     def _stutter_watch(self, now):
-        """多层同时停帧 ⇒ 记一行（判定见 `_STUTTER_AGE` 常量注释）。
+        """图层停帧取证：单层或同时多层 ⇒ 记一行（判定见 `_STUTTER_AGE` 常量注释）。
 
         只统计**可见且活跃**的层：不可见图层有意不解码（`_tick_locked`），
         它的帧龄天然会涨，算进来就会天天误报。
@@ -3606,9 +3944,16 @@ class AutoVJEngine(QObject):
             if not getattr(p, "_active", False):
                 continue
             last = float(getattr(p, "_last_t", 0.0) or 0.0)
-            if not last:
+            # ★★ 2026-11-08（日志误导排查）：判据必须与 `_DecoderHealth.stalled()`
+            #   一致，用 `max(最后产帧, 本次变活跃)` 作基准。
+            #   复用缓存播放器时，`_last_t` 可能停在**上一次被切走**的时刻（例如
+            #   16 拍前 = 6.4s），刚重新激活还没出首帧就会被旧写法报成
+            #   "age=6.4s 停帧"——日志里那一串 6.4s 大多是这种假阳性，不是真卡了 6.4s。
+            active_since = float(getattr(p, "_active_since", 0.0) or 0.0)
+            base = last if last > active_since else active_since
+            if not base:
                 continue
-            age = now - last
+            age = now - base
             if age < _STUTTER_AGE:
                 continue
             nm = ""
@@ -3616,16 +3961,18 @@ class AutoVJEngine(QObject):
                 nm = os.path.basename(getattr(lay.clips[lay.cur], "path", ""))
             except Exception:                                      # noqa: BLE001
                 nm = ""
-            hits.append("「%s」age=%.2fs frames=%d %s"
+            hits.append("「%s」age=%.2fs(active=%.2fs raw=%.2fs) frames=%d %s"
                         % (getattr(lay, "name", "?"), age,
+                           (now - active_since) if active_since else -1.0,
+                           (now - last) if last else -1.0,
                            int(getattr(p, "_frames", 0) or 0), nm))
-        if len(hits) < 2:
+        if not hits:
             return
         self._stutter_log_t = now
         try:
             import stallwatch
-            stallwatch.log_line("!! 多层同时停帧（%d 层）：%s"
-                                % (len(hits), " | ".join(hits)))
+            label = ("多层同时停帧（%d 层）" % len(hits)) if len(hits) >= 2 else "图层停帧"
+            stallwatch.log_line("!! %s：%s" % (label, " | ".join(hits)))
         except Exception:                                          # noqa: BLE001
             pass
 
@@ -3694,11 +4041,16 @@ class AutoVJEngine(QObject):
                             % (i, name, vis, cur, nclips, in_cache))
                 continue
             last = float(getattr(p, "_last_t", 0.0) or 0.0)
+            active_since = float(getattr(p, "_active_since", 0.0) or 0.0)
+            base = last if last > active_since else active_since
+            # ★ 复用播放器刚被激活时 `_last_t` 还是上一次用它的时间；直接拿它算
+            #   age 会显示 6.4s 这种吓人的假阳性（2026-11-08 排查确认）。
+            #   与 `stalled()` / `_stutter_watch` 一致，用 max(last, active_since)。
             # ★ 不可见图层现在**有意**不解码（见 `_tick_locked` 活跃标记），它的
             #   `age` 会一直涨 —— 那是挂起、不是卡帧。不区分的话以后一看日志就会
             #   把"用户关掉的图层"误判成冻帧（本文件已经被这类误读坑过多次）。
             _susp = (not vis) and (not getattr(p, "_active", False))
-            age = "-" if _susp else (("%.2f" % (now - last)) if last else "-")
+            age = "-" if _susp else (("%.2f" % (now - base)) if base else "-")
             segs.append("L%d %s vis=%d cur=%d/%d p=id%d incache=%d active=%d frames=%d age=%s ended=%d"
                         % (i, name, vis, cur, nclips, id(p), in_cache,
                            1 if getattr(p, "_active", False) else 0,
@@ -3716,10 +4068,9 @@ class AutoVJEngine(QObject):
         #      2026-09-30「12 核 / 磁盘 750MB/s」事故的根因之一。
         if getattr(lay, "is_cuesheet", False):
             return self._cue_get_player(lay, clip)
-        # 解码缩放上限：画布 ×1.5（留 img_scale 放大余量），4K/5K 素材在解码线程缩到该尺寸，
-        # 避免每帧对超大帧做 cvtColor+copy+QPainter 缩放（画面持续卡、FPS 掉的主因）。
-        mw = max(1, int(self.canvas.width() * 1.5))
-        mh = max(1, int(self.canvas.height() * 1.5))
+        # 解码缩放上限：默认画布 1.0x（720p 输出不再把 1080p 源整帧搬来搬去）；
+        # 有放大/旋转/码表时仍用 1.5x 留余量。见 `_decode_limit`。
+        mw, mh = self._decode_limit(lay)
         # 缩略图缺失时 alpha 是**后台**探测的：探测回来发现确实带 alpha → 丢掉当时按
         # 「无 alpha」建的解码器（OpenCV 会丢透明通道），下次取自然重开成 PyAV。
         if getattr(clip, "_alpha_recheck", False):
@@ -3766,7 +4117,9 @@ class AutoVJEngine(QObject):
         while len(lay.cache) > 8:
             evicted = False
             for k, v in list(lay.cache.items()):
-                if k == cur_path or v is lay.player or v is lay.prev_player:
+                if (k == cur_path
+                        or k == getattr(lay, "_presec_path", None)
+                        or v is lay.player or v is lay.prev_player):
                     continue
                 v.close()
                 lay.cache.pop(k)
@@ -3783,8 +4136,7 @@ class AutoVJEngine(QObject):
         与普通图层的 `lay.cache` 完全隔离，原因见 `_get_player` 开头的注释。
         逐出顺序固定：**`set_active(False)` → `close()` → 从 dict 删引用**（缺一不可）。
         """
-        mw = max(1, int(self.canvas.width() * 1.5))
-        mh = max(1, int(self.canvas.height() * 1.5))
+        mw, mh = self._decode_limit(lay)
         cache = getattr(lay, "_cue_players", None)
         if not isinstance(cache, dict):
             cache = {}
@@ -5416,8 +5768,11 @@ class AutoVJEngine(QObject):
             return
         old = lay.player
         old_idx = lay.cur
+        old_item = (lay.clips[old_idx]
+                    if (0 <= old_idx < len(getattr(lay, "clips", None) or [])) else None)
         lay.prev_player = None if instant else old
         lay.prev_idx = old_idx if not instant else -1
+        lay._trans_prev_item = None if instant else old_item
         lay.cur = idx
         lay.player = self._get_player(lay, lay.clips[idx])
         lay.trans_start = time.perf_counter()
@@ -6022,31 +6377,718 @@ class AutoVJEngine(QObject):
         return chosen[:3]
 
 
+    def _auto_fps_tick(self):
+        """Cap composition cadence to the fastest visible video source.
+
+        A 30fps clip does not need a 60Hz QPainter/post-FX pass: every second
+        frame is a duplicate image.  This is the single largest *render-side*
+        saving on the default 60fps config and costs no visual quality because
+        the source has no new frame to show.  GIFs/images still animate via
+        effects/transitions at the capped rate.
+        """
+        try:
+            if not bool((self.cfg["perf"] or {}).get("fps_follow_source", True)):
+                return
+            now = time.perf_counter()
+            if now < float(getattr(self, "_fps_next_t", 0.0) or 0.0):
+                return
+            self._fps_next_t = now + 2.0
+            src_fps = 0.0
+            for lay in self.layers:
+                if not getattr(lay, "visible", True):
+                    continue
+                p = getattr(lay, "player", None)
+                if p is None:
+                    continue
+                try:
+                    f = float(getattr(p, "fps", 0.0) or 0.0)
+                except Exception:
+                    f = 0.0
+                if 1.0 < f < 240.0:
+                    src_fps = max(src_fps, f)
+            if src_fps <= 0.0:
+                src_fps = 30.0
+            target = max(24, int(math.ceil(src_fps - 0.01)))
+            try:
+                configured = int((self.cfg["perf"] or {}).get("render_fps", 60) or 60)
+            except Exception:
+                configured = 60
+            target = max(15, min(120, min(configured, target)))
+            if target != self._effective_fps:
+                self._effective_fps = target
+                # QTimer must be (re)started from its owning engine thread;
+                # _auto_fps_tick is called from _tick_locked, so this is safe.
+                if self.timer.isActive():
+                    self.timer.start(self.frame_interval_ms())
+        except Exception:
+            pass
+
+    # ---------------- GPU 合成（可选，失败自动回退 CPU） ----------------
+    def _init_gpu_backend(self):
+        """Create the GPU composer on the engine thread (idempotent)."""
+        if self._gpu_dead or self._gpu_comp is not None:
+            return
+        try:
+            if not bool((self.cfg["perf"] or {}).get("gpu_compose", True)):
+                self._gpu_dead = True
+                self._gpu_last_reason = "配置已关闭"
+                return
+        except Exception:
+            pass
+        try:
+            from gpu_compose import GpuCompositor
+            self._gpu_comp = GpuCompositor(log=self._gpu_log)
+            if not self._gpu_comp.ensure(self.canvas.width(), self.canvas.height()):
+                self._gpu_last_reason = self._gpu_comp.last_error
+                self._gpu_comp = None
+                self._gpu_dead = True
+        except Exception as e:                                    # noqa: BLE001
+            self._gpu_last_reason = "导入/初始化失败：%s" % e
+            self._gpu_comp = None
+            self._gpu_dead = True
+
+    def _gpu_log(self, msg):
+        try:
+            from config import app_base_dir
+            p = os.path.join(app_base_dir(), "gpu_compose.log")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+        except Exception:
+            pass
+
+    def _gpu_safe_for_scene(self):
+        """True when every visible layer can be represented by Qt's GL paint engine.
+
+        Qt's QOpenGLPaintDevice supports SourceOver/Plus.  Other blend modes
+        (screen/multiply/lighten/darken) are silently ignored by Qt's GL paint
+        engine, and subtract is a project-specific pixel pass -> keep CPU.
+
+        Also keep video layers on the CPU path by default: QPainter's GL paint
+        engine re-uploads each new video QImage, and at 720p that costs more
+        than CPU QPainter composition (measured 12.4ms vs 7.0ms for 3 layers).
+        Static images/GIFs cache their texture and are a clear win.
+        """
+        safe = {"normal", "add"}
+        allow_video = bool((self.cfg["perf"] or {}).get("gpu_compose_video", False))
+        for lay in self.layers:
+            if not getattr(lay, "visible", True):
+                continue
+            # Cue containers mix video/image sublayers; keep the CPU compositor
+            # for them (same reason as video layers: per-frame texture upload).
+            if getattr(lay, "is_cuesheet", False):
+                return False
+            p = getattr(lay, "player", None)
+            if (not allow_video and p is not None
+                    and type(p).__name__ in ("VideoPlayer", "AvAlphaPlayer", "GpuDxvPlayer")):
+                return False
+            if getattr(lay, "is_cuesheet", False):
+                for ps in (getattr(lay, "cs_states", None) or []):
+                    if not getattr(ps, "active", False):
+                        continue
+                    if str(getattr(ps, "blend", "normal") or "normal") not in safe:
+                        return False
+            else:
+                if str(getattr(lay, "blend", "normal") or "normal") not in safe:
+                    return False
+        return True
+
+    def _gpu_prepare_image(self, img):
+        """GL paint engine expects premultiplied alpha for ARGB sources.
+
+        Opaque images (RGB32 / no alpha) need no conversion.  Static images are
+        cached by cacheKey so the conversion is paid once; video alpha frames
+        are converted per frame (still cheaper than CPU-compositing several
+        layers, and correctness comes first).
+        """
+        if img is None or img.isNull():
+            return img
+        try:
+            if not img.hasAlphaChannel():
+                return img
+            if img.format() == QImage.Format_ARGB32_Premultiplied:
+                return img
+            key = int(img.cacheKey())
+            got = self._gpu_premul.get(key)
+            if got is not None:
+                return got
+            out = img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            self._gpu_premul[key] = out
+            self._gpu_premul_order.append(key)
+            while len(self._gpu_premul_order) > self._gpu_premul_max:
+                old = self._gpu_premul_order.pop(0)
+                self._gpu_premul.pop(old, None)
+            return out
+        except Exception:
+            return img
+
+    def _gpu_begin(self, W, H):
+        if self._gpu_dead or self._gpu_comp is None:
+            return None
+        try:
+            if not self._gpu_comp.ensure(W, H):
+                self._gpu_last_reason = self._gpu_comp.last_error
+                self._gpu_dead = True
+                return None
+            p = self._gpu_comp.begin(W, H)
+            if p is None:
+                self._gpu_last_reason = self._gpu_comp.last_error
+                self._gpu_dead = True
+                return None
+            self._gpu_mode = "gpu"
+            return p
+        except Exception as e:                                    # noqa: BLE001
+            self._gpu_last_reason = str(e)
+            self._gpu_dead = True
+            self._gpu_mode = "cpu"
+            return None
+
+    def _gpu_finish(self, p):
+        try:
+            img = self._gpu_comp.end(p) if self._gpu_comp is not None else None
+        except Exception:
+            img = None
+        if img is None or img.isNull():
+            self._gpu_dead = True
+            self._gpu_mode = "cpu"
+            return None
+        return img
+
+    @_locked
+    def set_frame_consumers(self, on):
+        """Tell the engine whether the GUI/output window needs a CPU frame copy.
+
+        When preview is off and the independent output window is hidden, the
+        full-frame copy + frame_ready signal are pure waste.  Spout/NDI read
+        the canvas directly and are unaffected.
+        """
+        self._gpu_frame_consumers = bool(on)
+
+    # ================= 多屏输出（2026-11-08） =================
+    @_locked
+    def set_output_config(self, cfg_snapshot):
+        """UI 下发当前活动的输出配置（深拷贝）。
+
+        ⚠ 不在这里创建/关闭发送端：配置切换可能发生在 GUI 线程，NDI/Spout 的
+          close 最坏要等 1 秒；统一放到引擎线程的 `_rebuild_output_plan()` 里做，
+          GUI 只负责保存配置和下发快照。
+        """
+        try:
+            _was_plan = self._out_cfg is not None
+            self._out_cfg = copy.deepcopy(cfg_snapshot) if cfg_snapshot else None
+        except Exception:
+            _was_plan = self._out_cfg is not None
+            self._out_cfg = cfg_snapshot
+        # 单路 → 多路：先关掉旧的单路 Spout/NDI，避免两套发送端同时存在
+        if self._out_cfg is not None and not _was_plan:
+            try:
+                self._close_legacy_output()
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._plan_rev = int(getattr(self, "_plan_rev", 0)) + 1
+        self._plan_rev_ready = -1
+        if self._out_cfg:
+            self._out_mode = str(self._out_cfg.get("mode") or "multi")
+
+    def _close_legacy_output(self):
+        for attr in ("_spout", "_ndi"):
+            obj = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:                                 # noqa: BLE001
+                    pass
+
+    def latest_route_thumbs(self):
+        """无锁只读：{screen_id: QImage 缩略图}，给上方输出预览工作区。"""
+        return self._route_thumbs
+
+    def set_preview_route(self, sid):
+        """选择本地输出窗口/主预览要显示哪一路（多路模式）。"""
+        self._preview_route_id = str(sid or "")
+
+    def _out_layers_by_ids(self, ids):
+        if ids is None:
+            return list(self.layers)
+        want = set(str(x) for x in ids)
+        return [l for l in self.layers if str(getattr(l, "lid", "")) in want]
+
+    def _rebuild_output_plan(self):
+        """在引擎线程里按 `_out_cfg` 重建画布/发送端。调用者已持 `_tick_lock`。"""
+        plan = self._out_cfg
+        self._plan_rev_ready = self._plan_rev
+        if not plan:
+            self._close_all_route_senders()
+            self._spout = None
+            self._ndi = None
+            self._screen_canvases.clear()
+            self._route_frames.clear()
+            self._combined_canvas = None
+            self._combined_key = None
+            return
+
+        fmt = self._canvas_format()
+        main = output_model.main_screen(plan)
+        if main is not None:
+            mw, mh = output_model.effective_size(plan, main)
+            if self.canvas.width() != mw or self.canvas.height() != mh:
+                self.canvas = QImage(mw, mh, fmt)
+                self._clear_canvas(self.canvas)
+                self._latest_frame = None
+        # 独立屏幕画布（主屏用 self.canvas；copy/split 不单独合成）
+        keep = set()
+        for s in (plan.get("screens") or []):
+            st = s.get("type")
+            sid = str(s.get("id") or "")
+            if not sid:
+                continue
+            if st == "independent":
+                w, h = output_model.effective_size(plan, s)
+                cv = self._screen_canvases.get(sid)
+                if cv is None or cv.width() != w or cv.height() != h:
+                    cv = QImage(w, h, fmt)
+                    self._screen_canvases[sid] = cv
+                self._clear_canvas(cv)
+                keep.add(sid)
+            elif st == "split":
+                w, h = output_model.effective_size(plan, s)
+                cv = self._screen_canvases.get(sid)
+                if cv is None or cv.width() != w or cv.height() != h:
+                    self._screen_canvases[sid] = QImage(w, h, fmt)
+                keep.add(sid)
+        for sid in list(self._screen_canvases.keys()):
+            if sid not in keep:
+                self._screen_canvases.pop(sid, None)
+        # 整合单路画布
+        if str(plan.get("mode") or "multi") == "single":
+            cw, ch = output_model.combined_size(plan)
+            if (self._combined_canvas is None
+                    or self._combined_canvas.width() != cw
+                    or self._combined_canvas.height() != ch):
+                self._combined_canvas = QImage(cw, ch, fmt)
+                self._clear_canvas(self._combined_canvas)
+            self._combined_key = (cw, ch)
+        else:
+            self._combined_canvas = None
+            self._combined_key = None
+        self._sync_route_senders()
+        self._route_frames.clear()
+
+    def _route_specs(self):
+        """返回当前需要发送/预览的路由：[(route_id, frame_kind, name, spout, ndi)]。"""
+        plan = self._out_cfg
+        if not plan:
+            return []
+        mode = str(plan.get("mode") or "multi")
+        main = output_model.main_screen(plan)
+        if mode == "single":
+            if main is None:
+                return []
+            return [("__combined__", "combined",
+                     str(plan.get("spout_name") or "EasyRealityAutoVJ"),
+                     bool(main.get("spout", False)), bool(main.get("ndi", False)))]
+        names = output_model.screen_output_names(plan)
+        out = []
+        for s in plan.get("screens") or []:
+            sid = str(s.get("id") or "")
+            if not sid:
+                continue
+            out.append((sid, str(s.get("type") or "independent"),
+                        names.get(sid) or s.get("name") or sid,
+                        bool(s.get("spout", False)), bool(s.get("ndi", False))))
+        return out
+
+    def _sync_route_senders(self):
+        """按当前路由表增删 NDI/Spout 发送端；旧发送端先关再建。"""
+        plan = self._out_cfg
+        specs = self._route_specs()
+        want = {sid: (name, sp, nd) for sid, _kind, name, sp, nd in specs}
+        # 删除不再需要的路由
+        for sid in list(self._route_senders.keys()):
+            if sid not in want:
+                self._close_route_sender(sid)
+        # 创建/更新
+        for sid, (name, want_sp, want_nd) in want.items():
+            st = self._route_senders.get(sid)
+            if st is None:
+                st = {"spout": None, "ndi": None, "spout_name": "", "ndi_name": ""}
+                self._route_senders[sid] = st
+            if st.get("spout") is not None and st.get("spout_name") != name:
+                self._close_route_spout(sid)
+            if st.get("ndi") is not None and st.get("ndi_name") != name:
+                self._close_route_ndi(sid)
+            if want_sp and st.get("spout") is None:
+                try:
+                    import spout_out
+                    st["spout"] = spout_out.SpoutOut(name)
+                    st["spout_name"] = name
+                except Exception as e:                             # noqa: BLE001
+                    _output_health_write("Spout 路由 %s 创建失败：%s" % (name, e))
+            if not want_sp and st.get("spout") is not None:
+                self._close_route_spout(sid)
+            if want_nd and st.get("ndi") is None:
+                try:
+                    from ndi_out import NDIOutput
+                    st["ndi"] = NDIOutput(name)
+                    st["ndi_name"] = name
+                except Exception as e:                             # noqa: BLE001
+                    _output_health_write("NDI 路由 %s 创建失败：%s" % (name, e))
+            if not want_nd and st.get("ndi") is not None:
+                self._close_route_ndi(sid)
+            self._route_state.setdefault(sid, {"spout_fail": 0, "spout_retry": 0.0,
+                                               "ndi_fail": 0, "ndi_retry": 0.0,
+                                               "log_t": 0.0})
+        # 兼容旧代码：NDI 音频喂给主屏/整合路由
+        main_sid = "__combined__" if str(plan.get("mode") or "multi") == "single" else (
+            (output_model.main_screen(plan) or {}).get("id") or "")
+        st = self._route_senders.get(main_sid)
+        self._ndi = (st or {}).get("ndi")
+        self._spout = (st or {}).get("spout")
+
+    def _close_route_spout(self, sid):
+        st = self._route_senders.get(sid) or {}
+        sp = st.get("spout")
+        st["spout"] = None
+        st["spout_name"] = ""
+        if sp is not None:
+            try:
+                sp.close()
+            except Exception:                                     # noqa: BLE001
+                pass
+
+    def _close_route_ndi(self, sid):
+        st = self._route_senders.get(sid) or {}
+        nd = st.get("ndi")
+        st["ndi"] = None
+        st["ndi_name"] = ""
+        if nd is not None:
+            try:
+                nd.close()
+            except Exception:                                     # noqa: BLE001
+                pass
+
+    def _close_route_sender(self, sid):
+        self._close_route_spout(sid)
+        self._close_route_ndi(sid)
+        self._route_senders.pop(sid, None)
+        self._route_state.pop(sid, None)
+
+    def _close_all_route_senders(self):
+        for sid in list(self._route_senders.keys()):
+            self._close_route_sender(sid)
+
+    def _compose_independent(self, snap):
+        """合成所有独立屏幕（copy/split 不单独合成）。"""
+        plan = self._out_cfg
+        if not plan:
+            return
+        all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+        for s in plan.get("screens") or []:
+            if s.get("type") != "independent":
+                continue
+            sid = str(s.get("id") or "")
+            cv = self._screen_canvases.get(sid)
+            if cv is None:
+                continue
+            if self._independent_reuses_main(plan, s, all_ids):
+                continue
+            ids = output_model.effective_layers(plan, s, all_ids)
+            layers = self._out_layers_by_ids(ids)
+            self._compose_to(cv, layers, snap, allow_gpu=False)
+
+    def _independent_reuses_main(self, plan, s, all_ids=None):
+        """“跟随主屏 + 图层集合与主屏一致 + 分辨率一致”时直接复用主屏画布。"""
+        if not s or s.get("type") != "independent" or not s.get("follow_main"):
+            return False
+        try:
+            if all_ids is None:
+                all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+            main = output_model.main_screen(plan)
+            if main is None:
+                return False
+            mw, mh = output_model.effective_size(plan, main)
+            sw, sh = output_model.effective_size(plan, s)
+            if (int(sw), int(sh)) != (int(mw), int(mh)):
+                return False
+            return set(output_model.effective_layers(plan, s, all_ids)) == set(all_ids)
+        except Exception:
+            return False
+
+    def _build_combined(self, snap):
+        """单路模式：把主屏/独立屏按布局拼到整合画布。"""
+        plan = self._out_cfg
+        cv = self._combined_canvas
+        if not plan or cv is None:
+            return
+        self._clear_canvas(cv)
+        p = QPainter(cv)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        for s in output_model.layout_sources(plan):
+            sid = str(s.get("id") or "")
+            frame = self._route_frame(plan, sid, str(s.get("type") or "independent"))
+            if frame is None or frame.isNull():
+                continue
+            x, y, w, h = output_model.screen_rect(plan, s)
+            if frame.width() == w and frame.height() == h:
+                p.drawImage(int(x), int(y), frame)
+            else:
+                p.drawImage(QRectF(x, y, w, h), frame,
+                            QRectF(0, 0, frame.width(), frame.height()))
+        p.end()
+
+    def _split_frame(self, plan, screen):
+        """切分屏幕：把源画布按 UV 裁到复用缓冲。"""
+        sid = str(screen.get("id") or "")
+        cv = self._screen_canvases.get(sid)
+        if cv is None:
+            w, h = output_model.effective_size(plan, screen)
+            cv = QImage(w, h, self._canvas_format())
+            self._screen_canvases[sid] = cv
+        src = source_frame = None
+        src_screen = output_model.source_screen(plan, screen)
+        if src_screen is not None:
+            ssid = str(src_screen.get("id") or "")
+            source_frame = self.canvas if src_screen.get("type") == "main" else self._screen_canvases.get(ssid)
+        if source_frame is None or source_frame.isNull():
+            self._clear_canvas(cv)
+            return cv
+        u0, v0, u1, v1 = screen.get("uv") or [0, 0, 1, 1]
+        sw, sh = source_frame.width(), source_frame.height()
+        sx = max(0, min(sw - 1, int(round(sw * float(u0)))))
+        sy = max(0, min(sh - 1, int(round(sh * float(v0)))))
+        tw = max(1, min(sw - sx, int(round(sw * (float(u1) - float(u0))))))
+        th = max(1, min(sh - sy, int(round(sh * (float(v1) - float(v0))))))
+        if cv.width() != tw or cv.height() != th:
+            cv = QImage(tw, th, self._canvas_format())
+            self._screen_canvases[sid] = cv
+        p = QPainter(cv)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.drawImage(0, 0, source_frame, sx, sy, tw, th)
+        p.end()
+        return cv
+
+    def _route_frame(self, plan, sid, kind):
+        if kind == "combined":
+            return self._combined_canvas
+        s = output_model.screen_by_id(plan, sid)
+        if s is None:
+            return None
+        t = s.get("type")
+        if t == "main":
+            return self.canvas
+        if t == "independent":
+            if self._independent_reuses_main(plan, s):
+                return self.canvas
+            return self._screen_canvases.get(sid)
+        if t == "copy":
+            return self.canvas
+        if t == "split":
+            return self._split_frame(plan, s)
+        return None
+
+    def _publish_multi_frame(self):
+        """生成缩略图 + 选中路由的全分辨率预览帧；返回是否有新帧。"""
+        plan = self._out_cfg
+        if not plan:
+            return False
+        self._thumb_tick += 1
+        do_thumbs = (self._thumb_tick % max(1, int(self._thumb_every))) == 0
+        mode = str(plan.get("mode") or "multi")
+        thumbs = {}
+        frames = {}
+        if mode == "single":
+            sid = "__combined__"
+            frame = self._combined_canvas
+            if frame is not None:
+                frames[sid] = frame
+                if do_thumbs:
+                    thumbs[sid] = frame.scaled(480, 270, Qt.KeepAspectRatio,
+                                               Qt.FastTransformation)
+            self._route_frames = frames
+            self._route_thumbs = thumbs if do_thumbs else self._route_thumbs
+            if self._gpu_frame_consumers and frame is not None:
+                self._latest_frame = frame.copy()
+                self._frame_seq += 1
+                self.frame_ready.emit(self._frame_seq)
+                return True
+            return False
+        # multi
+        for s in plan.get("screens") or []:
+            sid = str(s.get("id") or "")
+            frame = self._route_frame(plan, sid, str(s.get("type") or "independent"))
+            if frame is not None:
+                frames[sid] = frame
+                if do_thumbs:
+                    thumbs[sid] = frame.scaled(480, 270, Qt.KeepAspectRatio,
+                                               Qt.FastTransformation)
+        self._route_frames = frames
+        if do_thumbs:
+            self._route_thumbs = thumbs
+        sel = str(self._preview_route_id or "")
+        if sel not in frames:
+            main = output_model.main_screen(plan)
+            sel = str((main or {}).get("id") or "")
+        frame = frames.get(sel)
+        if self._gpu_frame_consumers and frame is not None:
+            self._latest_frame = frame.copy()
+            self._frame_seq += 1
+            self.frame_ready.emit(self._frame_seq)
+            return True
+        return False
+
+    def _send_multi_routes(self):
+        """把各路由帧提交给 NDI/Spout（不阻塞 GUI）。"""
+        if not self.running:
+            return
+        plan = self._out_cfg
+        if not plan:
+            return
+        mode = str(plan.get("mode") or "multi")
+        now = time.perf_counter()
+        for sid, kind, name, want_sp, want_nd in self._route_specs():
+            if not (want_sp or want_nd):
+                continue
+            frame = self._route_frame(plan, sid, kind)
+            if frame is None or frame.isNull():
+                continue
+            st = self._route_state.setdefault(sid, {})
+            if want_sp:
+                retry = float(st.get("spout_retry", 0.0) or 0.0)
+                if now >= retry:
+                    sp = (self._route_senders.get(sid) or {}).get("spout")
+                    if sp is None:
+                        # 发送端可能在失败后被关掉，重建一次
+                        try:
+                            import spout_out
+                            sp = spout_out.SpoutOut(name)
+                            self._route_senders[sid]["spout"] = sp
+                            self._route_senders[sid]["spout_name"] = name
+                        except Exception as e:                     # noqa: BLE001
+                            self._route_fail(sid, "spout", now, e)
+                            sp = None
+                    if sp is not None:
+                        try:
+                            sp.send(frame.bits(), frame.width(), frame.height(),
+                                    frame.bytesPerLine())
+                        except Exception as e:                     # noqa: BLE001
+                            self._route_fail(sid, "spout", now, e)
+            if want_nd:
+                retry = float(st.get("ndi_retry", 0.0) or 0.0)
+                if now >= retry:
+                    nd = (self._route_senders.get(sid) or {}).get("ndi")
+                    if nd is None:
+                        try:
+                            from ndi_out import NDIOutput
+                            nd = NDIOutput(name)
+                            self._route_senders[sid]["ndi"] = nd
+                            self._route_senders[sid]["ndi_name"] = name
+                        except Exception as e:                     # noqa: BLE001
+                            self._route_fail(sid, "ndi", now, e)
+                            nd = None
+                    if nd is not None:
+                        try:
+                            if not nd._ensure(frame.width(), frame.height()):
+                                raise RuntimeError("NDI _ensure(%dx%d) 返回 False"
+                                                   % (frame.width(), frame.height()))
+                            bpl = frame.bytesPerLine()
+                            bgra = np.frombuffer(frame.bits(), dtype=np.uint8,
+                                                 count=bpl * frame.height())
+                            nd.send_video(bgra, frame.width(), frame.height())
+                        except Exception as e:                     # noqa: BLE001
+                            self._route_fail(sid, "ndi", now, e)
+
+    def _route_fail(self, sid, chan, now, exc):
+        st = self._route_state.setdefault(sid, {})
+        key = "%s_fail" % chan
+        n = int(st.get(key, 0) or 0) + 1
+        st[key] = n
+        st["%s_retry" % chan] = now + min(30.0, 1.0 * (2 ** min(5, n - 1)))
+        if now - float(st.get("log_t", 0.0) or 0.0) >= 10.0:
+            st["log_t"] = now
+            _output_health_write("%s 路由发送失败（第 %d 次，将退避重试）：%s"
+                                 % (chan.upper(), n, exc))
+        if chan == "spout":
+            self._close_route_spout(sid)
+        else:
+            self._close_route_ndi(sid)
+
+    def _decode_limit(self, lay):
+        """Decode at canvas size (1.0x).
+
+        ★ 2026-11-08（用户：显示器输出码表演出仍掉帧）：真机 A/B 实测 1280×720 画布、
+          7 图层 + 码表 + Alpha + Spout：
+            · 1.5×（旧）：引擎 tick 平均 21ms / p95 38ms，显示器绘制 p95 110ms
+            · 1.0×（现）：引擎 tick 平均 8ms / p95 13ms，显示器绘制 p95 39ms
+          CPU 总占用基本持平（5.5 核对 5.5 核）：解码线程多做一次 INTER_AREA 缩小，
+          换掉渲染线程里每层每帧的 Smooth 缩放，**延迟大幅下降**，而画质由解码器的
+          INTER_AREA 保证（不是 QPainter 的快速缩放）。DXV GPU 路径更省：GPU 直接
+          缩到目标尺寸，回读带宽也从 1920×1080 降到 1280×720。
+          想改回去：环境变量 AUTO_VJ_DECODE_SCALE=1.5（排障用）。
+        """
+        scale = 1.0
+        try:
+            _s = float(os.environ.get("AUTO_VJ_DECODE_SCALE", "0") or 0)
+            if _s > 0.2:
+                scale = _s
+        except (TypeError, ValueError):
+            pass
+        return (max(1, int(self.canvas.width() * scale)),
+                max(1, int(self.canvas.height() * scale)))
+
     def _compose(self, snap):
-        canvas = self.canvas
-        canvas.fill(Qt.black)
-        p = QPainter(canvas)
+        """主屏合成（保留旧入口）：主画布 + 全部图层，允许 GPU 合成。"""
+        self._compose_to(self.canvas, self.layers, snap, allow_gpu=True)
+
+    def _compose_to(self, canvas, layers, snap, allow_gpu=False):
+        """把指定图层集合合成到指定画布。
+
+        ★ 2026-11-08 多屏输出：独立屏幕用这个入口各自合成；主屏仍走 `_compose()`。
+          `allow_gpu=False` 时强制 CPU——多块 QOpenGLPaintDevice 同帧并发会抢驱动，
+          独立屏画布量一般不大，CPU 更稳。
+        """
+        W, H = canvas.width(), canvas.height()
+        # ---- optional GPU composition ------------------------------------
+        # Only normal/add layers are safe on Qt's GL paint engine (see
+        # _gpu_safe_for_scene).  Subtracts and the other blend modes stay CPU.
+        gpu_p = None
+        if (allow_gpu and not self._gpu_dead and self._gpu_comp is not None
+                and not self._alpha_out
+                and self._gpu_safe_for_scene()):
+            gpu_p = self._gpu_begin(W, H)
+        if gpu_p is not None:
+            p = gpu_p
+            p.fillRect(0, 0, W, H, Qt.black)
+        else:
+            self._clear_canvas(canvas)
+            p = QPainter(canvas)
+        self._gpu_active = bool(gpu_p)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        W, H = canvas.width(), canvas.height()
         now = time.perf_counter()
 
-        # 能量脉冲缩放（振幅强度：0 低 / 1 中 / 2 高 / 3 极高）
+        # 能量脉冲缩放（振幅强度：-1 关闭 / 0 低 / 1 中 / 2 高 / 3 极高）
         # 2026-09-24 用户要求「所有选项数值全部上调」：0.4/0.7/1.0/1.4 → 0.6/1.0/1.4/2.0
-        # （缩放量 = bass × 0.08 × 该系数 → 满低频时 4.8% / 8% / 11.2% / 16%）
+        # （缩放量 = bass × 0.08 × 该系数 → 满低频时 0% / 4.8% / 8% / 11.2% / 16%）
         # 索引做钳位：旧配置只有 0~2，新版本加了第 4 档也不会 IndexError
-        inten = [0.6, 1.0, 1.4, 2.0][max(0, min(3, int(self.cfg["auto"]["intensity"])))]
+        try:
+            _iv = int(self.cfg["auto"].get("intensity", 1))
+        except (TypeError, ValueError):
+            _iv = 1
+        if _iv < 0:
+            inten = 0.0                 # 关闭：pulse 恒为 1.0，完全不缩放画面
+        else:
+            inten = [0.6, 1.0, 1.4, 2.0][max(0, min(3, _iv))]
         pulse = 1.0 + snap["bass"] * 0.08 * inten
         drift_x = drift_y = 0.0
 
         # ★ 静音判据统一读防抖结果（见 `_tick_locked` 开头的 `_silent_hide_tick`）：
         #   与 `pause_silent` 活跃标记同帧同值，保证 hide 与 pause 的时机一致。
         silent = self._silent_now_debounced
-        solo_on = any(getattr(l, "solo", False) for l in self.layers)
+        solo_on = any(getattr(l, "solo", False) for l in layers)
         subtract_jobs = []  # 需要逐像素"减少"混合的图层
 
         # 图层列表 index 0 = 最上层 → 从下往上绘制
-        for lay in reversed(self.layers):
+        for lay in reversed(layers):
             if not lay.visible:
                 continue
             # ★★ 码表图层是**容器**：它没有单一 player，画面由内部子层按码表渲染。
@@ -6070,7 +7112,8 @@ class AutoVJEngine(QObject):
                 continue
             if lay.hide_silent and silent and not is_kv:
                 continue  # 该图层设置了"无声音时隐藏"且当前没有声音
-            img = lay.player.current()
+            cur_img = lay.player.current()
+            img = cur_img
             if img is None or img.isNull():
                 img = lay.prev_player.current() if lay.prev_player else None
             if img is None or img.isNull():
@@ -6080,6 +7123,16 @@ class AutoVJEngine(QObject):
                 img = getattr(lay, "_last_frame", None)
             if img is None or img.isNull():
                 continue
+            # ★ 2026-11-08：淡入淡出等过渡在**新素材首帧就绪前先冻结计时**。
+            #   旧行为：切换瞬间就按墙钟推进 prog，解码器开容器 70~690ms，
+            #   等首帧出来时 prog 已到 1.0 ⇒ 直接硬切 —— 用户看到的"卡一下"。
+            #   现在：首帧未就绪时把上一帧当当前帧画（prog=1），trans_start 每帧重置；
+            #   首帧一到才从 0 开始真正的 fade/slide/zoom。
+            hold_trans = False
+            if (not is_kv and getattr(lay, "trans_active", False)
+                    and (cur_img is None or cur_img.isNull())):
+                hold_trans = True
+                lay.trans_start = now
             lay._last_frame = img
             if is_kv:
                 # Kv 图层：进度=显示强度；过渡方式只用它自己的切入/切出设置，不受其它设置影响
@@ -6088,12 +7141,16 @@ class AutoVJEngine(QObject):
             else:
                 prog = 1.0
                 if lay.trans_active:
-                    dur = (lay.trans_ms or MODE_META[self.mode]["trans_ms"]) / 1000.0
-                    dur = max(0.016, dur)
-                    prog = min(1.0, (now - lay.trans_start) / dur)
-                    if prog >= 1.0:
-                        lay.trans_active = False
-                        lay.prev_player = None  # 播放器在缓存中复用，不关闭
+                    if hold_trans:
+                        prog = 1.0       # 先完整显示上一帧，等首帧
+                    else:
+                        dur = (lay.trans_ms or MODE_META[self.mode]["trans_ms"]) / 1000.0
+                        dur = max(0.016, dur)
+                        prog = min(1.0, (now - lay.trans_start) / dur)
+                        if prog >= 1.0:
+                            lay.trans_active = False
+                            lay.prev_player = None  # 播放器在缓存中复用，不关闭
+                            lay._trans_prev_item = None
 
                 # 过渡方式：用户覆盖 > 旧版保存的设置 > 模式默认（逐拍=硬切，其余=淡入）
                 ov_tr = (self.cfg["mode"].get("transition") or "").strip()
@@ -6133,6 +7190,19 @@ class AutoVJEngine(QObject):
             p.fillRect(0, 0, W, H, Qt.black)
 
         p.end()
+
+        if gpu_p is not None:
+            img = self._gpu_finish(gpu_p)
+            if img is not None:
+                self.canvas = img
+                canvas = img
+            else:
+                # GPU failed mid-frame: rebuild a CPU canvas for the next tick so
+                # the fallback does not inherit a stale frame.
+                self.canvas = QImage(W, H, self._canvas_format())
+                self._clear_canvas(self.canvas)
+                canvas = self.canvas
+            self._gpu_active = False
 
         # "减少"混合：画布 RGB 减去图层 RGB（逐像素，仅在该图层使用"减少"时执行）
         if subtract_jobs:
@@ -6214,12 +7284,18 @@ class AutoVJEngine(QObject):
                 fp.end()
                 lay._alpha_key, lay._alpha_img = key, flat
             img = lay._alpha_img
-        prev = lay.prev_player.current() if lay.prev_player else None
+        prev = (lay.prev_player.current()
+                if (getattr(lay, "trans_active", False) and lay.prev_player) else None)
+        if getattr(self, "_gpu_active", False):
+            img = self._gpu_prepare_image(img)
+            prev = self._gpu_prepare_image(prev)
         now = time.perf_counter()
 
         # 每个素材独立的大小/位置（存在 MediaItem 上，而非整个图层）
         cur_item = lay.clips[lay.cur] if 0 <= lay.cur < len(lay.clips) else None
-        prev_item = lay.clips[lay.prev_idx] if (lay.trans_active and 0 <= lay.prev_idx < len(lay.clips)) else None
+        prev_item = getattr(lay, "_trans_prev_item", None)
+        if prev_item is None and lay.trans_active and 0 <= lay.prev_idx < len(lay.clips):
+            prev_item = lay.clips[lay.prev_idx]
 
         def _t(item):
             if item is None:
@@ -6261,7 +7337,14 @@ class AutoVJEngine(QObject):
                     painter.drawImage(_tgt, image, src)
             else:
                 _tgt = QRectF((W - tw) / 2 + dx + ux, (H - th) / 2 + dy + uy, tw, th)
-                if src is None:
+                # 1:1 快路径：解码尺寸已按画布裁过（见 _decode_limit），
+                # 此时 target 恰好等于整幅画布，省掉 QPainter 的缩放/矩形路径。
+                if (src is None and abs(_tgt.x()) < 0.01 and abs(_tgt.y()) < 0.01
+                        and abs(_tgt.width() - iw) < 0.01
+                        and abs(_tgt.height() - ih) < 0.01
+                        and iw == W and ih == H):
+                    painter.drawImage(0, 0, image)
+                elif src is None:
                     painter.drawImage(_tgt, image)
                 else:
                     painter.drawImage(_tgt, image, src)
@@ -6397,6 +7480,11 @@ class AutoVJEngine(QObject):
         except Exception:                                         # noqa: BLE001
             pass
         self.timer.stop()
+        # ★ 多屏输出：先关各路由发送端（NDI/Spout 发送线程）
+        try:
+            self._close_all_route_senders()
+        except Exception:                                         # noqa: BLE001
+            pass
         for lay in self.layers:
             lay.close_all()
         # 关闭每层健康快照日志句柄（见 `_LayerHealthLog`；进程退出时收尾）

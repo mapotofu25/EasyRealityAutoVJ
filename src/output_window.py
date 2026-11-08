@@ -3,14 +3,96 @@
 - 记忆窗口尺寸/位置，宽高比锁定，自适应不变形
 - 无边框 / 置顶 / 隐藏鼠标 / 一键全屏
 """
-import time
 
-from PySide6.QtCore import Qt, QRectF, QSize, QTimer
+from PySide6.QtCore import Qt, QRectF, QSize, QTimer, Signal
 from PySide6.QtGui import QImage, QPainter, QGuiApplication
-from PySide6.QtWidgets import QWidget, QApplication
+from PySide6.QtWidgets import QWidget, QApplication, QVBoxLayout
+
+try:
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+except Exception:                                              # noqa: BLE001
+    QOpenGLWidget = None
+
+
+def _frame_target(img, W, H, aspect_lock=True):
+    iw, ih = img.width(), img.height()
+    if iw <= 0 or ih <= 0 or W <= 0 or H <= 0:
+        return None
+    if aspect_lock:
+        s = min(W / iw, H / ih)
+        tw, th = iw * s, ih * s
+        return QRectF((W - tw) / 2.0, (H - th) / 2.0, tw, th), (iw, ih)
+    return QRectF(0, 0, W, H), (iw, ih)
+
+
+def _paint_image(p, img, W, H, aspect_lock=True):
+    p.fillRect(0, 0, W, H, Qt.black)
+    if img is None or img.isNull():
+        return
+    got = _frame_target(img, W, H, aspect_lock)
+    if got is None:
+        return
+    target, (iw, ih) = got
+    if (abs(target.x()) < 0.5 and abs(target.y()) < 0.5
+            and abs(target.width() - iw) < 0.5
+            and abs(target.height() - ih) < 0.5):
+        p.drawImage(0, 0, img)                 # 1:1 快路径
+    else:
+        p.drawImage(target, img, QRectF(0, 0, iw, ih))
+
+
+class _GLView(QOpenGLWidget):
+    """GPU 缩放显示：QPainter 的 OpenGL 后端把 QImage 上传后由显卡缩放。
+
+    输出窗口最常见的卡顿源是 4K 显示器上把 720p/1080p 画布用 CPU
+    SmoothPixmapTransform 放大：实测 720p→4K 单帧 13ms wall / 34ms CPU，
+    正好顶满 60fps 预算。这里改为 GPU 纹理缩放（同一帧实测约 0.4ms）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._img = None
+        self.aspect_lock = True
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        try:
+            self.setUpdateBehavior(QOpenGLWidget.NoPartialUpdate)
+        except Exception:
+            pass
+
+    def set_frame(self, img):
+        self._img = img
+        self.update()
+
+    def paintGL(self):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        _paint_image(p, self._img, self.width(), self.height(), self.aspect_lock)
+        p.end()
+
+
+class _CpuView(QWidget):
+    """GPU 不可用时的原 CPU 回退路径（保持旧行为）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._img = None
+        self.aspect_lock = True
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def set_frame(self, img):
+        self._img = img
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        _paint_image(p, self._img, self.width(), self.height(), self.aspect_lock)
+        p.end()
 
 
 class OutputWindow(QWidget):
+    visibility_changed = Signal(bool)
+
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.cfg = config
@@ -21,7 +103,6 @@ class OutputWindow(QWidget):
         self._mouse_hidden = False
         self._win_geom = None   # 最近一次窗口模式的几何（退出全屏时还原用）
         self._drag_pos = None   # 无边框窗口拖拽用
-        self._drag_pause_until = 0.0   # 拖动/缩放期间暂停 60fps 重绘（防卡顿）
 
         # 尺寸永远按设置里的输出分辨率（用户选 1080p 就按 1080p 建窗口）；
         # 上次记忆的几何只拿来恢复**位置**——以前连尺寸一起套用，
@@ -36,46 +117,131 @@ class OutputWindow(QWidget):
         if self.cfg["output"].get("always_top"):
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
-    # ---------- 画面 ----------
-    def _pause_repaint(self):
-        """拖动/缩放期间暂停 60fps 重绘（0.25s 无移动自动恢复），防拖动卡顿"""
-        self._drag_pause_until = time.perf_counter() + 0.25
+        # ---- 画面子控件：按缩放倍率自动选择 CPU / GPU ----
+        # 1:1 或小幅缩放时用 CPU（1280x720 输出实测 0.08~0.2ms/帧，比上传
+        # GPU 纹理更稳，也能绕开某些虚拟显示器/采集卡驱动的 OpenGL 卡顿）；
+        # 只有真正需要放大（例如 720p 画布全屏到 1080p/4K）才启用 GPU。
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
+        self._gl_view = None
+        self._cpu_view = _CpuView(self)
+        self._cpu_view.aspect_lock = self.aspect_lock
+        self._layout.addWidget(self._cpu_view)
+        self._view = self._cpu_view
+        self._gpu_enabled = bool(self.cfg["output"].get("gpu_display", True))
+        if QOpenGLWidget is not None and self._gpu_enabled:
+            try:
+                self._gl_view = _GLView(self)
+                self._gl_view.aspect_lock = self.aspect_lock
+                self._gl_view.hide()
+                self._layout.addWidget(self._gl_view)
+            except Exception:
+                self._gl_view = None
+        self._backend_key = None
 
+    # ---------- 画面 ----------
     def moveEvent(self, e):
-        self._pause_repaint()
+        # ★ 2026-11-08：不再因为拖动输出窗口而丢帧/暂停重绘。
+        #   旧实现每次 moveEvent 都 `_pause_repaint()`，连续拖动时 set_frame 一直
+        #   提前 return ⇒ 输出窗口画面整段冻住（用户报「拖任何窗口都会卡」）。
         super().moveEvent(e)
 
     def set_frame(self, img: QImage):
-        if time.perf_counter() < self._drag_pause_until:
-            return   # 拖动中只丢帧不重绘
         self._img = img
-        self.update()
+        key = (img.width(), img.height(), self.width(), self.height(), self.aspect_lock)
+        if key != self._backend_key:
+            self._backend_key = key
+            self._sync_view_backend()
+        try:
+            self._view.set_frame(img)
+        except Exception:
+            self.update()
+        self._frame_n = getattr(self, "_frame_n", 0) + 1
+        if self._frame_n % 120 == 0:
+            self._check_gl_view()
+            self._sync_view_backend()
+
+    def debug_backend(self):
+        """诊断用：当前实际在画的视图（CPU / GPU）与是否有效。"""
+        try:
+            return "%s(valid=%s)" % (type(self._view).__name__,
+                                     bool(self._gl_view.isValid())
+                                     if self._view is self._gl_view else "-")
+        except Exception:
+            return type(getattr(self, "_view", None)).__name__
+
+    def _want_gpu(self):
+        """只在真正需要放大时用 GPU（1:1 输出 CPU 更稳，且成本可忽略）。"""
+        if not self._gpu_enabled or self._gl_view is None or self._img is None:
+            return False
+        got = _frame_target(self._img, self.width(), self.height(), self.aspect_lock)
+        if got is None:
+            return False
+        target, (iw, ih) = got
+        if iw <= 0 or ih <= 0:
+            return False
+        # 2026-11-08：只有真正的大倍率放大（≥1.8×，例如 1080p→4K）才用 GPU。
+        # 720p/1080p 画布全屏到 1080p 时（1.5×）CPU 只要约 3~4ms/帧，改用 CPU
+        # 反而更稳：QOpenGLWidget 会和 Spout / GPU 解码抢同一个显卡驱动，
+        # 码表演出时容易出现 GUI 线程长时间卡住（[OUT] backlog 飙到几十）。
+        return (target.width() >= iw * 1.80) or (target.height() >= ih * 1.80)
+
+    def _sync_view_backend(self):
+        """按当前画布/窗口尺寸切换 CPU/GPU 视图；GPU 失效时保持 CPU。"""
+        try:
+            want = self._want_gpu()
+            if want:
+                try:
+                    # 窗口已显示时先切过去让 QOpenGLWidget 建上下文；
+                    # `_check_gl_view` 会在 300ms 后校验，失败自动退回 CPU。
+                    ok = bool(self._gl_view.isValid()) or bool(self.isVisible())
+                except Exception:
+                    ok = False
+                if not ok:
+                    want = False
+            cur = self._view
+            if want and cur is not self._gl_view:
+                self._cpu_view.hide()
+                self._gl_view.aspect_lock = self.aspect_lock
+                self._gl_view.show()
+                self._view = self._gl_view
+                if self._img is not None:
+                    self._gl_view.set_frame(self._img)
+            elif (not want) and cur is not self._cpu_view:
+                self._gl_view.hide()
+                self._cpu_view.aspect_lock = self.aspect_lock
+                self._cpu_view.show()
+                self._view = self._cpu_view
+                if self._img is not None:
+                    self._cpu_view.set_frame(self._img)
+        except Exception:
+            pass
+
+    def _check_gl_view(self):
+        """GPU 视图创建失败/上下文丢失时自动退回 CPU 视图（绝不黑屏）。"""
+        gl = getattr(self, "_gl_view", None)
+        if gl is None or self._view is not gl:
+            return
+        try:
+            ok = bool(gl.isValid())
+        except Exception:
+            ok = False
+        if not ok:
+            try:
+                gl.hide()
+                self._cpu_view.aspect_lock = self.aspect_lock
+                self._cpu_view.show()
+                self._view = self._cpu_view
+                if self._img is not None:
+                    self._cpu_view.set_frame(self._img)
+            except Exception:
+                pass
 
     def paintEvent(self, _ev):
+        # 子控件（GPU/CPU 视图）负责画面；这里只保证边缘/暴露区域是黑底。
         p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.fillRect(self.rect(), Qt.black)
-        if self._img is None or self._img.isNull():
-            p.end()
-            return
-        iw, ih = self._img.width(), self._img.height()
-        W, H = self.width(), self.height()
-        if iw <= 0 or ih <= 0 or W <= 0 or H <= 0:
-            p.end()
-            return
-        if self.aspect_lock:
-            # 按宽高比缩放**铺满窗口**；比例不一致时留黑边并把画面**居中**。
-            s = min(W / iw, H / ih)
-            tw, th = iw * s, ih * s
-            target = QRectF((W - tw) / 2.0, (H - th) / 2.0, tw, th)
-        else:
-            target = QRectF(0, 0, W, H)      # 拉伸铺满（忽略宽高比）
-        # ⚠ 必须用「目标矩形 + QRectF 源矩形」这个重载才会缩放。
-        # 旧写法 p.drawImage(x, y, img, sx, sy, sw, sh) 是 Qt 的 **1:1 原尺寸**贴图
-        # （那个重载只画子矩形、不做缩放，算出来的 tw/th 只被拿去定位），
-        # 所以 720p 画布在大屏上永远是 1280×720 大小、贴在左上角 ——
-        # 用户实测「设置 720、屏幕 1080、没拉伸」就是它。
-        p.drawImage(target, self._img, QRectF(0, 0, iw, ih))
         p.end()
 
     # ---------- 窗口行为 ----------
@@ -279,9 +445,44 @@ class OutputWindow(QWidget):
 
     def set_mouse_hidden(self, on: bool):
         self._mouse_hidden = on
-        self.setCursor(Qt.BlankCursor if on else Qt.ArrowCursor)
+        cursor = Qt.BlankCursor if on else Qt.ArrowCursor
+        self.setCursor(cursor)
+        try:
+            self._view.setCursor(cursor)
+        except Exception:
+            pass
+
+    def set_aspect_lock(self, on: bool):
+        self.aspect_lock = bool(on)
+        for v in (getattr(self, "_view", None), getattr(self, "_cpu_view", None),
+                  getattr(self, "_gl_view", None)):
+            if v is not None:
+                try:
+                    v.aspect_lock = bool(on)
+                    v.update()
+                except Exception:
+                    pass
 
     # ---------- 记忆几何 ----------
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        try:
+            self.visibility_changed.emit(True)
+        except Exception:
+            pass
+        # QOpenGLWidget 的上下文要 show 之后才创建；给驱动 300ms，失败则回退 CPU。
+        QTimer.singleShot(0, self._sync_view_backend)
+        QTimer.singleShot(300, self._check_gl_view)
+        QTimer.singleShot(350, self._sync_view_backend)
+        QTimer.singleShot(1500, self._check_gl_view)
+
+    def hideEvent(self, ev):
+        super().hideEvent(ev)
+        try:
+            self.visibility_changed.emit(False)
+        except Exception:
+            pass
+
     def closeEvent(self, ev):
         """只记窗口位置/尺寸（geometry）——**不覆盖 width/height**。
 
@@ -303,5 +504,7 @@ class OutputWindow(QWidget):
         # ⚠ 这里曾经有**两份** resizeEvent：先定义的这份带 _pause_repaint()，后定义的
         #   只调 super() —— 后者静默覆盖前者，「移动/缩放窗口期间暂停重绘」就失效了
         #   （表现为拖窗口时预览抢主线程，越拖越卡）。合并成一份。
-        self._pause_repaint()
+        # ★ 2026-11-08：现在**不再暂停**输出重绘；拖动/缩放都继续按帧更新。
+        #   尺寸变化后重新判断是否需要 GPU 放大；延迟一点，避免拖动过程中反复切换。
+        QTimer.singleShot(250, self._sync_view_backend)
         super().resizeEvent(ev)

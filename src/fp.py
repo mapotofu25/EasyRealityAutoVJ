@@ -97,27 +97,35 @@ def _find_peaks(spec):
 
     先做可分离最大滤波（先时间轴、后频率轴的滑动最大值）得到每个点的邻域最大值，
     候选 = 值等于邻域最大且 > 阈值；再排除「平顶并列」（邻域有同值）保证严格最大。
+
+    ★ 2026-11-08：可分离最大值改用 cv2.dilate（1×41 + 41×1 两次），
+      1080p/4.5s 窗实测 9.5ms → 2.2ms，峰值列表与旧 numpy 实现逐项相同
+      （tools/_opt_verify_fp.py 断言）。没有 cv2 时退回旧实现。
     """
-    from numpy.lib.stride_tricks import sliding_window_view
     F, T = spec.shape
     N = PEAK_NEIGHBORHOOD
     W = 2 * N + 1
     if F <= 2 * N or T <= 2 * N:
         return []
+    try:
+        import cv2
+        a = cv2.dilate(spec, np.ones((1, W), np.uint8),
+                       borderType=cv2.BORDER_CONSTANT, borderValue=-np.inf)
+        mx = cv2.dilate(a, np.ones((W, 1), np.uint8),
+                        borderType=cv2.BORDER_CONSTANT, borderValue=-np.inf)
+    except Exception:                                          # noqa: BLE001
+        # 旧路径：numpy 可分离滑动最大
+        from numpy.lib.stride_tricks import sliding_window_view
+        pad_t = np.full((F, N), -np.inf, dtype=np.float32)
+        a = np.concatenate([pad_t, spec, pad_t], axis=1)
+        tMax = sliding_window_view(a, W, axis=1).max(axis=2)
+        pad_f = np.full((N, T), -np.inf, dtype=np.float32)
+        b = np.concatenate([pad_f, tMax, pad_f], axis=0)
+        mx = sliding_window_view(b, W, axis=0).max(axis=2)
 
-    # 1) 时间轴滑动最大（每频率行）
-    pad_t = np.full((F, N), -np.inf, dtype=np.float32)
-    a = np.concatenate([pad_t, spec, pad_t], axis=1)          # (F, T+2N)
-    tMax = sliding_window_view(a, W, axis=1).max(axis=2)      # (F, T)
-
-    # 2) 频率轴滑动最大（每时间列）
-    pad_f = np.full((N, T), -np.inf, dtype=np.float32)
-    b = np.concatenate([pad_f, tMax, pad_f], axis=0)          # (F+2N, T)
-    sqMax = sliding_window_view(b, W, axis=0).max(axis=2)     # (F, T)
-
-    # 3) 候选：内部点，值 == 邻域最大 且 > 阈值
+    # 候选：内部点，值 == 邻域最大 且 > 阈值
     inner = spec[N:F - N, N:T - N]
-    cand = np.where((inner == sqMax[N:F - N, N:T - N]) & (inner > AMP_MIN))
+    cand = np.where((inner == mx[N:F - N, N:T - N]) & (inner > AMP_MIN))
     peaks = []
     ap = peaks.append
     for r, c in zip(*cand):
