@@ -547,9 +547,7 @@ class OutputPreview(QWidget):
             a = m.addAction("复制此屏幕（跟随主屏）")
             a.setEnabled(s.get("type") in ("main", "independent"))
             a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.add_copy_screen(sid))
-            a = m.addAction("切分此屏幕…")
-            a.setEnabled(s.get("type") in ("main", "independent"))
-            a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.add_split_screen(sid))
+            # ★ 用户第 9 条：「切分」已删除（语义并入复制）
             a = m.addAction("删除屏幕")
             a.setEnabled(s.get("type") != "main")
             a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.delete_screen(sid))
@@ -757,9 +755,7 @@ class ScreenCard(QFrame):
         a = m.addAction("复制此屏幕（跟随主屏）")
         a.setEnabled(self.screen.get("type") in ("main", "independent"))
         a.triggered.connect(lambda _=False: self.studio.add_copy_screen(self.screen.get("id")))
-        a = m.addAction("切分此屏幕…")
-        a.setEnabled(self.screen.get("type") in ("main", "independent"))
-        a.triggered.connect(lambda _=False: self.studio.add_split_screen(self.screen.get("id")))
+        # ★ 用户第 9 条：「切分」已删除（切分语义并入复制）⇒ 这里不再提供切分入口
         a = m.addAction("删除屏幕")
         a.setEnabled(self.screen.get("type") != "main")
         a.triggered.connect(lambda _=False: self.studio.delete_screen(self.screen.get("id")))
@@ -822,6 +818,15 @@ class ScreenCard(QFrame):
 
 # ---------------------------------------------------------------- 新建屏幕对话框
 class ScreenDialog(QDialog):
+    """新建屏幕。
+
+    ★ 2026-11-09（用户第 9 条）：
+      ① **类型只留「独立屏幕 / 复制屏幕」** —— 「切分」删掉（切分语义并入复制：
+         复制出来的屏就是"跟着一块源屏走"的屏，不再让用户先选切分再拖 UV）；
+      ② 选「独立屏幕」时**不显示「源屏幕」这一行**（独立屏没有源，摆一行只会误导）；
+      ③ **分辨率对独立屏可手改**（以前跟着"跟随主屏"联动，看起来像只读）。
+    """
+
     def __init__(self, studio, source_screen=None, forced_type=None, parent=None):
         super().__init__(parent or studio)
         self.studio = studio
@@ -832,14 +837,14 @@ class ScreenDialog(QDialog):
         self.name = QLineEdit()
         form.addRow("名称", self.name)
         self.type = QComboBox()
-        items = [("independent", "独立屏幕"), ("copy", "复制屏幕（跟随主屏）"),
-                 ("split", "切分屏幕")]
+        items = [("independent", "独立屏幕"), ("copy", "复制屏幕（跟随主屏）")]
         for k, label in items:
             self.type.addItem(label, k)
         form.addRow("类型", self.type)
         self.source = QComboBox()
         self._fill_sources()
-        form.addRow("源屏幕", self.source)
+        self.lbl_source = QLabel("源屏幕")
+        form.addRow(self.lbl_source, self.source)
         self.w = QSpinBox(); self.w.setRange(16, 7680); self.w.setValue(1920)
         self.h = QSpinBox(); self.h.setRange(16, 4320); self.h.setValue(1080)
         try:
@@ -908,13 +913,18 @@ class ScreenDialog(QDialog):
         t = self.type.currentData()
         src = OM.screen_by_id(self.cfg, self.source.currentData())
         is_ind = t == "independent"
-        is_split = t == "split"
+        is_copy = t == "copy"
+        # ★ 用户第 9 条：独立屏的分辨率**永远可手改**；复制屏跟随主屏 ⇒ 只读。
         self.w.setEnabled(is_ind)
         self.h.setEnabled(is_ind)
-        self.source.setEnabled(not is_ind and src is not None)
-        if is_split:
-            self.hint.setText("切分屏幕的分辨率/颜色/图层跟随源屏幕；创建后可在右侧输入 UV 或直接拖动裁切框。")
-        elif t == "copy":
+        # ★ 用户第 9 条：只有「复制屏幕」才需要选源屏幕；独立屏把这一行整行藏掉。
+        try:
+            self.lbl_source.setVisible(is_copy)
+        except Exception:                                          # noqa: BLE001
+            pass
+        self.source.setVisible(is_copy)
+        self.source.setEnabled(is_copy and src is not None)
+        if is_copy:
             self.hint.setText("复制屏幕只跟随主屏幕：没有独立图层，内容/分辨率/颜色/性能全部跟主屏，名称可改。")
         else:
             self.hint.setText("独立屏幕初始参数复制主屏幕，创建后可单独修改分辨率/颜色/图层。")
@@ -924,13 +934,12 @@ class ScreenDialog(QDialog):
             if main is not None and self.w.value() <= 0:
                 self.w.setValue(OM.effective_size(self.cfg, main)[0])
                 self.h.setValue(OM.effective_size(self.cfg, main)[1])
-        if t == "copy":
+        if is_copy:
             self.source.blockSignals(True)
             main = OM.main_screen(self.cfg)
             if main is not None:
                 self.source.setCurrentIndex(max(0, self.source.findData(main.get("id"))))
             self.source.blockSignals(False)
-            self.source.setEnabled(False)
 
     def _ok(self):
         name = self.name.text().strip()
@@ -980,7 +989,10 @@ class ScreenSettingsPanel(QWidget):
         f.addRow("源屏幕", self.source)
         self.w = QSpinBox(); self.w.setRange(16, 7680)
         self.h = QSpinBox(); self.h.setRange(16, 4320)
-        self.w.valueChanged.connect(self._on_any); self.h.valueChanged.connect(self._on_any)
+        # ★ 用户第 9 条：分辨率单独走 `_on_size`（手改 = 要独立尺寸 ⇒ 顺带取消「跟随主屏」），
+        #   不能再和 spout/ndi 那个 `_on_any` 绑在一起。
+        self.w.valueChanged.connect(self._on_size)
+        self.h.valueChanged.connect(self._on_size)
         row = QHBoxLayout(); row.addWidget(self.w); row.addWidget(QLabel("×")); row.addWidget(self.h)
         f.addRow("分辨率", row)
         self.color = QPushButton("选择颜色…")
@@ -1074,10 +1086,11 @@ class ScreenSettingsPanel(QWidget):
         self.source.setEnabled(t == "split")
         w, h = OM.effective_size(cfg, screen) if screen else (0, 0)
         self.w.setValue(w); self.h.setValue(h)
+        # ★ 用户第 9 条（「独立屏幕的分辨率像是只读的」）：独立屏**始终可改**分辨率。
+        #   以前"独立屏 + 跟随主屏"会把这两个框置灰 ⇒ 用户以为改不了；现在可改，
+        #   一改就自动取消「跟随主屏」（见 `_on_size`）。
         editable_size = bool(screen) and t in ("main", "independent")
         follow = bool((screen or {}).get("follow_main", False))
-        if t == "independent" and mode == "multi" and follow:
-            editable_size = False
         self.w.setEnabled(editable_size); self.h.setEnabled(editable_size)
         col = OM.effective_color(cfg, screen) if screen else "#7B2FF7"
         self.color.setText(str(col).upper())
@@ -1146,6 +1159,30 @@ class ScreenSettingsPanel(QWidget):
             self.changed.emit()
             self.studio.refresh_all()
             self.studio.apply()
+
+    def _on_size(self, *_):
+        """改了分辨率（用户第 9 条）：独立屏手改尺寸 ⇒ 自动取消「跟随主屏」。
+
+        不取消的话下一次 `apply()` 会强行把宽高镜像回主屏 ⇒ 用户会觉得"改了没反应"。
+        """
+        if self._loading or not self.screen:
+            return
+        s = self.screen
+        t = s.get("type")
+        if t not in ("main", "independent"):
+            return
+        s["width"] = max(16, self.w.value())
+        s["height"] = max(16, self.h.value())
+        if t == "independent" and self.mode == "multi":
+            s["follow_main"] = False
+            try:
+                self.chk_follow.blockSignals(True)
+                self.chk_follow.setChecked(False)
+                self.chk_follow.blockSignals(False)
+            except Exception:                                      # noqa: BLE001
+                pass
+        self.changed.emit()
+        self.studio.apply()
 
     def _on_any(self, *_):
         if self._loading or not self.screen:
