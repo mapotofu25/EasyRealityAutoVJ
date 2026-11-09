@@ -6404,7 +6404,7 @@ class AutoVJEngine(QObject):
     # （`_apply_screen_cp()` 已于 2026-11-10 删除：每屏 color/postfx 合进
     #   `_compose_independent()`，否则单路会套两遍、颜色/特效叠加。）
 
-    def _apply_color_postfx(self, snap, canvas=None):
+    def _apply_color_postfx(self, snap, canvas=None, advance=True):
         """颜色 + 后处理：**共用一次**全画布 BGR 读回 / 写回。
 
         ★ 2026-10-28（性能）：原来 `_apply_color` 和 `_apply_postfx` 各自
@@ -6489,7 +6489,7 @@ class AutoVJEngine(QObject):
             return True
         return False
 
-    def _apply_color(self, snap, bgr=None, write=True, canvas=None):
+    def _apply_color(self, snap, bgr=None, write=True, canvas=None, advance=True):
         """颜色渲染器（一键调色）：合成后、后处理前跑一次。
 
         **铁律**：Kv 待机层激活时绝不染色（`kv_on>0.01` 时强度直接硬归零，连渐变都不走），
@@ -6520,7 +6520,8 @@ class AutoVJEngine(QObject):
         except Exception:                                     # noqa: BLE001
             _rot = None
         s = cfx.tick(cfg, snap, kv_on=kv_on, flicker=flick,
-                     bypass=bool(cfg.get("bypass", False)), rotate_hint=_rot)
+                     bypass=bool(cfg.get("bypass", False)), rotate_hint=_rot,
+                     advance=advance)
         if s > 0.004:
             _tgt = canvas if canvas is not None else self.canvas
             try:

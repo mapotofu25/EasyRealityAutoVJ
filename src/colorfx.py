@@ -124,7 +124,8 @@ class ColorRenderer:
 
     # -------- 决策 --------
     def tick(self, cfg, snap, *,
-             kv_on=0.0, flicker=False, bypass=False, rotate_hint=None):
+             kv_on=0.0, flicker=False, bypass=False, rotate_hint=None,
+             advance=True):
         """推进一帧决策，返回当前染色强度 0..1。
 
         `rotate_hint`：**要不要在这一帧换色**，由调用方判定。
@@ -194,6 +195,15 @@ class ColorRenderer:
         else:
             want = (0.80 + 0.20 * min(1.0, (E - TIER_HIGH) / 0.35)) * gain
             self.last_state = T("强制染色（高能量）")
+
+        # ★ 2026-11-10（多屏颜色漂移）：`advance=False` 时**只读不写** ——
+        #   返回"当前已推进到的那一档强度"，绝不改 `e_hist` / `palette_i` / `self.s` /
+        #   `pending` 等内部状态。多屏下主屏（advance=True）推进一次，其余屏复用同一份，
+        #   否则同一帧里第 2、3 块屏拿到的颜色和第一块不同，且换色速度按屏数翻倍。
+        if not advance:
+            if (not on) or bypass or kv_on > 0.01:
+                return 0.0
+            return float(self.s)
 
         # ---- 目标颜色 ----
         rotate = max(1.0, float(c.get("rotate_sec", 45) or 45))   # 1~60 秒（UI 滑块给的范围）
