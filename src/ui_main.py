@@ -4017,6 +4017,18 @@ class MainWindow(QMainWindow):
         #   "释放固定高度"重复执行无害。
         self._blocks_split_user_set = True
         self._record_block_ratios()
+        # ★ 关键：块被 `setFixedHeight` 钉死后，QSplitter 的 maximumHeight 会跟着变成
+        #   "子块高之和"（实测 386）⇒ 之后无论块区多大，splitter 都不再长、`setSizes`
+        #   永远被夹回下限。所以拖拽一开始就要**把 splitter 自己也解锁**。
+        for vs in (getattr(self, "_blocks_vsplit_left", None),
+                   getattr(self, "_blocks_vsplit_right", None)):
+            if vs is None:
+                continue
+            try:
+                vs.setMinimumHeight(0)
+                vs.setMaximumHeight(16777215)
+            except Exception:                                      # noqa: BLE001
+                pass
         # 只**放开上限**（固定高会锁死拖拽），下限 150（team-lead 定的硬底）：
         #   · 默认没拖过时仍由 `_fit_block_height` 钉死 ⇒ "三块全可见"不变
         #   · 拖过之后不再被自动改；splitter 记住 sizes
