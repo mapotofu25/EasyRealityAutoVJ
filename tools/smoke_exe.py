@@ -120,6 +120,14 @@ def main():
         _real_tmp = tempfile.gettempdir()
         data_root = os.path.join(_real_tmp, "autovj_smoke_%d" % os.getpid())
         os.makedirs(data_root, exist_ok=True)
+        # ★ 用完就删：以前这个隔离目录**永远留着**，每跑一次冒烟就在 C://Temp 堆一份
+        #   （本轮 C 盘被吃满的元凶之一）。退出时无条件清理，失败静默。
+        try:
+            import atexit as _atexit
+            import shutil as _shutil
+            _atexit.register(_shutil.rmtree, data_root, True)
+        except Exception:                                          # noqa: BLE001
+            pass
         env = os.environ.copy()
         env["LOCALAPPDATA"] = data_root
         # ★★ 关键：单实例锁在 `tempfile.gettempdir()`（= TEMP/TMP）里，不在 LOCALAPPDATA。
