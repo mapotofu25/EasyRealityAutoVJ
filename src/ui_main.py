@@ -6448,9 +6448,24 @@ class MainWindow(QMainWindow):
         _blocked(getattr(self, "color_strength", None), lambda w: w.setValue(_cs))
         _blocked(getattr(self, "btn_color_bypass", None),
                  lambda w: w.setChecked(bool(col.get("bypass", False))))
-        #   · 后处理：总开关（`enabled`）
-        _blocked(getattr(self, "chk_postfx_on", None),
+        #   · 后处理：顶层键（总开关 / 模式 / 整体强度 / 自动联动 / 保持拍数）
+        #   ⚠ 这些控件挂在 `self.settings` 上；以前写成 `getattr(self, "chk_postfx_on")`
+        #     恒为 None ⇒ 后处理页永远不回填（QA 报的 "chk_postfx_on / postfx_mode 没回填"）。
+        _blocked(getattr(st, "chk_postfx_on", None),
                  lambda w: w.setChecked(bool(post.get("enabled", True))))
+        _blocked(getattr(st, "postfx_mode", None),
+                 lambda w: w.setCurrentIndex(1 if str(post.get("mode") or "auto") == "manual" else 0))
+        _blocked(getattr(st, "postfx_auto", None),
+                 lambda w: w.setChecked(bool(post.get("auto", True))))
+        _blocked(getattr(st, "postfx_global", None),
+                 lambda w: w.setValue(int(post.get("global_level", 60) or 60)))
+        try:
+            _hb2 = int(post.get("auto_hold_beats", 16) or 16)
+        except (TypeError, ValueError):
+            _hb2 = 16
+        _blocked(getattr(st, "postfx_hold", None),
+                 lambda w: w.setCurrentIndex([0, 8, 16, 32, 64].index(_hb2)
+                                             if _hb2 in (0, 8, 16, 32, 64) else 2))
         #   · 每个效果：遍历**配置里的 effects 键**（不写死列表），回填 on + level
         try:
             _effs = post.get("effects") or {}

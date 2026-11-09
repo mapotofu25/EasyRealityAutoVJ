@@ -5676,15 +5676,41 @@ class AutoVJEngine(QObject):
                 except Exception:                                 # noqa: BLE001
                     pass
 
-    def _cuesheet_on(self):
+    def _canvas_screen(self, canvas):
+        """从画布对象反查它是哪块屏的（认不出 ⇒ None，调用方按全局处理）。"""
+        try:
+            if canvas is None or canvas is self.canvas:
+                return output_model.main_screen(self._out_cfg) if self._out_cfg else None
+            for sid, cv in (getattr(self, "_screen_canvases", None) or {}).items():
+                if cv is canvas:
+                    return output_model.screen_by_id(self._out_cfg, sid)
+        except Exception:                                          # noqa: BLE001
+            pass
+        return None
+
+    def _cuesheet_on(self, screen=None):
         """码表图层本帧是否在接管画面（1.0 / 0.0）。
+
+        ★ BUG-G（2026-11-10）：多屏下必须**按屏**判断。以前只要**任意一屏**有码表在接管
+          就返回 1 ⇒ 所有屏的调色 + 后处理全被跳过（用户"颜色渲染失效"的真因）。
+          `screen` 为 None 时保持原行为（全局任意一屏），不影响别处调用。
 
         用户 2026-09-28：「码表图层和 Kv 图层一样，不受画面效果的影响」——
         码表里是 DJ 做好的成片，再叠调色/特效就不是原片了 ⇒ 接管期间后处理整条跳过。
         """
+        _sid = str((screen or {}).get("id") or "") if screen else ""
         for lay in (getattr(self, "layers", None) or []):
-            if getattr(lay, "is_cuesheet", False) and getattr(lay, "cs_active", False):
+            if not (getattr(lay, "is_cuesheet", False) and getattr(lay, "cs_active", False)):
+                continue
+            if screen is None:
+                return 1.0                       # 兼容：不传屏 ⇒ 原来的"任意一屏"语义
+            try:
+                sc = self._layer_screen(lay)
+                if sc is not None and str(sc.get("id") or "") == _sid:
+                    return 1.0
+            except Exception:                                      # noqa: BLE001
                 return 1.0
+        return 0.0
         return 0.0
 
     def set_cue_seek_profile(self, name):
@@ -6476,7 +6502,8 @@ class AutoVJEngine(QObject):
           传 None（默认）时行为与改动前逐字一致（读 `self.canvas`）。
         """
         # ★ 码表接管期间跳整条调色链（与 Kv 同口径：码表里是 DJ 做好的成片，不能再染色）
-        if self._cuesheet_on():
+        #   ★ 按**画布所属的屏**判断（多屏下别的屏有码表不该拖累本屏）
+        if self._cuesheet_on(self._canvas_screen(canvas)):
             return bgr
         cfx = self.color_fx
         try:
@@ -6560,7 +6587,8 @@ class AutoVJEngine(QObject):
         自动联动总开关 auto=False 时，全部退化为常驻。
         """
         # ★ 码表接管期间跳整条后处理链（同 Kv：成片不该被辉光/色差等污染）
-        if self._cuesheet_on():
+        #   ★ 同样按画布所属的屏判断
+        if self._cuesheet_on(self._canvas_screen(canvas)):
             # 拖影缓冲必须一起清：不清的话码表切回来会闪一帧上一场的残影
             self._postfx_reset_trails()
             self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
