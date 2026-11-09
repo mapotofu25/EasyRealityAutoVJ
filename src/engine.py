@@ -1595,6 +1595,38 @@ class AutoVJEngine(QObject):
         return info
 
     @_locked
+    def _layer_screen(self, lay):
+        """该图层"所属屏"的 screen dict（多屏自建图层后一层只属于一块屏）。
+
+        兜底顺序：屏幕的 `layers` 里显式包含它 → 主屏（共享层/脏数据）。
+        `_layer_screen_map` 在每次重建输出计划时失效重建。
+        """
+        try:
+            m = getattr(self, "_layer_screen_map", None)
+            if m is None:
+                m = {}
+                plan = self._out_cfg
+                for s in (plan or {}).get("screens") or []:
+                    ids = output_model.effective_layers(
+                        plan, s, [l.lid for l in self.layers])
+                    for lid in ids:
+                        # 主屏先遍历 ⇒ 共享层天然落到主屏那套（上面注释里的兜底）
+                        m.setdefault(str(lid), s)
+                self._layer_screen_map = m
+            return m.get(str(getattr(lay, "lid", "")))
+        except Exception:                                          # noqa: BLE001
+            return None
+
+    def _auto_for(self, lay=None):
+        """该层所属屏的 `auto` 参数（没有 → 全局）。U7 第二步。"""
+        try:
+            s = self._layer_screen(lay) if lay is not None else None
+            if s is not None and (s.get("params") or {}).get("auto"):
+                return output_model.effective_params(self.cfg, s)["auto"]
+        except Exception:                                          # noqa: BLE001
+            pass
+        return self.cfg["auto"]
+
     def _refresh_auto_layers(self, snap, force_tier=None, force=False, instant=True,
                              presec=False):
         """用 `match_clips` 重新挑自动图层的素材池并立即切换。
@@ -1992,6 +2024,9 @@ class AutoVJEngine(QObject):
             tier = nxt.get("tier") or "mid"
             energy = float(nxt.get("energy") or 0.0)
             try:
+                # ⚠ `seed` 仍是**全局**：这里的 rng 是一个跨图层共用的随机序列，
+                #   "每屏一个 seed" 需要每层各自一颗 rng（会改变现有的选片随机序列），
+                #   属于下一步；本步只把**逐层决策**（cooldown / energy_map）按屏。
                 seed = int(self.cfg["auto"].get("seed") or 0)
             except Exception:                                  # noqa: BLE001
                 seed = 0
@@ -3396,12 +3431,13 @@ class AutoVJEngine(QObject):
 
     def _candidate_indices(self, lay, snap):
         """当前可切换的候选素材索引（不改动任何状态，供切换与"下一个素材"预估共用）"""
-        cooldown = float(self.cfg["auto"].get("cooldown_sec", 20))
+        _a = self._auto_for(lay)          # ★ U7：按该层所属屏的 auto 参数
+        cooldown = float(_a.get("cooldown_sec", 20))
         now = time.perf_counter()
         idxs = list(range(len(lay.clips)))
         prefer = []
         fallback = None   # 缓和段二级兜底：避开高动态/频闪（用中动态/未标动态兜底）
-        if self.cfg["auto"].get("energy_map", True):
+        if _a.get("energy_map", True):
             hi, lo, mid = [], [], []
             flash = set()
             for i, c in enumerate(lay.clips):
@@ -6700,6 +6736,7 @@ class AutoVJEngine(QObject):
         else:
             self._combined_canvas = None
             self._combined_key = None
+        self._layer_screen_map = None       # ★ U7：屏幕/图层归属可能变了 ⇒ 重算映射
         self._sync_route_senders()
         self._route_frames.clear()
 

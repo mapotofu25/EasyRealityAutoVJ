@@ -4502,6 +4502,12 @@ class MainWindow(QMainWindow):
                 except Exception:                              # noqa: BLE001
                     pass
                 lbl.setText(T("单路：以下设置对所有屏幕生效（只发一路）"))
+                # ★ U7 第二步：单路下参数按屏 ⇒ 面板必须**回填当前屏的生效值**
+                try:
+                    from PySide6.QtCore import QTimer as _QT3
+                    _QT3.singleShot(0, self._reload_screen_params_ui)
+                except Exception:                                  # noqa: BLE001
+                    self._reload_screen_params_ui()
                 lbl.show()
                 box_s = getattr(self, "screen_setup_box", None)
                 if box_s is not None:
@@ -5725,6 +5731,80 @@ class MainWindow(QMainWindow):
         except Exception as e:                                     # noqa: BLE001
             self._log_ui_error("store_screen_param", e)
             return False
+
+    def _reload_screen_params_ui(self):
+        """★ U7 第二步（发版前置）：单路下把**面板回填**成"当前选中屏的生效值"。
+
+        只有写入侧按屏、读取侧还是全局 ⇒ 用户会看到"我改的值没保存"。
+        这里对**有控件的键**逐项回填（blockSignals 防止回填触发写回）；多路/未选中屏 ⇒ 不动，
+        仍由 `_load_settings_to_ui()` 显示全局值。
+        """
+        sc = self._params_target_screen()
+        if sc is None:
+            return
+        try:
+            import output_model as _om
+            eff = _om.effective_params(self.cfg.data, sc)
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("_reload_screen_params_ui.eff", e)
+            return
+        auto = eff.get("auto") or {}
+        post = eff.get("postfx") or {}
+        col = eff.get("color") or {}
+
+        def _blocked(w, fn):
+            if w is None:
+                return
+            try:
+                w.blockSignals(True)
+                fn(w)
+            except Exception:                                      # noqa: BLE001
+                pass
+            finally:
+                try:
+                    w.blockSignals(False)
+                except Exception:                                  # noqa: BLE001
+                    pass
+
+        st = getattr(self, "settings", None)
+        if st is not None:
+            # 演出行为
+            try:
+                iv = int(auto.get("intensity", 1))
+            except (TypeError, ValueError):
+                iv = 1
+            _blocked(getattr(st, "intensity", None),
+                     lambda w: w.setCurrentIndex(max(0, min(4, iv + 1))))
+            tr = str(auto.get("transition") or "")
+            _blocked(getattr(st, "transition", None),
+                     lambda w: w.setCurrentIndex(
+                         ["", "fade", "cut", "slide", "zoom", "glitch"].index(tr)
+                         if tr in ["", "fade", "cut", "slide", "zoom", "glitch"] else 0))
+            _blocked(getattr(st, "energy_map", None),
+                     lambda w: w.setChecked(bool(auto.get("energy_map", True))))
+            _blocked(getattr(st, "bpm_sync", None),
+                     lambda w: w.setChecked(bool(auto.get("bpm_speed_sync", True))))
+            _blocked(getattr(st, "chk_beat_grid", None),
+                     lambda w: w.setChecked(bool(auto.get("beat_grid", True))))
+            # 调色（Bypass）
+            _blocked(getattr(st, "btn_color_bypass", None),
+                     lambda w: w.setChecked(bool(col.get("bypass", False))))
+        # 画面效果（扁平键）
+        _blocked(getattr(self, "postfx_auto", None),
+                 lambda w: w.setChecked(bool(post.get("auto", True))))
+        try:
+            gl = int(post.get("global_level", 60) or 60)
+        except (TypeError, ValueError):
+            gl = 60
+        _blocked(getattr(self, "postfx_global", None), lambda w: w.setValue(gl))
+        md = str(post.get("mode") or "auto")
+        _blocked(getattr(self, "postfx_mode", None),
+                 lambda w: w.setCurrentIndex(1 if md == "manual" else 0))
+        try:
+            hb = [0, 8, 16, 32, 64].index(int(post.get("auto_hold_beats", 16) or 16))
+        except (ValueError, TypeError):
+            hb = 2
+        _blocked(getattr(self, "postfx_hold", None), lambda w: w.setCurrentIndex(hb))
 
     def clear_screen_param(self, sec=None):
         """「恢复跟随全局」：清掉当前屏（某一段）的 override。"""

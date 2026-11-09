@@ -470,9 +470,66 @@ def effective_params(data, screen):
         base = dict((data or {}).get(sec) or {})
         ov = ((screen or {}).get("params") or {}).get(sec) or {}
         if ov:
-            base.update(ov)
+            # ⚠ `postfx.effects` 是**嵌套** dict（effects[key][field]）：必须逐级深合并，
+            #   否则一个二级 override 会把整段 effects 顶掉（其它特效全丢）。
+            for k, v in ov.items():
+                if k == "effects" and isinstance(v, dict):
+                    merged = {kk: dict(vv) if isinstance(vv, dict) else vv
+                              for kk, vv in (base.get("effects") or {}).items()}
+                    for ek, ev in v.items():
+                        if isinstance(ev, dict):
+                            tgt = dict(merged.get(ek) or {})
+                            tgt.update(ev)
+                            merged[ek] = tgt
+                        else:
+                            merged[ek] = ev
+                    base["effects"] = merged
+                else:
+                    base[k] = v
         out[sec] = base
     return out
+
+
+def set_screen_effect_param(screen, eff, field, val, data=None):
+    """按屏 override 一个**二级**特效字段（`postfx.effects[eff][field]`）。
+
+    「与全局同值 ⇒ 删键」对嵌套结构同样成立：比较的是**那个二级字段**，不是整个 effects。
+    """
+    if not isinstance(screen, dict) or not eff:
+        return False
+    g_eff = ((((data or {}).get("postfx") or {}).get("effects") or {}).get(eff) or {})
+    glob = g_eff.get(field, _MISSING)
+    params = screen.get("params") if isinstance(screen.get("params"), dict) else {}
+    post = params.get("postfx") if isinstance(params.get("postfx"), dict) else {}
+    effs = post.get("effects") if isinstance(post.get("effects"), dict) else {}
+    d = effs.get(eff) if isinstance(effs.get(eff), dict) else {}
+    if glob is _MISSING:
+        if val is None:
+            d.pop(field, None)
+        else:
+            d[field] = val
+    elif glob == val:
+        d.pop(field, None)
+    else:
+        d[field] = val
+    # 逐级回写 + 清理空壳
+    if d:
+        effs[eff] = d
+    else:
+        effs.pop(eff, None)
+    if effs:
+        post["effects"] = effs
+    else:
+        post.pop("effects", None)
+    if post:
+        params["postfx"] = post
+    else:
+        params.pop("postfx", None)
+    if params:
+        screen["params"] = params
+    else:
+        screen.pop("params", None)
+    return bool(screen.get("params"))
 
 
 def screen_params(data, screen, sec):
