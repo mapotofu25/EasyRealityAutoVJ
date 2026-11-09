@@ -479,6 +479,16 @@ def effective_params(data, screen):
       数据模型是 override 式：`screen["params"][sec][key]` **只存与全局不同的键**，
       没这个键 ⇒ 继承全局 ⇒ **零迁移**、默认行为与改动前完全一致。
     """
+    # ★★★ 2026-11-10（一级 bug 根因）：`data` 必须兼容 **`Config` 对象**。
+    #   `Config` 只实现了 `__getitem__`，**没有 `.get`**；而引擎里有 6 处调用传的是
+    #   `self.cfg`（Config 实例）⇒ 本函数第一句 `data.get(sec)` 抛 AttributeError，
+    #   那些调用点又全在 `try/except` 里 ⇒ **静默回落全局**：
+    #     · 波1「按屏 auto（cooldown/energy_map）」从未生效
+    #     · 波2「按屏切换节奏 / 灵敏度」从未生效
+    #     · 更严重：`_compose_independent()` 里"读参数 + `_compose_to()`"曾写在同一个 try，
+    #       异常让合成被整段跳过 ⇒ **带 params 的独立屏全黑**（已实测 RGB(0,0,0)）
+    #   在这里一次兜住，别去逐个 call site 补（漏一个就是一处静默失效）。
+    data = getattr(data, "data", data)
     out = {}
     for sec in PARAM_SECTIONS:
         base = dict((data or {}).get(sec) or {})
