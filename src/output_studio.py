@@ -2372,6 +2372,48 @@ class OutputStudio(QWidget):
 
 
 # ---------------------------------------------------------------- 输出画布（mapping）
+def fit_block_font(lines, avail_w, avail_h, hi=28, lo=10):
+    """H2 内部：给一组文本行**实测**挑字号（不保证一定放得下，放不下返回下限）。"""
+    for fs in range(int(hi), int(lo) - 1, -1):
+        f = QFont("Microsoft YaHei", fs, QFont.Bold)
+        fm = QFontMetrics(f)
+        widest = max([fm.horizontalAdvance(str(x)) for x in lines] or [0])
+        total_h = fm.lineSpacing() * max(1, len(lines))
+        if widest <= avail_w and total_h <= avail_h:
+            return f, widest, total_h
+    f = QFont("Microsoft YaHei", int(lo), QFont.Bold)
+    fm = QFontMetrics(f)
+    return (f, max([fm.horizontalAdvance(str(x)) for x in lines] or [0]),
+            fm.lineSpacing() * max(1, len(lines)))
+
+
+def fit_block(lines, avail_w, avail_h, hi=28, lo=10, shorten=None):
+    """H2：把一段文字**排进给定矩形**，保证每行宽 ≤ avail_w、总高 ≤ avail_h。
+
+    三级兜底（只在必要时逐级降级，尽量保留信息）：
+      1. 降字号：从 `hi` 试到 `lo`（默认 28→10）；
+      2. 换短文案：`shorten` 给出"同一信息的短版本"，只在字号已到底仍放不下时启用；
+      3. 省略号：仍放不下就逐行 ElideRight（**永远不溢出**）。
+
+    Returns:
+        (font, lines, widest_px, total_h_px)
+    """
+    font, widest, total_h = fit_block_font(lines, avail_w, avail_h, hi=hi, lo=lo)
+    out = list(lines)
+    if widest > avail_w and shorten:
+        short = shorten(out)
+        f2, w2, h2 = fit_block_font(short, avail_w, avail_h, hi=hi, lo=lo)
+        if w2 <= avail_w:
+            font, widest, total_h, out = f2, w2, h2, list(short)
+    fm = QFontMetrics(font)
+    avail_w = max(1.0, float(avail_w))
+    out = [fm.elidedText(str(b), Qt.ElideRight, int(avail_w))
+           if fm.horizontalAdvance(str(b)) > avail_w else str(b) for b in out]
+    widest = max([fm.horizontalAdvance(b) for b in out] or [0])
+    total_h = fm.lineSpacing() * max(1, len(out))
+    return font, out, widest, total_h
+
+
 class _CanvasBoard(QWidget):
     """输出画布：把每块屏幕按 mapping 坐标摆在一张画布上，**拖动即可排布**。
 
@@ -2558,11 +2600,31 @@ class _CanvasBoard(QWidget):
             p.drawRect(r)
             pw, ph = OM.effective_size(self.cfg, s)
             uv = OM.screen_uv(self.cfg, s)
-            fs = int(max(9, min(22, min(r.width(), r.height()) / 8.0)))
-            p.setFont(QFont("Microsoft YaHei", fs, QFont.Bold))
+            # ★ H2：字号**先量文本再定**——从上限 28 往下试，直到"最宽那行 ≤ 格宽-16"
+            #   且"总高 ≤ 格高-16"；下限 10。UV 拆两行（比一行 `→` 短一半，不再被裁）。
+            blocks = [
+                str(s.get("name") or ""),
+                "%d × %d" % (pw, ph),
+                "U0,V0 = %.4f, %.4f" % (uv[0], uv[1]),
+                "U1,V1 = %.4f, %.4f" % (uv[2], uv[3]),
+            ]
+            avail_w = max(1.0, r.width() - 16)
+            avail_h = max(1.0, r.height() - 16)
+            # 极窄格子的短文案：去掉 `U0,V0 = ` 前缀（信息不丢，只是短一半）
+            def _shorten(_ls, _uv=uv):
+                return [_ls[0], _ls[1],
+                        "%.4f, %.4f" % (_uv[0], _uv[1]),
+                        "%.4f, %.4f" % (_uv[2], _uv[3])]
+            font, blocks, widest, total_h = fit_block(
+                blocks, avail_w, avail_h, hi=28, lo=10, shorten=_shorten)
+            fm = QFontMetrics(font)
+            p.setFont(font)
             p.setPen(_text_color(col))
-            p.drawText(r, Qt.AlignCenter, "%s\n%d × %d\nUV %.4f,%.4f → %.4f,%.4f"
-                       % (s.get("name") or "", pw, ph, uv[0], uv[1], uv[2], uv[3]))
+            line_h = fm.lineSpacing()
+            y0 = r.center().y() - (line_h * len(blocks)) / 2.0      # 整块垂直居中
+            for i, line in enumerate(blocks):
+                p.drawText(QRectF(r.x(), y0 + i * line_h, r.width(), line_h),
+                           Qt.AlignCenter, line)
             # ★ 超界的屏描红框（只提示，不改数据）：右/下边超出画布就是会被裁掉的那块
             if x + w > cw or y + h > ch:
                 p.setBrush(Qt.NoBrush)

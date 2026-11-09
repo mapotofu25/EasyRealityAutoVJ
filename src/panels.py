@@ -5041,11 +5041,40 @@ class PreviewPanel(QWidget):
         self._place_overlays()
         self._rescale()
 
+    #: HUD 靠右上（多屏模式置 True；单屏演出台保持左上）
+    hud_align_right = False
+    #: 右上时 HUD 顶边额外下移量（给「当前选择屏幕」胶囊让位）
+    hud_top_extra = 0
+
+    def set_hud_align(self, right, top_extra=None):
+        """H1：多屏模式把 HUD 从左上挪到**右上**；单屏保持原样。
+
+        Args:
+            right: True ⇒ 贴右边缘（距预览区右边 8px）；False ⇒ 回到左上 (8,8)。
+            top_extra: 顶边额外下移像素（胶囊在**同一个预览区**时传胶囊底边+6；
+                       None ⇒ 沿用上次的值）。
+        """
+        self.hud_align_right = bool(right)
+        if top_extra is not None:
+            self.hud_top_extra = max(0, int(top_extra))
+        self._place_overlays()
+
+    def hud_anchor(self):
+        """HUD 当前锚点，供几何断言用：(x, y, w, h)。"""
+        r = self.hud.geometry()
+        return (r.x(), r.y(), r.width(), r.height())
+
     def _place_overlays(self):
         w, h = self.view.width(), self.view.height()
         self.hud.adjustSize()
-        self.hud.move(8, 8)
-        self.beatbar.move(8, 8 + self.hud.height() + 4)
+        if self.hud_align_right:
+            # ★ H1：右上角，右边缘留 8px（要求 ≤12px）；顶边默认 8，胶囊在时下移
+            hx = max(8, int(w) - int(self.hud.width()) - 8)
+            hy = 8 + int(getattr(self, "hud_top_extra", 0) or 0)
+        else:
+            hx, hy = 8, 8
+        self.hud.move(hx, hy)
+        self.beatbar.move(hx, hy + self.hud.height() + 4)
         self._place_thumbs()
 
     def _place_thumbs(self):

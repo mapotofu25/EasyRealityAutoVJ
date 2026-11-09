@@ -4603,6 +4603,11 @@ class MainWindow(QMainWindow):
     def toggle_multi_output(self, on, startup=False):
         """打开/关闭多屏输出：整个演出台切换布局，输出引擎也切换单路/多路。"""
         on = bool(on)
+        # ★ H1：多屏模式 HUD 挪到预览区右上角；单屏演出台保持左上不变
+        try:
+            self.preview_panel.set_hud_align(on)
+        except Exception:                                          # noqa: BLE001
+            pass
         try:
             if on:
                 # 首次从普通演出台进入：把旧输出设置同步到主屏幕，避免主屏输出开关/分辨率被旧值覆盖
