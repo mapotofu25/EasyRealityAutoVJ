@@ -3936,7 +3936,9 @@ class MainWindow(QMainWindow):
         is_copy = str(s.get("type")) == "copy"
         blk = QFrame()
         blk.setObjectName("multiScreenBlock")
-        blk.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # ★ 纵向必须是 Expanding：`Fixed` 会让 sizeHint 焊死块高，父 splitter 拉不大
+        #   （实测块永远停在 min 150、且在 splitter 里被居中）。
+        blk.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         blk._screen_id = sid
         blk._multi_screen_id = sid          # eventFilter：点块体 ⇒ 选中该屏
         v = QVBoxLayout(blk)
@@ -4462,6 +4464,21 @@ class MainWindow(QMainWindow):
                     continue
                 nat = [self._natural_block_h(vs.widget(i)) for i in range(vs.count())]
                 try:
+                    # ★ 差异补到最后一列：QSplitter 在 Σsizes < 高度时会把子项**居中**，
+                    #   补满后没有富余，块就自然贴顶排（实测 y=165 居中就是这个原因）。
+                    try:
+                        _h = int(vs.height() or 0)
+                        _n = len(nat)
+                        if _h > 0 and _n > 0:
+                            _gap = vs.handleWidth() * max(0, _n - 1)
+                            _diff = _h - sum(nat) - _gap
+                            if _diff > 0:
+                                # 差额只补给**最后一块**：前面的块保持自己的 natural
+                                # （改行高才看得出变化）；若按比例摊到所有块，块高会变成
+                                # "列高/块数"，行高再怎么改都不动（实测 [309,309] 卡死）。
+                                nat[-1] += _diff
+                    except Exception:                          # noqa: BLE001
+                        pass
                     # splitter 自身撑满列高（**只管 splitter，不碰子块**）：
                     # 否则它的高度只等于子块 sizeHint 之和，setSizes 没有富余可分配。
                     colh = int(vs.parentWidget().height()) if vs.parentWidget() else 0
