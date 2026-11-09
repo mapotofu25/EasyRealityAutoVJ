@@ -182,7 +182,7 @@ def main():
         if not cond:
             fails.append(name)
 
-    tmp = tempfile.mkdtemp(prefix="cuepos_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuepos_")
     media = os.path.join(tmp, "media")
     os.makedirs(media, exist_ok=True)
     for nm, col in (("a.mp4", (210, 30, 30, 255)), ("b.mp4", (30, 90, 220, 255))):

@@ -203,7 +203,7 @@ def main():
 
     os.environ.pop("QT_QPA_PLATFORM", None)      # 真实平台（offscreen 没 CJK 字体，中文会变方块）
     app = QApplication.instance() or QApplication(sys.argv)
-    tmp = tempfile.mkdtemp(prefix="badge_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="badge_")
 
     cue_lay = engine.Layer("码表层")
     cue_lay.is_cuesheet = True

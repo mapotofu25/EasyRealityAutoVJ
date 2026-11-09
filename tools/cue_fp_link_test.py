@@ -113,7 +113,7 @@ def main():
         if not cond:
             fails.append(name)
 
-    tmp = tempfile.mkdtemp(prefix="cuefp_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuefp_")
     FP_ID = "fp2-0123456789abcdef"
     FILE_MD5 = "d41d8cd98f00b204e9800998ecf8427e"
     MEDIA = os.path.join(tmp, "songA.flac")

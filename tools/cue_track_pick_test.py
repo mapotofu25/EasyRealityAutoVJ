@@ -213,7 +213,7 @@ def save_pkg(sheet, path):
 # ==========================================================================
 def main():
     app = QApplication.instance() or QApplication(sys.argv)          # noqa: F841
-    tmp = tempfile.mkdtemp(prefix="cuepick_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuepick_")
     os.makedirs(tmp, exist_ok=True)
     media = os.path.join(tmp, "media")
     os.makedirs(media, exist_ok=True)

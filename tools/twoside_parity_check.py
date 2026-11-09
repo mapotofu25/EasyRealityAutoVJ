@@ -807,7 +807,7 @@ def _prepare_pkg(pkg, bpm_override=0.0):
             else:
                 t["identity"] = {"bpm": float(bpm_override)}
         src_desc += "（bpm 覆盖为 %g）" % bpm_override
-    tmp = os.path.join(tempfile.mkdtemp(prefix="parity_"), "parity_input.ercue")
+    tmp = os.path.join(tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="parity_"), "parity_input.ercue")
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         z.writestr("cuesheet.json", json.dumps(raw, ensure_ascii=False, indent=1))
     return tmp, (not pkg), src_desc

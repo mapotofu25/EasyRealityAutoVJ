@@ -931,7 +931,7 @@ def _import_mutant_policy(Policy, name):
     patched = text.replace(old, new, 1)
     if patched == text:
         raise RuntimeError("变异未生效：%s" % name)
-    d = tempfile.mkdtemp(prefix="cuepolicy_mut_")
+    d = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuepolicy_mut_")
     path = os.path.join(d, "cue_seek_policy.py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(patched)

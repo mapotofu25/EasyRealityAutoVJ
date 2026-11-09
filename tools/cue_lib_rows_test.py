@@ -129,7 +129,7 @@ def main():
         if not cond:
             fails.append(name)
 
-    tmp = tempfile.mkdtemp(prefix="cuelib_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuelib_")
     pkg = os.path.join(tmp, "演出码表.ercue")
     cuesheet.save(make_sheet(TRACKS), pkg, app_version="2026.10.17.12")
 

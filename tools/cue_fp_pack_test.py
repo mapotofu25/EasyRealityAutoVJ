@@ -52,7 +52,7 @@ import cue_fp_pack                                                   # noqa: E40
 import fp as fpvj                                                    # noqa: E402
 
 OK, FAIL = [], []
-TMP = tempfile.mkdtemp(prefix="cuefppack_")
+TMP = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuefppack_")
 
 #: 真实素材目录不写死在仓库里（会暴露本机目录结构）——用 `ERAVJ_CUE_MEDIA` 指过来
 MAT_DIR = os.environ.get("ERAVJ_CUE_MEDIA", "")

@@ -116,7 +116,7 @@ def new_engine(cfg, lay):
 
 def run_seeks(profile, seconds=12.0, fps=30.0):
     """按 `profile` 跑一段"位置领先、播放器落后"的模拟，返回 seek 次数。"""
-    tmp = tempfile.mkdtemp(prefix="cueprof_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cueprof_")
     media = os.path.join(tmp, "media")
     os.makedirs(media, exist_ok=True)
     open(os.path.join(media, "a.mp4"), "wb").close()

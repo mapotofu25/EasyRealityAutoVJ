@@ -142,7 +142,7 @@ def main():
     print("=" * 88)
     print("码表缩略图（thumbs/<clip_id>.png）回归：解出 + 详情页显示")
     print("=" * 88)
-    tmp = tempfile.mkdtemp(prefix="cuethumb_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuethumb_")
     png_a = make_png_bytes(64, 36, (220, 40, 40, 255))
     png_b = make_png_bytes(40, 40, (40, 200, 90, 255))
 

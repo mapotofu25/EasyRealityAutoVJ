@@ -92,7 +92,7 @@ def main():
         if not cond:
             fails.append(name)
 
-    tmp = tempfile.mkdtemp(prefix="cueidx_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cueidx_")
 
     # 表 A：3 首（其中 "Nimbus Spark" 与表 B 重复）
     A = make_sheet("表A-三首", [

@@ -26,7 +26,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 隔离：配置/日志都写到临时目录，绝不碰用户真实 data
-_DATA = tempfile.mkdtemp(prefix="smoke_mw_")
+_DATA = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="smoke_mw_")
 os.environ["LOCALAPPDATA"] = _DATA
 
 import config as CFG                                             # noqa: E402

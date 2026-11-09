@@ -72,7 +72,7 @@ def make_sheet(title, track_title, media_name):
 def main():
     os.environ.pop("QT_QPA_PLATFORM", None)      # 真平台（offscreen 没 CJK 字体）
     app = QApplication.instance() or QApplication(sys.argv)
-    tmp = tempfile.mkdtemp(prefix="cueui_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cueui_")
 
     # 两张码表 + 素材目录（放到 cfg 里 ⇒ 装表时不会弹"找不到素材"）
     media_root = os.path.join(tmp, "media")

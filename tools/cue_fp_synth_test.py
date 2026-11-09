@@ -213,7 +213,7 @@ def build_pkg(pkg, fp_id, hashes, media_name="a.mp4"):
 
 def main():
     app = QApplication.instance() or QApplication(sys.argv)          # noqa: F841
-    tmp = tempfile.mkdtemp(prefix="cuefpsynth_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuefpsynth_")
     media = os.path.join(tmp, "media")
     os.makedirs(media, exist_ok=True)
     open(os.path.join(media, "a.mp4"), "wb").close()

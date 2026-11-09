@@ -1000,7 +1000,7 @@ def selftest():
         assert beat_len(bad) == DEGENERATE_BEAT_LEN
         assert sec_to_beats(3.0, bad) == 3.0
 
-    tmp = tempfile.mkdtemp(prefix="ercue_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="ercue_")
     p = os.path.join(tmp, "t" + EXT)
 
     s = new_sheet("自检码表", "unit-test", res_w=1440, res_h=1080)

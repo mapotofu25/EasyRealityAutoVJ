@@ -238,7 +238,7 @@ def main():
 
     os.environ.pop("QT_QPA_PLATFORM", None)      # 真平台（offscreen 没 CJK 字体）
     app = QApplication.instance() or QApplication(sys.argv)
-    tmp = tempfile.mkdtemp(prefix="cuepage_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cuepage_")
 
     # 造两个码表包（+ 素材目录，避免"缺素材"弹目录选择）
     media_root = os.path.join(tmp, "media")

@@ -187,7 +187,7 @@ def main():
 
     real_fd0 = cue_ui.QFileDialog
     cue_ui.QFileDialog = _FDStub
-    tmp = tempfile.mkdtemp(prefix="cueui_")
+    tmp = tempfile.mkdtemp(dir=tempfile.gettempdir(), prefix="cueui_")
     cfg_path = os.path.join(tmp, "cfg.json")
     cfg = FakeCfg(cfg_path)
 

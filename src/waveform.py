@@ -223,7 +223,7 @@ def selftest():
     # 缓存往返（把 _base_dir 指到临时目录，避免污染真实缓存目录）
     import tempfile as _tf
     import waveform as _wf
-    tmpdir = _tf.mkdtemp(prefix="eravj_wf_")
+    tmpdir = _tf.mkdtemp(dir=tempfile.gettempdir(), prefix="eravj_wf_")
     _orig_base_dir = _wf._base_dir
     _wf._base_dir = lambda: tmpdir
     try:
