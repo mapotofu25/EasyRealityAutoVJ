@@ -1359,6 +1359,10 @@ class OutputStudio(QWidget):
         bar.addWidget(self.lbl_combined)
         self.comb_w = QSpinBox(); self.comb_w.setRange(16, 16384); self.comb_w.setValue(1920)
         self.comb_h = QSpinBox(); self.comb_h.setRange(16, 16384); self.comb_h.setValue(1080)
+        # ★ S2 #3（用户第 3 条）：整合画布这两个数字框**字号小一号**（原来和按钮一样大，
+        #   在页签行里显得笨重）。
+        for _sp in (self.comb_w, self.comb_h):
+            _sp.setStyleSheet("QSpinBox{font-size:11px;padding:0 2px;}")
         self.comb_w.valueChanged.connect(self._on_combined)
         self.comb_h.valueChanged.connect(self._on_combined)
         bar.addWidget(self.comb_w)
@@ -1643,6 +1647,11 @@ class OutputStudio(QWidget):
                       self.btn_auto_layout):
                 w.setVisible(single)
         except Exception:
+            pass
+        # ★ S2 #3/#4/#14：右下角「输出设置」按模式决定显示哪些项
+        try:
+            self.main.output_panel.set_mode("single" if single else "multi")
+        except Exception:                                          # noqa: BLE001
             pass
         self.lbl_mode_hint.setText(
             "多路：每块屏幕独立 NDI/Spout；上方棋盘格是监看工作区，拖动/缩放不改输出。"

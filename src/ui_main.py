@@ -853,7 +853,8 @@ class OutputPanel(QWidget):
         outer.setContentsMargins(4, 4, 4, 4)
         g = QGroupBox("输出设置")
         go = QGridLayout(g)
-        go.addWidget(QLabel(tr("resolution")), 0, 0)
+        self.lbl_resolution = QLabel(tr("resolution"))
+        go.addWidget(self.lbl_resolution, 0, 0)
         self.resolution = QComboBox()
         self.resolution.setEditable(True)          # 允许直接手输分辨率，如 1600 x 900
         self.resolution.setInsertPolicy(QComboBox.NoInsert)
@@ -879,14 +880,20 @@ class OutputPanel(QWidget):
         self.btn_reset_win.clicked.connect(main.reset_window_size)
         go.addWidget(self.btn_reset_win, 3, 1)
         go.addWidget(QLabel("输出显示器"), 4, 0)
+        self.lbl_output_screen = go.itemAtPosition(4, 0).widget()
         self.screen_combo = QComboBox()
         self._screens = QGuiApplication.screens()
-        items = ["窗口模式（可拖动）"]
+        # ★ S2 #14（用户第 14 条）：第 0 项 = **关闭**（默认，不弹输出窗口）。
+        #   索引与配置值的换算统一为 `cfg = index - 2`
+        #   （0→-2 关闭 / 1→-1 窗口模式 / 2→0 显示器1 / …）。
+        items = [T("关闭（不弹出输出窗口）"), T("窗口模式（可拖动）")]
         for i, sc in enumerate(self._screens):
             tag = "（主）" if sc == QGuiApplication.primaryScreen() else ""
             items.append(f"显示器 {i + 1} 全屏{tag}  {sc.geometry().width()}x{sc.geometry().height()}")
         self.screen_combo.addItems(items)
-        self.screen_combo.setToolTip("选择后输出窗口会全屏到对应显示器（适合双屏演出）")
+        self.screen_combo.setToolTip(
+            "关闭 = 不弹出输出窗口（默认；开始 VJ 时仍会自动显示，可在这里关掉）\n"
+            "窗口模式 = 可拖动的独立窗口；显示器 N = 全屏到该显示器（适合双屏演出）")
         go.addWidget(self.screen_combo, 4, 1)
         # ---- Spout / NDI 输出 ----
         # ★★ 2026-10-30（用户：「两个输出名字改成固定的 分别加本地和局域网的括号说明」）：
@@ -975,6 +982,45 @@ class OutputPanel(QWidget):
         self.chk_alpha.stateChanged.connect(main.set_output_alpha)
         self._update_ndi_full()   # NDI 完整接收名（机器名 + 源名）
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
+
+    def set_mode(self, mode):
+        """★ S2 #3/#4/#14：按**输出模式**决定"输出设置"里显示哪些项。
+
+        · 单路（多屏整合单路）：只留 4 项 —— 输出显示器 / Spout 输出 / NDI 输出 /
+          Spout·NDI Alpha（用户第 4 条：分辨率、显示输出窗口、锁定比例、无边框、
+          窗口置顶、重置窗口大小 这一块**不要**）。
+        · 多路：保留 分辨率 + 上述 4 项；但 **不显示** 显示输出窗口 / 锁定比例 /
+          无边框 / 窗口置顶 / 重置窗口大小（用户第 14 条）。
+        """
+        single = str(mode) == "single"
+        # (控件, 单路是否显示, 多路是否显示)
+        rules = (
+            (getattr(self, "lbl_resolution", None), False, True),
+            (getattr(self, "resolution", None), False, True),
+            (getattr(self, "btn_show_out", None), False, False),
+            (getattr(self, "chk_aspect", None), False, False),
+            (getattr(self, "chk_border", None), False, False),
+            (getattr(self, "chk_top", None), False, False),
+            (getattr(self, "btn_reset_win", None), False, False),
+        )
+        for w, in_single, in_multi in rules:
+            if w is None:
+                continue
+            try:
+                w.setVisible(in_single if single else in_multi)
+            except Exception:                                     # noqa: BLE001
+                pass
+        # 下面 4 项两种模式都显示（单路时就是"独立一块"的全部内容）
+        for w in (getattr(self, "lbl_output_screen", None),
+                  getattr(self, "screen_combo", None),
+                  getattr(self, "chk_spout", None),
+                  getattr(self, "chk_ndi", None),
+                  getattr(self, "chk_alpha", None)):
+            if w is not None:
+                try:
+                    w.setVisible(True)
+                except Exception:                                 # noqa: BLE001
+                    pass
 
     def _update_ndi_full(self):
         """刷新 NDI **完整接收名**提示：`<本机名> (<源名>)`。
@@ -1070,7 +1116,7 @@ class OutputPanel(QWidget):
         cur = self.screen_combo.currentIndex()
         self.screen_combo.blockSignals(True)
         self.screen_combo.clear()
-        items = [T("窗口模式（可拖动）")]
+        items = [T("关闭（不弹出输出窗口）"), T("窗口模式（可拖动）")]
         for i, sc in enumerate(self._screens):
             tag = T("（主）") if sc == QGuiApplication.primaryScreen() else ""
             items.append(Tf("显示器 {} 全屏{}  {}x{}", i + 1, tag,
@@ -5473,8 +5519,8 @@ class MainWindow(QMainWindow):
             pass
 
     def set_output_screen(self, i):
-        """输出显示器：0=窗口模式，1..n=全屏到对应显示器"""
-        self.cfg["output"]["screen"] = i - 1
+        """输出显示器（S2 #14）：下拉索引 0=关闭(-2) / 1=窗口模式(-1) / 2..=显示器 0.."""
+        self.cfg["output"]["screen"] = int(i) - 2
         self.cfg.save()
         # 运行中立即生效（否则只存配置，要等下次开始才应用 →「更改失效」）
         if self.engine.running:
@@ -5747,8 +5793,21 @@ class MainWindow(QMainWindow):
             pass
 
     def apply_output_screen(self):
-        idx = int(self.cfg["output"].get("screen", -1))
+        idx = int(self.cfg["output"].get("screen", -2))
         screens = QGuiApplication.screens()
+        if idx <= -2:
+            # ★ S2 #14：「关闭」⇒ 不弹输出窗口（默认行为）。引擎照常合成，
+            #   Spout/NDI 发送不受影响（它们不走显示器窗口）。
+            try:
+                self.out_win.hide()
+            except Exception:                                     # noqa: BLE001
+                pass
+            try:
+                self.engine.set_frame_consumers(
+                    bool(self.preview_panel.preview_on()))
+            except Exception:                                     # noqa: BLE001
+                pass
+            return
         if 0 <= idx < len(screens):
             self.out_win.show()
             self.out_win.show_fullscreen_on(screens[idx])
@@ -5931,9 +5990,16 @@ class MainWindow(QMainWindow):
         self.output_panel.chk_border.setChecked(o.get("borderless", False))
         self.output_panel.chk_top.setChecked(o.get("always_top", False))
         try:
-            self.output_panel.screen_combo.setCurrentIndex(int(o.get("screen", -1)) + 1)
+            self.output_panel.screen_combo.setCurrentIndex(int(o.get("screen", -2)) + 2)
         except Exception:
             self.output_panel.screen_combo.setCurrentIndex(0)
+        # ★ S2 #3/#4/#14：启动时也按当前配置的模式决定「输出设置」显示哪些项
+        try:
+            import output_model as _om0
+            _c0 = _om0.active_config(self.cfg.data)
+            self.output_panel.set_mode(str((_c0 or {}).get("mode", "multi")))
+        except Exception:                                        # noqa: BLE001
+            pass
         self.output_panel.chk_spout.setChecked(o.get("spout_enabled", False))
         # Alpha 开关：只回填，不触发 set_output_alpha（引擎已按配置初始化画布格式）
         _wa = self.output_panel.chk_alpha
