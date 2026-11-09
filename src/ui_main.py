@@ -3584,9 +3584,22 @@ class MainWindow(QMainWindow):
         holder = QWidget()
         # ★ S5 #10（用户第 10 条）：**左列 = 主屏（独占）**，**右列 = 各独立屏纵向排列**；
         #   复制屏/切分屏跟着**源屏**所在的列（源屏是主屏 → 左列，源屏是独立屏 → 右列）。
-        self._multi_blocks_lay = QHBoxLayout(holder)
+        # ★ T2 #4（用户第 4 条）：左右两列之间要能拖 ⇒ 用 QSplitter(Horizontal) 装两列
+        #   （原来是 QHBoxLayout + 固定等宽）。默认 1:1；拖过之后按用户比例，
+        #   切配置 / 进出多屏时复位（`_blocks_cols_user_set`）。
+        self._multi_blocks_lay = QVBoxLayout(holder)
         self._multi_blocks_lay.setContentsMargins(2, 2, 2, 2)
-        self._multi_blocks_lay.setSpacing(6)
+        self._multi_blocks_lay.setSpacing(0)
+        self._blocks_cols_split = QSplitter(Qt.Horizontal)
+        self._blocks_cols_split.setObjectName("multiBlocksCols")
+        self._blocks_cols_split.setChildrenCollapsible(False)
+        self._blocks_cols_split.setHandleWidth(6)
+        self._blocks_cols_user_set = False
+        try:
+            self._blocks_cols_split.splitterMoved.connect(self._on_blocks_cols_moved)
+        except Exception:                                         # noqa: BLE001
+            pass
+        self._multi_blocks_lay.addWidget(self._blocks_cols_split)
         self._multi_col_left = QVBoxLayout()
         self._multi_col_left.setContentsMargins(0, 0, 0, 0)
         self._multi_col_left.setSpacing(6)
@@ -3607,10 +3620,12 @@ class MainWindow(QMainWindow):
         # ⚠ 两列必须**等宽**（用户对照图是左右各一半）：用 Ignored 宽度策略让 QHBoxLayout
         #   只按 stretch 分配，而不是按各自内容的 sizeHint（否则图层多的那一列会更宽）。
         for _cw in (self._multi_col_left_w, self._multi_col_right_w):
-            _cw.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-            _cw.setMinimumWidth(0)
-        self._multi_blocks_lay.addWidget(self._multi_col_left_w, 1)
-        self._multi_blocks_lay.addWidget(self._multi_col_right_w, 1)
+            # 每列最小 320：拖到底也不能把块压没（用户第 4 条）
+            _cw.setMinimumWidth(320)
+            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._blocks_cols_split.addWidget(self._multi_col_left_w)
+        self._blocks_cols_split.addWidget(self._multi_col_right_w)
+        self._blocks_cols_split.setSizes([1, 1])       # 默认等宽 1:1
         self._multi_blocks_scroll = QScrollArea()
         self._multi_blocks_scroll.setWidgetResizable(True)
         # 块是满宽的 ⇒ 正常窗口宽度下不该出现横向滚动条（只有在窗口被拖得极窄时才需要）
@@ -3890,9 +3905,14 @@ class MainWindow(QMainWindow):
         """用户手拖过分隔条 ⇒ 记住"别再自动改"（屏幕数变化时才会强制重排）。"""
         self._blocks_split_user_set = True
 
+    def _on_blocks_cols_moved(self, *_a):
+        """用户拖动过左右分栏 ⇒ 之后不再自动等宽（切配置/进出多屏时复位）。"""
+        self._blocks_cols_user_set = True
+
     def _on_blocks_split_config_switch(self, *_a):
         """切输出配置：复位"用户手拖过"的标记，但**不**动当前尺寸（用户拖的就保留）。"""
         self._blocks_split_user_set = False
+        self._blocks_cols_user_set = False      # 左右分栏同理（下次重建会等比复位）
 
     def _auto_size_blocks_split(self, force=False):
         """按块数自动分配「图层块区 : 预览工作区」的高度。
@@ -4094,6 +4114,12 @@ class MainWindow(QMainWindow):
                     getattr(self, "_multi_col_right", None)):
             if col is not None:
                 col.addStretch(1)                   # 块少时贴顶
+        # 没被用户拖过 ⇒ 两列等比（用户拖过就保留他的比例）
+        try:
+            if not getattr(self, "_blocks_cols_user_set", False):
+                self._blocks_cols_split.setSizes([1, 1])
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_rebuild_multi_blocks.cols_equal", e)
         self._refresh_block_styles(cfg)
         # 新建的栈马上把行/高亮画出来（否则要等下一次广播）
         self._layers_call("refresh_playing")
@@ -4143,6 +4169,7 @@ class MainWindow(QMainWindow):
         self._screen_panels = {}
         self._multi_block_sig = ()
         self._blocks_split_user_set = False     # 退出多屏：手拖标记复位
+        self._blocks_cols_user_set = False      # 左右分栏比例也复位（下次进多屏回到 1:1）
         try:
             self.layers_panel.set_layer_ids(None)
         except Exception:                                         # noqa: BLE001
