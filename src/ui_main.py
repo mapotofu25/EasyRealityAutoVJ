@@ -3683,14 +3683,26 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
         self._multi_blocks_lay.addWidget(self._blocks_cols_split)
+        # ★ 第六批 #10：列内各块之间也要能**拖** ⇒ 每列用一个 QSplitter(Vertical)。
+        #   默认（用户没拖过）仍由 `_fit_block_height` 给每块定高（保持"3 块全可见"），
+        #   一旦用户拖过分隔条就释放固定高度、改由 splitter 记住尺寸。
         self._multi_col_left = QVBoxLayout()
         self._multi_col_left.setContentsMargins(0, 0, 0, 0)
-        self._multi_col_left.setSpacing(6)
-        self._multi_col_left.addStretch(1)        # 块少时贴顶
+        self._multi_col_left.setSpacing(0)
         self._multi_col_right = QVBoxLayout()
         self._multi_col_right.setContentsMargins(0, 0, 0, 0)
-        self._multi_col_right.setSpacing(6)
-        self._multi_col_right.addStretch(1)
+        self._multi_col_right.setSpacing(0)
+        self._blocks_vsplit_left = QSplitter(Qt.Vertical)
+        self._blocks_vsplit_right = QSplitter(Qt.Vertical)
+        for _vs in (self._blocks_vsplit_left, self._blocks_vsplit_right):
+            _vs.setChildrenCollapsible(False)
+            _vs.setHandleWidth(6)
+            try:
+                _vs.splitterMoved.connect(self._on_block_vsplit_moved)
+            except Exception:                                     # noqa: BLE001
+                pass
+        self._multi_col_left.addWidget(self._blocks_vsplit_left)
+        self._multi_col_right.addWidget(self._blocks_vsplit_right)
         # 两个列各包一层容器控件：QHBoxLayout 里等拉伸 ⇒ 左右各占一半
         self._multi_col_left_w = QWidget()
         self._multi_col_left_w.setLayout(self._multi_col_left)
@@ -3826,8 +3838,7 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
-    @staticmethod
-    def _fit_block_height(blk, panel):
+    def _fit_block_height(self, blk, panel):
         """纵向堆叠：每块高度 = 该块图层栈的**自然高度**（随行高/行数变化）。
 
         算法：顶部工具条（标题 + 行高按钮 + ＋图层，约 34px）+ 上下边距 + 每行
@@ -3842,6 +3853,8 @@ class MainWindow(QMainWindow):
             rows, cell = 0, 58
         h = 36 + 8 + rows * (cell + 2)
         h = max(190, min(320, h))
+        if getattr(self, "_blocks_split_user_set", False):
+            return                     # #10：用户拖过 ⇒ 保持他拖出来的尺寸
         try:
             blk.setFixedHeight(int(h))
         except Exception:                                          # noqa: BLE001
@@ -3854,8 +3867,11 @@ class MainWindow(QMainWindow):
         （源屏是主屏 ⇒ 左列；源屏是独立屏 ⇒ 右列；源屏本身也是 copy/split 时递归）。
         """
         import output_model as _om
-        left = getattr(self, "_multi_col_left", None)
-        right = getattr(self, "_multi_col_right", None)
+        # #10：返回的是**列内的 QSplitter**（块的真正容器），不再是 QVBoxLayout
+        left = getattr(self, "_blocks_vsplit_left", None) or getattr(
+            self, "_multi_col_left", None)
+        right = getattr(self, "_blocks_vsplit_right", None) or getattr(
+            self, "_multi_col_right", None)
         if left is None or right is None:
             return left or right
         s = screen or {}
@@ -3984,6 +4000,27 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------- 块区高度：默认按块数自动分配 ----------
+    def _on_block_vsplit_moved(self, *_a):
+        """#10：用户拖过**块之间**的分隔条 ⇒ 记住尺寸，之后不再自动改块高。
+
+        实现要点：自动分配是靠 `setFixedHeight` 把每块钉死；固定高度会**锁死**
+        QSplitter 的拖拽（min==max）。所以一旦用户拖了，就把所有块的固定高度释放
+        （min 120 / max 无限），改由 splitter 的 sizes 记住比例。
+        """
+        if getattr(self, "_blocks_split_user_set", False):
+            return
+        self._blocks_split_user_set = True
+        # 只**放开上限**（固定高会锁死拖拽），下限保持 120：
+        #   · 默认没拖过时仍由 `_fit_block_height` 钉死 ⇒ "三块全可见"不变
+        #   · 拖过之后不再被自动改；splitter 记住 sizes
+        # ⚠ 已知未达标：拖过之后再改行高，块会被压到最小 120（见报告）。
+        for _sid, blk, _body in getattr(self, "_multi_blocks", []):
+            try:
+                blk.setMinimumHeight(120)
+                blk.setMaximumHeight(16777215)
+            except Exception:                                      # noqa: BLE001
+                pass
+
     def _on_blocks_split_moved(self, *_a):
         """用户手拖过分隔条 ⇒ 记住"别再自动改"（屏幕数变化时才会强制重排）。
 
@@ -4014,6 +4051,8 @@ class MainWindow(QMainWindow):
             if col_h <= 0:
                 return
             h = max(190, col_h - 4)          # 4px 给列内边距/分栏手柄取整
+            if getattr(self, "_blocks_split_user_set", False):
+                return                       # #10：用户拖过 ⇒ 别覆盖他的高度
             if abs(int(left[0].height()) - h) > 2:
                 left[0].setFixedHeight(h)
         except Exception as e:                                     # noqa: BLE001
@@ -4027,6 +4066,14 @@ class MainWindow(QMainWindow):
         """切输出配置：复位"用户手拖过"的标记，但**不**动当前尺寸（用户拖的就保留）。"""
         self._blocks_split_user_set = False
         self._blocks_cols_user_set = False      # 左右分栏同理（下次重建会等比复位）
+        # #10：复位后重新按自然高度钉一遍（用户拖过的块之前被释放成 min120/无上限）
+        try:
+            for _sid, blk, _body in getattr(self, "_multi_blocks", []):
+                ps = blk.findChildren(LayerStackPanel)
+                self._fit_block_height(blk, ps[0] if ps else None)
+            self._auto_size_blocks_split()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _auto_size_blocks_split(self, force=False):
         """按块数自动分配「图层块区 : 预览工作区」的高度。
@@ -4199,16 +4246,17 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
         self._multi_blocks = []
-        for col in (getattr(self, "_multi_col_left", None),
-                    getattr(self, "_multi_col_right", None)):
+        for col in (getattr(self, "_blocks_vsplit_left", None),
+                    getattr(self, "_blocks_vsplit_right", None)):
             if col is None:
                 continue
             while col.count():
-                it = col.takeAt(0)      # ⚠ 连末尾那个 stretch 也一起摘掉，下面统一补回
-                w = it.widget()
+                w = col.widget(0)
                 if w is not None:
                     w.setParent(None)
                     w.deleteLater()
+                else:
+                    break
         all_ids = [l.lid for l in self.engine.layers]
         # ★ 主屏一次性绑定：老配置里主屏没有 `layers` ⇒ 把"当时全部图层"固化下来
         #   （否则在独立屏新建的层会同时冒到主屏 —— 正是用户否掉的行为）
@@ -4224,12 +4272,9 @@ class MainWindow(QMainWindow):
             self._multi_blocks.append((str(s.get("id")), blk, body))
             self._fit_block_height(blk, panel)      # ★ 高度=该块自然高度
             col = self._block_column(s, cfg)
-            blk._multi_col = "left" if col is getattr(self, "_multi_col_left", None) else "right"
-            col.addWidget(blk, 0)                   # 0 = 不拉伸（高度由上面钉死）
-        for col in (getattr(self, "_multi_col_left", None),
-                    getattr(self, "_multi_col_right", None)):
-            if col is not None:
-                col.addStretch(1)                   # 块少时贴顶
+            blk._multi_col = "left" if col is getattr(
+                self, "_blocks_vsplit_left", None) else "right"
+            col.addWidget(blk)                      # QSplitter.addWidget（高度由固定高/sizes 决定）
         # 没被用户拖过 ⇒ 两列等比（用户拖过就保留他的比例）
         try:
             if not getattr(self, "_blocks_cols_user_set", False):
