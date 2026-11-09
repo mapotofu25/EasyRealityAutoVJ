@@ -4373,13 +4373,16 @@ class MainWindow(QMainWindow):
                     getattr(self, "_blocks_vsplit_right", None)):
             if col is None:
                 continue
+            # ★ 必须"先 setParent(None) 立即脱离 splitter，再 deleteLater 回收"：
+            #   只 deleteLater 是**延迟销毁** ⇒ 下一次重建时旧块还挂在 splitter 里
+            #   ⇒ 块数 4 ≠ 屏数 3，`setSizes` 长度对不上，块高全乱（用户看到"多一块空壳"）。
+            #   反过来只 setParent(None) 不 deleteLater 会漏内存。
             while col.count():
                 w = col.widget(0)
-                if w is not None:
-                    w.setParent(None)
-                    w.deleteLater()
-                else:
+                if w is None:
                     break
+                w.setParent(None)      # 立即从 splitter 移除 —— 这一步是关键
+                w.deleteLater()        # 内存回收交给事件循环
         all_ids = [l.lid for l in self.engine.layers]
         # ★ 主屏一次性绑定：老配置里主屏没有 `layers` ⇒ 把"当时全部图层"固化下来
         #   （否则在独立屏新建的层会同时冒到主屏 —— 正是用户否掉的行为）
