@@ -4501,7 +4501,21 @@ class MainWindow(QMainWindow):
                     self.output_panel.set_screen(None)     # 单路 ⇒ 解绑，全局一份
                 except Exception:                              # noqa: BLE001
                     pass
-                lbl.setText(T("单路：以下设置对所有屏幕生效（只发一路）"))
+                # ★ U7 性能提示（team-lead 要求：不加限制，但要告诉用户代价）
+                _n_ov = 0
+                try:
+                    for _sc in (cfg or {}).get("screens") or []:
+                        _pp = _sc.get("params") or {}
+                        if _pp.get("postfx") or _pp.get("color") or _pp.get("auto"):
+                            _n_ov += 1
+                except Exception:                                  # noqa: BLE001
+                    _n_ov = 0
+                if _n_ov > 0:
+                    lbl.setText(Tf("单路：以下设置对所有屏幕生效（只发一路）"
+                                   "　·　当前 {} 块屏各有独立参数，每帧多跑 {} 次调色"
+                                   "（1080p 约 +4.4ms/屏）", _n_ov, _n_ov))
+                else:
+                    lbl.setText(T("单路：以下设置对所有屏幕生效（只发一路）"))
                 # ★ U7 第二步：单路下参数按屏 ⇒ 面板必须**回填当前屏的生效值**
                 try:
                     from PySide6.QtCore import QTimer as _QT3
@@ -5727,6 +5741,10 @@ class MainWindow(QMainWindow):
             _om.set_screen_param(sc, sec, key, val, self.cfg.data)
             self.cfg.save()
             self.engine.set_output_config(cfg)
+            try:
+                self._sync_multi_right()      # 刷新"当前 N 块屏各有独立参数"提示
+            except Exception:                                  # noqa: BLE001
+                pass
             return True
         except Exception as e:                                     # noqa: BLE001
             self._log_ui_error("store_screen_param", e)
@@ -5817,6 +5835,10 @@ class MainWindow(QMainWindow):
             _om.clear_screen_params(sc, sec)
             self.cfg.save()
             self.engine.set_output_config(cfg)
+            try:
+                self._sync_multi_right()
+            except Exception:                                  # noqa: BLE001
+                pass
         except Exception as e:                                     # noqa: BLE001
             self._log_ui_error("clear_screen_param", e)
 

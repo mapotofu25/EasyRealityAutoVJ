@@ -112,7 +112,41 @@ def _cleanup_registered_copies():
     _TMP_COPIES.clear()
 
 
-def cleanup_stale_ascii_copies(ttl_hours=24.0, logger=None, directory=None):
+def _pid_alive(pid):
+    """该 pid 的进程还活着吗？（Windows/POSIX 通用，异常一律当"活着"以免误删）"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                      # 存在但没权限 ⇒ 活着
+    except OSError as e:
+        # Windows: os.kill(pid,0) 对不存在的进程会抛 OSError(errno=22/EINVAL)
+        return getattr(e, "errno", None) not in (22, 2)
+    except Exception:
+        return True
+
+
+def _tmp_pid_of(name):
+    """从 `xxx.tmp12345` 这种原子写中间名里取出 pid；取不到返回 None。"""
+    try:
+        base = os.path.basename(name)
+        if ".tmp" not in base:
+            return None
+        tail = base.rsplit(".tmp", 1)[1]
+        return int(tail)
+    except Exception:
+        return None
+
+
+def cleanup_stale_ascii_copies(ttl_hours=6.0, logger=None, directory=None):
     """启动期回收「上次崩溃/强杀遗留」的孤儿 ASCII 副本。
 
     只在**启动早期**调用（此时规范上无素材在播，删文件安全）。判定：
@@ -154,6 +188,17 @@ def cleanup_stale_ascii_copies(ttl_hours=24.0, logger=None, directory=None):
                     mtime = os.path.getmtime(p)
                 except OSError:
                     continue
+                # ★ 原子写的中间文件 `xxx.tmp<pid>`：进程都不在了 ⇒ 立刻删（不等 TTL）。
+                #   这类是"复制到一半被杀"的残留，按 TTL 等 6 小时纯属浪费空间。
+                _tp = _tmp_pid_of(p)
+                if _tp is not None and not _pid_alive(_tp):
+                    try:
+                        os.remove(p)
+                        removed += 1
+                        continue
+                    except OSError:
+                        skipped_locked += 1
+                        continue
                 if mtime > cutoff:
                     kept_recent += 1             # 太新：可能是别的实例刚建的，保留
                     continue
@@ -175,6 +220,100 @@ def cleanup_stale_ascii_copies(ttl_hours=24.0, logger=None, directory=None):
     return removed, skipped_locked, kept_recent
 
 
+_ASCII_CACHE_DIRNAME = "_ascii_cache"
+#: 缓存总量上限（team-lead 定的：10 GB / 200 个，超出按 mtime 淘汰最旧）
+ASCII_CACHE_MAX_BYTES = 10 * 1024 ** 3
+ASCII_CACHE_MAX_ITEMS = 200
+_LAST_LINK_CALLS = 0      # 统计用（判据要 os.link 次数 / copy2 次数）
+_LAST_COPY_CALLS = 0
+
+
+def _mark_windows_hidden(p):
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(str(p), 0x02)   # FILE_ATTRIBUTE_HIDDEN
+    except Exception:
+        pass
+
+
+def ascii_cache_dir(path, create=True):
+    """ASCII 副本目录：**源文件所在盘**的 `_ascii_cache`（同卷才能硬链接）。
+
+    顺序：`<盘符>:/_ascii_cache` → `<源目录>/_ascii_cache` → 系统临时目录。
+    放源盘的理由：① 不挤系统盘；② 同卷可直接 `os.link` 硬链接，几乎零成本零空间。
+    """
+    import tempfile
+    cands = []
+    try:
+        drive = os.path.splitdrive(os.path.abspath(path))[0]
+        if drive:
+            cands.append(os.path.join(drive + os.sep, _ASCII_CACHE_DIRNAME))
+    except Exception:
+        pass
+    try:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(path)),
+                                  _ASCII_CACHE_DIRNAME))
+    except Exception:
+        pass
+    cands.append(os.path.join(tempfile.gettempdir(), _ASCII_CACHE_DIRNAME))
+    for d in cands:
+        try:
+            if create:
+                os.makedirs(d, exist_ok=True)
+                _mark_windows_hidden(d)
+            if os.path.isdir(d):
+                return d
+        except Exception:
+            continue
+    return tempfile.gettempdir()
+
+
+def enforce_ascii_cache_limits(directory=None, max_bytes=ASCII_CACHE_MAX_BYTES,
+                               max_items=ASCII_CACHE_MAX_ITEMS):
+    """③ 缓存总量上限：超过 max_bytes 或 max_items ⇒ 按 mtime 淘汰最旧的。
+
+    返回 (removed, freed_bytes)。本进程正在用的（`_TMP_COPIES`）不删。
+    """
+    removed = 0
+    freed = 0
+    try:
+        d = directory or ascii_cache_dir("", create=False)
+        if not d or not os.path.isdir(d):
+            return 0, 0
+        items = []
+        total = 0
+        for name in os.listdir(d):
+            if not name.startswith(_COPY_PREFIX):
+                continue
+            fp = os.path.join(d, name)
+            try:
+                if not os.path.isfile(fp):
+                    continue
+                st = os.stat(fp)
+            except OSError:
+                continue
+            if fp in _TMP_COPIES:
+                continue
+            items.append((st.st_mtime, st.st_size, fp))
+            total += st.st_size
+        if total <= max_bytes and len(items) <= max_items:
+            return 0, 0
+        items.sort(key=lambda x: x[0])       # 最旧优先
+        for _mt, sz, fp in items:
+            if total <= max_bytes and len(items) - removed <= max_items:
+                break
+            try:
+                os.remove(fp)
+                removed += 1
+                freed += sz
+                total -= sz
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return removed, freed
+
+
 def _ascii_safe_path(path):
     """OpenCV 在 Windows 读不了非 ASCII 路径：含中文等字符时复制到临时 ASCII 副本。
 
@@ -188,9 +327,9 @@ def _ascii_safe_path(path):
         return path
     except UnicodeEncodeError:
         pass
+    global _LAST_LINK_CALLS, _LAST_COPY_CALLS
     try:
         import hashlib
-        import tempfile
         import shutil
         ext = os.path.splitext(path)[1]
         h = hashlib.md5(path.encode("utf-8")).hexdigest()[:12]
@@ -201,16 +340,28 @@ def _ascii_safe_path(path):
             sig = "%d_%d" % (st.st_size, int(st.st_mtime))
         except OSError:
             sig = "0_0"
-        tmp = os.path.join(tempfile.gettempdir(), f"{_COPY_PREFIX}{h}_{sig}{ext}")
+        # ★ 副本放**源文件所在盘**（不是 C://Temp）：同卷可硬链接、不挤系统盘
+        cache = ascii_cache_dir(path)
+        tmp = os.path.join(cache, f"{_COPY_PREFIX}{h}_{sig}{ext}")
         _register_tmp_copy(tmp)
         if os.path.exists(tmp):
-            return tmp                       # 复用已有副本（不复制）
+            return tmp                       # 复用已有副本（不复制也不链接）
+        # ① 同卷 ⇒ 硬链接（零拷贝零空间）。失败（跨卷/文件系统不支持）再退回复制。
+        try:
+            os.link(path, tmp)
+            _LAST_LINK_CALLS += 1
+            enforce_ascii_cache_limits(cache)
+            return tmp
+        except OSError:
+            pass
         # 原子写：先写唯一临时名再 rename，避免并发下读到「半个副本」。
         # （rename 原子；若两线程竞争，先到者 rename 成功，后者 OSError 后走复用分支。）
         tmp_w = tmp + ".tmp%d" % os.getpid()
         try:
             shutil.copy2(path, tmp_w)
+            _LAST_COPY_CALLS += 1
             os.replace(tmp_w, tmp)
+            enforce_ascii_cache_limits(cache)     # ③ 每次新增后检查总量上限
         except OSError:
             try:
                 if os.path.exists(tmp_w):

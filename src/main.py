@@ -180,7 +180,8 @@ def main():
     t = time.perf_counter()
     try:
         from media_manager import cleanup_stale_ascii_copies
-        _rm, _lk, _keep = cleanup_stale_ascii_copies(ttl_hours=24.0)
+        # ★ TTL 24h → 6h：崩溃残留最多占盘 6 小时；`.tmp<pid>` 只要 pid 已死会立刻删。
+        _rm, _lk, _keep = cleanup_stale_ascii_copies(ttl_hours=6.0)
     except Exception:
         pass
     mark("临时副本清理", t)
