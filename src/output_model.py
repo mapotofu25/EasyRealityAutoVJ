@@ -472,15 +472,6 @@ _MISSING = object()
 
 
 def effective_params(data, screen):
-    # ★★★ 2026-11-10（一级问题）：`data` 要的是**根配置 dict**，但引擎/UI 有多处传的是
-    #   `Config` 对象 —— 它只有 `__getitem__`、**没有 `.get`** ⇒ 这里一 `.get` 就抛
-    #   AttributeError，而 6 处调用都在 try/except 里 ⇒ **静默回落全局**（波1/波2 全假生效），
-    #   更糟的是 `_compose_independent()` 里那句抛异常会把 `_compose_to()` 整段跳过 ⇒ **该屏黑屏**。
-    #   一处兼容，全修：Config 有 `.data` 就取出来。
-    data = getattr(data, "data", data)
-    if not isinstance(data, dict):
-        data = {}
-
     """某块屏实际生效的参数：**全局为底 + 该屏 override**（没有 override 就全继承全局）。
 
     ⚠ `data` 是**根配置**（`cfg.data`，里面才有 color/postfx/auto 三段），
@@ -491,6 +482,11 @@ def effective_params(data, screen):
       数据模型是 override 式：`screen["params"][sec][key]` **只存与全局不同的键**，
       没这个键 ⇒ 继承全局 ⇒ **零迁移**、默认行为与改动前完全一致。
     """
+    # ★ 兼容 Config 对象（它只有 __getitem__、没有 .get）—— team-lead 的 4108ea9 同款。
+    data = getattr(data, "data", data)
+    if not isinstance(data, dict):
+        data = {}
+
     # ★★★ 2026-11-10（一级 bug 根因）：`data` 必须兼容 **`Config` 对象**。
     #   `Config` 只实现了 `__getitem__`，**没有 `.get`**；而引擎里有 6 处调用传的是
     #   `self.cfg`（Config 实例）⇒ 本函数第一句 `data.get(sec)` 抛 AttributeError，

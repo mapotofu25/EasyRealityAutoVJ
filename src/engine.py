@@ -1700,7 +1700,7 @@ class AutoVJEngine(QObject):
         try:
             s = self._layer_screen(lay) if lay is not None else None
             if s is not None and (s.get("params") or {}).get("auto"):
-                return output_model.effective_params(self.cfg, s)["auto"]
+                return output_model.effective_params(self.cfg.data, s)["auto"]
         except Exception:                                          # noqa: BLE001
             pass
         return self.cfg["auto"]
@@ -2522,10 +2522,10 @@ class AutoVJEngine(QObject):
             if self._out_cfg:
                 _main = output_model.main_screen(self._out_cfg)
                 if _main and _main.get("params"):
-                    self._cp_cfg = output_model.effective_params(self.cfg, _main)
+                    self._cp_cfg = output_model.effective_params(self.cfg.data, _main)
         except Exception as _e:                                    # noqa: BLE001
             self._cp_cfg = None
-            _output_health_write("读主屏参数失败（回落全局）：%s" % _e)
+            self._section_log("主屏参数读取失败（回落全局）：%s" % _e)
         self._compose(snap)
         # 颜色渲染 + 后处理特效链（合成后、输出前）。
         # ★ 2026-10-28（性能）：合并成一个入口，**整帧只读回/写回一次**。
@@ -3185,7 +3185,7 @@ class AutoVJEngine(QObject):
         try:
             if not (screen.get("params") or {}).get("mode"):
                 return self.mode
-            md = output_model.effective_params(self.cfg, screen).get("mode") or {}
+            md = output_model.effective_params(self.cfg.data, screen).get("mode") or {}
             if bool(md.get("auto", True)):
                 return self.mode                    # 自动：仍用引擎实时判定的模式
             man = str(md.get("manual") or "")
@@ -3209,7 +3209,7 @@ class AutoVJEngine(QObject):
     def _screen_sensitivity(self, screen=None):
         try:
             if screen and (screen.get("params") or {}).get("mode"):
-                md = output_model.effective_params(self.cfg, screen).get("mode") or {}
+                md = output_model.effective_params(self.cfg.data, screen).get("mode") or {}
                 return int(md.get("sensitivity", 1))
         except Exception:                                          # noqa: BLE001
             pass
@@ -6393,6 +6393,19 @@ class AutoVJEngine(QObject):
             不会出现"颜色生效了但没上屏"的诡异半帧。
         """
         bgr = None
+        # ★★★ 2026-11-10（一级 bug，QA 实测到「独立屏偶尔显示主屏画面」）：
+        #   `_apply_color()` 里 `if bgr is None: bgr = _np_view_bgr(self.canvas)` ——
+        #   它读的是**主画布**。给独立屏调色时如果不管，就会「读主屏像素、写独立屏画布」
+        #   ⇒ 那块独立屏被主屏画面整块覆盖（症状：内容在"自己的画面"和"主屏画面"之间跳）。
+        #   ⇒ 非主画布必须**先把它自己的像素读回来**，后面两段就会接着这份 bgr 处理。
+        #   （主画布路径不变：`bgr` 仍是 None，由 `_apply_color` 自己读，零额外搬运。）
+        tgt = canvas if canvas is not None else self.canvas
+        if tgt is not self.canvas:
+            try:
+                from postprocess import _np_view_bgr
+                bgr = _np_view_bgr(tgt)
+            except Exception:                                  # noqa: BLE001
+                bgr = None
         try:
             bgr = self._apply_color(snap, bgr=bgr, write=False)
         except Exception:
@@ -6405,7 +6418,7 @@ class AutoVJEngine(QObject):
             return                      # 两段都没跑（或都没生效）⇒ 一次都不用搬
         try:
             from postprocess import write_back_bgr
-            write_back_bgr(canvas if canvas is not None else self.canvas, bgr)
+            write_back_bgr(tgt, bgr)
         except Exception:
             pass                        # 写回失败不影响下一帧（下一帧会重新读回）
 
@@ -7185,20 +7198,20 @@ class AutoVJEngine(QObject):
             #   ⇒ 带 params 的独立屏**整块黑屏**（用户"一改画面设置这屏就黑了"）。
             #   现在：取参数单独 try，合成**无条件执行**。
             try:
-                self._cp_cfg = (output_model.effective_params(self.cfg, s)
+                self._cp_cfg = (output_model.effective_params(self.cfg.data, s)
                                 if _has_ov else None)
             except Exception as _e:                            # noqa: BLE001
                 self._cp_cfg = None
-                _output_health_write("读屏参数失败（已回落全局，合成继续）：%s" % _e)
+                self._section_log("屏参数读取失败（退回全局，合成继续）：%s" % _e)
             self._compose_to(cv, layers, snap, allow_gpu=False)
             # ★ B2：每屏自己的 color/postfx（参数已挂好，这里只做一次调色/后期）
             if _has_ov:
                 try:
-                    self._cp_cfg = output_model.effective_params(self.cfg, s)
+                    self._cp_cfg = output_model.effective_params(self.cfg.data, s)
                     self._apply_color_postfx(snap, canvas=cv)
                     self._screen_cp_calls += 1
                 except Exception as _e:                        # noqa: BLE001
-                    _output_health_write("屏调色失败（跳过本屏调色）：%s" % _e)
+                    self._section_log("屏调色失败（跳过本屏调色）：%s" % _e)
             self._cp_cfg = None
 
     def _independent_reuses_main(self, plan, s, all_ids=None):
