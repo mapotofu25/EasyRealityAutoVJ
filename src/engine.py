@@ -7203,14 +7203,21 @@ class AutoVJEngine(QObject):
                 self._cp_cfg = None
                 self._section_log("屏参数读取失败（退回全局，合成继续）：%s" % _e)
             self._compose_to(cv, layers, snap, allow_gpu=False)
-            # ★ B2：每屏自己的 color/postfx（参数已挂好，这里只做一次调色/后期）
-            if _has_ov:
-                try:
+            # ★ B2 + 2026-11-10（QA 实测「同一配置下两块屏颜色不一致」）：
+            #   以前**只有带 params 的屏**才套色 ⇒ 带参数的屏被调了色、不带的屏原样输出
+            #   （实测主屏 255,24,28 vs 独立屏 20,200,20）。
+            #   现在口径统一：**每块独立屏都用自己的生效参数套一次**（无 override ⇒ 全局，
+            #   与主屏在 tick 里那次完全同源）。`_apply_color_postfx` 内部"没效果不读回"，
+            #   所以全局没开颜色/后处理时这里仍然零搬运。
+            try:
+                if not _has_ov:
+                    # ⚠ 传 `self.cfg` 即可：`effective_params` 已兼容 Config 对象/普通 dict
+                    #   （生产是 Config，单测夹具是 dict，两边都能吃）。
                     self._cp_cfg = output_model.effective_params(self.cfg, s)
-                    self._apply_color_postfx(snap, canvas=cv)
-                    self._screen_cp_calls += 1
-                except Exception as _e:                        # noqa: BLE001
-                    self._section_log("屏调色失败（跳过本屏调色）：%s" % _e)
+                self._apply_color_postfx(snap, canvas=cv)
+                self._screen_cp_calls += 1
+            except Exception as _e:                            # noqa: BLE001
+                self._section_log("屏调色失败（跳过本屏调色）：%s" % _e)
             self._cp_cfg = None
 
     def _independent_reuses_main(self, plan, s, all_ids=None):
