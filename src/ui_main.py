@@ -3697,12 +3697,18 @@ class MainWindow(QMainWindow):
         for _vs in (self._blocks_vsplit_left, self._blocks_vsplit_right):
             _vs.setChildrenCollapsible(False)
             _vs.setHandleWidth(6)
+            # ★ 必须**纵向可扩展**：否则 splitter 的高度只等于子块自然高之和，
+            #   用户把块区拉大后 splitter 不跟着长 ⇒ setSizes 没有富余空间可分配
+            #   （实测：块区 628、splitter 仍 386，setSizes([240,170]) 直接被夹成 150/150）。
+            _vs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             try:
                 _vs.splitterMoved.connect(self._on_block_vsplit_moved)
             except Exception:                                     # noqa: BLE001
                 pass
-        self._multi_col_left.addWidget(self._blocks_vsplit_left)
-        self._multi_col_right.addWidget(self._blocks_vsplit_right)
+        # stretch=1：让 splitter 吃掉列里剩余高度（否则它只占"子块自然高之和"，
+        # 用户把块区拉大后 splitter 不长 ⇒ setSizes 没有富余可分配，块高永远被夹到下限）
+        self._multi_col_left.addWidget(self._blocks_vsplit_left, 1)
+        self._multi_col_right.addWidget(self._blocks_vsplit_right, 1)
         # 两个列各包一层容器控件：QHBoxLayout 里等拉伸 ⇒ 左右各占一半
         self._multi_col_left_w = QWidget()
         self._multi_col_left_w.setLayout(self._multi_col_left)
