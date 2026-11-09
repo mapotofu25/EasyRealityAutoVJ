@@ -2362,17 +2362,28 @@ class OutputStudio(QWidget):
         with open(os.path.join(folder, base + ".json"), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         # PNG 可视化（1:1，太大时按比例缩到 <=4096）
-        sc = min(1.0, 4096.0 / max(cw, ch, 1))
-        iw, ih = max(1, int(cw * sc)), max(1, int(ch * sc))
+        # ★ V2：导出 PNG 也要按**显示位置**画（切分/复制屏排到源屏右侧），
+        #   否则导出的图里它们仍然叠在源屏上 = 用户看到的"屏中屏"。
+        _disps = []
+        _x0 = _y0 = 0
+        _x1, _y1 = cw, ch
+        for _s in OM.mapping_screens(cfg):
+            _dx, _dy, _dw, _dh = mapping_display_rect(cfg, _s)
+            _disps.append((_s, (_dx, _dy, _dw, _dh)))
+            _x0 = min(_x0, _dx); _y0 = min(_y0, _dy)
+            _x1 = max(_x1, _dx + _dw); _y1 = max(_y1, _dy + _dh)
+        _bw, _bh = max(1, _x1 - _x0), max(1, _y1 - _y0)
+        sc = min(1.0, 4096.0 / max(_bw, _bh, 1))
+        iw, ih = max(1, int(_bw * sc)), max(1, int(_bh * sc))
         img = QImage(iw, ih, QImage.Format_ARGB32)
         img.fill(QColor("#1a1a1a"))
         p = QPainter(img)
+        p.translate(-_x0 * sc, -_y0 * sc)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setRenderHint(QPainter.TextAntialiasing, True)
         p.setPen(QPen(QColor("#777"), 1))
-        p.drawRect(QRectF(0.5, 0.5, iw - 1, ih - 1))
-        for s in OM.mapping_screens(cfg):
-            x, y, w, h = OM.screen_rect(cfg, s)
+        p.drawRect(QRectF(0, 0, cw * sc, ch * sc))       # 整合画布边界（合成范围）
+        for s, (x, y, w, h) in _disps:
             r = QRectF(x * sc, y * sc, w * sc, h * sc)
             c = _color(OM.effective_color(cfg, s))
             fill = QColor(c)
@@ -2448,6 +2459,43 @@ def fit_block(lines, avail_w, avail_h, hi=28, lo=10, shorten=None):
     return font, out, widest, total_h
 
 
+def mapping_display_rect(cfg, screen, screens=None):
+    """Mapping **显示用**矩形（画布窗口与导出 PNG 共用这一套）。
+
+    ★ V2（用户第 1 条）：「切分出来的屏幕也要把它单独显示到 Mapping 图里面」。
+      切分/复制屏的 `layout` 和源屏完全重叠（都 [0,0]）⇒ 画出来是"屏中屏"。
+      这里只给**显示**偏移：排到所有源屏（main/independent）右侧，辅助屏统一序号垂直堆叠。
+
+    ⚠ **不动 `cfg` 里的 `layout`**（整合画布只合成 main+independent，辅助屏 layout 无意义）；
+      **也不改屏自己的 UV / 分辨率 / 名字** —— 换的只是画在哪。
+    """
+    t = str((screen or {}).get("type") or "main")
+    x, y, w, h = OM.screen_rect(cfg, screen)
+    if t not in ("split", "copy"):
+        return x, y, w, h
+    lst = list(screens if screens is not None else OM.mapping_screens(cfg))
+    right = 0.0
+    y0 = 0.0
+    first = True
+    for o in lst:
+        if str(o.get("type") or "main") in ("split", "copy"):
+            continue
+        try:
+            ox, oy, ow, oh = OM.screen_rect(cfg, o)
+        except Exception:                                          # noqa: BLE001
+            continue
+        right = max(right, float(ox + ow))
+        y0 = float(oy) if first else min(y0, float(oy))
+        first = False
+    idx = 0
+    for o in lst:
+        if o is screen:
+            break
+        if str(o.get("type") or "main") in ("split", "copy"):
+            idx += 1
+    return int(right + 40), int(y0 + idx * (h + 24)), w, h
+
+
 class _CanvasBoard(QWidget):
     """输出画布：把每块屏幕按 mapping 坐标摆在一张画布上，**拖动即可排布**。
 
@@ -2509,42 +2557,8 @@ class _CanvasBoard(QWidget):
         return OM.mapping_screens(self.cfg) if self.cfg else []
 
     def _display_rect(self, s):
-        """画布上**显示用**的矩形。
-
-        ★ V2（用户第 1 条）：切分/复制屏的 `layout` 和源屏完全重叠（都 [0,0]），
-          画上去就是"屏中屏"，看着像少了两块。
-          这里只给**显示**一个偏移：排到源屏右侧、同类垂直堆叠；
-          `cfg` 里的 `layout` **一个字节都不改**（整合画布只合成 main+independent，
-          它们的 layout 本来就没有语义，不能为了显示去动数据）。
-        """
-        t = str(s.get("type") or "main")
-        x, y, w, h = OM.screen_rect(self.cfg, s)
-        if t not in ("split", "copy"):
-            return x, y, w, h
-        # 排到**所有源屏**（main/independent）的右侧，而不是紧贴某一块 —— 否则会和
-        # 紧挨着的独立屏撞在一起（实测：独立屏 x=1280、切分屏被放到 1320 就重叠了）。
-        right = 0.0
-        y0 = 0.0
-        first = True
-        for o in self._frames():
-            if str(o.get("type") or "main") in ("split", "copy"):
-                continue
-            try:
-                ox, oy, ow, oh = OM.screen_rect(self.cfg, o)
-            except Exception:                                      # noqa: BLE001
-                continue
-            right = max(right, float(ox + ow))
-            y0 = float(oy) if first else min(y0, float(oy))
-            first = False
-        # 序号按"所有辅助屏（切分+复制）"统一计：否则切分和复制各自从 0 数，会叠在
-        # 同一个 y 上互相压住（实测过）。
-        idx = 0
-        for o in self._frames():
-            if o is s:
-                break
-            if str(o.get("type") or "main") in ("split", "copy"):
-                idx += 1
-        return int(right + 40), int(y0 + idx * (h + 24)), w, h
+        """画布上显示用的矩形（逻辑在模块级 `mapping_display_rect`，与导出 PNG 共用）。"""
+        return mapping_display_rect(self.cfg, s, self._frames())
 
     def _hit(self, pos):
         for s in reversed(self._frames()):
