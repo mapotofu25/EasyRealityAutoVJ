@@ -444,34 +444,51 @@ class OutputPreview(QWidget):
                 self._guides = []
             s["preview_rect"] = [int(round(nx)), int(round(ny)), int(w), int(h)]
         elif kind == "resize":
+            # ★ T3 #8（用户第 8 条 BUG）：拖右下角手柄原来会把屏幕拉成**非等比**
+            #   （尤其 S6 给缩放加了吸附之后，宽高各吸各的）。现在：
+            #   · 默认**等比**：按该屏原始宽高比推算另一轴（拖哪个轴多就以哪个轴为准）
+            #   · 按住 **Shift** 才允许非等比
+            #   · 吸附：等比模式只吸"右边"（吸完按比例重算高）；自由模式两边都吸
             x, y, w0, h0 = d["orig"]
-            w = max(80, w0 + wd.x())
-            ar = (w0 / h0) if h0 else 1.6
-            h = max(45, w / ar)
-            # ★ S6 #11（用户第 11 条）：**拖右下角手柄缩放时也要吸附**（原来只有移动吸）。
-            #   做法：把"右/下边"当两条边去找最近的目标线，命中就改尺寸（左上角不动）。
+            _sw, _sh = OM.effective_size(self.cfg, s)
+            ar = (_sw / _sh) if _sh else ((w0 / h0) if h0 else 1.7778)
+            free = bool(ev.modifiers() & Qt.ShiftModifier)
+            if free:
+                w = max(80, w0 + wd.x())
+                h = max(45, h0 + wd.y())
+            else:
+                if abs(wd.y()) > abs(wd.x()):
+                    h = max(45, h0 + wd.y())
+                    w = max(80, h * ar)
+                else:
+                    w = max(80, w0 + wd.x())
+                    h = max(45, w / ar)
+            self._guides = []
             if self.snap and not (ev.modifiers() & Qt.AltModifier):
-                self._guides = []
                 thr = 8.0 / max(0.05, self.zoom)
-                rx, by = x + w, y + h
-                best_rx = best_by = None
+                rx = x + w
+                best_rx = None
                 for tr in self._snap_targets(s.get("id")):
                     for tv in (tr.left(), tr.center().x(), tr.right()):
                         dd = tv - rx
                         if abs(dd) <= thr and (best_rx is None or abs(dd) < abs(best_rx[0])):
                             best_rx = (dd, tv)
-                    for tv in (tr.top(), tr.center().y(), tr.bottom()):
-                        dd = tv - by
-                        if abs(dd) <= thr and (best_by is None or abs(dd) < abs(best_by[0])):
-                            best_by = (dd, tv)
                 if best_rx is not None:
                     w = max(80, w + best_rx[0])
                     self._guides.append(("v", best_rx[1]))
-                if best_by is not None:
-                    h = max(45, h + best_by[0])
-                    self._guides.append(("h", best_by[1]))
-            else:
-                self._guides = []
+                    if not free:
+                        h = max(45, w / ar)      # 等比：宽变了高跟着变
+                if free:
+                    by = y + h
+                    best_by = None
+                    for tr in self._snap_targets(s.get("id")):
+                        for tv in (tr.top(), tr.center().y(), tr.bottom()):
+                            dd = tv - by
+                            if abs(dd) <= thr and (best_by is None or abs(dd) < abs(best_by[0])):
+                                best_by = (dd, tv)
+                    if best_by is not None:
+                        h = max(45, h + best_by[0])
+                        self._guides.append(("h", best_by[1]))
             s["preview_rect"] = [int(x), int(y), int(w), int(h)]
         elif kind == "layout":
             x, y, w, h = d["orig"]
