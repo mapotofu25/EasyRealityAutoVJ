@@ -1682,7 +1682,12 @@ class OutputStudio(QWidget):
             #   单路模式有意义；多路模式下必须**整组**藏掉，否则工具条上孤零零剩一个 ×。
             for w in (self.lbl_combined, self.comb_w, self.lbl_x, self.comb_h,
                       self.btn_auto_layout):
-                w.setVisible(single)
+                # ★ T4 #6（用户第 6 条）：单路模式下「整合画布 + 自动排列」也**不再放顶部条**，
+                #   整组搬进「输出画布…」窗口（那窗口本来就是干这个的）。顶部条单路下只剩「模式」。
+                w.setVisible(False)
+            # ★ T1 #1（用户第 1 条）：「输出画布…」只属于**单路**模式
+            #   （多路每屏各自输出，没有"整合画布"这回事）。
+            self.btn_canvas.setVisible(single)
         except Exception:
             pass
         # ★ S2 #3/#4/#14：右下角「输出设置」按模式决定显示哪些项

@@ -3965,6 +3965,15 @@ class MainWindow(QMainWindow):
             _compress(right_lst)
             need = max(_col_need(left_lst), _col_need(right_lst)) + gap_total
         area = need if need <= budget else cap_hard
+        # ★ T1 #3（用户第 3 条）：左列只有主屏一块时，让它**占满左列**（与右列最高的块齐平或撑满），
+        #   不要只占一半、下面留空。切分/复制屏不再建块之后左列通常就只剩主屏这一块。
+        try:
+            if len(left_lst) == 1 and area > 0:
+                _fill = int(max(190, area - gap_total))
+                if int(left_lst[0].height()) != _fill:
+                    left_lst[0].setFixedHeight(_fill)
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_auto_size_blocks_split.fill_main", e)
         # 块区最小高：1 块时就是它自己的自然高度（不硬撑 220），多块才用 220 兜底
         try:
             sa.setMinimumHeight(min(220, max(120, area)))
@@ -4034,9 +4043,14 @@ class MainWindow(QMainWindow):
         # 但把"别自动改"的标记复位（下次数量变化仍会重新自动分配）。
         if not count_changed:
             self._blocks_split_user_set = False
-        # 已经删掉的屏幕：它的图层栈要销毁（别让 N 个栈无限堆积）
+        # ★ T1 #2（用户第 2 条）：**切分屏 / 复制屏不建块** —— 它们的内容跟随源屏，
+        #   本来就没有自己的图层。只在右键「屏幕设置…」里改名/改源/UV。
+        block_screens = [sc for sc in screens
+                         if str(sc.get("type")) in ("main", "independent")]
+        block_ids = set(str(sc.get("id")) for sc in block_screens)
+        # 不再给块/已删掉的屏：它的图层栈要销毁（别让 N 个栈无限堆积）
         for sid in list(self._screen_panels.keys()):
-            if sid not in sig:
+            if sid not in block_ids:
                 p = self._screen_panels.pop(sid, None)
                 if p is not None:
                     try:
@@ -4068,7 +4082,7 @@ class MainWindow(QMainWindow):
                 self.cfg.save()
         except Exception as e:                                    # noqa: BLE001
             self._log_ui_error("_rebuild_multi_blocks.bind_main_layers", e)
-        for s in screens:
+        for s in block_screens:
             panel = self._panel_for_screen(s, cfg)
             blk, body = self._make_screen_block(s, cfg, all_ids, panel)
             self._multi_blocks.append((str(s.get("id")), blk, body))
