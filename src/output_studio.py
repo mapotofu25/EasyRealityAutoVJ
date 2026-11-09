@@ -117,7 +117,14 @@ class OutputPreview(QWidget):
 
     # ---------- 数据 ----------
     def set_context(self, mode, screens, cfg, selected_id=""):
-        self.mode = str(mode or "multi")
+        """喂数据。**`mode` 只记录、不再改变绘制方式**（S1 #2，用户第 2 条）。
+
+        ★ 用户：「切模式预览区不许变样 —— 一换模式预览就变'整合画布+布局框'，看不懂」。
+          所以预览**永远**按多路那套画（每屏一个独立预览框）；`mode` 只影响
+          「输出画布」窗口和引擎输出。`cfg_mode` 保留原值以备查询。
+        """
+        self.cfg_mode = str(mode or "multi")
+        self.mode = "multi"          # ⚠ 绘制/交互一律走多路分支（`_paint_multi`）
         self.screens = list(screens or [])
         self.cfg = cfg
         self.selected_id = str(selected_id or "")
@@ -1394,7 +1401,14 @@ class OutputStudio(QWidget):
         bar.addStretch(1)
         self.lbl_mode_hint = QLabel("")
         self.lbl_mode_hint.setStyleSheet("color:#888;")
-        bar.addWidget(self.lbl_mode_hint)
+        # ★ S1 #2（用户第 2 条）：这条提示文字很长，`QLabel` 的**最小宽度 = 整行文字宽**
+        #   ⇒ 它会把整条页签行（多屏模式下控制条搬在那一行）撑到超出窗口，进而把整个
+        #   页面拉宽、预览区跟着改尺寸（"一换模式预览就变样"的真根因之一）。
+        #   这里让它**可被压缩**（Ignored）、文字用 tooltip 兜底，宽度不再影响布局。
+        self.lbl_mode_hint.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                        QSizePolicy.Policy.Preferred)
+        self.lbl_mode_hint.setMinimumWidth(0)
+        bar.addWidget(self.lbl_mode_hint, 1)
         outer.addWidget(self.top_bar)
         self._style_top_bar()
         theme.register(self, self._style_top_bar)
@@ -1531,9 +1545,11 @@ class OutputStudio(QWidget):
         b = getattr(self, "btn_screen_badge", None)
         if b is None:
             return
-        multi = (cfg or {}).get("mode", "multi") != "single"
-        b.setVisible(multi)          # 单路模式没有"当前屏幕"的概念
-        if not multi:
+        # ★ S1 #2：这颗胶囊是**预览区自己的浮层**，与"多路/单路"无关
+        #   （用户要求切模式时预览逐像素不变；隐藏它会直接改变预览画面）。
+        b.setVisible(True)
+        if not (cfg or {}).get("screens"):
+            b.hide()
             return
         s = OM.screen_by_id(cfg, self.selected_id) or OM.main_screen(cfg)
         name = str((s or {}).get("name") or "-")
@@ -1632,6 +1648,7 @@ class OutputStudio(QWidget):
             "多路：每块屏幕独立 NDI/Spout；上方棋盘格是监看工作区，拖动/缩放不改输出。"
             if not single else
             "单路：多屏拼成一张大画布，只发一路；上方布局会影响 mapping/最终输出。")
+        self.lbl_mode_hint.setToolTip(self.lbl_mode_hint.text())
         self._loading = False
         self._refresh_screen_badge(cfg)     # ★ 预览区左上角胶囊（选中屏幕 + 颜色）
         try:

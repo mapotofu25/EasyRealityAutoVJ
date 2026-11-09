@@ -3554,6 +3554,11 @@ class MainWindow(QMainWindow):
         lay.addLayout(self._multi_right_lay, 0)
         self._multi_page = page
         self.perf_stack.addWidget(page)
+        # ★ S1 #1：多屏页刚建好时，按当前运行状态决定开关能不能点
+        try:
+            self._sync_multi_controls()
+        except Exception:                                         # noqa: BLE001
+            pass
 
     def _on_studio_selection(self, sid=""):
         """选中屏幕变了：右侧设置换作用域 + 下方图层块重排（用户第 8/10/11 条）。"""
@@ -5030,6 +5035,11 @@ class MainWindow(QMainWindow):
         try:
             self.output_panel.set_gate(running)
         except Exception:
+            pass
+        # ★ S1 #1：运行中不许切多屏/切模式（现场切错会黑屏）
+        try:
+            self._sync_multi_controls()
+        except Exception:                                         # noqa: BLE001
             pass
         if running:
             # 每次开始 VJ 都按设置应用（全屏→该屏；窗口→按分辨率重置大小），
@@ -8463,6 +8473,36 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _sync_multi_controls(self):
+        """★ S1 #1（用户第 1 条）：VJ 运行中**禁用**「多屏输出」开关与「模式」下拉。
+
+        为什么：运行中切多屏/切单路会重建整条输出计划（发送端/画布全重建），
+        现场一按就可能黑一下或掉帧。停止 VJ 后恢复可用。
+        判据（QA 会验）：运行中两个控件都是灰的、点了没反应，tooltip 为「停止 VJ 后才能切换」。
+        """
+        try:
+            running = bool(self.engine.running)
+        except Exception:                                         # noqa: BLE001
+            running = False
+        try:
+            self.btn_multi_out.setEnabled(not running)
+            self.btn_multi_out.setToolTip(
+                T("停止 VJ 后才能切换") if running else
+                T("关闭：普通演出台（原图层/预览/素材库）\n"
+                  "打开：多屏输出工作区 + 同一套图层和素材库"))
+        except Exception:                                         # noqa: BLE001
+            pass
+        st = getattr(self, "output_studio", None)
+        if st is not None:
+            try:
+                st.mode_combo.setEnabled(not running)
+                st.mode_combo.setToolTip(
+                    T("停止 VJ 后才能切换") if running else
+                    T("多路：每块屏幕独立 NDI/Spout 输出\n"
+                      "单路：多屏拼成一张大画布，只发一路（在「输出画布…」里排布）"))
+            except Exception:                                     # noqa: BLE001
+                pass
+
     def _on_auto_layers_changed(self, idxs):
         """自动图层素材池被重算：刷新对应行素材格 + 播放高亮"""
         for i in (idxs or []):
@@ -8629,6 +8669,10 @@ class MainWindow(QMainWindow):
         self._sync_color_bypass_btn()
         self.lbl_status.setText(tr("running") if running
                                 else tr("stopped") + T("（自动切换已停，画面实时）"))
+        try:
+            self._sync_multi_controls()      # ★ S1 #1：启动/切语言时也按运行状态上锁
+        except Exception:                                         # noqa: BLE001
+            pass
         try:
             self._layers_call("refresh_header")      # 图层名 tooltip / 不透明度 / 角色按钮
         except Exception:
