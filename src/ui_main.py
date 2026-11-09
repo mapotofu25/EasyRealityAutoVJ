@@ -4010,14 +4010,130 @@ class MainWindow(QMainWindow):
         if getattr(self, "_blocks_split_user_set", False):
             return
         self._blocks_split_user_set = True
-        # 只**放开上限**（固定高会锁死拖拽），下限保持 120：
+        self._record_block_ratios()
+        # 只**放开上限**（固定高会锁死拖拽），下限 150（team-lead 定的硬底）：
         #   · 默认没拖过时仍由 `_fit_block_height` 钉死 ⇒ "三块全可见"不变
         #   · 拖过之后不再被自动改；splitter 记住 sizes
         # ⚠ 已知未达标：拖过之后再改行高，块会被压到最小 120（见报告）。
         for _sid, blk, _body in getattr(self, "_multi_blocks", []):
             try:
-                blk.setMinimumHeight(120)
+                blk.setMinimumHeight(150)
                 blk.setMaximumHeight(16777215)
+            except Exception:                                      # noqa: BLE001
+                pass
+
+    #: 用户拖过分隔条后记下的比例 {sid: p}（切配置/退出多屏时清空）
+    _blocks_split_ratio = None
+
+    def _block_sid(self, wdg):
+        for sid, blk, _body in getattr(self, "_multi_blocks", []):
+            if blk is wdg:
+                return sid
+        return ""
+
+    def _record_block_ratios(self):
+        """记下用户拖出来的**比例**（不是绝对高度）。⑥(B) 的第一步。"""
+        ratios = {}
+        for vs in (getattr(self, "_blocks_vsplit_left", None),
+                   getattr(self, "_blocks_vsplit_right", None)):
+            if vs is None:
+                continue
+            sz = [max(0, int(x)) for x in vs.sizes()]
+            tot = sum(sz)
+            if tot <= 0:
+                continue
+            for i, cur in enumerate(sz):
+                w = vs.widget(i)
+                sid = self._block_sid(w) if w is not None else ""
+                if sid:
+                    ratios[sid] = cur / float(tot)
+        self._blocks_split_ratio = ratios
+
+    @staticmethod
+    def _distribute_by_ratio(weights, target, lo=150, hi=320, rounds=3):
+        """按权重把 `target` 分给 n 个槽，每槽夹在 [lo, hi]，余量/超量二次分配。
+
+        做法（team-lead 定的口径）：每一轮按当前"未夹住"的权重分一次；只要有槽越界，
+        就先把**越界最多**的那个夹到边界、从预算里扣掉，再重分一轮（最多 rounds 轮）。
+        ⚠ 必须"夹一个、重算一次"：若在同一轮里先扣掉一块再用旧权重继续算，
+          剩下的槽会算偏、余量发不出去（实测 [320,150,150] 就是那个 bug）。
+        """
+        n = len(weights)
+        if n <= 0:
+            return []
+        w = [max(0.0, float(x)) for x in weights]
+        if sum(w) <= 0:
+            w = [1.0] * n
+        sizes = [None] * n
+        free = list(range(n))
+        remaining = float(target)
+        for _ in range(int(rounds) * n + 2):
+            if not free:
+                break
+            fw = sum(w[i] for i in free) or 1.0
+            alloc = {i: remaining * w[i] / fw for i in free}
+            viol = [i for i in free if alloc[i] < lo or alloc[i] > hi]
+            if not viol:
+                for i in free:
+                    sizes[i] = alloc[i]
+                free = []
+                break
+            worst = max(viol, key=lambda k: abs(alloc[k] - (lo if alloc[k] < lo else hi)))
+            if alloc[worst] < lo:
+                sizes[worst] = lo
+                remaining -= lo
+            else:
+                sizes[worst] = hi
+                remaining -= hi
+            free.remove(worst)
+        if free:                       # 兜底（理论上到不了）
+            share = max(lo, min(hi, remaining / max(1, len(free))))
+            for i in free:
+                sizes[i] = share
+        return [int(round(max(lo, min(hi, x)))) for x in sizes]
+
+    def _natural_block_h(self, blk):
+        """该块的**自然高度**（与 `_fit_block_height` 同一口径）。"""
+        try:
+            ps = blk.findChildren(LayerStackPanel)
+            panel = ps[0] if ps else None
+            rows = len(getattr(panel, "rows", []) or []) if panel is not None else 0
+            cell = int(getattr(panel, "cell_h", 58) or 58) if panel is not None else 58
+        except Exception:                                          # noqa: BLE001
+            rows, cell = 0, 58
+        return max(150, min(320, 36 + 8 + rows * (cell + 2)))
+
+    def _apply_block_ratios(self):
+        """⑥(B)：行高等变化后，按**用户拖出的比例**把块高落到新的目标总额。
+
+        target_total = min(Σ自然高, 块区可用高 × 0.62)；每块 clamp 到 [150, 320]，
+        被夹住产生的余量按未夹块的比例再分配（最多 3 轮）。
+        """
+        if not getattr(self, "_blocks_split_user_set", False):
+            return
+        ratios = getattr(self, "_blocks_split_ratio", None) or {}
+        if not ratios:
+            return
+        sa = getattr(self, "_multi_blocks_scroll", None)
+        try:
+            view_h = int(sa.viewport().height()) if sa is not None else 0
+        except Exception:                                          # noqa: BLE001
+            view_h = 0
+        for vs in (getattr(self, "_blocks_vsplit_left", None),
+                   getattr(self, "_blocks_vsplit_right", None)):
+            if vs is None or vs.count() <= 0:
+                continue
+            blocks = [vs.widget(i) for i in range(vs.count())]
+            sids = [self._block_sid(b) for b in blocks]
+            wts = [float(ratios.get(sid, 0.0)) for sid in sids]
+            if sum(wts) <= 0:                       # 没有比例（新块）⇒ 等分
+                wts = [1.0] * len(blocks)
+            nat = [self._natural_block_h(b) for b in blocks]
+            cap = int(view_h * 0.62) if view_h > 0 else sum(nat)
+            target = max(150 * len(blocks), min(sum(nat), cap))
+            sizes = self._distribute_by_ratio(wts, target)
+            try:
+                vs.setSizes(sizes)
             except Exception:                                      # noqa: BLE001
                 pass
 
@@ -4065,6 +4181,7 @@ class MainWindow(QMainWindow):
     def _on_blocks_split_config_switch(self, *_a):
         """切输出配置：复位"用户手拖过"的标记，但**不**动当前尺寸（用户拖的就保留）。"""
         self._blocks_split_user_set = False
+        self._blocks_split_ratio = None         # ⑥：比例也清空（回到自动）
         self._blocks_cols_user_set = False      # 左右分栏同理（下次重建会等比复位）
         # #10：复位后重新按自然高度钉一遍（用户拖过的块之前被释放成 min120/无上限）
         try:
@@ -4192,6 +4309,8 @@ class MainWindow(QMainWindow):
                     continue
             # 行高变了 ⇒ 块高变了 ⇒ 块区高度重算（用户没手拖过时）
             self._auto_size_blocks_split()
+            # ⑥(B)：用户手拖过 ⇒ 按他拖出的**比例**把块高落到新的目标总额
+            self._apply_block_ratios()
         finally:
             self._rh_guard = False
 
