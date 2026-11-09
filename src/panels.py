@@ -3409,6 +3409,11 @@ class LayerStackPanel(QWidget):
     #: 码表图层：那 4 个控件隐藏（不占布局）⇒ 可以宽到 200px，长表名能看清。
     CUE_COMBO_W_COMPACT = 92
     CUE_COMBO_W = 200
+    #: ★ S8 #14（用户第 14 条）：码表 pill 的**最大宽度**。
+    #:   原来写死 200 且不随列宽变：长表名被裁、列宽拉大后右边又空一大截。
+    #:   现在 = min(本上限, 列宽 − 左侧田字格 56 − 两边距)，既不溢出图层头，
+    #:   也在宽列下多给一点空间（超出部分由 Qt 截断，tooltip 里有全名）。
+    CUE_COMBO_W_MAX = 260
 
     #: ★ 2026-11-06（用户：「行高最小想再小一点，38 那么小」）：
     #:   图层头**两个尺寸档**的参数表（见 `_apply_row_metrics`）。
@@ -4268,8 +4273,16 @@ class LayerStackPanel(QWidget):
                     r1.insertWidget(1, cmb)
             f._cue_mode = is_cue
         cmb.setVisible(is_cue)
-        # 码表图层右侧空了 ⇒ 下拉铺满剩余宽度；普通图层保持 92（隐藏时也不占位）
-        cmb.setFixedWidth(self.CUE_COMBO_W if is_cue else self.CUE_COMBO_W_COMPACT)
+        # 码表图层右侧空了 ⇒ 按"可用宽度"自适应并封顶；普通图层保持 92（隐藏时也不占位）
+        if is_cue:
+            try:
+                avail = int(self.header_w) - 56 - 20      # 田字格 56 + 两边距
+            except Exception:                             # noqa: BLE001
+                avail = self.CUE_COMBO_W
+            w = max(140, min(self.CUE_COMBO_W_MAX, avail))
+        else:
+            w = self.CUE_COMBO_W_COMPACT
+        cmb.setFixedWidth(w)
 
     # ---- 图层头尺寸档（行高 ≥ HEADER_COMPACT_H ⇒ 标准档；否则紧凑档）----
     def _apply_row_metrics(self, hdr, h):

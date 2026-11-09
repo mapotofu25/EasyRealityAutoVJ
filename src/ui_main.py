@@ -3361,8 +3361,9 @@ class MainWindow(QMainWindow):
         #   所以外面套一个 QFrame（QFrame 直接支持 stylesheet 的 border/圆角）。
         right_frame = QFrame()
         right_frame.setObjectName("stageRightFrame")
-        right_frame.setMinimumWidth(304)
-        right_frame.setMaximumWidth(434)
+        # ★ S8 #13：右侧列收紧（304/434 → 288/410），压低"预览与设置之间的缝"
+        right_frame.setMinimumWidth(288)
+        right_frame.setMaximumWidth(410)
         _rf = QVBoxLayout(right_frame)
         _rf.setContentsMargins(2, 2, 2, 2)
         _rf.setSpacing(0)

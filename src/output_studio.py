@@ -1489,7 +1489,10 @@ class OutputStudio(QWidget):
         self.screen_combo.currentIndexChanged.connect(self._on_screen_combo)
 
         # ---- 中间：预览 + 右侧设置 ----
+        # ★ S8 #13（用户第 13 条）：预览与右侧设置之间那条缝太宽 ⇒ 收紧
+        #   （spacing 6→2；设置列最小宽 300→280，不会把内容挤变形）。
         mid = QHBoxLayout()
+        mid.setSpacing(2)
         left = QVBoxLayout()
         self.preview = OutputPreview(self)
         self.preview.action.connect(self._on_preview_action)
@@ -1519,6 +1522,7 @@ class OutputStudio(QWidget):
         left.addWidget(cardbox, 0)
         mid.addLayout(left, 1)
         self.settings = ScreenSettingsPanel(self)
+        self.settings.setMinimumWidth(280)
         self.settings.changed.connect(self._on_settings_changed)
         mid.addWidget(self.settings, 0)
         outer.addLayout(mid, 1)
