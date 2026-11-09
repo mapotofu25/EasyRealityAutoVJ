@@ -2337,7 +2337,7 @@ class OutputStudio(QWidget):
         p.setRenderHint(QPainter.TextAntialiasing, True)
         p.setPen(QPen(QColor("#777"), 1))
         p.drawRect(QRectF(0.5, 0.5, iw - 1, ih - 1))
-        for s in cfg.get("screens") or []:
+        for s in OM.mapping_screens(cfg):
             x, y, w, h = OM.screen_rect(cfg, s)
             r = QRectF(x * sc, y * sc, w * sc, h * sc)
             c = _color(OM.effective_color(cfg, s))
@@ -2467,8 +2467,12 @@ class _CanvasBoard(QWidget):
         self.update()
 
     def _frames(self):
-        """能摆到画布上的屏：主屏 + 独立屏（复制/切分跟随源屏，不单独摆放）。"""
-        return OM.layout_sources(self.cfg) if self.cfg else []
+        """画布上要画的**全部**屏（含切分/复制），源屏先画、切分/复制后画（叠在上层）。
+
+        ⚠ 之前只返回 `layout_sources()`（主屏+独立屏），导致 4 屏配置里
+          切分屏和复制屏在 Mapping 里完全看不到（用户反馈 #2）。
+        """
+        return OM.mapping_screens(self.cfg) if self.cfg else []
 
     def _hit(self, pos):
         for s in reversed(self._frames()):
@@ -2495,7 +2499,8 @@ class _CanvasBoard(QWidget):
         if ev.button() != Qt.LeftButton or not self.cfg:
             return
         s, r = self._hit(ev.position())
-        if s is not None:
+        # 切分/复制屏的矩形是从源屏派生的，拖它们没有意义 ⇒ 当作空白拖动平移画布
+        if s is not None and str(s.get("type") or "main") not in ("split", "copy"):
             x, y, _w, _h = OM.screen_rect(self.cfg, s)
             self._drag = {"sid": s.get("id"), "start": ev.position(),
                           "orig": [x, y]}
@@ -2595,15 +2600,28 @@ class _CanvasBoard(QWidget):
             col = _color(OM.effective_color(self.cfg, s))
             fill = QColor(col)
             fill.setAlpha(200)
+            _t = str(s.get("type") or "main")
+            if _t in ("split", "copy"):
+                # 切分/复制屏和源屏矩形重叠（复制=整块、切分=子区域）⇒ 淡填充 + 虚线框，
+                # 否则画上去就被源屏盖住、看着"少了两块"
+                fill.setAlpha(60)
             p.fillRect(r, fill)
-            p.setPen(QPen(col.lighter(140), 2))
+            if _t in ("split", "copy"):
+                _pen = QPen(col.lighter(160), 2, Qt.DashLine)
+                _pen.setDashPattern([6, 4])
+                p.setPen(_pen)
+            else:
+                p.setPen(QPen(col.lighter(140), 2))
             p.drawRect(r)
             pw, ph = OM.effective_size(self.cfg, s)
             uv = OM.screen_uv(self.cfg, s)
             # ★ H2：字号**先量文本再定**——从上限 28 往下试，直到"最宽那行 ≤ 格宽-16"
             #   且"总高 ≤ 格高-16"；下限 10。UV 拆两行（比一行 `→` 短一半，不再被裁）。
+            _name = str(s.get("name") or "")
+            if str(s.get("type") or "main") in ("split", "copy"):
+                _name += " [%s]" % OM.TYPE_LABELS.get(s.get("type"), s.get("type"))
             blocks = [
-                str(s.get("name") or ""),
+                _name,
                 "%d × %d" % (pw, ph),
                 "U0,V0 = %.4f, %.4f" % (uv[0], uv[1]),
                 "U1,V1 = %.4f, %.4f" % (uv[2], uv[3]),
@@ -2636,8 +2654,11 @@ class _CanvasBoard(QWidget):
                        "%d,%d" % (x, y))
         p.setPen(QColor(220, 220, 220, 180))
         p.setFont(QFont("Segoe UI", 8))
-        p.drawText(8, self.height() - 8,
-                   "画布 %d×%d · %d%%" % (cw, ch, int(round(self.zoom * 100))))
+        _hint = "画布 %d×%d · %d%%" % (cw, ch, int(round(self.zoom * 100)))
+        if any(str(x.get("type")) in ("split", "copy")
+               for x in (self.cfg or {}).get("screens") or []):
+            _hint += "　·　整合画布只合成主屏与独立屏；切分/复制屏是各自独立的输出"
+        p.drawText(8, self.height() - 8, _hint)
         p.end()
 
 

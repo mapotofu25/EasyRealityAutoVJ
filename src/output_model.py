@@ -449,6 +449,7 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
 
 
 #: U7：可按屏 override 的参数段（性能/屏幕设置不在此列，仍全局）
+#: 可以**按屏各存一份**的配置段（其余段如 perf/output 始终全局一份）
 PARAM_SECTIONS = ("auto", "postfx", "color")
 
 _MISSING = object()
@@ -658,6 +659,19 @@ def layout_sources(cfg):
     """单路模式需要摆到整合画布上的源屏幕：主屏 + 独立屏。"""
     return [s for s in (cfg or {}).get("screens") or []
             if s.get("type") in ("main", "independent")]
+
+
+def mapping_screens(cfg):
+    """Mapping 图里要画的**全部**屏（含切分/复制），按"源屏先、切分/复制后"排序。
+
+    ⚠ 与 `layout_sources()` 的区别：那个是"参与整合画布合成的源屏"（只有
+      主屏 + 独立屏），用于算画布尺寸；这里是**画图用**的完整列表 ——
+      切分屏/复制屏虽然不参与合成，但用户要在图里看到它们各自的输出区域。
+    """
+    screens = list((cfg or {}).get("screens") or [])
+    order = {"main": 0, "independent": 1, "split": 2, "copy": 3}
+    # sorted 是稳定排序：同类型内保持配置顺序
+    return sorted(screens, key=lambda s: order.get(s.get("type"), 9))
 
 
 def combined_size(cfg):
