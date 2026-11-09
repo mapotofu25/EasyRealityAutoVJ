@@ -2022,8 +2022,10 @@ class OutputStudio(QWidget):
             s["layers"] = None
             s["follow_main"] = True
         else:
-            # 独立屏：初始图层复制主屏（全部图层）
-            s["layers"] = [l.lid for l in self.main.engine.layers]
+            # ★ S4 #7（用户第 7 条）：独立屏**初始图层为空**（该屏不显示任何图层），
+            #   由用户在块头「⋯ → 屏幕设置」里自己勾。以前复制主屏全部图层，
+            #   结果是"新建一块屏，画面上立刻出现主屏所有图层"，与预期不符。
+            s["layers"] = []
             s["width"], s["height"] = v["width"], v["height"]
             # 默认勾选“跟随主屏”；但用户在新建对话框里选了不同分辨率时自动取消，
             # 否则刚建出来就被主屏分辨率覆盖，等于白填。
