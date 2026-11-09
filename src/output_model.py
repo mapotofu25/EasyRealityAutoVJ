@@ -450,7 +450,7 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
 
 #: U7：可按屏 override 的参数段（性能/屏幕设置不在此列，仍全局）
 #: 可以**按屏各存一份**的配置段（其余段如 perf/output 始终全局一份）
-PARAM_SECTIONS = ("auto", "postfx", "color")
+PARAM_SECTIONS = ("auto", "postfx", "color", "kv", "beat")
 
 _MISSING = object()
 

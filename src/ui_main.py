@@ -647,7 +647,8 @@ class SettingsPanel(QWidget):
         self._fx_tabs.addTab(pc, "颜色渲染")
         self._fx_tabs.addTab(p4, "后处理")
         self._add_section(box, "画面效果", self._fx_tabs)
-        self._add_section(box, "性能", p_perf)
+        # ★ #3：性能是**全局**项（不跟屏走）⇒ 收进「屏幕设置」这个可展开分组里当子项
+        self._add_section(box, "屏幕设置 · 性能（全局）", p_perf)
 
         # 信号
         self.kv_db.valueChanged.connect(self._on_kv_db)
@@ -4510,12 +4511,23 @@ class MainWindow(QMainWindow):
                             _n_ov += 1
                 except Exception:                                  # noqa: BLE001
                     _n_ov = 0
+                _sname = "-"
+                try:
+                    _om2 = _om
+                    _sid = str(getattr(st, "selected_id", "") or "")
+                    _sc = _om2.screen_by_id(cfg, _sid) if _sid else None
+                    if _sc is None:
+                        _sc = _om2.main_screen(cfg)
+                    _sname = str((_sc or {}).get("name") or "-")
+                except Exception:                                  # noqa: BLE001
+                    _sname = "-"
+                _base = Tf("单路 · 当前屏幕：{}（以下设置只作用于这块屏；"
+                           "性能与输出设置是全局的）", _sname)
                 if _n_ov > 0:
-                    lbl.setText(Tf("单路：以下设置对所有屏幕生效（只发一路）"
-                                   "　·　当前 {} 块屏各有独立参数，每帧多跑 {} 次调色"
-                                   "（1080p 约 +4.4ms/屏）", _n_ov, _n_ov))
+                    lbl.setText(_base + Tf("　·　当前 {} 块屏各有独立参数，每帧多跑 {} 次调色"
+                                           "（1080p 约 +4.4ms/屏）", _n_ov, _n_ov))
                 else:
-                    lbl.setText(T("单路：以下设置对所有屏幕生效（只发一路）"))
+                    lbl.setText(_base)
                 # ★ U7 第二步：单路下参数按屏 ⇒ 面板必须**回填当前屏的生效值**
                 try:
                     from PySide6.QtCore import QTimer as _QT3
@@ -5828,6 +5840,89 @@ class MainWindow(QMainWindow):
         except (ValueError, TypeError):
             hb = 2
         _blocked(getattr(self, "postfx_hold", None), lambda w: w.setCurrentIndex(hb))
+
+        # ★ #3：Kv 主视觉 / 演出行为 / 色彩渲染 这三组的控件也必须按屏回填，
+        #   否则"改的是这块屏、显示的还是全局值" ⇒ 用户看着就是没做。
+        #   用一张声明表统一处理（控件属性名, 段, 键, 类型）。
+        if st is None:
+            return
+        kv = eff.get("kv") or {}
+        beat = eff.get("beat") or {}
+
+        def _num(sec_d, key, dflt):
+            try:
+                return float(sec_d.get(key, dflt))
+            except (TypeError, ValueError):
+                return float(dflt)
+
+        # (属性名, 取值函数, 应用函数)
+        #  ×10 类：配置是秒/dB 浮点，滑条是整数（值×10）
+        for attr, sec_d, key, dflt in (
+                ("kv_db", kv, "db_threshold", -40.0),
+                ("kv_silent", kv, "silent_delay", 2.0),
+                ("kv_resume", kv, "resume_delay", 1.0),
+                ("kv_in_dur", kv, "in_dur", 1.0),
+                ("kv_out_dur", kv, "out_dur", 1.0),
+                ("kv_switch", kv, "switch_sec", 8.0)):
+            _blocked(getattr(st, attr, None),
+                     (lambda w, v=int(round(_num(sec_d, key, dflt) * 10)):
+                          w.setValue(max(w.minimum(), min(w.maximum(), v)))))
+        _blocked(getattr(st, "kv_in_trans", None),
+                 lambda w: w.setCurrentIndex(
+                     ["fade", "cut", "glitch"].index(str(kv.get("in_trans") or "fade"))
+                     if str(kv.get("in_trans") or "fade") in ["fade", "cut", "glitch"] else 0))
+        _blocked(getattr(st, "kv_out_trans", None),
+                 lambda w: w.setCurrentIndex(
+                     ["fade", "cut", "zoom"].index(str(kv.get("out_trans") or "fade"))
+                     if str(kv.get("out_trans") or "fade") in ["fade", "cut", "zoom"] else 0))
+        # 色彩渲染
+        _blocked(getattr(st, "chk_color_on", None),
+                 lambda w: w.setChecked(bool(col.get("on", True))))
+        _blocked(getattr(st, "chk_color_auto", None),
+                 lambda w: w.setChecked(bool(col.get("auto", True))))
+        _blocked(getattr(st, "color_mode", None),
+                 lambda w: w.setCurrentIndex(1 if str(col.get("mode") or "lut") == "duotone" else 0))
+        try:
+            _cs = int(col.get("strength", 60) or 60)
+        except (TypeError, ValueError):
+            _cs = 60
+        _blocked(getattr(st, "color_strength", None),
+                 lambda w: w.setValue(max(w.minimum(), min(w.maximum(), _cs))))
+        try:
+            _cr = int(col.get("rotate_sec", 6) or 6)
+        except (TypeError, ValueError):
+            _cr = 6
+        _blocked(getattr(st, "color_rotate", None),
+                 lambda w: w.setValue(max(w.minimum(), min(w.maximum(), _cr))))
+        _blocked(getattr(st, "chk_color_burst", None),
+                 lambda w: w.setChecked(bool(col.get("burst", False))))
+        _blocked(getattr(st, "color_flicker", None),
+                 lambda w: w.setCurrentIndex(
+                     ["on", "off", "random"].index(str(col.get("flicker_mode") or "off"))
+                     if str(col.get("flicker_mode") or "off") in ["on", "off", "random"] else 1))
+        # 演出行为（逐拍交替）
+        _blocked(getattr(st, "beat_pick", None),
+                 lambda w: w.setCurrentIndex(1 if str(beat.get("pick_mode") or "seq") == "rand" else 0))
+        _blocked(getattr(st, "beat_interval", None),
+                 lambda w: w.setCurrentIndex(
+                     [0.25, 0.5, 1, 2, 4, 8, 16].index(float(beat.get("interval_beats", 1) or 1))
+                     if float(beat.get("interval_beats", 1) or 1) in [0.25, 0.5, 1, 2, 4, 8, 16] else 2))
+        _blocked(getattr(st, "beat_bars", None),
+                 lambda w: w.setValue(int(beat.get("bars_per_pair", 1) or 1)))
+        _blocked(getattr(st, "beat_end", None),
+                 lambda w: w.setCurrentIndex(1 if str(beat.get("end_action") or "loop") == "reverse" else 0))
+        # 联动刷新数值标签（blockSignals 挡掉了回调，标签得手动同步）
+        try:
+            st.kv_db_lbl.setText("%.1f dB" % _num(kv, "db_threshold", -40.0))
+            st.kv_silent_lbl.setText("%.1f s" % _num(kv, "silent_delay", 2.0))
+            st.kv_resume_lbl.setText("%.1f s" % _num(kv, "resume_delay", 1.0))
+            st.kv_in_dur_lbl.setText("%.1f s" % _num(kv, "in_dur", 1.0))
+            st.kv_out_dur_lbl.setText("%.1f s" % _num(kv, "out_dur", 1.0))
+            st.kv_switch_lbl.setText("%.1f s" % _num(kv, "switch_sec", 8.0))
+            st.color_strength_lbl.setText("%d%%" % _cs)
+            st.color_rotate_lbl.setText("%d s" % _cr)
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def clear_screen_param(self, sec=None):
         """「恢复跟随全局」：清掉当前屏（某一段）的 override。"""
