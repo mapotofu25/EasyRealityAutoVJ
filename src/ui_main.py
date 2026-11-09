@@ -4802,6 +4802,18 @@ class MainWindow(QMainWindow):
             if win.isVisible():
                 win.hide()
             else:
+                # ★ BUG-A（QA 抓到，`4da9c32` 起就有）：退出多屏时
+                #   `_restore_stage_panels()` → `_detach_library_from_float()` 会把
+                #   `library_panel` 从浮窗布局里摘掉、塞回演出台的 QSplitter。
+                #   这里只 show 不装回去 ⇒ **第二次打开是 700×520 的空窗口**
+                #   （只剩「收藏夹」那一条）。所以显示之前无条件装回。
+                try:
+                    _lay = win.layout()
+                    if _lay is not None and _lay.indexOf(self.library_panel) < 0:
+                        self.library_panel.setParent(None)
+                        _lay.addWidget(self.library_panel, 1)
+                except Exception as e:                             # noqa: BLE001
+                    self._log_ui_error("toggle_library_float.attach", e)
                 win.show()
                 win.raise_()
                 win.activateWindow()

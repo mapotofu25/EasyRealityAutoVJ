@@ -5,6 +5,12 @@ r"""PyInstaller 打包脚本：生成 <项目根>\dist\EasyRealityAutoVJ\EasyRea
 import os
 import subprocess
 import sys
+import time
+
+# ★ 构建开始时间：收尾要拿它判断"exe 到底有没有被这次构建覆盖"。
+#   （QA 实测坑：同一 dist 目录重打时 safe-delete 会拦住 PyInstaller 覆盖，rc=1 但 exe
+#     mtime 一点没变 ⇒ 不看 mtime 就会拿旧 exe 去冒烟还自以为验了新代码。）
+T_BUILD_START = time.time()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
@@ -198,6 +204,29 @@ if rc != 0 and _EXE_BUILT:
     print("[build] PyInstaller 返回 %d，但 exe 已产出（通常由 safe-delete 拦下清理步骤引起）"
           " ⇒ 继续收尾" % rc)
 if _EXE_BUILT:
+    # ---- ① 产物新鲜度校验（必须在任何"验收动作"之前）----
+    try:
+        _exe_mtime = os.path.getmtime(_EXE_PATH)
+        _exe_size = os.path.getsize(_EXE_PATH)
+    except OSError as e:
+        print("\n❌ 拿不到 exe 的时间戳/大小：%s" % e)
+        sys.exit(2)
+    print("[build] 产物：%s" % _EXE_PATH)
+    print("[build]   mtime = %s（本地时间）"
+          % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_exe_mtime)))
+    print("[build]   size  = %d bytes" % _exe_size)
+    if _exe_mtime < T_BUILD_START:
+        print("\n" + "!" * 72)
+        print("❌ 产物没更新，本次打包无效（多半是 dist 目录被 safe-delete 拦住，"
+              "PyInstaller 没覆盖旧 exe）")
+        print("   exe mtime = %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_exe_mtime)))
+        print("   build 开始 = %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(T_BUILD_START)))
+        print("   ⇒ 解决：换一个新的 AUTOVJ_DIST 目录，或先把旧 dist 目录改名再打。")
+        print("!" * 72)
+        sys.exit(2)
+
     # ★ 顺序很重要：完成提示 + UI 冒烟**必须在瘦身之前**。
     #   cyndilib 瘦身会批量 os.remove 几十个文件，本机 safe-delete 钩子会直接**终止整个
     #   构建进程**（不是抛异常，捕不到）⇒ 放它后面的代码永远不执行（实测：冒烟和
