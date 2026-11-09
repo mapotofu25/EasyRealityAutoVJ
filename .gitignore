@@ -335,3 +335,6 @@ docs/码表实装_进度看板.html
 EasyRealityCue/docs/规格书_旧实现考古.md
 EasyRealityCue/docs/需求_*.md
 EasyRealityCue/docs/*_24.mermaid
+
+# 运行期能量日志（每次启动会新建/追加），不入库
+energy_*.csv
