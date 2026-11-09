@@ -4279,7 +4279,11 @@ class MainWindow(QMainWindow):
             sa.setMinimumHeight(min(220, max(120, area)))
         except Exception:                                         # noqa: BLE001
             pass
-        area = max(min(need, 220), min(area, max(160, budget)))
+        # ★ #10 前置（team-lead 定）：删掉单块时代的 `min(need, 220)` 夹取。
+        #   它把"最多给 220"套到了**多块**场景 ⇒ 3 块 need≈570 也只拿到 220 量级，
+        #   块区永远偏小、用户拖大也受牵制。原设计意图就是：**装得下就全给，装不下才封顶**。
+        #   1 块时 need = 该块自然高度（~190）⇒ area=190，不硬撑，与旧行为一致。
+        area = min(need, max(160, budget))
         try:
             sp.setSizes([max(1, avail - area), area])
         except Exception:                                         # noqa: BLE001
