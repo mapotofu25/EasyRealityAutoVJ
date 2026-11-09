@@ -3682,7 +3682,7 @@ class MainWindow(QMainWindow):
             self._blocks_cols_split.splitterMoved.connect(self._on_blocks_cols_moved)
         except Exception:                                         # noqa: BLE001
             pass
-        self._multi_blocks_lay.addWidget(self._blocks_cols_split)
+        self._multi_blocks_lay.addWidget(self._blocks_cols_split, 1)   # 吃掉整块区域高度
         # ★ 第六批 #10：列内各块之间也要能**拖** ⇒ 每列用一个 QSplitter(Vertical)。
         #   默认（用户没拖过）仍由 `_fit_block_height` 给每块定高（保持"3 块全可见"），
         #   一旦用户拖过分隔条就释放固定高度、改由 splitter 记住尺寸。
@@ -3713,11 +3713,11 @@ class MainWindow(QMainWindow):
         self._multi_col_left_w = QWidget()
         self._multi_col_left_w.setLayout(self._multi_col_left)
         self._multi_col_left_w.setSizePolicy(QSizePolicy.Policy.Expanding,
-                                             QSizePolicy.Policy.Preferred)
+                                             QSizePolicy.Policy.Expanding)
         self._multi_col_right_w = QWidget()
         self._multi_col_right_w.setLayout(self._multi_col_right)
         self._multi_col_right_w.setSizePolicy(QSizePolicy.Policy.Expanding,
-                                              QSizePolicy.Policy.Preferred)
+                                              QSizePolicy.Policy.Expanding)
         # ⚠ 两列必须**等宽**（用户对照图是左右各一半）：用 Ignored 宽度策略让 QHBoxLayout
         #   只按 stretch 分配，而不是按各自内容的 sizeHint（否则图层多的那一列会更宽）。
         for _cw in (self._multi_col_left_w, self._multi_col_right_w):
@@ -3860,7 +3860,15 @@ class MainWindow(QMainWindow):
         h = 36 + 8 + rows * (cell + 2)
         h = max(190, min(320, h))
         if getattr(self, "_blocks_split_user_set", False):
-            return                     # #10：用户拖过 ⇒ 保持他拖出来的尺寸
+            # #10：用户拖过 ⇒ **不再钉死**，只保下限、显式放开上限。
+            #   `setFixedHeight` 会让 QSplitter 的 maximumHeight 变成"子块高之和"
+            #   （实测 386），之后 `setSizes` 永远被夹回下限 —— 这是 ⑥① 的真根因。
+            try:
+                blk.setMinimumHeight(150)
+                blk.setMaximumHeight(16777215)
+            except Exception:                                      # noqa: BLE001
+                pass
+            return
         try:
             blk.setFixedHeight(int(h))
         except Exception:                                          # noqa: BLE001
@@ -4039,6 +4047,27 @@ class MainWindow(QMainWindow):
                 blk.setMaximumHeight(16777215)
             except Exception:                                      # noqa: BLE001
                 pass
+        # 布局会在本轮事件处理里回落（splitter 高度被重算）⇒ 下一轮再施加一次 sizes
+        try:
+            _snap = {id(vs): list(vs.sizes()) for vs in (
+                getattr(self, "_blocks_vsplit_left", None),
+                getattr(self, "_blocks_vsplit_right", None)) if vs is not None}
+
+            def _reapply():
+                for _vs in (getattr(self, "_blocks_vsplit_left", None),
+                            getattr(self, "_blocks_vsplit_right", None)):
+                    if _vs is None:
+                        continue
+                    sz = _snap.get(id(_vs))
+                    if sz:
+                        try:
+                            _vs.setSizes(sz)
+                        except Exception:                          # noqa: BLE001
+                            pass
+            from PySide6.QtCore import QTimer as _QT
+            _QT.singleShot(0, _reapply)
+        except Exception:                                          # noqa: BLE001
+            pass
 
     #: 用户拖过分隔条后记下的比例 {sid: p}（切配置/退出多屏时清空）
     _blocks_split_ratio = None
