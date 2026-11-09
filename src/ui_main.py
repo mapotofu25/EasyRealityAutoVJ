@@ -853,6 +853,7 @@ class OutputPanel(QWidget):
 
     def __init__(self, main):
         super().__init__()
+        self.main = main                    # ★ V6：刷新发送端名要读当前配置
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         g = QGroupBox("输出设置")
@@ -1037,10 +1038,10 @@ class OutputPanel(QWidget):
         单路下 `screen=None` ⇒ 退回原来的全局一份。
         """
         self._screen = screen
-        try:
-            ls = list(self.lbl_spout_name.text() or "")
-        except Exception:                                          # noqa: BLE001
-            ls = []
+        # ★★ V6（用户第 8 条，真根因）：这两个标签以前**写死常量**、从不按屏更新 ⇒
+        #    用户改屏名成 898 之后，标签还显示 EasyRealityAutoVJ（他看的是标签）。
+        #    现在每次绑定屏幕都按该屏的发送名刷新；单路（None）用主屏的名字。
+        self.refresh_output_names(screen)
         if screen is None:
             return
         try:
@@ -1071,6 +1072,40 @@ class OutputPanel(QWidget):
                     _w.blockSignals(False)
                 except Exception:                                  # noqa: BLE001
                     pass
+
+    def refresh_output_names(self, screen=None):
+        """把「Spout 名 / NDI 完整接收名」刷成**该屏**的发送端名。
+
+        名字来源与引擎完全一致：`output_model.screen_output_names(cfg)`（同一函数，
+        所以标签显示什么、实际发送端就叫什么，不会两套口径）。
+        主屏若还叫默认名（"主屏幕"/空），该函数会回落到 `EasyRealityAutoVJ`。
+        """
+        try:
+            import output_model as _om
+            cfg = _om.active_config(getattr(self.main, "cfg").data)
+        except Exception:                                          # noqa: BLE001
+            cfg = None
+        try:
+            names = _om.screen_output_names(cfg) if cfg else {}
+            sc = screen
+            if sc is None and cfg:
+                sc = _om.main_screen(cfg)
+            sid = str((sc or {}).get("id") or "")
+            nm = names.get(sid) or str((sc or {}).get("name") or "") or DEFAULT_SPOUT_NAME
+            try:
+                self.lbl_spout_name.setText(nm)
+            except Exception:                                      # noqa: BLE001
+                pass
+            # NDI：`<本机名> (<源名>)`，与 `_update_ndi_full` 同格式
+            try:
+                comp = str(os.environ.get("COMPUTERNAME") or "").strip()
+                full = ("%s (%s)" % (comp, nm)) if comp else nm
+                self.lbl_ndi_name.setText(full)
+                self._flow_ndi()
+            except Exception:                                      # noqa: BLE001
+                pass
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _update_ndi_full(self):
         """刷新 NDI **完整接收名**提示：`<本机名> (<源名>)`。
@@ -4518,6 +4553,23 @@ class MainWindow(QMainWindow):
             except Exception:                                      # noqa: BLE001
                 pass
 
+    def _refresh_output_name_labels(self):
+        """V6：改屏名后**立刻**刷新输出设置里的两个名字标签（不用重开窗口）。"""
+        try:
+            import output_model as _om
+            st = getattr(self, "output_studio", None)
+            op = getattr(self, "output_panel", None)
+            if st is None or op is None:
+                return
+            cfg = st.active_config()
+            if str((cfg or {}).get("mode") or "multi") == "single":
+                op.refresh_output_names(None)          # 单路：用主屏的名字（全局一块）
+            else:
+                sid = str(getattr(st, "selected_id", "") or "")
+                op.refresh_output_names(_om.screen_by_id(cfg, sid) if sid else None)
+        except Exception:                                          # noqa: BLE001
+            pass
+
     def _sync_multi_right(self, *_a):
         """用户第 8/11 条：多屏模式右侧设置的作用域 = 当前选中的屏幕。
 
@@ -4536,6 +4588,7 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             return
         cfg = st.active_config()
+        self._refresh_output_name_labels()      # V6：名字标签跟着屏名走
         # ★ T4 #7（用户第 7 条）：**单路**模式下输出设置是**全局一份** ——
         #   不跟"当前选中屏幕"走、也不该因为"没选中屏幕"被置灰
         #   （用户原话：「都单路了干嘛还每个屏幕弄一个设置」）。
