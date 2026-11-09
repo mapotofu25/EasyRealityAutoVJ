@@ -213,4 +213,36 @@ if rc == 0:
         print(f"cyndilib 瘦身被拦截（可忽略，手动再删即可）: {e}")
     print(f"打包完成 → 版本 {VER}（{DATE_KEY} 第 {SEQ} 次生成）；"
           f"压缩包命名 {build_version.zip_name(DATE_KEY, SEQ)}")
+
+    # ---- 收尾：UI 冒烟（offscreen 真构造一次 MainWindow）----
+    # ★ 为什么必须自动跑（P0 BUG-2 的教训）：2026-11-09 有一次 `QDoubleSpinBox` 忘了加进
+    #   `PySide6.QtWidgets` 导入 —— 语法完全合法 ⇒ py_compile / 静态检查全过，但
+    #   `MainWindow()` 一构造就 NameError，软件**根本起不来**，而包已经打出来了。
+    #   这类错只有"真构造一次"才发现 ⇒ 挂在这里，忘了跑也会被拦一道。
+    #   ⚠ 失败只打印醒目警告、**不改 rc**（包本身是好的，别让 CI 因为告警误判为构建失败）。
+    smoke = os.path.join(ROOT, "tools", "_smoke_mainwindow.py")
+    if os.path.isfile(smoke):
+        print("\n" + "=" * 72)
+        print("收尾：UI 冒烟（tools/_smoke_mainwindow.py）")
+        print("=" * 72)
+        try:
+            src = subprocess.run([sys.executable, "-u", smoke], cwd=ROOT,
+                                 capture_output=True, text=True, timeout=300)
+            out = (src.stdout or "") + (src.stderr or "")
+            if "SMOKE_OK" in out and src.returncode == 0:
+                print("✅ UI 冒烟通过（SMOKE_OK）")
+            else:
+                print("\n" + "!" * 72)
+                print("!! ★★ UI 冒烟失败 —— 这个包很可能起不来，别发给客户 ★★")
+                print("!!   修好后重打：venv/Scripts/python.exe -u tools/_smoke_mainwindow.py")
+                print("!" * 72)
+                for line in out.strip().splitlines()[-25:]:
+                    print("!! " + line)
+        except Exception as e:                                     # noqa: BLE001
+            print("\n" + "!" * 72)
+            print("!! ★★ UI 冒烟没跑起来（%s）—— 请手动执行 ★★" % e)
+            print("!!   venv/Scripts/python.exe -u tools/_smoke_mainwindow.py")
+            print("!" * 72)
+    else:
+        print("\n⚠ 找不到 tools/_smoke_mainwindow.py，跳过 UI 冒烟（请确认脚本还在）")
 sys.exit(rc)
