@@ -198,27 +198,10 @@ if rc != 0 and _EXE_BUILT:
     print("[build] PyInstaller 返回 %d，但 exe 已产出（通常由 safe-delete 拦下清理步骤引起）"
           " ⇒ 继续收尾" % rc)
 if _EXE_BUILT:
-    internal = os.path.join(DIST_ROOT, "EasyRealityAutoVJ", "_internal", "cyndilib")
-    removed = 0
-    try:
-        if os.path.isdir(internal):
-            for root, dirs, files in os.walk(internal):
-                for f in files:
-                    low = f.lower()
-                    p = os.path.join(root, f)
-                    if (low.endswith((".cpp", ".pyx", ".pxd", ".html"))
-                            or "directshow" in low or "uwp" in low
-                            or low.endswith((".lib", ".so", ".a"))):
-                        os.remove(p)
-                        removed += 1
-            for root, dirs, files in os.walk(internal, topdown=False):
-                if not os.listdir(root) and root != internal:
-                    os.rmdir(root)
-        print(f"cyndilib 瘦身: 删除 {removed} 个文件")
-    except Exception as e:
-        # safe-delete 钩子可能拦截批量删除——瘦身失败不影响打包结果（exe 已生成），
-        # 可另行手动瘦身，勿让 rc 变非零。
-        print(f"cyndilib 瘦身被拦截（可忽略，手动再删即可）: {e}")
+    # ★ 顺序很重要：完成提示 + UI 冒烟**必须在瘦身之前**。
+    #   cyndilib 瘦身会批量 os.remove 几十个文件，本机 safe-delete 钩子会直接**终止整个
+    #   构建进程**（不是抛异常，捕不到）⇒ 放它后面的代码永远不执行（实测：冒烟和
+    #   "打包完成" 都不打印）。
     print(f"打包完成 → 版本 {VER}（{DATE_KEY} 第 {SEQ} 次生成）；"
           f"压缩包命名 {build_version.zip_name(DATE_KEY, SEQ)}")
 
@@ -253,4 +236,26 @@ if _EXE_BUILT:
             print("!" * 72)
     else:
         print("\n⚠ 找不到 tools/_smoke_mainwindow.py，跳过 UI 冒烟（请确认脚本还在）")
+    # ---- 最后：cyndilib 瘦身（可能被 safe-delete 终止，放最后不影响上面两步）----
+    internal = os.path.join(DIST_ROOT, "EasyRealityAutoVJ", "_internal", "cyndilib")
+    removed = 0
+    try:
+        if os.path.isdir(internal):
+            for root, dirs, files in os.walk(internal):
+                for f in files:
+                    low = f.lower()
+                    p = os.path.join(root, f)
+                    if (low.endswith((".cpp", ".pyx", ".pxd", ".html"))
+                            or "directshow" in low or "uwp" in low
+                            or low.endswith((".lib", ".so", ".a"))):
+                        os.remove(p)
+                        removed += 1
+            for root, dirs, files in os.walk(internal, topdown=False):
+                if not os.listdir(root) and root != internal:
+                    os.rmdir(root)
+        print(f"cyndilib 瘦身: 删除 {removed} 个文件")
+    except Exception as e:
+        # safe-delete 钩子可能拦截批量删除——瘦身失败不影响打包结果（exe 已生成），
+        # 可另行手动瘦身，勿让 rc 变非零。
+        print(f"cyndilib 瘦身被拦截（可忽略，手动再删即可）: {e}")
 sys.exit(rc)
