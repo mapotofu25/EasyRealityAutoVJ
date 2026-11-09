@@ -147,6 +147,9 @@ def main():
     bad = len(_results) - sum(1 for x in _results if x)
     print("\n通过 %d / 失败 %d" % (len(_results) - bad, bad), flush=True)
     print("结论：" + ("✅ UI 冒烟通过" if bad == 0 else "★ UI 冒烟失败"), flush=True)
+    if bad == 0:
+        # 固定字样 + 退出码 0：供打包验收脚本 grep（team-lead 要求）
+        print("SMOKE_OK", flush=True)
     return 0 if bad == 0 else 1
 
 
