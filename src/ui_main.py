@@ -4007,8 +4007,8 @@ class MainWindow(QMainWindow):
         QSplitter 的拖拽（min==max）。所以一旦用户拖了，就把所有块的固定高度释放
         （min 120 / max 无限），改由 splitter 的 sizes 记住比例。
         """
-        if getattr(self, "_blocks_split_user_set", False):
-            return
+        # ⚠ 必须**幂等**：每次拖都要重新记比例（否则第二次拖不改比例）；
+        #   "释放固定高度"重复执行无害。
         self._blocks_split_user_set = True
         self._record_block_ratios()
         # 只**放开上限**（固定高会锁死拖拽），下限 150（team-lead 定的硬底）：
