@@ -649,6 +649,9 @@ class SettingsPanel(QWidget):
         self._add_section(box, "画面效果", self._fx_tabs)
         # ★ #3：性能是**全局**项（不跟屏走）⇒ 收进「屏幕设置」这个可展开分组里当子项
         self._add_section(box, "屏幕设置 · 性能（全局）", p_perf)
+        # ★ V3：单路模式下「性能」要挪到右下角与输出设置合并成一块 ⇒ 记住容器与分区
+        self._box = box
+        self.perf_section = self._sections.get("屏幕设置 · 性能（全局）")
 
         # 信号
         self.kv_db.valueChanged.connect(self._on_kv_db)
@@ -3441,8 +3444,16 @@ class MainWindow(QMainWindow):
         #     复制屏/切分屏要把上面那组设置整块置灰，但这块必须仍然可编辑。
         self.screen_setup_box = self._build_screen_setup_box()
         _rf.addWidget(right)
-        _rf.addWidget(self.screen_setup_box, 0)
-        _rf.addWidget(self.output_panel, 0)
+        # ★ V3（用户第 3 条）：**性能 + 输出设置**合并成右下角独立一块（不带屏幕色描框）；
+        #   单路时「屏幕设置（源屏/分辨率/UV）」也在这块里。
+        self.bottom_right_box = QWidget()
+        _brl = QVBoxLayout(self.bottom_right_box)
+        _brl.setContentsMargins(0, 0, 0, 0)
+        _brl.setSpacing(4)
+        self._bottom_right_layout = _brl
+        _brl.addWidget(self.screen_setup_box, 0)
+        _brl.addWidget(self.output_panel, 0)
+        _rf.addWidget(self.bottom_right_box, 0)
         main_split.addWidget(right_frame)
         main_split.setSizes([1150, 360])
         # 记住这两块：多屏模式下要把它们搬进多屏页（同一个对象，不复制）
@@ -4473,6 +4484,40 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
+    def _place_perf_section(self, to_bottom):
+        """V3：把「性能」分区在「设置面板里」与「右下角独立块」之间搬运。
+
+        user 第 3 条：性能+视频输出合并到右下角单独一块；其余（Kv/演出行为/画面效果）
+        用屏幕色描框。多路模式保持原样（性能留在设置面板）。
+        """
+        st = getattr(self, "settings", None)
+        sec = getattr(st, "perf_section", None) if st is not None else None
+        brl = getattr(self, "_bottom_right_layout", None)
+        sbox = getattr(st, "_box", None)
+        if sec is None or brl is None or sbox is None:
+            return
+        try:
+            cur = sec.parentWidget()
+            if to_bottom:
+                if cur is not getattr(self, "bottom_right_box", None):
+                    if cur is not None and cur.layout() is not None:
+                        cur.layout().removeWidget(sec)
+                    sec.setParent(None)
+                    brl.insertWidget(0, sec)      # 放在输出设置上面
+                sec.setVisible(True)
+            else:
+                if cur is not getattr(st, "_box", None):
+                    if cur is not None and cur.layout() is not None:
+                        cur.layout().removeWidget(sec)
+                    sec.setParent(None)
+                    sbox.addWidget(sec)
+                sec.setVisible(True)
+        except Exception as e:                                     # noqa: BLE001
+            try:
+                self._log_ui_error("_place_perf_section", e)
+            except Exception:                                      # noqa: BLE001
+                pass
+
     def _sync_multi_right(self, *_a):
         """用户第 8/11 条：多屏模式右侧设置的作用域 = 当前选中的屏幕。
 
@@ -4496,12 +4541,21 @@ class MainWindow(QMainWindow):
         #   （用户原话：「都单路了干嘛还每个屏幕弄一个设置」）。
         if str((cfg or {}).get("mode") or "multi") == "single":
             try:
-                rf.setStyleSheet("")
                 rc.setEnabled(True)
                 try:
                     self.output_panel.set_screen(None)     # 单路 ⇒ 解绑，全局一份
                 except Exception:                              # noqa: BLE001
                     pass
+                # ★ V3：单路也用**当前屏的颜色**给"屏内设置"这一整块描框
+                _cur = _om.screen_by_id(cfg, str(getattr(st, "selected_id", "") or "")) \
+                    or _om.main_screen(cfg)
+                try:
+                    rf.setStyleSheet(
+                        "QFrame#stageRightFrame{border:2px solid %s;border-radius:5px;}"
+                        % _om.effective_color(cfg, _cur))
+                except Exception:                              # noqa: BLE001
+                    rf.setStyleSheet("")
+                self._place_perf_section(True)
                 # ★ U7 性能提示（team-lead 要求：不加限制，但要告诉用户代价）
                 _n_ov = 0
                 try:
@@ -4537,9 +4591,11 @@ class MainWindow(QMainWindow):
                 except Exception:                                  # noqa: BLE001
                     self._reload_screen_params_ui()
                 lbl.show()
+                # ★ V3：屏幕设置（源屏/分辨率/UV）在单路下也要显示 —— 切分屏没有
+                #   "单独的一套设置"，它沿用的就是这套 + 上面那三组。
                 box_s = getattr(self, "screen_setup_box", None)
                 if box_s is not None:
-                    box_s.setVisible(False)
+                    box_s.setVisible(True)
             except Exception:                                     # noqa: BLE001
                 pass
             return
@@ -4567,6 +4623,7 @@ class MainWindow(QMainWindow):
                 (getattr(self, "output_studio", None) or object) and s))
         except Exception:                                          # noqa: BLE001
             pass
+        self._place_perf_section(False)     # 多路：性能留在设置面板里
         t = s.get("type")
         col = _om.effective_color(cfg, s)
         rf.setStyleSheet(
@@ -4620,6 +4677,12 @@ class MainWindow(QMainWindow):
         # ★ H1：多屏模式 HUD 挪到预览区右上角；单屏演出台保持左上不变
         try:
             self.preview_panel.set_hud_align(on)
+        except Exception:                                          # noqa: BLE001
+            pass
+        # ★ V3：进出多屏页时「性能」分区先归位到设置面板；
+        #   单路（mode=single）时由 `_sync_multi_right` 再搬到右下角独立块。
+        try:
+            self._place_perf_section(False)
         except Exception:                                          # noqa: BLE001
             pass
         try:

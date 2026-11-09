@@ -6736,6 +6736,13 @@ class AutoVJEngine(QObject):
         except Exception:
             _was_plan = self._out_cfg is not None
             self._out_cfg = cfg_snapshot
+        # ★ V6：多路下也要确保**遗留全局发送端**被释放 —— 否则用户在新发送端列表里
+        #   仍会看到老的 `EasyRealityAutoVJ`（那是 `_spout`/`_ndi` 这对旧对象）。
+        try:
+            if (self._out_cfg or {}).get("mode") == "multi" and _was_plan:
+                self._close_legacy_output()
+        except Exception:                                          # noqa: BLE001
+            pass
         # 单路 → 多路：先关掉旧的单路 Spout/NDI，避免两套发送端同时存在
         if self._out_cfg is not None and not _was_plan:
             try:
