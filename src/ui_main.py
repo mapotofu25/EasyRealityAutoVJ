@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QStatusBar, QDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QApplication, QProgressBar, QAbstractItemView, QInputDialog,
     QToolBox, QScrollArea, QMenu, QFrame, QSizePolicy, QLineEdit, QButtonGroup,
-    QRadioButton, QTabWidget, QAbstractSpinBox, QToolButton,
+    QRadioButton, QTabWidget, QAbstractSpinBox, QToolButton, QDoubleSpinBox,
 )
 
 import i18n
@@ -3368,8 +3368,14 @@ class MainWindow(QMainWindow):
         right_scroll.setWidget(self.settings)
         rv.addWidget(right_scroll, 1)
         self.output_panel = OutputPanel(self)              # 右下角：输出设置
-        rv.addWidget(self.output_panel, 0)
+        # ★ S3 #5（用户第 5 条）：「屏幕设置」一栏 —— 选中切分屏幕时出现，
+        #   和「画面效果 / 性能 / 输出设置」同级（都在右侧同一列），放该屏的 UV/源屏/分辨率。
+        #   ⚠ 它和输出设置都挂在 `right_frame` 上（**不是** `right` 内部）：
+        #     复制屏/切分屏要把上面那组设置整块置灰，但这块必须仍然可编辑。
+        self.screen_setup_box = self._build_screen_setup_box()
         _rf.addWidget(right)
+        _rf.addWidget(self.screen_setup_box, 0)
+        _rf.addWidget(self.output_panel, 0)
         main_split.addWidget(right_frame)
         main_split.setSizes([1150, 360])
         # 记住这两块：多屏模式下要把它们搬进多屏页（同一个对象，不复制）
@@ -4076,6 +4082,101 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
+    def _build_screen_setup_box(self):
+        """★ S3 #5：选中「切分屏幕」时右侧出现的「屏幕设置」栏（UV / 源屏 / 分辨率）。"""
+        g = QGroupBox(T("屏幕设置"))
+        f = QGridLayout(g)
+        f.setContentsMargins(8, 6, 8, 6)
+        f.setVerticalSpacing(4)
+        self.lbl_ss_source = QLabel(T("源屏幕"))
+        f.addWidget(self.lbl_ss_source, 0, 0)
+        self.ss_source = QComboBox()
+        self.ss_source.setMinimumWidth(150)
+        self.ss_source.currentIndexChanged.connect(self._on_screen_setup_changed)
+        f.addWidget(self.ss_source, 0, 1)
+        f.addWidget(QLabel(T("分辨率")), 1, 0)
+        _row = QHBoxLayout()
+        _row.setContentsMargins(0, 0, 0, 0)
+        self.ss_w = QSpinBox(); self.ss_w.setRange(16, 16384); self.ss_w.setMinimumWidth(70)
+        self.ss_h = QSpinBox(); self.ss_h.setRange(16, 16384); self.ss_h.setMinimumWidth(70)
+        self.ss_w.valueChanged.connect(self._on_screen_setup_changed)
+        self.ss_h.valueChanged.connect(self._on_screen_setup_changed)
+        _row.addWidget(self.ss_w)
+        _row.addWidget(QLabel("×"))
+        _row.addWidget(self.ss_h)
+        _row.addStretch(1)
+        f.addLayout(_row, 1, 1)
+        self.ss_uv = []
+        for i, lab in enumerate(("左 U0", "上 V0", "右 U1", "下 V1")):
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1.0)
+            sp.setDecimals(4)
+            sp.setSingleStep(0.001)
+            sp.setMinimumWidth(80)
+            sp.valueChanged.connect(self._on_screen_setup_changed)
+            self.ss_uv.append(sp)
+            f.addWidget(QLabel(T(lab)), 2 + i // 2, (i % 2) * 2)
+            f.addWidget(sp, 2 + i // 2, (i % 2) * 2 + 1)
+        self.lbl_ss_hint = QLabel(T("切分屏幕取源屏的一块：改 UV 或直接在预览里拖裁切框。"))
+        self.lbl_ss_hint.setWordWrap(True)
+        self.lbl_ss_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
+        f.addWidget(self.lbl_ss_hint, 4, 0, 1, 4)
+        self._ss_loading = False
+        g.setVisible(False)
+        return g
+
+    def _fill_screen_setup(self, cfg, screen):
+        """把选中切分屏的数据回填到「屏幕设置」栏（不触发写回）。"""
+        if not hasattr(self, "ss_source"):
+            return
+        import output_model as _om
+        self._ss_loading = True
+        try:
+            self.ss_source.blockSignals(True)
+            self.ss_source.clear()
+            for sc in (cfg or {}).get("screens") or []:
+                if sc.get("type") in ("main", "independent"):
+                    self.ss_source.addItem(sc.get("name") or sc.get("id"), sc.get("id"))
+            idx = self.ss_source.findData((screen or {}).get("source_id"))
+            self.ss_source.setCurrentIndex(max(0, idx))
+            self.ss_source.blockSignals(False)
+            w, h = _om.effective_size(cfg, screen)
+            self.ss_w.blockSignals(True); self.ss_h.blockSignals(True)
+            self.ss_w.setValue(int(w)); self.ss_h.setValue(int(h))
+            self.ss_w.blockSignals(False); self.ss_h.blockSignals(False)
+            uv = (screen or {}).get("uv") or [0, 0, 1, 1]
+            for i, sp in enumerate(self.ss_uv):
+                sp.blockSignals(True)
+                sp.setValue(float(uv[i]))
+                sp.blockSignals(False)
+        finally:
+            self._ss_loading = False
+
+    def _on_screen_setup_changed(self, *_a):
+        """「屏幕设置」栏被改动 ⇒ 写回当前切分屏并重建输出（S3 #5）。"""
+        if getattr(self, "_ss_loading", False):
+            return
+        st = getattr(self, "output_studio", None)
+        if st is None:
+            return
+        try:
+            import output_model as _om
+            cfg = st.active_config()
+            s = _om.screen_by_id(cfg, getattr(st, "selected_id", ""))
+            if not s or s.get("type") != "split":
+                return
+            s["source_id"] = self.ss_source.currentData() or s.get("source_id")
+            s["width"] = max(16, int(self.ss_w.value()))
+            s["height"] = max(16, int(self.ss_h.value()))
+            u0 = float(self.ss_uv[0].value())
+            v0 = float(self.ss_uv[1].value())
+            u1 = max(u0 + 0.002, float(self.ss_uv[2].value()))
+            v1 = max(v0 + 0.002, float(self.ss_uv[3].value()))
+            s["uv"] = [u0, v0, u1, v1]
+            st.apply()
+        except Exception:                                         # noqa: BLE001
+            pass
+
     def _sync_multi_right(self, *_a):
         """用户第 8/11 条：多屏模式右侧设置的作用域 = 当前选中的屏幕。
 
@@ -4101,25 +4202,37 @@ class MainWindow(QMainWindow):
             rc.setEnabled(False)
             lbl.setText("未选中屏幕：设置不可修改（先在预览里点一块屏）")
             lbl.show()
+            box0 = getattr(self, "screen_setup_box", None)
+            if box0 is not None:
+                box0.setVisible(False)
             return
         t = s.get("type")
         col = _om.effective_color(cfg, s)
         rf.setStyleSheet(
             "QFrame#stageRightFrame{border:2px solid %s;border-radius:5px;}" % col)
         lbl.show()
+        box = getattr(self, "screen_setup_box", None)
         if t == "copy":
             src = _om.source_screen(cfg, s) or _om.main_screen(cfg) or {}
             rc.setEnabled(False)
             lbl.setText("「%s」是复制屏幕：请选择原屏幕「%s」后再修改"
                         % (s.get("name") or "复制屏幕", src.get("name") or "主屏幕"))
+            if box is not None:
+                box.setVisible(False)
         elif t == "split":
-            src = _om.source_screen(cfg, s) or {}
+            src = _om.source_screen(cfg, s) or _om.main_screen(cfg) or {}
             rc.setEnabled(False)
-            lbl.setText("「%s」是切分屏幕：请选择源屏幕「%s」后再修改"
-                        % (s.get("name") or "切分屏幕", src.get("name") or "主屏幕"))
+            lbl.setText("「%s」是切分屏幕：下面「屏幕设置」里填源屏 / UV / 分辨率"
+                        % (s.get("name") or "切分屏幕"))
+            if box is not None:
+                # 切分屏的"这块屏设置"就在这个栏里 ⇒ 上面那组演出设置置灰，它自己要能改
+                self._fill_screen_setup(cfg, s)
+                box.setVisible(True)
         else:
             rc.setEnabled(True)
             lbl.setText("以下设置作用于当前屏幕「%s」" % (s.get("name") or "主屏幕"))
+            if box is not None:
+                box.setVisible(False)
 
     def _host_top_bar(self, on):
         """把多屏控制条搬进页签行 / 搬回输出页（用户第 1 条）。

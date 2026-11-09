@@ -548,13 +548,13 @@ class OutputPreview(QWidget):
             t = s.get("type")
             a.setEnabled(t in ("main", "independent"))
             a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.change_color(sid))
+            # ★ S3 #6：以前这里只 select_screen（什么都不弹）⇒ 用户会觉得"点了没反应"。
+            #   现在真的打开屏幕设置对话框（复制屏不可改，会退化成选中并提示）。
             a = m.addAction("屏幕设置…")
-            a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.select_screen(sid))
+            a.triggered.connect(lambda _=False, sid=s.get("id"):
+                                self.studio.select_screen(sid) or self.studio.edit_screen(sid))
             m.addSeparator()
-            a = m.addAction("复制此屏幕（跟随主屏）")
-            a.setEnabled(s.get("type") in ("main", "independent"))
-            a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.add_copy_screen(sid))
-            # ★ 用户第 9 条：「切分」已删除（语义并入复制）
+            # ★ S3 #6：删掉「复制此屏幕（跟随主屏）」入口（用户要求）
             a = m.addAction("删除屏幕")
             a.setEnabled(s.get("type") != "main")
             a.triggered.connect(lambda _=False, sid=s.get("id"): self.studio.delete_screen(sid))
@@ -759,10 +759,7 @@ class ScreenCard(QFrame):
         a.setEnabled(self.screen.get("type") in ("main", "independent"))
         a.triggered.connect(lambda _=False: self.studio.change_color(self.screen.get("id")))
         m.addSeparator()
-        a = m.addAction("复制此屏幕（跟随主屏）")
-        a.setEnabled(self.screen.get("type") in ("main", "independent"))
-        a.triggered.connect(lambda _=False: self.studio.add_copy_screen(self.screen.get("id")))
-        # ★ 用户第 9 条：「切分」已删除（切分语义并入复制）⇒ 这里不再提供切分入口
+        # ★ S3 #6：删掉「复制此屏幕（跟随主屏）」入口（用户要求）
         a = m.addAction("删除屏幕")
         a.setEnabled(self.screen.get("type") != "main")
         a.triggered.connect(lambda _=False: self.studio.delete_screen(self.screen.get("id")))
@@ -846,7 +843,9 @@ class ScreenDialog(QDialog):
         self.name = QLineEdit()
         form.addRow("名称", self.name)
         self.type = QComboBox()
-        items = [("independent", "独立屏幕"), ("copy", "复制屏幕（跟随主屏）")]
+        # ★ S3 #5（用户第 5 条）：把「切分屏幕」加回来（三种类型都在）。
+        items = [("independent", "独立屏幕"), ("copy", "复制屏幕（跟随主屏）"),
+                 ("split", "切分屏幕（取源屏的一块）")]
         for k, label in items:
             self.type.addItem(label, k)
         form.addRow("类型", self.type)
@@ -954,20 +953,26 @@ class ScreenDialog(QDialog):
         src = OM.screen_by_id(self.cfg, self.source.currentData())
         is_ind = t == "independent"
         is_copy = t == "copy"
-        # ★ 用户第 9 条：独立屏的分辨率**永远可手改**；复制屏跟随主屏 ⇒ 只读。
-        self.w.setEnabled(is_ind)
-        self.h.setEnabled(is_ind)
+        is_split = t == "split"
+        # ★ S3 #5：**三种类型都能手改分辨率**（用户要求）；复制屏填了也会被主屏尺寸覆盖，
+        #   但输入框本身不再置灰（以前灰着让人以为不能改）。
+        self.w.setEnabled(True)
+        self.h.setEnabled(True)
         # ★ 用户第 9 条：只有「复制屏幕」才需要选源屏幕；独立屏把这一行整行藏掉。
+        _need_src = bool(is_copy or is_split)
         try:
-            self.lbl_source.setVisible(is_copy)
+            self.lbl_source.setVisible(_need_src)
         except Exception:                                          # noqa: BLE001
             pass
-        self.source.setVisible(is_copy)
-        self.source.setEnabled(is_copy and src is not None)
+        self.source.setVisible(_need_src)
+        self.source.setEnabled(_need_src and src is not None)
         if is_copy:
             self.hint.setText("复制屏幕只跟随主屏幕：没有独立图层，内容/分辨率/颜色/性能全部跟主屏，名称可改。")
+        elif is_split:
+            self.hint.setText("切分屏幕取源屏幕的一块：创建后在右侧「屏幕设置」里填 UV（左/上/右/下），"
+                              "或直接拖动裁切框；图层与分辨率跟随源屏。")
         else:
-            self.hint.setText("独立屏幕初始参数复制主屏幕，创建后可单独修改分辨率/颜色/图层。")
+            self.hint.setText("独立屏幕初始图层为空、不显示任何图层，创建后可单独修改分辨率/颜色/图层。")
         if is_ind:
             main = OM.main_screen(self.cfg)
             # 初始值已在 __init__ 里设成主屏尺寸；这里不再覆盖用户输入
