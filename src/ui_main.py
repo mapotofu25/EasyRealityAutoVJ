@@ -4013,8 +4013,11 @@ class MainWindow(QMainWindow):
         screens = list((cfg or {}).get("screens") or [])
         sig = tuple(str(s.get("id")) for s in screens)
         # 过滤集也进签名：某屏"使用的图层"勾选变了 ⇒ 必须重建它那块
+        # ★ 复制屏/切分屏**跟随源屏** ⇒ 类型和源屏变了也要重建（否则过滤集是旧的：
+        #   把复制屏的源从主屏改成独立屏，块里的行数不会变）。
         filt_sig = tuple(
-            (str(s.get("id")), tuple(sorted(str(x) for x in (s.get("layers") or [])))
+            (str(s.get("id")), str(s.get("type")), str(s.get("source_id") or ""),
+             tuple(sorted(str(x) for x in (s.get("layers") or [])))
              if s.get("layers") is not None else None)
             for s in screens)
         sig_all = (sig, filt_sig)

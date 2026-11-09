@@ -410,27 +410,42 @@ def effective_color(cfg, screen):
     return screen.get("color") or SCREEN_PALETTE[0]
 
 
-def effective_layers(cfg, screen, all_layer_ids):
-    """返回该屏幕使用的图层 id 列表；None 表示“全部图层”。"""
+def effective_layers(cfg, screen, all_layer_ids, _seen=None):
+    """返回该屏幕使用的图层 id 列表。
+
+    ★ 2026-11-09（用户：「每一个图层、每一个屏幕的图层自己建」）：
+      · 主屏：认**自己的** `layers`（老配置没有/空 ⇒ 全量兼容）
+      · 独立屏：认自己的 `layers`
+      · **复制屏 / 切分屏：跟随源屏**（递归求值，不是快照）——
+        复制屏标签写的就是"跟随主屏"，若按自己的 layers 落回"全部"，
+        它会把独立屏里新建的层也渲出来，与语义直接冲突。
+    """
     if not screen:
         return list(all_layer_ids)
+    ids = set(all_layer_ids)
     t = screen.get("type")
-    if t in ("main", "copy"):
-        # ★ 2026-11-09（用户：「每一个图层、每一个屏幕的图层自己建」）：
-        #   主屏/复制屏也**走自己的 `layers`** —— 在某块屏里新建的层只属于那块屏。
-        #   老配置没有这个键（或空）⇒ 退回"全部图层"，保证升级后画面不变。
+    if t == "main":
         lay = screen.get("layers")
         if lay:
-            ids = set(all_layer_ids)
             return [x for x in lay if x in ids]
         return list(all_layer_ids)
-    if t == "split":
+    if t in ("copy", "split"):
+        # 环保护：源屏指向自己 / A→B→A 这种成环，退回"全部"，绝不无限递归
+        _seen = set(_seen or ())
+        sid = str(screen.get("id") or "")
+        if sid and sid in _seen:
+            return list(all_layer_ids)
+        if sid:
+            _seen.add(sid)
         src = source_screen(cfg, screen)
-        return effective_layers(cfg, src, all_layer_ids)
+        if not src or (sid and str(src.get("id") or "") == sid):
+            return list(all_layer_ids)
+        return effective_layers(cfg, src, all_layer_ids, _seen)
+    # 独立屏
     layers = screen.get("layers")
     if layers is None:
         return list(all_layer_ids)
-    return [x for x in layers if x in set(all_layer_ids)]
+    return [x for x in layers if x in ids]
 
 
 def bind_main_layers(cfg, all_layer_ids):
