@@ -4722,7 +4722,26 @@ class MainWindow(QMainWindow):
             self.library_panel.setParent(None)
         except Exception:
             pass
-        self.library_panel.setMinimumSize(380, 200)
+        # ★ S7 #12（用户第 12 条）：reparent 之后素材库内容区会塌（控件挤成一行、网格几乎空白）。
+        #   根因是它离开 QSplitter 后没有任何尺寸约束：
+        #   ① 进度条（thumb_bar）还留着 640×480 的旧尺寸，横在上面把行压扁；
+        #   ② 面板 min size 被 `_detach_library_from_float` 清成 0×0，布局可以压到很扁。
+        #   这里把它恢复成"和演出台一致"：进度条固定矮、面板给最小尺寸、网格保证最小高度。
+        self.library_panel.setMinimumSize(380, 240)
+        try:
+            tb = getattr(self.library_panel, "thumb_bar", None)
+            if tb is None:
+                tb = getattr(self, "thumb_bar", None)
+            if tb is not None:
+                tb.setMaximumHeight(14)
+                tb.setMinimumHeight(0)
+                tb.hide()
+        except Exception:                                          # noqa: BLE001
+            pass
+        try:
+            self.grid.setMinimumHeight(240)
+        except Exception:                                          # noqa: BLE001
+            pass
         lay.addWidget(self.library_panel, 1)
         self._lib_float = win
         geo = (self.cfg["ui"] or {}).get("library_float")
@@ -4742,6 +4761,15 @@ class MainWindow(QMainWindow):
         vis = bool((self.cfg["ui"] or {}).get("library_float_visible", False))
         if vis:
             win.show()
+        # reparent 后必须显式让布局重算一次（否则控件保持旧几何 ⇒「挤成一行」）
+        try:
+            self.library_panel.updateGeometry()
+            if self.library_panel.layout() is not None:
+                self.library_panel.layout().activate()
+            win.layout().activate()
+            win.resize(max(win.width(), 700), max(win.height(), 520))
+        except Exception:                                          # noqa: BLE001
+            pass
         self._sync_library_float_btn()
 
     def _sync_library_float_btn(self):
@@ -4766,6 +4794,14 @@ class MainWindow(QMainWindow):
                 win.show()
                 win.raise_()
                 win.activateWindow()
+                # ★ S7 #12：每次重新打开都重算一次布局（防止沿用旧几何挤成一行）
+                try:
+                    self.library_panel.updateGeometry()
+                    if self.library_panel.layout() is not None:
+                        self.library_panel.layout().activate()
+                    win.layout().activate()
+                except Exception:                                  # noqa: BLE001
+                    pass
             self._sync_library_float_btn()
         except Exception:
             pass
