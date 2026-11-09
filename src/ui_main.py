@@ -3948,23 +3948,30 @@ class MainWindow(QMainWindow):
                 panel.title.setCursor(Qt.PointingHandCursor)
             except Exception:                                     # noqa: BLE001
                 pass
-            # ② 「⋯」放进图层栈自己的工具条（靠右），复制屏置灰
-            btn_edit = QPushButton("⋯")
-            btn_edit.setFixedWidth(26)
-            btn_edit.setToolTip(T("屏幕设置：名称 / 分辨率 / 边框颜色 / 使用的图层"))
-            btn_edit.setEnabled(not is_copy)
-            if is_copy:
-                btn_edit.setToolTip(T("复制屏幕跟随主屏，不能单独改；请选择原屏幕后再修改"))
-            btn_edit.clicked.connect(
-                lambda _c=False, x=sid: self.output_studio.edit_screen(x))
+            # ② ★ #9（team-lead 定案）：块头右侧的「⋯」**删除**。
+            #    唯一入口改为**预览右键 →「屏幕设置…」**（`OutputPreview._show_menu`
+            #    里已有该项，且对复制/切分屏置灰，行为一致）。
             try:
                 bar = panel.layout().itemAt(0).layout()
                 old_btn = getattr(panel, "_btn_edit", None)
                 if old_btn is not None:
                     bar.removeWidget(old_btn)
                     old_btn.deleteLater()
-                bar.addWidget(btn_edit)
-                panel._btn_edit = btn_edit
+                    panel._btn_edit = None
+            except Exception:                                     # noqa: BLE001
+                pass
+            # ③ 块头压矮：工具条行高从 ~36 降到 ~26（≤ 原来的 0.8），边距/间距同步收紧
+            try:
+                hdr = panel.layout().itemAt(0).layout()
+                hdr.setContentsMargins(2, 0, 2, 0)
+                hdr.setSpacing(2)
+                for _i in range(hdr.count()):
+                    _w = hdr.itemAt(_i).widget()
+                    if _w is not None:
+                        _w.setFixedHeight(min(24, max(20, int(_w.sizeHint().height()))))
+                panel.layout().setContentsMargins(2, 1, 2, 1)
+                panel.layout().setSpacing(1)
+                blk.layout().setContentsMargins(2, 1, 2, 1)
             except Exception:                                     # noqa: BLE001
                 pass
             # ★ BUG-B（QA 抓到）：`_panel_for_screen()` **永远**返回一个 panel（哪怕 0 行），
