@@ -866,6 +866,13 @@ class OutputPanel(QWidget):
         self.resolution.addItems(["1280 x 720 (720p)", "1920 x 1080 (1080p)",
                                   "1080 x 1920 (竖屏)", "1080 x 1080 (方形)"])
         self.resolution.setToolTip("可直接输入，例如 1600 900（宽 高，空格分隔）")
+        # ★ BUG-C：关掉 QCompleter —— 它是"敲第一位就把文本替换成匹配项"的元凶
+        #   （实测敲 "1" 文本立刻变成 "1280 x 720 (720p)"）。
+        try:
+            self.resolution.setCompleter(None)
+            self.resolution.setInsertPolicy(QComboBox.NoInsert)
+        except Exception:                                          # noqa: BLE001
+            pass
         go.addWidget(self.resolution, 0, 1)
         self.btn_show_out = QPushButton(tr("show_output"))
         self.btn_show_out.clicked.connect(main.show_output)
@@ -978,7 +985,18 @@ class OutputPanel(QWidget):
         #   只是不再有 UI 入口；配置文件里 ndi_audio 仍按原逻辑生效。
         outer.addWidget(g)
         self.resolution.currentIndexChanged.connect(main.set_resolution)
-        self.resolution.editTextChanged.connect(main.set_resolution_text)
+        # ★ BUG-C（2026-11-10）：**不能再连 editTextChanged**。
+        #   用户敲 `1920 x 10` 时就已经匹配成 (1920,10) ⇒ clamp 成 120 ⇒ 回填
+        #   `1920 x 120` ⇒ 接着敲的 "80" 变成 "1920 x 12080"（"自动跳成别的数字"）。
+        #   改成 回车 / 失焦 才提交一次。
+        try:
+            _le = self.resolution.lineEdit()
+            _le.editingFinished.connect(
+                lambda: main.set_resolution_text(self.resolution.currentText()))
+            _le.returnPressed.connect(
+                lambda: main.set_resolution_text(self.resolution.currentText()))
+        except Exception:                                          # noqa: BLE001
+            pass
         self.chk_aspect.stateChanged.connect(main.set_aspect_lock)
         self.chk_border.stateChanged.connect(main.set_borderless)
         self.chk_top.stateChanged.connect(main.set_always_top)
@@ -1056,7 +1074,10 @@ class OutputPanel(QWidget):
             except Exception:                                      # noqa: BLE001
                 pass
         try:
-            self.resolution.setEditText("%d x %d" % (w, h))
+            # ★ BUG-C：用户正在这个框里打字就别回填（否则光标/内容被重置）
+            _le = self.resolution.lineEdit()
+            if not (_le is not None and _le.hasFocus()):
+                self.resolution.setEditText("%d x %d" % (w, h))
             disp = screen.get("display", None)
             self.screen_combo.setCurrentIndex(
                 max(0, min(self.screen_combo.count() - 1,
@@ -4913,6 +4934,12 @@ class MainWindow(QMainWindow):
             return
         cfg = st.active_config()
         self._refresh_output_name_labels()      # V6：名字标签跟着屏名走
+        # ★ BUG-D：选中屏变了 ⇒ 把右侧面板回填成该屏的**生效值**
+        #   （以前只有单路切屏会调，多路下面板永远显示上一次全局值）
+        try:
+            self._reload_screen_params_ui()
+        except Exception:                                          # noqa: BLE001
+            pass
         # ★ T4 #7（用户第 7 条）：**单路**模式下输出设置是**全局一份** ——
         #   不跟"当前选中屏幕"走、也不该因为"没选中屏幕"被置灰
         #   （用户原话：「都单路了干嘛还每个屏幕弄一个设置」）。
@@ -6190,8 +6217,8 @@ class MainWindow(QMainWindow):
         try:
             import output_model as _om
             cfg = _om.active_config(self.cfg.data)
-            if str((cfg or {}).get("mode") or "multi") != "single":
-                return None
+            # ★ BUG-D（2026-11-10）：**多路也按屏存**。以前这里 `mode != "single"` 直接
+            #   返回 None ⇒ 多路下一律写全局 ⇒ "选中 bottom 改，所有屏都变"。
             st = getattr(self, "output_studio", None)
             sid = str(getattr(st, "selected_id", "") or "") if st is not None else ""
             return _om.screen_by_id(cfg, sid) if sid else None
@@ -6275,6 +6302,25 @@ class MainWindow(QMainWindow):
             # 调色（Bypass）
             _blocked(getattr(st, "btn_color_bypass", None),
                      lambda w: w.setChecked(bool(col.get("bypass", False))))
+            # ★ BUG-D：素材切换节奏（mode 段）——auto→0 / normal→1 / fast→2 / beat→3 / manual→4
+            md_ = eff.get("mode") or {}
+            try:
+                from config import SWITCH_MANUAL as _SM
+            except Exception:                                      # noqa: BLE001
+                _SM = "manual"
+            if bool(md_.get("auto", True)):
+                _mi = 0
+            elif str(md_.get("manual") or "") == str(_SM):
+                _mi = 4
+            else:
+                _mi = {"normal": 1, "fast": 2, "beat": 3}.get(
+                    str(md_.get("manual") or "normal"), 1)
+            _blocked(getattr(st, "mode_combo", None),
+                     lambda w: w.setCurrentIndex(max(0, min(4, _mi))))
+            _blocked(getattr(st, "sens", None),
+                     lambda w: w.setCurrentIndex(
+                         {"low": 0, "mid": 1, "high": 2}.get(
+                             str(md_.get("sensitivity") or "mid"), 1) & 3))
         # 画面效果（扁平键）
         _blocked(getattr(self, "postfx_auto", None),
                  lambda w: w.setChecked(bool(post.get("auto", True))))
@@ -6674,6 +6720,14 @@ class MainWindow(QMainWindow):
             self._log_ui_error("_commit_screen_output", e)
 
     def set_resolution(self, i):
+        # ★ BUG-C：用户正在这个可编辑框里打字（敲到与预置项同名）时，
+        #   下拉的 currentIndexChanged 也会触发；此时**不要**回填/改写输入框。
+        try:
+            _le = self.resolution.lineEdit()
+            if _le is not None and _le.hasFocus() and _le.isModified():
+                return
+        except Exception:                                          # noqa: BLE001
+            pass
         # U2：多路 + 已绑定屏 ⇒ 直接写该屏分辨率（下拉只是快捷方式）
         _sc = self._bound_screen_for_output()
         if _sc is not None and i is not None and 0 <= int(i) <= 3:
@@ -6713,6 +6767,9 @@ class MainWindow(QMainWindow):
             return
         if (w, h) == (self.cfg["output"]["width"], self.cfg["output"]["height"]):
             return
+        # ★ BUG-C：clamp 保留（set_custom_resolution 里做），但**不再**为了回写
+        #   同一个输入框去 `refresh_all()` —— 只在失焦/回车时提交，回填由别处的
+        #   `set_screen()` 负责，且它会在用户有焦点时跳过。
         self.set_custom_resolution(w, h)
 
     def set_custom_resolution(self, w, h):

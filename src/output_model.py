@@ -455,7 +455,10 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
 
 #: U7：可按屏 override 的参数段（性能/屏幕设置不在此列，仍全局）
 #: 可以**按屏各存一份**的配置段（其余段如 perf/output 始终全局一份）
-PARAM_SECTIONS = ("auto", "postfx", "color", "kv", "beat")
+#: ★ BUG-D（2026-11-10）：加入 `"mode"`（素材切换节奏/灵敏度）——
+#:   不加的话即使写了 `screen["params"]["mode"]`，`effective_params()` 也不会合并，
+#:   引擎读到的还是全局 ⇒ "一屏改了所有屏都变"。
+PARAM_SECTIONS = ("auto", "postfx", "color", "kv", "beat", "mode")
 
 _MISSING = object()
 

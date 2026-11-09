@@ -87,6 +87,34 @@ class _CheckerTile:
 
 
 # ---------------------------------------------------------------- 预览工作区
+def _is_editing(widget):
+    """控件是否正被用户编辑中（有焦点 / 行编辑有焦点）。
+
+    ★ BUG-C（2026-11-10）：分辨率类数字框"边输入边提交 + 立刻回填"会把用户
+      正在敲的字覆盖掉（敲 `1920 x 10` 就已被匹配成 (1920,10)，clamp 成 120 再回填）。
+      回填前先看这个，别抢用户的字。
+    """
+    try:
+        le = widget.lineEdit() if hasattr(widget, "lineEdit") else None
+        if le is not None and le.hasFocus():
+            return True
+        return bool(widget.hasFocus() and widget.isModified())
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def _set_spin_quiet(spin, value):
+    """回填数值框：用户正在编辑就**跳过**；否则 blockSignals 后 setValue。"""
+    try:
+        if _is_editing(spin):
+            return
+        spin.blockSignals(True)
+        spin.setValue(int(value))
+        spin.blockSignals(False)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
 class OutputPreview(QWidget):
     """可缩放/平移/吸附的多屏预览工作区。"""
 
@@ -956,6 +984,8 @@ class ScreenDialog(QDialog):
         form.addRow(self.lbl_source, self.source)
         self.w = QSpinBox(); self.w.setRange(16, 7680); self.w.setValue(1920)
         self.h = QSpinBox(); self.h.setRange(16, 4320); self.h.setValue(1080)
+        # ★ BUG-C：只在回车/失焦提交，别边敲边提交（否则一敲第一位就写配置+回填）
+        self.w.setKeyboardTracking(False); self.h.setKeyboardTracking(False)
         try:
             _m = OM.main_screen(self.cfg)
             if _m is not None:
@@ -1139,6 +1169,8 @@ class ScreenSettingsPanel(QWidget):
         f.addRow("源屏幕", self.source)
         self.w = QSpinBox(); self.w.setRange(16, 7680)
         self.h = QSpinBox(); self.h.setRange(16, 4320)
+        # ★ BUG-C：同上，关掉 keyboardTracking
+        self.w.setKeyboardTracking(False); self.h.setKeyboardTracking(False)
         # ★ 用户第 9 条：分辨率单独走 `_on_size`（手改 = 要独立尺寸 ⇒ 顺带取消「跟随主屏」），
         #   不能再和 spout/ndi 那个 `_on_any` 绑在一起。
         self.w.valueChanged.connect(self._on_size)
@@ -1235,7 +1267,7 @@ class ScreenSettingsPanel(QWidget):
             self.source.setCurrentIndex(max(0, idx))
         self.source.setEnabled(t == "split")
         w, h = OM.effective_size(cfg, screen) if screen else (0, 0)
-        self.w.setValue(w); self.h.setValue(h)
+        _set_spin_quiet(self.w, w); _set_spin_quiet(self.h, h)
         # ★ 用户第 9 条（「独立屏幕的分辨率像是只读的」）：独立屏**始终可改**分辨率。
         #   以前"独立屏 + 跟随主屏"会把这两个框置灰 ⇒ 用户以为改不了；现在可改，
         #   一改就自动取消「跟随主屏」（见 `_on_size`）。
@@ -3000,6 +3032,8 @@ class OutputCanvasWindow(QDialog):
         bar.addWidget(QLabel("输出分辨率"))
         self.sp_w = QSpinBox()
         self.sp_h = QSpinBox()
+        # ★ BUG-C：映射画布的宽高也只回车/失焦提交
+        self.sp_w.setKeyboardTracking(False); self.sp_h.setKeyboardTracking(False)
         for sp in (self.sp_w, self.sp_h):
             sp.setRange(16, self.MAX_SIDE)
             sp.setToolTip("输出画布尺寸，最大 %d（2^14）" % self.MAX_SIDE)
@@ -3062,10 +3096,9 @@ class OutputCanvasWindow(QDialog):
         self.board.set_config(cfg)
         if cfg:
             cw, ch = OM.combined_size(cfg)
-            for sp, v in ((self.sp_w, cw), (self.sp_h, ch)):
-                sp.blockSignals(True)
-                sp.setValue(int(max(16, min(self.MAX_SIDE, v))))
-                sp.blockSignals(False)
+            # ★ BUG-C：回填不抢用户正在敲的字
+            _set_spin_quiet(self.sp_w, max(16, min(self.MAX_SIDE, cw)))
+            _set_spin_quiet(self.sp_h, max(16, min(self.MAX_SIDE, ch)))
         self._update_warn()
         # ★ U5（用户第 5 条）：拖动屏幕**不再**自动"适应窗口"（画布/视图被自动改）。
         #   只在第一次打开窗口时自适应一次，之后完全交给用户点「适应窗口」。
@@ -3089,10 +3122,8 @@ class OutputCanvasWindow(QDialog):
                 cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(bw))),
                                         max(16, min(self.MAX_SIDE, int(bh)))]
                 self.studio.apply()
-                for sp, v in ((self.sp_w, bw), (self.sp_h, bh)):
-                    sp.blockSignals(True)
-                    sp.setValue(int(max(16, min(self.MAX_SIDE, v))))
-                    sp.blockSignals(False)
+                _set_spin_quiet(self.sp_w, max(16, min(self.MAX_SIDE, bw)))
+                _set_spin_quiet(self.sp_h, max(16, min(self.MAX_SIDE, bh)))
                 self.board.set_config(cfg)
         self._update_warn()
         self.board.fit()

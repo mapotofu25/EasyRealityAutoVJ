@@ -2513,6 +2513,16 @@ class AutoVJEngine(QObject):
             self._phase = "output_plan"
             self._rebuild_output_plan()
             self._phase = "compose"
+        # ★ BUG-D 波1：主屏合成前先把**主屏**的生效参数挂上（有 override 才挂；
+        #   没有 ⇒ None ⇒ 读全局 ⇒ 与改动前逐字等价）。
+        self._cp_cfg = None
+        try:
+            if self._out_cfg:
+                _main = output_model.main_screen(self._out_cfg)
+                if _main and _main.get("params"):
+                    self._cp_cfg = output_model.effective_params(self.cfg, _main)
+        except Exception:                                          # noqa: BLE001
+            self._cp_cfg = None
         self._compose(snap)
         # 颜色渲染 + 后处理特效链（合成后、输出前）。
         # ★ 2026-10-28（性能）：合并成一个入口，**整帧只读回/写回一次**。
@@ -2521,6 +2531,7 @@ class AutoVJEngine(QObject):
         #   顺序不变：颜色先、后处理后 —— 辉光/色差等仍吃到调色后的画面。
         self._phase = "postfx"
         self._apply_color_postfx(snap)
+        self._cp_cfg = None      # ★ BUG-D：主屏这段用完就复位，别漏到别的屏
         self._phase = "copy"
         if self._out_cfg is not None:
             # ---- 多屏输出 ----
@@ -6969,20 +6980,25 @@ class AutoVJEngine(QObject):
                 continue
             ids = output_model.effective_layers(plan, s, all_ids)
             layers = self._out_layers_by_ids(ids)
-            self._compose_to(cv, layers, snap, allow_gpu=False)
-            # ★ B2（2026-11-10）：每屏自己的 color/postfx —— 从 `_apply_screen_cp()`
-            #   合进来（那个方法只服务单路，删掉后多路也自动获得"每屏画面设置独立"）。
-            #   · 没有 `screen["params"]` 的屏**一次都不多跑**（性能判据不变）
-            #   · `_independent_reuses_main()` 命中的屏已 continue 跳过（同一张画布不能套两套参数）
-            if (s or {}).get("params"):
+            _has_ov = bool((s or {}).get("params"))
+            # ★ BUG-D 波1：**合成前**就把该屏参数挂上 —— `_compose_to()` 里的
+            #   "振幅强度(intensity)" 要读本屏的 auto 段（以前读全局 ⇒ 一屏改了全屏都变）。
+            #   只影响"读参数"，不额外套色。
+            try:
+                self._cp_cfg = (output_model.effective_params(self.cfg, s)
+                                if _has_ov else None)
+                self._compose_to(cv, layers, snap, allow_gpu=False)
+            finally:
+                pass
+            # ★ B2：每屏自己的 color/postfx（参数已挂好，这里只做一次调色/后期）
+            if _has_ov:
                 try:
                     self._cp_cfg = output_model.effective_params(self.cfg, s)
                     self._apply_color_postfx(snap, canvas=cv)
                     self._screen_cp_calls += 1
                 except Exception:                              # noqa: BLE001
                     pass
-                finally:
-                    self._cp_cfg = None
+            self._cp_cfg = None
 
     def _independent_reuses_main(self, plan, s, all_ids=None):
         """“跟随主屏 + 图层集合与主屏一致 + 分辨率一致”时直接复用主屏画布。"""
@@ -7356,7 +7372,9 @@ class AutoVJEngine(QObject):
         # （缩放量 = bass × 0.08 × 该系数 → 满低频时 0% / 4.8% / 8% / 11.2% / 16%）
         # 索引做钳位：旧配置只有 0~2，新版本加了第 4 档也不会 IndexError
         try:
-            _iv = int(self.cfg["auto"].get("intensity", 1))
+            # ★ BUG-D 波1：振幅强度按**当前屏**取（`_cp_cfg` 由 `_compose_independent` /
+            #   主屏合成前设好；没设就是全局 ⇒ 主屏无 override 时与现状逐字等价）。
+            _iv = int((self._cp_cfg or self.cfg)["auto"].get("intensity", 1))
         except (TypeError, ValueError):
             _iv = 1
         if _iv < 0:
