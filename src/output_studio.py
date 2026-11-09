@@ -636,12 +636,37 @@ class OutputPreview(QWidget):
         p.end()
 
     def _paint_multi(self, p):
+        # ★ U6（用户第 6 条 BUG）：单路模式下**预览区是黑的**。根因：预览自 S1 #2 起
+        #   一律按"每屏一个框"画（按屏 id 取缩略图），而**单路模式下引擎只产
+        #   `__combined__` 一张缩略图** ⇒ 每块屏 `content=None` → `_paint_frame` 填黑。
+        #   这里兜底：单路时从 `__combined__` 里按该屏 layout 占比**裁出属于它的那块**。
+        comb = self.thumbs.get("__combined__")
+        cw = ch = 0
+        try:
+            if self.cfg:
+                cw, ch = OM.combined_size(self.cfg)
+        except Exception:                                          # noqa: BLE001
+            cw = ch = 0
         for s in self.screens:
             r = OM._normalize_preview_rect(s.get("preview_rect"))
             if not r:
                 continue
             sr = self._rect_screen(*r)
-            self._paint_frame(p, s, sr, content=self.thumbs.get(s.get("id")))
+            content = self.thumbs.get(s.get("id"))
+            if (content is None and comb is not None and not comb.isNull()
+                    and int(cw) > 0 and int(ch) > 0):
+                try:
+                    lx, ly, lw, lh = OM.screen_rect(self.cfg, s)
+                    sx = max(0, int(round(lx * comb.width() / float(cw))))
+                    sy = max(0, int(round(ly * comb.height() / float(ch))))
+                    sw = max(1, int(round(lw * comb.width() / float(cw))))
+                    sh = max(1, int(round(lh * comb.height() / float(ch))))
+                    sw = max(1, min(sw, comb.width() - sx))
+                    sh = max(1, min(sh, comb.height() - sy))
+                    content = comb.copy(sx, sy, sw, sh)
+                except Exception:                                  # noqa: BLE001
+                    content = None
+            self._paint_frame(p, s, sr, content=content)
         # 选中框
         s = self._screen(self.selected_id)
         if s is not None:
@@ -2600,6 +2625,23 @@ class OutputCanvasWindow(QDialog):
 
     def reload(self):
         cfg = self.studio.active_config()
+        # ★ U5-1（用户第 5 条）：Mapping 里"只看到一块大屏"的根因是**新建屏的 layout 默认都是
+        #   [0,0]**（完全重叠，最后画的那块把前面的全盖住）。打开窗口时若检测到完全重叠，
+        #   自动横向排开一次（只改 layout 坐标、不动 combined_size），并在提示里说明。
+        try:
+            if cfg:
+                src = OM.layout_sources(cfg)
+                pos = [(int(x), int(y)) for x, y, _w, _h in
+                       (OM.screen_rect(cfg, s) for s in src)]
+                if len(src) > 1 and len(set(pos)) < len(pos):
+                    OM.auto_layout(cfg, "h")
+                    self.studio.apply()
+                    cfg = self.studio.active_config()
+                    self.hint.setText(
+                        "检测到多块屏幕叠在同一位置（新建屏默认都在原点），已自动横向排开；"
+                        "可再拖动调整。拖动不会改动画布尺寸，要改就点「适应窗口」。")
+        except Exception:                                          # noqa: BLE001
+            pass
         self.board.set_config(cfg)
         if cfg:
             cw, ch = OM.combined_size(cfg)
@@ -2608,7 +2650,11 @@ class OutputCanvasWindow(QDialog):
                 sp.setValue(int(max(16, min(self.MAX_SIDE, v))))
                 sp.blockSignals(False)
         self._update_warn()
-        self.board.fit()
+        # ★ U5（用户第 5 条）：拖动屏幕**不再**自动"适应窗口"（画布/视图被自动改）。
+        #   只在第一次打开窗口时自适应一次，之后完全交给用户点「适应窗口」。
+        if not getattr(self, "_fitted_once", False):
+            self._fitted_once = True
+            self.board.fit()
 
     def _fit(self):
         """★「适应窗口」= **显式**把画布改成"刚好装下当前布局"（包围盒），再自适应视图。
