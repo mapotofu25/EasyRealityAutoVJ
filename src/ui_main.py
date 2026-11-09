@@ -5087,6 +5087,14 @@ class MainWindow(QMainWindow):
                 except Exception:                                  # noqa: BLE001
                     self._reload_screen_params_ui()
                 lbl.show()
+                # ★★ BUG-F（2026-11-10）：**多路下切屏也要回填**。
+                #   以前 `_reload_screen_params_ui()` 只在单路分支里调 ⇒ 多路切屏后
+                #   面板一直显示上一次/全局的值，看起来"所有屏都一样"。
+                try:
+                    from PySide6.QtCore import QTimer as _QT4
+                    _QT4.singleShot(0, self._reload_screen_params_ui)
+                except Exception:                              # noqa: BLE001
+                    self._reload_screen_params_ui()
                 # ★ V3：屏幕设置（源屏/分辨率/UV）在单路下也要显示 —— 切分屏没有
                 #   "单独的一套设置"，它沿用的就是这套 + 上面那三组。
                 box_s = getattr(self, "screen_setup_box", None)
@@ -6424,6 +6432,46 @@ class MainWindow(QMainWindow):
             hb = 2
         _blocked(getattr(self, "postfx_hold", None), lambda w: w.setCurrentIndex(hb))
 
+        # ★★ BUG-F（2026-11-10）：把「颜色渲染」和「后处理」两页的**所有控件**都回填。
+        #   以前只回填 mode/强度/几个开关 ⇒ 切屏后看起来"所有屏都一样"。
+        #   · 颜色：启用/自动/模式/强度/旁路
+        _blocked(getattr(self, "chk_color_on", None),
+                 lambda w: w.setChecked(bool(col.get("on", True))))
+        _blocked(getattr(self, "chk_color_auto", None),
+                 lambda w: w.setChecked(bool(col.get("auto", True))))
+        _blocked(getattr(self, "color_mode", None),
+                 lambda w: w.setCurrentIndex(1 if str(col.get("mode") or "lut") == "duotone" else 0))
+        try:
+            _cs = int(col.get("strength", 60) or 60)
+        except (TypeError, ValueError):
+            _cs = 60
+        _blocked(getattr(self, "color_strength", None), lambda w: w.setValue(_cs))
+        _blocked(getattr(self, "btn_color_bypass", None),
+                 lambda w: w.setChecked(bool(col.get("bypass", False))))
+        #   · 后处理：总开关（`enabled`）
+        _blocked(getattr(self, "chk_postfx_on", None),
+                 lambda w: w.setChecked(bool(post.get("enabled", True))))
+        #   · 每个效果：遍历**配置里的 effects 键**（不写死列表），回填 on + level
+        try:
+            _effs = post.get("effects") or {}
+            _checks = getattr(st, "postfx_checks", None) or {}
+            _sliders = getattr(st, "postfx_sliders", None) or {}
+            for _k, _e in _effs.items():
+                _on = bool((_e or {}).get("on", False))
+                _lv = (_e or {}).get("level", 50)
+                _w1 = _checks.get(_k)
+                _w2 = _sliders.get(_k)
+                if _w1 is not None:
+                    _blocked(_w1, lambda w, v=_on: w.setChecked(v))
+                if _w2 is not None:
+                    try:
+                        _lvi = int(_lv or 0)
+                    except (TypeError, ValueError):
+                        _lvi = 0
+                    _blocked(_w2, lambda w, v=_lvi: w.setValue(v))
+        except Exception:                                          # noqa: BLE001
+            pass
+
         # ★ #3：Kv 主视觉 / 演出行为 / 色彩渲染 这三组的控件也必须按屏回填，
         #   否则"改的是这块屏、显示的还是全局值" ⇒ 用户看着就是没做。
         #   用一张声明表统一处理（控件属性名, 段, 键, 类型）。
@@ -6575,7 +6623,28 @@ class MainWindow(QMainWindow):
         self.settings.btn_color_bypass.setChecked(v)
 
     def set_postfx(self, key, field, val):
-        """后处理特效：更新开关/强度/触发模式/参数并保存"""
+        """后处理特效：更新开关/强度/触发模式/参数并保存。
+
+        ★ BUG-E（2026-11-10）：以前**直接写全局** ⇒ 同一面板里其它开关都按屏存
+          （`set_postfx_master/auto/mode/global` 都走 `store_screen_param`），只有
+          "具体效果"这一层漏了 ⇒ A 屏勾「光晕」，B 屏也显示勾上（读的是同一份全局）。
+          现在优先按屏存（`set_screen_effect_param` 专门处理 `
+          postfx.effects[key][field]` 二级键，与全局同值会自动删键）。
+        """
+        sc = self._params_target_screen()
+        if sc is not None:
+            try:
+                import output_model as _om
+                _om.set_screen_effect_param(sc, key, field, val, self.cfg.data)
+                self.cfg.save()
+                self.engine.set_output_config(_om.active_config(self.cfg.data))
+                try:
+                    self._sync_multi_right()
+                except Exception:                              # noqa: BLE001
+                    pass
+                return
+            except Exception as e:                             # noqa: BLE001
+                self._log_ui_error("set_postfx.screen", e)
         try:
             self.cfg["postfx"]["effects"][key][field] = val
         except (KeyError, TypeError):
