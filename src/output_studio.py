@@ -1780,7 +1780,12 @@ class OutputStudio(QWidget):
             try:
                 cw, ch = cfg.get("combined_size") or [0, 0]
                 if bw > int(cw) or bh > int(ch):
-                    cfg["combined_size"] = [max(16, int(bw)), max(16, int(bh))]
+                    # ★ BUG-1（QA 抓到）：这里原来把**两个轴都**替换成包围盒
+                    #   ⇒ 用户刚输入的另一轴被抹掉（2345×1234 变 2560×720、4000×600 变
+                    #   2560×720）。语义应该是"布局超出时把画布扩到**至少**装得下包围盒"，
+                    #   所以**逐轴取 max**：溢出的轴被撑大，没溢出的轴保持用户的值。
+                    cfg["combined_size"] = [max(16, int(cw), int(bw)),
+                                            max(16, int(ch), int(bh))]
             except (TypeError, ValueError):
                 cfg["combined_size"] = [max(16, bw), max(16, bh)]
         OM.sync_legacy_output(self.cfg.data)
