@@ -359,6 +359,20 @@ class Config:
                 spec["global"] = True
             self.data["_hk_next_ctrl_right"] = True
             self.save()
+        # ★ 2026-11-09（S2 #14 的配套，必须做否则"改了没生效"）：
+        #   `output.screen` 的默认值改成了 -2（关闭：不弹输出窗口），但那**只对新建配置生效**；
+        #   老配置里存的是 -1（窗口模式）⇒ 用户升级后照样弹输出窗口，改动等于看不见。
+        #   这里做**一次性**迁移：
+        #     · 没有 `output.screen_closed_migrated` 标记 ⇒ screen 置 -2 并记标记、落盘；
+        #     · 之后用户自己在界面里选回「窗口模式」，标记已在 ⇒ **绝不再覆盖**。
+        try:
+            out = self.data.setdefault("output", {})
+            if not out.get("screen_closed_migrated"):
+                out["screen"] = -2
+                out["screen_closed_migrated"] = True
+                self.save()
+        except Exception:                                         # noqa: BLE001
+            pass
         # ★ 2026-11-08 多屏输出：图层稳定 id + 输出配置迁移。
         #   只做一次；之后用户增删屏幕/配置不再被覆盖。
         try:
