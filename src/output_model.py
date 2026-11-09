@@ -397,14 +397,14 @@ def effective_size(cfg, screen):
     if t == "copy":
         return effective_size(cfg, main_screen(cfg))
     if t == "split":
-        # ★ 2026-11-10：切分屏的 `width/height` 以前**完全不被读**（只按 UV 反算）
-        #   ⇒ 用户在「屏幕设置」里改分辨率等于改了个没人用的字段，界面又被反算值盖回去。
-        #   现在：用户显式设过就认它（写入侧会同步反算 UV，两边自洽），缺失才用 UV 反算。
+        # ★★★ 2026-11-10（真机回归，必须记下来）：**UV 才是权威**，`width/height` 只能是
+        #   派生值。一度改成"优先读 width/height"⇒ 老配置里被写脏的 `w=47 / h=720`
+        #   （UV 其实是全幅 [0,0,1,1]）直接生效 ⇒ 那块屏被拉成 47×720、画面严重变形。
+        #   ⇒ 尺寸永远由 `UV × 源屏` 反算；用户改分辨率走 `_on_screen_setup_changed()`
+        #     反算 UV（写回 uv），所以"输入 585 → 显示 585"仍然成立，且两边绝不会打架。
         src = source_screen(cfg, screen)
         sw, sh = effective_size(cfg, src)
-        cw, ch = _crop_size((sw, sh), screen.get("uv") or [0, 0, 1, 1])
-        return (max(16, _as_int(screen.get("width"), cw)),
-                max(16, _as_int(screen.get("height"), ch)))
+        return _crop_size((sw, sh), screen.get("uv") or [0, 0, 1, 1])
     return (max(16, _as_int(screen.get("width"), 1280)),
             max(16, _as_int(screen.get("height"), 720)))
 

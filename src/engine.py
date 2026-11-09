@@ -7282,17 +7282,10 @@ class AutoVJEngine(QObject):
         sy = max(0, min(sh - 1, int(round(sh * float(v0)))))
         tw = max(1, min(sw - sx, int(round(sw * (float(u1) - float(u0))))))
         th = max(1, min(sh - sy, int(round(sh * (float(v1) - float(v0))))))
-        # ★ 2026-11-10：切分屏"分辨率 = 裁切尺寸"必须真生效。用户显式设过 `width/height`
-        #   就按它出图（与 `effective_size()` 的 split 分支同一口径），否则才用 UV 反算。
-        try:
-            _own_w = int(screen.get("width") or 0)
-            _own_h = int(screen.get("height") or 0)
-            if _own_w > 0:
-                tw = max(1, min(sw - sx, _own_w))
-            if _own_h > 0:
-                th = max(1, min(sh - sy, _own_h))
-        except (TypeError, ValueError):
-            pass
+        # ⚠ 2026-11-10 真机回归：这里一度"优先用 screen['width'/'height'] 出图"，
+        #   结果老配置里被写脏的 `w=47 / h=720`（UV 其实是全幅）直接把切分屏裁成
+        #   一条 47 像素宽的竖条。**UV 才是权威**，尺寸只能由 UV 反算；
+        #   用户改分辨率走 `_on_screen_setup_changed()` 反算 UV，不在这里覆盖。
         if cv.width() != tw or cv.height() != th:
             cv = QImage(tw, th, self._canvas_format())
             self._screen_canvases[sid] = cv

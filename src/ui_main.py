@@ -4749,14 +4749,11 @@ class MainWindow(QMainWindow):
             self.ss_source.setCurrentIndex(max(0, idx))
             self.ss_source.blockSignals(False)
             w, h = _om.effective_size(cfg, screen)
-            # ★ 2026-11-10：切分屏的分辨率以 `s["width"]/["height"]` 为**权威显示值**
-            #   （写入侧已反算 UV，两边自洽）；只有字段缺失时才用 `effective_size()` 反算。
-            if str((screen or {}).get("type") or "") == "split":
-                try:
-                    w = int((screen or {}).get("width") or w)
-                    h = int((screen or {}).get("height") or h)
-                except (TypeError, ValueError):
-                    pass
+            # ⚠ 2026-11-10 真机回归：这里一度"以 s['width'/'height'] 为权威显示值"，
+            #   老配置里被写脏的 47/720 就会盖掉 UV 反算出来的 1280×120，用户看到的是
+            #   一个根本不成立的数字。**显示值永远来自 `effective_size()`（UV 反算）**；
+            #   用户改分辨率时 `_on_screen_setup_changed()` 会把 UV 反算回去，
+            #   所以"输入 585 → 显示 585"照样成立，且不会和 UV 打架。
             # ⚠ 不要把 setRange 收紧到源屏尺寸：QSpinBox 的校验器会**逐字符**拒绝，
             #   用户输 99999 只会停在 999（QA 量到的那个 9999 就是这个机制）。
             #   上限 clamp 放到提交处（`_on_screen_setup_changed`），提交后回写控件。
