@@ -368,7 +368,15 @@ class Config:
         try:
             out = self.data.setdefault("output", {})
             if not out.get("screen_closed_migrated"):
-                out["screen"] = -2
+                try:
+                    cur = int(out.get("screen", -1))
+                except (TypeError, ValueError):
+                    cur = -1
+                # ⚠ 只在"**仍是旧默认值**"时改：-1 = 窗口模式（旧默认，所有人升级后都是它）。
+                #   0..n = 用户自己明确选了某台显示器（双屏演出常用）⇒ 一个字都不动，
+                #   否则一次升级就把人家的全屏输出吃掉，比不改更糟。
+                if cur == -1:
+                    out["screen"] = -2
                 out["screen_closed_migrated"] = True
                 self.save()
         except Exception:                                         # noqa: BLE001
