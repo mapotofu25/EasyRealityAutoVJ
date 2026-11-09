@@ -5697,7 +5697,53 @@ class MainWindow(QMainWindow):
             + "（设置、图层与素材库列表均已复位；素材文件仍保留在磁盘上）")
 
     # ================= 设置同步 =================
+    def _params_target_screen(self):
+        """★ U7：单路模式 + 预览里选中了一块屏 ⇒ 返回它（参数按屏存）；否则 None（改全局）。"""
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            if str((cfg or {}).get("mode") or "multi") != "single":
+                return None
+            st = getattr(self, "output_studio", None)
+            sid = str(getattr(st, "selected_id", "") or "") if st is not None else ""
+            return _om.screen_by_id(cfg, sid) if sid else None
+        except Exception:                                          # noqa: BLE001
+            return None
+
+    def store_screen_param(self, sec, key, val):
+        """单路：把这次改动写成**当前屏**的 override（与全局相同则自动删键）。返回是否已按屏存。"""
+        sc = self._params_target_screen()
+        if sc is None:
+            return False
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            _om.set_screen_param(sc, sec, key, val, self.cfg.data)
+            self.cfg.save()
+            self.engine.set_output_config(cfg)
+            return True
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("store_screen_param", e)
+            return False
+
+    def clear_screen_param(self, sec=None):
+        """「恢复跟随全局」：清掉当前屏（某一段）的 override。"""
+        sc = self._params_target_screen()
+        if sc is None:
+            return
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            _om.clear_screen_params(sc, sec)
+            self.cfg.save()
+            self.engine.set_output_config(cfg)
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("clear_screen_param", e)
+
     def engine_cfg(self, sec, key, val):
+        # ★ U7：单路且选中了某块屏 ⇒ 只改这块屏（写 override），不影响其它屏
+        if self.store_screen_param(sec, key, val):
+            return
         self.cfg[sec][key] = val
         self.cfg.save()
 
@@ -5729,7 +5775,8 @@ class MainWindow(QMainWindow):
           ⇒ 永远"还没到期" ⇒ 一开机就被上次的颜色锁死（用户报"颜色一直不变"）。
         """
         import time
-        self.cfg["color"]["manual_color"] = name
+        if not self.store_screen_param("color", "manual_color", name):
+            self.cfg["color"]["manual_color"] = name
         self.cfg["color"]["manual_t"] = time.time()
         self.cfg.save()
         self.settings.sync_color_palette(name)
@@ -5737,7 +5784,8 @@ class MainWindow(QMainWindow):
     def toggle_color_bypass(self):
         """一键旁路（原片 / 调色 闪切），供热键与按钮共用"""
         v = not bool(self.cfg["color"].get("bypass", False))
-        self.cfg["color"]["bypass"] = v
+        if not self.store_screen_param("color", "bypass", v):
+            self.cfg["color"]["bypass"] = v
         self.cfg.save()
         self.settings.btn_color_bypass.setChecked(v)
 
@@ -5752,24 +5800,29 @@ class MainWindow(QMainWindow):
     def set_postfx_auto(self, on):
         """后处理自动联动总开关"""
         try:
-            self.cfg["postfx"]["auto"] = bool(on)
+            if not self.store_screen_param("postfx", "auto", bool(on)):
+                self.cfg["postfx"]["auto"] = bool(on)
         except (KeyError, TypeError):
             return
         self.cfg.save()
 
     def set_postfx_master(self, on):
-        self.cfg["postfx"]["enabled"] = bool(on)
+        if not self.store_screen_param("postfx", "enabled", bool(on)):
+            self.cfg["postfx"]["enabled"] = bool(on)
         self.cfg.save()
 
     def set_postfx_mode(self, i):
-        self.cfg["postfx"]["mode"] = "manual" if i == 1 else "auto"
+        _m = "manual" if i == 1 else "auto"
+        if not self.store_screen_param("postfx", "mode", _m):
+            self.cfg["postfx"]["mode"] = _m
         self.cfg.save()
         st = self.settings
         st.postfx_auto_page.setVisible(i == 0)
         st.postfx_manual_page.setVisible(i == 1)
 
     def set_postfx_global(self, v):
-        self.cfg["postfx"]["global_level"] = int(v)
+        if not self.store_screen_param("postfx", "global_level", int(v)):
+            self.cfg["postfx"]["global_level"] = int(v)
         self.cfg.save()
 
     def set_postfx_hold(self, i):
@@ -5778,7 +5831,9 @@ class MainWindow(QMainWindow):
         只影响「多久重新挑一组效果」，与强度无关 ——
         全局强度决定的是效果有多强，不是多久换一次。
         """
-        self.cfg["postfx"]["auto_hold_beats"] = [0, 8, 16, 32, 64][max(0, min(4, int(i)))]
+        _hb = [0, 8, 16, 32, 64][max(0, min(4, int(i)))]
+        if not self.store_screen_param("postfx", "auto_hold_beats", _hb):
+            self.cfg["postfx"]["auto_hold_beats"] = _hb
         self.cfg.save()
 
     def open_postfx_detail(self, key):

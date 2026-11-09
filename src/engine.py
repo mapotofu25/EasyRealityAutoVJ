@@ -944,6 +944,10 @@ class AutoVJEngine(QObject):
         self._out_mode = "multi"
         self._screen_canvases = {}
         self._combined_canvas = None
+        # ★ U7：按屏 override 的 color/postfx。跑某屏的调色时临时把参数换成它那份，
+        #   跑完立刻复位（None = 用全局 self.cfg）。
+        self._cp_cfg = None
+        self._screen_cp_calls = 0      # 统计"这帧额外跑了几次按屏调色"（性能判据用）
         self._route_thumbs = {}
         self._route_frames = {}        # 发送端用（全分辨率，引用/裁切缓存）
         self._preview_route_id = ""
@@ -2411,6 +2415,8 @@ class AutoVJEngine(QObject):
             # ---- 多屏输出 ----
             mode = str(self._out_cfg.get("mode") or "multi")
             if mode == "single":
+                # ★ U7：各屏先套自己的 color/postfx，再拼整合画布
+                self._apply_screen_cp(snap)
                 self._build_combined(snap)
             else:
                 self._compose_independent(snap)
@@ -6027,7 +6033,35 @@ class AutoVJEngine(QObject):
         kv.player = self._get_player(kv, clip)
 
     # ---------------- 合成渲染 ----------------
-    def _apply_color_postfx(self, snap):
+    def _apply_screen_cp(self, snap):
+        """★ U7：单路模式下给「有 override 的屏」各自再套一遍 color/postfx。
+
+        · 没有 `screen["params"]` 的屏**一次都不多跑**（性能判据：3 屏都无 override ⇒ 额外 0 次）
+        · 独立屏若复用主画布（follow_main）则跳过（同一张画布不能套两套参数）
+        · 必须在 `_build_combined()` **之前**跑，整合画布贴上去的才是各屏调好色的帧
+        """
+        self._screen_cp_calls = 0
+        plan = self._out_cfg
+        if not plan or str(plan.get("mode") or "multi") != "single":
+            return
+        for s in output_model.layout_sources(plan):
+            if str(s.get("type")) != "independent":
+                continue
+            if not (s or {}).get("params"):
+                continue
+            cv = self._route_frame(plan, str(s.get("id") or ""), "independent")
+            if cv is None or cv.isNull() or cv is self.canvas:
+                continue
+            try:
+                self._cp_cfg = output_model.effective_params(self.cfg, s)
+                self._apply_color_postfx(snap, canvas=cv)
+                self._screen_cp_calls += 1
+            except Exception:                                      # noqa: BLE001
+                pass
+            finally:
+                self._cp_cfg = None
+
+    def _apply_color_postfx(self, snap, canvas=None):
         """颜色 + 后处理：**共用一次**全画布 BGR 读回 / 写回。
 
         ★ 2026-10-28（性能）：原来 `_apply_color` 和 `_apply_postfx` 各自
@@ -6054,7 +6088,7 @@ class AutoVJEngine(QObject):
             return                      # 两段都没跑（或都没生效）⇒ 一次都不用搬
         try:
             from postprocess import write_back_bgr
-            write_back_bgr(self.canvas, bgr)
+            write_back_bgr(canvas if canvas is not None else self.canvas, bgr)
         except Exception:
             pass                        # 写回失败不影响下一帧（下一帧会重新读回）
 
@@ -6118,7 +6152,7 @@ class AutoVJEngine(QObject):
             return bgr
         cfx = self.color_fx
         try:
-            cfg = self.cfg["color"]
+            cfg = (self._cp_cfg or self.cfg)["color"]
         except Exception:
             return bgr
         if cfx is None or not cfg:
@@ -6203,7 +6237,7 @@ class AutoVJEngine(QObject):
             self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
                                  "state": "码表接管中，已跳过"}
             return bgr
-        cfg = self.cfg["postfx"]
+        cfg = (self._cp_cfg or self.cfg)["postfx"]
         # Kv 待机层显示中：画面以 Kv 为主，跳过整条后处理链
         # （Kv 图层要求完全独立，不受「后处理」等任何设置影响）
         kv = self.kv_layer()

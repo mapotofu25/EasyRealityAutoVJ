@@ -448,6 +448,87 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
     return [x for x in layers if x in ids]
 
 
+#: U7：可按屏 override 的参数段（性能/屏幕设置不在此列，仍全局）
+PARAM_SECTIONS = ("auto", "postfx", "color")
+
+_MISSING = object()
+
+
+def effective_params(data, screen):
+    """某块屏实际生效的参数：**全局为底 + 该屏 override**（没有 override 就全继承全局）。
+
+    ⚠ `data` 是**根配置**（`cfg.data`，里面才有 color/postfx/auto 三段），
+      不是 output config。
+
+
+    ★ U7（用户第 7 条）：单路模式下"Kv 主视觉 / 演出行为 / 画面效果"要按屏各存一份。
+      数据模型是 override 式：`screen["params"][sec][key]` **只存与全局不同的键**，
+      没这个键 ⇒ 继承全局 ⇒ **零迁移**、默认行为与改动前完全一致。
+    """
+    out = {}
+    for sec in PARAM_SECTIONS:
+        base = dict((data or {}).get(sec) or {})
+        ov = ((screen or {}).get("params") or {}).get(sec) or {}
+        if ov:
+            base.update(ov)
+        out[sec] = base
+    return out
+
+
+def screen_params(data, screen, sec):
+    """该屏在某个参数段上的 override 字典（没有就返回空 dict）。"""
+    return dict((((screen or {}).get("params") or {}).get(sec) or {}))
+
+
+def set_screen_param(screen, sec, key, val, data=None):
+    """写一个按屏 override；**与全局值相同就删键**（自动瘦身），返回是否还有 override。
+
+    `data` = 根配置（用来判断"这个值是不是就等于全局"）。
+    """
+    if not isinstance(screen, dict) or sec not in PARAM_SECTIONS:
+        return False
+    glob = ((data or {}).get(sec) or {}).get(key, _MISSING)
+    params = screen.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    d = params.get(sec)
+    if not isinstance(d, dict):
+        d = {}
+    if glob is _MISSING:
+        # 全局根本没有这个键：写 None 等价于"恢复成全局那种没有的状态" ⇒ 删 override
+        if val is None:
+            d.pop(key, None)
+        else:
+            d[key] = val
+    elif glob == val:
+        d.pop(key, None)               # 与全局同值 ⇒ 自动瘦身
+    else:
+        d[key] = val
+    if d:
+        params[sec] = d
+    else:
+        params.pop(sec, None)
+    if params:
+        screen["params"] = params
+    else:
+        screen.pop("params", None)
+    return bool(screen.get("params"))
+
+
+def clear_screen_params(screen, sec=None):
+    """「恢复跟随全局」：清掉该屏（某一段）的 override。"""
+    if not isinstance(screen, dict):
+        return
+    if sec is None:
+        screen.pop("params", None)
+        return
+    params = screen.get("params")
+    if isinstance(params, dict):
+        params.pop(sec, None)
+        if not params:
+            screen.pop("params", None)
+
+
 def migrate_copy_screens(data):
     """把老配置里的 `copy` 屏迁移成 `split`（源=主屏、UV 全幅），返回改动数。
 
