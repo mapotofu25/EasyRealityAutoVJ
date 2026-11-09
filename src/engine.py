@@ -7237,6 +7237,17 @@ class AutoVJEngine(QObject):
         sy = max(0, min(sh - 1, int(round(sh * float(v0)))))
         tw = max(1, min(sw - sx, int(round(sw * (float(u1) - float(u0))))))
         th = max(1, min(sh - sy, int(round(sh * (float(v1) - float(v0))))))
+        # ★ 2026-11-10：切分屏"分辨率 = 裁切尺寸"必须真生效。用户显式设过 `width/height`
+        #   就按它出图（与 `effective_size()` 的 split 分支同一口径），否则才用 UV 反算。
+        try:
+            _own_w = int(screen.get("width") or 0)
+            _own_h = int(screen.get("height") or 0)
+            if _own_w > 0:
+                tw = max(1, min(sw - sx, _own_w))
+            if _own_h > 0:
+                th = max(1, min(sh - sy, _own_h))
+        except (TypeError, ValueError):
+            pass
         if cv.width() != tw or cv.height() != th:
             cv = QImage(tw, th, self._canvas_format())
             self._screen_canvases[sid] = cv

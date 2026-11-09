@@ -394,9 +394,14 @@ def effective_size(cfg, screen):
     if t == "copy":
         return effective_size(cfg, main_screen(cfg))
     if t == "split":
+        # ★ 2026-11-10：切分屏的 `width/height` 以前**完全不被读**（只按 UV 反算）
+        #   ⇒ 用户在「屏幕设置」里改分辨率等于改了个没人用的字段，界面又被反算值盖回去。
+        #   现在：用户显式设过就认它（写入侧会同步反算 UV，两边自洽），缺失才用 UV 反算。
         src = source_screen(cfg, screen)
         sw, sh = effective_size(cfg, src)
-        return _crop_size((sw, sh), screen.get("uv") or [0, 0, 1, 1])
+        cw, ch = _crop_size((sw, sh), screen.get("uv") or [0, 0, 1, 1])
+        return (max(16, _as_int(screen.get("width"), cw)),
+                max(16, _as_int(screen.get("height"), ch)))
     return (max(16, _as_int(screen.get("width"), 1280)),
             max(16, _as_int(screen.get("height"), 720)))
 

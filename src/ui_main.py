@@ -4749,6 +4749,17 @@ class MainWindow(QMainWindow):
             self.ss_source.setCurrentIndex(max(0, idx))
             self.ss_source.blockSignals(False)
             w, h = _om.effective_size(cfg, screen)
+            # ★ 2026-11-10：切分屏的分辨率以 `s["width"]/["height"]` 为**权威显示值**
+            #   （写入侧已反算 UV，两边自洽）；只有字段缺失时才用 `effective_size()` 反算。
+            if str((screen or {}).get("type") or "") == "split":
+                try:
+                    w = int((screen or {}).get("width") or w)
+                    h = int((screen or {}).get("height") or h)
+                except (TypeError, ValueError):
+                    pass
+            # ⚠ 不要把 setRange 收紧到源屏尺寸：QSpinBox 的校验器会**逐字符**拒绝，
+            #   用户输 99999 只会停在 999（QA 量到的那个 9999 就是这个机制）。
+            #   上限 clamp 放到提交处（`_on_screen_setup_changed`），提交后回写控件。
             # ★ BUG-C：用户正在这两个框里打字就不要回填（否则值被改成 config 里的旧值）
             self.ss_w.blockSignals(True); self.ss_h.blockSignals(True)
             if not self.ss_w.lineEdit().hasFocus():
@@ -4804,12 +4815,53 @@ class MainWindow(QMainWindow):
             if not s or s.get("type") != "split":
                 return
             s["source_id"] = self.ss_source.currentData() or s.get("source_id")
-            s["width"] = max(16, int(self.ss_w.value()))
-            s["height"] = max(16, int(self.ss_h.value()))
+            # ★ 2026-11-10：切分屏「分辨率 = 裁切尺寸」必须真生效。
+            #   以前这里只写 `s["width"]/["height"]`，而 `effective_size()` 的 split 分支
+            #   只按 UV 反算 ⇒ 改了个没人读的字段，界面又被反算值盖回去（用户报的"自动跳数"）。
+            #   现在：改了宽/高就**反算 UV**（u1 = u0 + w/src_w），两边自洽；并 clamp 到源屏尺寸。
             u0 = float(self.ss_uv[0].value())
             v0 = float(self.ss_uv[1].value())
-            u1 = max(u0 + 0.002, float(self.ss_uv[2].value()))
-            v1 = max(v0 + 0.002, float(self.ss_uv[3].value()))
+            src_w = src_h = 0
+            try:
+                _src = _om.source_screen(cfg, s)
+                if _src is None or str(_src.get("id") or "") == str(s.get("id") or ""):
+                    _src = _om.main_screen(cfg)
+                if _src is not None:
+                    src_w, src_h = _om.effective_size(cfg, _src)
+            except Exception:                                  # noqa: BLE001
+                src_w = src_h = 0
+            if not src_w or not src_h:
+                # 兜底：拿主屏尺寸（切分屏的源通常就是主屏；绝不因为解析失败而放弃反算 UV）
+                try:
+                    src_w, src_h = _om.effective_size(cfg, _om.main_screen(cfg))
+                except Exception:                              # noqa: BLE001
+                    src_w = src_h = 0
+            _w = int(self.ss_w.value())
+            _h = int(self.ss_h.value())
+            if src_w > 0:
+                _w = max(16, min(int(src_w), _w))
+            if src_h > 0:
+                _h = max(16, min(int(src_h), _h))
+            s["width"] = _w
+            s["height"] = _h
+            # 提交后把控件回写成 clamp 后的值（用户输 99999 ⇒ 显示源屏宽）
+            try:
+                if int(self.ss_w.value()) != _w:
+                    self.ss_w.blockSignals(True); self.ss_w.setValue(int(_w))
+                    self.ss_w.blockSignals(False)
+                if int(self.ss_h.value()) != _h:
+                    self.ss_h.blockSignals(True); self.ss_h.setValue(int(_h))
+                    self.ss_h.blockSignals(False)
+            except Exception:                                  # noqa: BLE001
+                pass
+            if src_w > 0:
+                u1 = max(u0 + 0.002, min(1.0, u0 + _w / float(src_w)))
+            else:
+                u1 = max(u0 + 0.002, float(self.ss_uv[2].value()))
+            if src_h > 0:
+                v1 = max(v0 + 0.002, min(1.0, v0 + _h / float(src_h)))
+            else:
+                v1 = max(v0 + 0.002, float(self.ss_uv[3].value()))
             s["uv"] = [u0, v0, u1, v1]
             st.apply()
             # ★ U3 双向同步：右侧改 UV ⇒ 裁切窗口里的框跟着动
