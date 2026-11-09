@@ -3859,18 +3859,13 @@ class MainWindow(QMainWindow):
             rows, cell = 0, 58
         h = 36 + 8 + rows * (cell + 2)
         h = max(190, min(320, h))
-        if getattr(self, "_blocks_split_user_set", False):
-            # #10：用户拖过 ⇒ **不再钉死**，只保下限、显式放开上限。
-            #   `setFixedHeight` 会让 QSplitter 的 maximumHeight 变成"子块高之和"
-            #   （实测 386），之后 `setSizes` 永远被夹回下限 —— 这是 ⑥① 的真根因。
-            try:
-                blk.setMinimumHeight(150)
-                blk.setMaximumHeight(16777215)
-            except Exception:                                      # noqa: BLE001
-                pass
-            return
+        # ★ 方案 B（team-lead 定案）：**任何情况下都不再 setFixedHeight**。
+        #   QSplitter 会从子项约束反推自身 maximumHeight ⇒ 一旦钉死子块，
+        #   splitter 的可用总高就恒等于 Σ子块高，`setSizes` 永远没有富余可分配。
+        #   块高统一交给 `splitter.setSizes([natural_i…])`。
         try:
-            blk.setFixedHeight(int(h))
+            blk.setMinimumHeight(150)
+            blk.setMaximumHeight(16777215)
         except Exception:                                          # noqa: BLE001
             pass
 
@@ -4216,8 +4211,10 @@ class MainWindow(QMainWindow):
             h = max(190, col_h - 4)          # 4px 给列内边距/分栏手柄取整
             if getattr(self, "_blocks_split_user_set", False):
                 return                       # #10：用户拖过 ⇒ 别覆盖他的高度
-            if abs(int(left[0].height()) - h) > 2:
-                left[0].setFixedHeight(h)
+            vs = getattr(self, "_blocks_vsplit_left", None)
+            if vs is not None and vs.count() == 1:
+                if abs(int(vs.sizes()[0]) - h) > 2:
+                    vs.setSizes([h])         # ★ 方案 B：用 sizes，不再 setFixedHeight
         except Exception as e:                                     # noqa: BLE001
             self._log_ui_error("_fill_main_block", e)
 
@@ -4303,7 +4300,8 @@ class MainWindow(QMainWindow):
                     h0 = max(1, int(b.height()))
                     if h0 > per:
                         try:
-                            b.setFixedHeight(int(per))
+                            b.setMinimumHeight(150)
+                            b.setMaximumHeight(16777215)
                         except Exception:                     # noqa: BLE001
                             pass
             _compress(left_lst)
@@ -4312,13 +4310,7 @@ class MainWindow(QMainWindow):
         area = need if need <= budget else cap_hard
         # ★ T1 #3（用户第 3 条）：左列只有主屏一块时，让它**占满左列**（与右列最高的块齐平或撑满），
         #   不要只占一半、下面留空。切分/复制屏不再建块之后左列通常就只剩主屏这一块。
-        try:
-            if len(left_lst) == 1 and area > 0:
-                _fill = int(max(190, area - gap_total))
-                if int(left_lst[0].height()) != _fill:
-                    left_lst[0].setFixedHeight(_fill)
-        except Exception as e:                                    # noqa: BLE001
-            self._log_ui_error("_auto_size_blocks_split.fill_main", e)
+        # 左列单块的"铺满"改由 `_fill_main_block()` 用 setSizes 完成（见该函数）
         # U1：块区高度定完后再按"左列实际可视高"兜一次（等比/拖分隔条两种来源都覆盖）
         self._fill_main_block()
         # 块区最小高：1 块时就是它自己的自然高度（不硬撑 220），多块才用 220 兜底
@@ -4448,6 +4440,22 @@ class MainWindow(QMainWindow):
             blk._multi_col = "left" if col is getattr(
                 self, "_blocks_vsplit_left", None) else "right"
             col.addWidget(blk)                      # QSplitter.addWidget（高度由固定高/sizes 决定）
+        # ★ 方案 B：没拖过 ⇒ sizes = 各块 natural（三块全可见就靠这个，不再依赖 fixed 高度）
+        if not getattr(self, "_blocks_split_user_set", False):
+            for vs in (getattr(self, "_blocks_vsplit_left", None),
+                       getattr(self, "_blocks_vsplit_right", None)):
+                if vs is None or vs.count() <= 0:
+                    continue
+                nat = [self._natural_block_h(vs.widget(i)) for i in range(vs.count())]
+                try:
+                    # splitter 自身撑满列高（**只管 splitter，不碰子块**）：
+                    # 否则它的高度只等于子块 sizeHint 之和，setSizes 没有富余可分配。
+                    colh = int(vs.parentWidget().height()) if vs.parentWidget() else 0
+                    if colh > 0:
+                        vs.setMinimumHeight(max(sum(nat), colh - 4))
+                    vs.setSizes(nat)
+                except Exception:                              # noqa: BLE001
+                    pass
         # 没被用户拖过 ⇒ 两列等比（用户拖过就保留他的比例）
         try:
             if not getattr(self, "_blocks_cols_user_set", False):
