@@ -448,6 +448,30 @@ class OutputPreview(QWidget):
             w = max(80, w0 + wd.x())
             ar = (w0 / h0) if h0 else 1.6
             h = max(45, w / ar)
+            # ★ S6 #11（用户第 11 条）：**拖右下角手柄缩放时也要吸附**（原来只有移动吸）。
+            #   做法：把"右/下边"当两条边去找最近的目标线，命中就改尺寸（左上角不动）。
+            if self.snap and not (ev.modifiers() & Qt.AltModifier):
+                self._guides = []
+                thr = 8.0 / max(0.05, self.zoom)
+                rx, by = x + w, y + h
+                best_rx = best_by = None
+                for tr in self._snap_targets(s.get("id")):
+                    for tv in (tr.left(), tr.center().x(), tr.right()):
+                        dd = tv - rx
+                        if abs(dd) <= thr and (best_rx is None or abs(dd) < abs(best_rx[0])):
+                            best_rx = (dd, tv)
+                    for tv in (tr.top(), tr.center().y(), tr.bottom()):
+                        dd = tv - by
+                        if abs(dd) <= thr and (best_by is None or abs(dd) < abs(best_by[0])):
+                            best_by = (dd, tv)
+                if best_rx is not None:
+                    w = max(80, w + best_rx[0])
+                    self._guides.append(("v", best_rx[1]))
+                if best_by is not None:
+                    h = max(45, h + best_by[0])
+                    self._guides.append(("h", best_by[1]))
+            else:
+                self._guides = []
             s["preview_rect"] = [int(x), int(y), int(w), int(h)]
         elif kind == "layout":
             x, y, w, h = d["orig"]
@@ -2423,10 +2447,49 @@ class _CanvasBoard(QWidget):
         else:
             s = OM.screen_by_id(self.cfg, d["sid"])
             if s is not None:
+                nx, ny = d["orig"][0] + dx, d["orig"][1] + dy
+                # ★ S6 #11（后半）：输出画布窗口里拖屏幕**也要吸附**（画布边 + 其它屏幕边/中线）
+                nx, ny = self._snap(s.get("id"), nx, ny)
                 # 写回的是**画布像素坐标**（和单路模式的 layout 同一套坐标系）
-                s["layout"] = [int(round(d["orig"][0] + dx)),
-                               int(round(d["orig"][1] + dy))]
+                s["layout"] = [int(round(nx)), int(round(ny))]
         self.update()
+
+    def _snap(self, sid, x, y):
+        """把要落下的 (x, y) 吸到画布边 / 其它屏幕的边与中线（阈值 8 画布像素）。"""
+        try:
+            if not self.cfg:
+                return x, y
+            s = OM.screen_by_id(self.cfg, sid)
+            if s is None:
+                return x, y
+            w, h = OM.effective_size(self.cfg, s)
+            cw, ch = OM.combined_size(self.cfg)
+            thr = 8.0
+            tx, ty = [0.0, cw / 2.0, float(cw)], [0.0, ch / 2.0, float(ch)]
+            for o in self._frames():
+                if o.get("id") == sid:
+                    continue
+                ox, oy, ow, oh = OM.screen_rect(self.cfg, o)
+                tx += [ox, ox + ow / 2.0, ox + ow]
+                ty += [oy, oy + oh / 2.0, oy + oh]
+            best_x = best_y = None
+            for e in (x, x + w / 2.0, x + w):
+                for tv in tx:
+                    dd = tv - e
+                    if abs(dd) <= thr and (best_x is None or abs(dd) < abs(best_x[0])):
+                        best_x = (dd, tv)
+            for e in (y, y + h / 2.0, y + h):
+                for tv in ty:
+                    dd = tv - e
+                    if abs(dd) <= thr and (best_y is None or abs(dd) < abs(best_y[0])):
+                        best_y = (dd, tv)
+            if best_x is not None:
+                x += best_x[0]
+            if best_y is not None:
+                y += best_y[0]
+        except Exception:                                          # noqa: BLE001
+            return x, y
+        return x, y
 
     def mouseReleaseEvent(self, ev):
         d = self._drag
