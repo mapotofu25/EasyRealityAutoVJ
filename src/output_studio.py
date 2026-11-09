@@ -1733,6 +1733,15 @@ class OutputStudio(QWidget):
             self.btn_canvas.setVisible(single)
         except Exception:
             pass
+        # ★ U2（用户第 2 条）：多路把「输出设置」绑到**当前选中的屏**（读它的分辨率/
+        #   输出显示器/Spout/NDI/Alpha），单路解绑 ⇒ 全局一份。
+        try:
+            if str((cfg or {}).get("mode") or "multi") == "multi":
+                self.main.output_panel.set_screen(OM.screen_by_id(cfg, self.selected_id))
+            else:
+                self.main.output_panel.set_screen(None)
+        except Exception:                                          # noqa: BLE001
+            pass
         # ★ S2 #3/#4/#14：右下角「输出设置」按模式决定显示哪些项
         try:
             self.main.output_panel.set_mode("single" if single else "multi")

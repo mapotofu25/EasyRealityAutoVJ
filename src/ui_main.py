@@ -980,6 +980,7 @@ class OutputPanel(QWidget):
         self.chk_spout.stateChanged.connect(main.set_spout_enabled)
         self.chk_ndi.stateChanged.connect(main.set_ndi_enabled)
         self.chk_alpha.stateChanged.connect(main.set_output_alpha)
+        self._screen = None       # ★ U2：当前绑定的屏幕（None=单路/全局一份）
         self._update_ndi_full()   # NDI 完整接收名（机器名 + 源名）
         self.set_gate(False)   # 输出设置默认锁定，点「开始」后才可操作
 
@@ -1020,6 +1021,50 @@ class OutputPanel(QWidget):
                 try:
                     w.setVisible(True)
                 except Exception:                                 # noqa: BLE001
+                    pass
+
+    def set_screen(self, screen, mode="multi"):
+        """★ U2（用户第 2 条）：把这块「输出设置」**绑定到某块屏**（多路）。
+
+        以前这里是个单例、读写全局 `cfg["output"]` ⇒ 改一屏其它屏跟着变。
+        现在：多路下 `screen` = 当前选中的屏，读它的 `width/height`（分辨率）、
+        `display`（输出显示器）、`spout` / `ndi` / `alpha`（各自独立）；
+        单路下 `screen=None` ⇒ 退回原来的全局一份。
+        """
+        self._screen = screen
+        try:
+            ls = list(self.lbl_spout_name.text() or "")
+        except Exception:                                          # noqa: BLE001
+            ls = []
+        if screen is None:
+            return
+        try:
+            w, h = int(screen.get("width") or 1280), int(screen.get("height") or 720)
+        except (TypeError, ValueError):
+            w, h = 1280, 720
+        _bs = (self.resolution, self.screen_combo, self.chk_spout, self.chk_ndi,
+               self.chk_alpha)
+        for _w in _bs:
+            try:
+                _w.blockSignals(True)
+            except Exception:                                      # noqa: BLE001
+                pass
+        try:
+            self.resolution.setEditText("%d x %d" % (w, h))
+            disp = screen.get("display", None)
+            self.screen_combo.setCurrentIndex(
+                max(0, min(self.screen_combo.count() - 1,
+                           0 if disp is None else int(disp) + 2)))
+            self.chk_spout.setChecked(bool(screen.get("spout", False)))
+            self.chk_ndi.setChecked(bool(screen.get("ndi", False)))
+            self.chk_alpha.setChecked(bool(screen.get("alpha", False)))
+        except Exception as e:                                     # noqa: BLE001
+            pass
+        finally:
+            for _w in _bs:
+                try:
+                    _w.blockSignals(False)
+                except Exception:                                  # noqa: BLE001
                     pass
 
     def _update_ndi_full(self):
@@ -4415,6 +4460,10 @@ class MainWindow(QMainWindow):
             try:
                 rf.setStyleSheet("")
                 rc.setEnabled(True)
+                try:
+                    self.output_panel.set_screen(None)     # 单路 ⇒ 解绑，全局一份
+                except Exception:                              # noqa: BLE001
+                    pass
                 lbl.setText(T("单路：以下设置对所有屏幕生效（只发一路）"))
                 lbl.show()
                 box_s = getattr(self, "screen_setup_box", None)
@@ -4434,6 +4483,19 @@ class MainWindow(QMainWindow):
             if box0 is not None:
                 box0.setVisible(False)
             return
+        # ★ U2：选中屏变了 ⇒ 「输出设置」跟着换绑到这块屏（读它自己的分辨率/Spout/NDI/Alpha）
+        #   ⚠ 立即绑一次 + 推到事件循环下一轮再绑一次：切屏这条链上还有别的刷新
+        #   （refresh_all / set_mode / 路由重建）会把勾选态写回旧值，延后一次才稳。
+        try:
+            self.output_panel.set_screen(s)
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("_sync_multi_right.bind_output_panel", e)
+        try:
+            from PySide6.QtCore import QTimer as _QT2
+            _QT2.singleShot(0, lambda: self.output_panel.set_screen(
+                (getattr(self, "output_studio", None) or object) and s))
+        except Exception:                                          # noqa: BLE001
+            pass
         t = s.get("type")
         col = _om.effective_color(cfg, s)
         rf.setStyleSheet(
@@ -5837,7 +5899,50 @@ class MainWindow(QMainWindow):
     def set_transition(self, i):
         self.engine_cfg("mode", "transition", ["", "fade", "cut", "slide", "zoom", "glitch"][i])
 
+    def _bound_screen_for_output(self):
+        """多路且已绑定某块屏 ⇒ 返回它；否则 None（单路/全局一份）。"""
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            if str((cfg or {}).get("mode") or "multi") != "multi":
+                return None
+            return getattr(self.output_panel, "_screen", None)
+        except Exception:                                          # noqa: BLE001
+            return None
+
+    def _commit_screen_output(self, screen):
+        """把"按屏存"的输出设置落盘并重建路由（Spout/NDI 名字/开关跟着变）。"""
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            # alpha 发送端仍是全局：任一屏开了就开
+            any_alpha = any(bool(x.get("alpha")) for x in (cfg or {}).get("screens") or [])
+            self.cfg["output"]["alpha_enabled"] = bool(any_alpha)
+            _om.sync_legacy_output(self.cfg.data)
+            self.cfg.save()
+            self.engine.set_output_config(cfg)
+            try:
+                self.engine.set_alpha_output(bool(any_alpha))
+            except Exception:                                      # noqa: BLE001
+                pass
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("_commit_screen_output", e)
+
     def set_resolution(self, i):
+        # U2：多路 + 已绑定屏 ⇒ 直接写该屏分辨率（下拉只是快捷方式）
+        _sc = self._bound_screen_for_output()
+        if _sc is not None and i is not None and 0 <= int(i) <= 3:
+            try:
+                w, h = [(1280, 720), (1920, 1080), (1080, 1920), (1080, 1080)][int(i)]
+            except (IndexError, ValueError):
+                return
+            _sc["width"], _sc["height"] = int(w), int(h)
+            self._commit_screen_output(_sc)
+            try:
+                self.output_panel.set_screen(_sc)
+            except Exception:                                      # noqa: BLE001
+                pass
+            return
         # ★ 2026-10-18 审计：可编辑下拉在"用户正在打字"时 currentIndex 会变成 -1，
         #   而 Python 的 [-1] 会取到**最后一项** ⇒ 画布被改成 1080x1080（方形）。
         if i is None or int(i) < 0 or int(i) > 3:
@@ -5927,6 +6032,12 @@ class MainWindow(QMainWindow):
 
     def set_output_screen(self, i):
         """输出显示器（S2 #14）：下拉索引 0=关闭(-2) / 1=窗口模式(-1) / 2..=显示器 0.."""
+        # U2：多路 + 绑定屏 ⇒ 存到该屏（切屏读自己的）
+        _sc = self._bound_screen_for_output()
+        if _sc is not None:
+            _sc["display"] = int(i) - 2
+            self._commit_screen_output(_sc)
+            return
         self.cfg["output"]["screen"] = int(i) - 2
         self.cfg.save()
         # 运行中立即生效（否则只存配置，要等下次开始才应用 →「更改失效」）
@@ -5935,6 +6046,27 @@ class MainWindow(QMainWindow):
 
     def set_spout_enabled(self, s):
         s = bool(s)
+        # ★ U2（用户第 2 条）：多路下只改**当前这块屏**（以前永远写主屏 ⇒ 改一屏全变）
+        _sc = self._bound_screen_for_output()
+        if _sc is not None:
+            if s:
+                ok, err = _probe_spout_once()
+                if not ok:
+                    QMessageBox.warning(
+                        self, T("Spout 不可用"),
+                        "无法启用 Spout 输出。\n\n%s\n\n"
+                        "常见原因：显卡驱动不支持共享纹理（GL/DX 互操作）。\n"
+                        "（NDI 输出不依赖这个，可改用 NDI）" % err)
+                    s = False
+                    try:
+                        self.output_panel.chk_spout.blockSignals(True)
+                        self.output_panel.chk_spout.setChecked(False)
+                        self.output_panel.chk_spout.blockSignals(False)
+                    except Exception:                              # noqa: BLE001
+                        pass
+            _sc["spout"] = s
+            self._commit_screen_output(_sc)
+            return
         # ★ 多屏输出：这个旧开关只代表“主屏幕”的 Spout，写入活动配置后由引擎路由表统一重建。
         try:
             import output_model as _om
@@ -6001,6 +6133,26 @@ class MainWindow(QMainWindow):
 
     def set_ndi_enabled(self, s):
         s = bool(s)
+        # ★ U2：同上，只改绑定的那块屏
+        _sc = self._bound_screen_for_output()
+        if _sc is not None:
+            if s:
+                from ndi_out import probe_runtime
+                ok, detail = probe_runtime()
+                if not ok:
+                    QMessageBox.warning(
+                        self, T(T("NDI 不可用")),
+                        T("NDI 运行时加载失败，无法启用 NDI 输出。") + "\n\n" + detail)
+                    s = False
+                    try:
+                        self.output_panel.chk_ndi.blockSignals(True)
+                        self.output_panel.chk_ndi.setChecked(False)
+                        self.output_panel.chk_ndi.blockSignals(False)
+                    except Exception:                              # noqa: BLE001
+                        pass
+            _sc["ndi"] = s
+            self._commit_screen_output(_sc)
+            return
         # ★ 多屏输出：旧开关只代表主屏幕 NDI；运行时探测保留，发送端由引擎路由表创建。
         try:
             import output_model as _om
@@ -6095,6 +6247,12 @@ class MainWindow(QMainWindow):
         ★ 运行中切换会重建一次画布（可能闪一帧），但不需要重启 Spout/NDI。
         """
         on = bool(s)
+        # U2：多路 + 绑定屏 ⇒ 存到该屏；引擎侧取"任一屏开启"
+        _sc = self._bound_screen_for_output()
+        if _sc is not None:
+            _sc["alpha"] = on
+            self._commit_screen_output(_sc)
+            return
         self.cfg["output"]["alpha_enabled"] = on
         try:
             self.engine.set_alpha_output(on)
