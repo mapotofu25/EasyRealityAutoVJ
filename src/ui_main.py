@@ -3835,6 +3835,16 @@ class MainWindow(QMainWindow):
                 panel._btn_edit = btn_edit
             except Exception:                                     # noqa: BLE001
                 pass
+            # ★ BUG-B（QA 抓到）：`_panel_for_screen()` **永远**返回一个 panel（哪怕 0 行），
+            #   所以下面 `else:` 里那句占位提示**永远走不到** ⇒ 新建独立屏是一块纯空框，
+            #   只有标题、一个字都不解释。这里在图层栈**上方**加一条灰字提示，
+            #   由 `_refresh_block_styles()` 按 rows 数决定显隐。
+            _hint = QLabel(T("该屏还没有图层 —— 点「⋯ → 使用的图层」勾选要显示的图层"))
+            _hint.setWordWrap(True)
+            _hint.setStyleSheet("color:#8a8a8a;font-size:11px;padding:2px 4px;")
+            _hint.setVisible(len(getattr(panel, "rows", []) or []) == 0)
+            blk._empty_hint = _hint
+            body.addWidget(_hint)
             body.addWidget(panel, 1)
         else:
             ph = QLabel(T("该屏没有可显示的图层（在「⋯ → 使用的图层」里勾选）"))
@@ -4071,6 +4081,10 @@ class MainWindow(QMainWindow):
                 ps = blk.findChildren(LayerStackPanel)
                 if ps:
                     ps[0].title.setText(("✔ " if sel else "") + info)
+                # ★ BUG-B：0 行时显示"还没有图层"的灰字提示，有行就藏起来
+                _h = getattr(blk, "_empty_hint", None)
+                if _h is not None:
+                    _h.setVisible(not ps or len(getattr(ps[0], "rows", []) or []) == 0)
             except Exception:                                     # noqa: BLE001
                 pass
 
@@ -4765,10 +4779,6 @@ class MainWindow(QMainWindow):
         except Exception:
             win.resize(620, 460)
         self._refresh_favorites_ui()
-        try:
-            self.btn_library_float.setCheckable(True)
-        except Exception:
-            pass
         vis = bool((self.cfg["ui"] or {}).get("library_float_visible", False))
         if vis:
             win.show()
@@ -4781,18 +4791,10 @@ class MainWindow(QMainWindow):
             win.resize(max(win.width(), 700), max(win.height(), 520))
         except Exception:                                          # noqa: BLE001
             pass
-        self._sync_library_float_btn()
-
-    def _sync_library_float_btn(self):
-        try:
-            win = getattr(self, "_lib_float", None)
-            vis = bool(win is not None and win.isVisible())
-            self.btn_library_float.blockSignals(True)
-            self.btn_library_float.setChecked(vis)
-            self.btn_library_float.blockSignals(False)
-            self.btn_library_float.setText("📚 素材库" if not vis else "📚 隐藏素材库")
-        except Exception:
-            pass
+        # ★ 死代码清理（QA 确认）：这里以前调一个"同步按钮勾选态"的私有方法，
+        #   去同步「📚 素材库 / 📚 隐藏素材库」那个开关；但那个开关**在 src/ 里
+        #   从来没有被创建过**（4 处使用、0 处创建），整段被 try/except 吞掉。
+        #   既然按钮不存在 ⇒ 方法与其调用一并删除，别再让人以为有这个入口。
 
     def toggle_library_float(self):
         try:
@@ -4801,6 +4803,21 @@ class MainWindow(QMainWindow):
             win = self._lib_float
             if win.isVisible():
                 win.hide()
+                # ★ BUG-C（QA 抓到）：关窗时素材库面板还挂在浮窗里 ⇒ **单屏模式下
+                #   "打开一次再关掉" = 素材库既不回演出台、也不在屏幕上（点一下就丢）。
+                #   单屏模式：关窗就把面板还回演出台原位置（多屏模式块区本来就不放素材库，
+                #   保持现状即可 —— 下次打开时 BUG-A 的装回逻辑会处理）。
+                try:
+                    _multi = bool(getattr(self, "_multi_page", None) is not None
+                                  and self.perf_stack.currentWidget() is self._multi_page)
+                    if not _multi:
+                        self._detach_library_from_float()
+                        self.library_panel.setParent(None)
+                        self._stage_bottom.addWidget(self.library_panel)
+                        self._stage_bottom.setSizes([560, 520])
+                        self.library_panel.setMinimumSize(0, 0)
+                except Exception as e:                             # noqa: BLE001
+                    self._log_ui_error("toggle_library_float.restore_stage", e)
             else:
                 # ★ BUG-A（QA 抓到，`4da9c32` 起就有）：退出多屏时
                 #   `_restore_stage_panels()` → `_detach_library_from_float()` 会把
@@ -4812,6 +4829,11 @@ class MainWindow(QMainWindow):
                     if _lay is not None and _lay.indexOf(self.library_panel) < 0:
                         self.library_panel.setParent(None)
                         _lay.addWidget(self.library_panel, 1)
+                    # ★ BUG-D：装回之后必须**恢复最小尺寸**（S7 #12 当初就是靠它防"挤成一行"）。
+                    #   `_detach_library_from_float()` 会把它清成 0×0，不补回来的话
+                    #   用户把浮窗拖小就能把素材库压扁。
+                    self.library_panel.setMinimumSize(380, 240)
+                    self.grid.setMinimumHeight(240)
                 except Exception as e:                             # noqa: BLE001
                     self._log_ui_error("toggle_library_float.attach", e)
                 win.show()
@@ -4825,7 +4847,7 @@ class MainWindow(QMainWindow):
                     win.layout().activate()
                 except Exception:                                  # noqa: BLE001
                     pass
-            self._sync_library_float_btn()
+            # （原"同步按钮勾选态"那步已删：它同步的按钮从未被创建）
         except Exception:
             pass
 
@@ -4839,7 +4861,7 @@ class MainWindow(QMainWindow):
             ui["library_float"] = [int(g.x()), int(g.y()), int(g.width()), int(g.height())]
             ui["library_float_visible"] = bool(win.isVisible() if visible is None else visible)
             self.cfg.save()
-            self._sync_library_float_btn()
+            # （原"同步按钮勾选态"那步已删：它同步的按钮从未被创建）
         except Exception:
             pass
 
