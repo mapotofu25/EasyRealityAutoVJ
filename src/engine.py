@@ -1617,6 +1617,55 @@ class AutoVJEngine(QObject):
         except Exception:                                          # noqa: BLE001
             return None
 
+    def _screen_params_refresh(self):
+        """重建「每屏一份生效参数」缓存。**只在参数/计划变化后算一次**，帧内只读。
+
+        用户拍板（2026-11-09）：每块屏都是独立的，Kv 待机与逐拍交替不该互相影响。
+        缓存键 = 屏 id；失效条件 = 输出计划版本号 `_plan_rev` 变了（改任何参数、
+        增删屏、切模式都会 bump 它）。
+        """
+        try:
+            rev = int(getattr(self, "_plan_rev", 0) or 0)
+        except (TypeError, ValueError):
+            rev = 0
+        if getattr(self, "_params_cache_rev", None) == rev:
+            return
+        cache = {}
+        try:
+            data = getattr(self.cfg, "data", None)
+            if not isinstance(data, dict):
+                data = self.cfg if isinstance(self.cfg, dict) else {}
+            for sc in (getattr(self, "_out_cfg", None) or {}).get("screens") or []:
+                try:
+                    cache[str(sc.get("id") or "")] = output_model.effective_params(data, sc)
+                except Exception:                                  # noqa: BLE001
+                    continue
+        except Exception:                                          # noqa: BLE001
+            cache = {}
+        self._params_cache = cache
+        self._params_cache_rev = rev
+
+    def _params_for(self, lay=None):
+        """该图层**所属屏**的生效参数（无计划/无归属 ⇒ 全局面，行为与改动前一致）。
+
+        ⚠ 帧内调用：只读缓存，绝不做深拷贝（`effective_params` 每屏每帧跑一次太重）。
+        """
+        try:
+            self._screen_params_refresh()
+            if lay is not None:
+                sc = self._layer_screen(lay)
+                if sc is not None:
+                    got = (getattr(self, "_params_cache", None) or {}).get(
+                        str(sc.get("id") or ""))
+                    if got:
+                        return got
+        except Exception:                                          # noqa: BLE001
+            pass
+        cfg = self.cfg
+        return {"auto": cfg.get("auto") or {}, "color": cfg.get("color") or {},
+                "postfx": cfg.get("postfx") or {}, "kv": cfg.get("kv") or {},
+                "beat": cfg.get("beat") or {}}
+
     def _auto_for(self, lay=None):
         """该层所属屏的 `auto` 参数（没有 → 全局）。U7 第二步。"""
         try:
@@ -5867,15 +5916,17 @@ class AutoVJEngine(QObject):
     def _beat_tick(self, snap):
         """逐拍交替（按拍位相位驱动，支持 1/4 拍粒度的交替间隔）。
         不受「素材最小切换间隔」影响（独立节奏）。"""
-        bc = self.cfg["beat"]
-        interval = max(0.25, float(bc.get("interval_beats", 1) or 1))
-        bars = max(1, int(bc.get("bars_per_pair", 2)))
         pos = self._beat_pos(snap)
         for lay in self.layers:
             if lay.fixed >= 0 or len(lay.clips) < 2 or self.locked:
                 continue
             if getattr(lay, "is_kv", False):
                 continue    # Kv 待机层不参与逐拍交替
+            # ★ 2026-11-09：逐拍参数按**该层所属屏**取（每屏可以不同间隔/模式/结束动作）；
+            #   相位本来就存在 layer 上（`beat_last` / `pair_start`），天然各屏独立。
+            bc = (self._params_for(lay) or {}).get("beat") or self.cfg["beat"]
+            interval = max(0.25, float(bc.get("interval_beats", 1) or 1))
+            bars = max(1, int(bc.get("bars_per_pair", 2)))
             if lay.pair is None:
                 lay.pair = self._new_pair(lay, bc, prev_second=None)
                 lay.pair_turn = 0
@@ -5981,22 +6032,38 @@ class AutoVJEngine(QObject):
         return None
 
     def _kv_tick(self, snap):
-        """Kv 待机层节奏（完全独立于其它设置）：
+        """Kv 待机层节奏（**每屏一份**）：
         - 电平低于「静音判定阈值」且持续 > 静音触发延迟 → 切入（待机画面进来）
         - 电平高于阈值且持续 > 声音恢复切出延迟 → 切出（待机画面出去）
-        不受视觉行为模式 / 能量映射 / 逐拍 / 曲风匹配 / BPM 变速等任何设置影响，
-        过渡方式与时长也只用 Kv 自己的配置。"""
-        kv = self.kv_layer()
+        不受视觉行为模式 / 能量映射 / 逐拍 / 曲风匹配 / BPM 变速等任何设置影响。
+
+        ★ 2026-11-09 用户拍板「每一个屏幕都是独立的」：每块屏的 Kv 层各跑一套状态
+          （状态本来就存在 layer 上：`kv_on/kv_silent_sec/...`），参数按该层所属屏取
+          `effective_params(cfg, screen)["kv"]`。没有 override ⇒ 与全局完全相同 ⇒ 零回归。
+        """
+        any_kv = False
+        for kv in self.layers:
+            if not getattr(kv, "is_kv", False):
+                continue
+            any_kv = True
+            self._kv_tick_one(kv, snap)
+        if any_kv:
+            return
+
+    def _kv_tick_one(self, kv, snap):
+        """单块屏的 Kv 待机逻辑（原来的 `_kv_tick` 主体，参数改为按屏取）。"""
         if kv is None or not kv.clips:
             return
-        cfg = self.cfg["kv"]
+        kvp = self._params_for(kv) or {}
+        cfg = kvp.get("kv") or self.cfg["kv"]
         thr = float(cfg.get("db_threshold", -50.0))
         silent_delay = max(0.0, float(cfg.get("silent_delay", 2.0)))
         resume_delay = max(0.0, float(cfg.get("resume_delay", 2.5)))
         now = time.perf_counter()
-        dt = now - getattr(self, "_kv_last_t", now)
+        # 计时基准**按层**一份：各屏各自累积静音/有声时长，互不干扰
+        dt = now - getattr(kv, "_kv_last_t", now)
         dt = max(0.0, min(0.5, dt))     # 保护：卡帧/暂停后不累加巨大 dt
-        self._kv_last_t = now
+        kv._kv_last_t = now
 
         lv = float(snap.get("lv_db", -80.0))
         if lv < thr:

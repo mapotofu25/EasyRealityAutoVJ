@@ -4521,7 +4521,9 @@ class MainWindow(QMainWindow):
                     _sname = str((_sc or {}).get("name") or "-")
                 except Exception:                                  # noqa: BLE001
                     _sname = "-"
-                _base = Tf("单路 · 当前屏幕：{}（以下设置只作用于这块屏；"
+                # ★ Kv / 演出行为 / 画面效果现在**引擎侧也按屏生效**（每屏一份实例）⇒
+                #   文案可以直接写清"这三组只作用于本屏"，不用再留"哪些是全局"的模糊说法。
+                _base = Tf("单路 · 当前屏幕：{}（Kv / 演出行为 / 画面效果只作用于这块屏；"
                            "性能与输出设置是全局的）", _sname)
                 if _n_ov > 0:
                     lbl.setText(_base + Tf("　·　当前 {} 块屏各有独立参数，每帧多跑 {} 次调色"
