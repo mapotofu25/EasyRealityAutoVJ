@@ -4804,6 +4804,64 @@ class MainWindow(QMainWindow):
         except Exception:                                          # noqa: BLE001
             pass
 
+    def _build_preview_toggles(self):
+        """#11：把「画面设置 / 预览 / HUD」收成一个**由 MainWindow 持有**的独立 widget。
+
+        单屏与多屏共用**同一个实例**（不复制控件）：多屏时插到输出工作条「打开素材库」后面，
+        单屏时留在预览工具栏末尾（单屏没有「打开素材库」按钮，硬塞会改单屏布局）。
+        """
+        from PySide6.QtWidgets import QWidget as _QW, QHBoxLayout as _QH
+        pv = getattr(self, "preview_panel", None)
+        if pv is None:
+            return
+        try:
+            if getattr(self, "preview_toggles", None) is not None:
+                return
+            box = _QW()
+            lay = _QH(box)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            for name in ("btn_pic", "chk_preview", "chk_hud"):
+                wdg = getattr(pv, name, None)
+                if wdg is None:
+                    continue
+                try:
+                    wdg.setParent(box)
+                except Exception:                              # noqa: BLE001
+                    pass
+                lay.addWidget(wdg)
+            lay.addStretch(1)
+            self.preview_toggles = box
+        except Exception as e:                                 # noqa: BLE001
+            try:
+                self._log_ui_error("_build_preview_toggles", e)
+            except Exception:                                  # noqa: BLE001
+                pass
+
+    def _place_preview_toggles(self, multi):
+        """#11：把三开关容器放到当前模式该在的位置（同一实例只换父/换位置）。"""
+        box = getattr(self, "preview_toggles", None)
+        if box is None:
+            return
+        try:
+            if multi:
+                st = getattr(self, "output_studio", None)
+                bar = getattr(getattr(st, "btn_open_lib", None), "parentWidget", lambda: None)()
+                # 直接借输出工作条：找到 btn_open_lib 所在的布局插到它后面
+                btn = getattr(st, "btn_open_lib", None)
+                lay = btn.parentWidget().layout() if btn is not None and btn.parentWidget() else None
+                if lay is not None:
+                    # 追加到该条布局的**末尾**：插在 btn_open_lib 之后但如果中间有 stretch
+                    # 会被顶到最左边（实测 x=380 vs 按钮右边缘 1131），所以直接 append。
+                    lay.addWidget(box)
+            else:
+                pv = getattr(self, "preview_panel", None)
+                lay = pv.layout().itemAt(0).layout() if pv is not None else None
+                if lay is not None:
+                    lay.addWidget(box)
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _sync_multi_right(self, *_a):
         """用户第 8/11 条：多屏模式右侧设置的作用域 = 当前选中的屏幕。
 
@@ -4996,6 +5054,9 @@ class MainWindow(QMainWindow):
                     pass
                 self._build_multi_stage()
                 self._move_panels_to_multi()
+                # ★ #11：output_studio 建好之后再把三开关容器挪进它的工作条
+                self._build_preview_toggles()
+                self._place_preview_toggles(True)
                 self.perf_stack.setCurrentWidget(self._multi_page)
                 self._host_top_bar(True)      # ★ 控制条搬进页签行（用户第 1 条）
                 # ★ 进入多屏：块区高度按块数自动分配（此时才拿得到真实页面高度，
