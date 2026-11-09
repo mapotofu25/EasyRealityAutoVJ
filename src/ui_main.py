@@ -4375,6 +4375,21 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             return
         cfg = st.active_config()
+        # ★ T4 #7（用户第 7 条）：**单路**模式下输出设置是**全局一份** ——
+        #   不跟"当前选中屏幕"走、也不该因为"没选中屏幕"被置灰
+        #   （用户原话：「都单路了干嘛还每个屏幕弄一个设置」）。
+        if str((cfg or {}).get("mode") or "multi") == "single":
+            try:
+                rf.setStyleSheet("")
+                rc.setEnabled(True)
+                lbl.setText(T("单路：以下设置对所有屏幕生效（只发一路）"))
+                lbl.show()
+                box_s = getattr(self, "screen_setup_box", None)
+                if box_s is not None:
+                    box_s.setVisible(False)
+            except Exception:                                     # noqa: BLE001
+                pass
+            return
         sid = str(getattr(st, "selected_id", "") or "")
         s = _om.screen_by_id(cfg, sid) if (cfg and sid) else None
         if s is None:

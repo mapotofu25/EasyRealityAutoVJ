@@ -579,11 +579,19 @@ def screen_uv(cfg, screen):
 
 
 def screen_output_names(cfg):
-    """给每个 screen 分配唯一发送端名，返回 {screen_id: name}。"""
+    """给每个 screen 分配唯一发送端名，返回 {screen_id: name}。
+
+    ★ T4 #9（用户第 9 条）：多路下**每屏一个输出，名字 = 这块屏的名字**，
+      不要再出现固定的「主屏幕」字样。主屏若还叫默认名（"主屏幕"/空），
+      用应用默认名（`EasyRealityAutoVJ`）——用户在「屏幕设置」里改过名才用新名字。
+    """
     used = set()
     out = {}
     for s in (cfg or {}).get("screens") or []:
-        nm = unique_sender_name(s.get("name"), used)
+        raw = str(s.get("name") or "").strip()
+        if str(s.get("type")) == "main" and raw in ("", "主屏幕", "主屏"):
+            raw = "EasyRealityAutoVJ"
+        nm = unique_sender_name(raw, used)
         used.add(nm)
         out[s["id"]] = nm
     return out
