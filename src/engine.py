@@ -1006,6 +1006,8 @@ class AutoVJEngine(QObject):
         self._mode_eval_t = 0.0
         self.switch_pos = 0.0
         self._next_due = None   # 已安排的下一次切换目标拍位（缓存：模式切换不重置，倒计时连续）
+        # ★ BUG-D 波2：**按屏**排期状态（只有带 override 的屏用；见 `_auto_switch_tick_overrides`）
+        self._scr_switch = {}   # {sid: {"pos": float, "due": float|None}}
         # ★ 2026-11-06：这一次的目标是"段落边界"还是"按拍"——HUD 文案据此换词
         #   （有段落表时说「距下一个段落」比「还有 N 拍切换」准确）。
         self._due_kind = None
@@ -3175,20 +3177,137 @@ class AutoVJEngine(QObject):
         return bool(snap.get("beat_active"))
 
     # ---------------- 自动切换（非逐拍模式） ----------------
-    def _current_interval(self, snap):
+    def _mode_for_screen(self, screen=None):
+        """该屏生效的"切换节奏"模式；无 override ⇒ 全局 `self.mode`（逐字等价）。"""
+        if not screen:
+            return self.mode
+        try:
+            if not (screen.get("params") or {}).get("mode"):
+                return self.mode
+            md = output_model.effective_params(self.cfg, screen).get("mode") or {}
+            if bool(md.get("auto", True)):
+                return self.mode                    # 自动：仍用引擎实时判定的模式
+            man = str(md.get("manual") or "")
+            if man == SWITCH_MANUAL:
+                return SWITCH_MANUAL
+            if man in MODE_META:
+                return man
+        except Exception:                                          # noqa: BLE001
+            pass
+        return self.mode
+
+    def _mode_for_layer(self, lay):
+        """该层所属屏的生效模式（渲染时取过渡时长用）；取不到 ⇒ 全局。"""
+        try:
+            if lay is not None and getattr(lay, "is_kv", False):
+                return self.mode
+            return self._mode_for_screen(self._layer_screen(lay) if lay is not None else None)
+        except Exception:                                          # noqa: BLE001
+            return self.mode
+
+    def _screen_sensitivity(self, screen=None):
+        try:
+            if screen and (screen.get("params") or {}).get("mode"):
+                md = output_model.effective_params(self.cfg, screen).get("mode") or {}
+                return int(md.get("sensitivity", 1))
+        except Exception:                                          # noqa: BLE001
+            pass
+        return int(self.cfg["mode"].get("sensitivity", 1))
+
+    def _layers_of_screen(self, screen):
+        """该屏自己的层（复用 `effective_layers`）。"""
+        plan = self._out_cfg
+        if not plan or not screen:
+            return []
+        try:
+            all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+            ids = output_model.effective_layers(plan, screen, all_ids)
+            return self._out_layers_by_ids(ids)
+        except Exception:                                          # noqa: BLE001
+            return []
+
+    def _auto_switch_tick_overrides(self, snap):
+        """★ BUG-D 波2：只给**带 override 的屏**各自排期（旁路，不动主路径）。
+
+        split/copy 没有自己的素材流 ⇒ 跳过。欠账钳位照抄全局那条（防抽搐）。
+        """
+        plan = self._out_cfg
+        if not plan:
+            return
+        if self.locked:
+            return
+        ov_sids = self._override_screen_ids()
+        # 清理已删除屏的状态（照 `_route_senders` 的写法）
+        for sid_ in list(self._scr_switch.keys()):
+            if sid_ not in ov_sids:
+                self._scr_switch.pop(sid_, None)
+        if not ov_sids:
+            return
+        pos = self._beat_pos(snap)
+        for sc in plan.get("screens") or []:
+            sid = str(sc.get("id") or "")
+            if sid not in ov_sids:
+                continue
+            mode = self._mode_for_screen(sc)
+            if mode == SWITCH_MANUAL:
+                continue                                    # 手动：不自动切
+            interval = self._current_interval(snap, screen=sc)
+            if interval is None:
+                continue
+            st = self._scr_switch.setdefault(sid, {"pos": 0.0, "due": None})
+            if pos < st["pos"]:                             # 拍钟被重置
+                st["pos"] = pos
+                st["due"] = None
+            st["pos"] = pos
+            if st["due"] is None:
+                st["due"] = float(self._bar_floor(pos, snap)) + float(interval)
+            due = st["due"]
+            if pos < due:
+                continue
+            # 欠账钳位：落后超过一个完整间隔 ⇒ 重排，不追
+            if pos - due > max(4.0, float(interval)):
+                st["due"] = None
+                continue
+            st["due"] = None                                # 切完重排（下一拍起算）
+            # 过渡时长按该屏模式 + 该屏灵敏度
+            meta = MODE_META[mode]
+            try:
+                TR = max(-1.0, min(1.0, snap["energy_trend"]))
+            except Exception:                               # noqa: BLE001
+                TR = 0.0
+            sens = self._screen_sensitivity(sc)
+            try:
+                E = max(0.0, min(1.0, self._energy_for_switch(snap)))
+            except Exception:                               # noqa: BLE001
+                E = 0.5
+            f = E + TR * 0.15 + (-0.1, 0.0, 0.1)[max(0, min(2, sens))]
+            f = max(0.0, min(1.0, f))
+            trans_ms = int(meta["trans_ms"] * (1.3 - f * 0.3))
+            for lay in self._layers_of_screen(sc):
+                if lay.fixed >= 0 or not lay.clips:
+                    continue
+                if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
+                    continue
+                lay.trans_ms = trans_ms
+                self._switch_layer_random(lay, snap)
+
+    def _current_interval(self, snap, screen=None):
         """当前生效的切换间隔（拍）；None 表示不自动切换。
         常规切/快切为固定拍数（16 拍 / 8 拍 = 4 / 2 个 4/4 小节），保证素材始终
         停留整数个小节、切换点踩在乐句结构线上；逐拍交替走独立的 _beat_tick 节奏。
         「素材最小切换间隔」选项已删除：间隔固定，不再被配置里的残留值覆盖。"""
-        if self.mode == "beat":
+        _mode = self._mode_for_screen(screen)
+        if _mode == SWITCH_MANUAL:
+            return None
+        if _mode == "beat":
             return 1.0
-        meta = MODE_META[self.mode]
+        meta = MODE_META[_mode]
         lo, hi = meta["beats"]
         if lo == hi:
             return float(lo)   # 固定拍数（常规 16 / 快切 8）
         # 兼容仍有区间的模式（未来扩展）：按能量在 lo~hi 间线性插值
         TR = max(-1.0, min(1.0, snap["energy_trend"]))
-        sens = int(self.cfg["mode"].get("sensitivity", 1))
+        sens = self._screen_sensitivity(screen)
         E = max(0.0, min(1.0, self._energy_for_switch(snap)))
         f = E + TR * 0.15 + (-0.1, 0.0, 0.1)[max(0, min(2, sens))]
         f = max(0.0, min(1.0, f))
@@ -3420,7 +3539,58 @@ class AutoVJEngine(QObject):
         self._due_w = w
         return self._next_due
 
+    def _layers_for_global_schedule(self):
+        """归"全局排期"的层。
+
+        ⚠ 没有任何屏带 `mode`/`auto` override 时 **必须返回 `self.layers` 这个对象本身**
+          （不是副本、不过滤）—— 这是"主屏逐字等价"的结构性保证。
+        """
+        try:
+            plan = self._out_cfg
+            if not plan:
+                return self.layers
+            ov_sids = self._override_screen_ids()
+            if not ov_sids:
+                return self.layers                    # ← 零回归的关键一行
+            keep = []
+            for lay in self.layers:
+                sc = None
+                try:
+                    sc = self._layer_screen(lay)
+                except Exception:                                  # noqa: BLE001
+                    sc = None
+                sid = str((sc or {}).get("id") or "")
+                if sid and sid in ov_sids:
+                    continue                          # 该层归它自己那块屏排期
+                keep.append(lay)
+            return keep
+        except Exception:                                          # noqa: BLE001
+            return self.layers
+
+    def _override_screen_ids(self):
+        """带 `mode`/`auto` override 的屏 id 集合（split/copy 不算：它们没有自己的素材流）。"""
+        out = set()
+        try:
+            for sc in (self._out_cfg or {}).get("screens") or []:
+                if str(sc.get("type")) not in ("main", "independent"):
+                    continue
+                p_ = sc.get("params") or {}
+                if p_.get("mode") or p_.get("auto"):
+                    out.add(str(sc.get("id") or ""))
+        except Exception:                                          # noqa: BLE001
+            pass
+        return out
+
     def _auto_switch_tick(self, snap):
+        """★ BUG-D 波2（旁路设计，主路径零改动）：
+        主体逻辑**原样**跑在 `_layers_for_global_schedule()` 选出的层上 ——
+        没有任何屏带 override 时它就是 `self.layers`（**同一对象**）⇒ 逐字等价；
+        带 override 的屏由 `_auto_switch_tick_overrides()` 在函数末尾单独排期。
+        """
+        # getattr 兜底：老的单测 Stub 只实现了部分方法，缺这个方法时退回 self.layers
+        # （真实引擎上永远走前者；无 override 时它返回的就是 self.layers 本身）
+        _sel = getattr(self, "_layers_for_global_schedule", None)
+        layers = _sel() if callable(_sel) else self.layers
         pos = self._beat_pos(snap)
         if pos < self.switch_pos:  # 拍钟被重置（重启采集/换曲归零）
             self.switch_pos = pos
@@ -3512,13 +3682,18 @@ class AutoVJEngine(QObject):
             f = E + TR * 0.15 + (-0.1, 0.0, 0.1)[max(0, min(2, sens))]
             f = max(0.0, min(1.0, f))
             trans_ms = int(meta["trans_ms"] * (1.3 - f * 0.3))  # 区间内微调过渡时长
-            for lay in self.layers:
+            for lay in layers:
                 if lay.fixed >= 0 or not lay.clips or self.locked:
                     continue
                 if getattr(lay, "is_kv", False):
                     continue    # Kv 待机层不参与按拍自动切换
                 lay.trans_ms = trans_ms
                 self._switch_layer_random(lay, snap)
+        # ★ BUG-D 波2：带 override 的屏各自排期（旁路；无 override 时本函数直接 return）
+        try:
+            self._auto_switch_tick_overrides(snap)
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _candidate_indices(self, lay, snap):
         """当前可切换的候选素材索引（不改动任何状态，供切换与"下一个素材"预估共用）"""
@@ -7447,7 +7622,8 @@ class AutoVJEngine(QObject):
                     if hold_trans:
                         prog = 1.0       # 先完整显示上一帧，等首帧
                     else:
-                        dur = (lay.trans_ms or MODE_META[self.mode]["trans_ms"]) / 1000.0
+                        dur = (lay.trans_ms
+                               or MODE_META[self._mode_for_layer(lay)]["trans_ms"]) / 1000.0
                         dur = max(0.016, dur)
                         prog = min(1.0, (now - lay.trans_start) / dur)
                         if prog >= 1.0:

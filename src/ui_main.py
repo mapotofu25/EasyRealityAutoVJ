@@ -4700,6 +4700,12 @@ class MainWindow(QMainWindow):
         self.btn_crop.setToolTip(T("打开裁切窗口：在源屏画面上拖框选区域，"
                                   "自动换算 UV 与分辨率（双向同步）"))
         self.btn_crop.clicked.connect(self._open_crop_dialog)
+        # ★ BUG-D 波2：切分屏「演出行为」置灰时的一行说明（非 split ⇒ 隐藏）
+        self.lbl_split_switch_hint = QLabel(T("切分屏的画面来自源屏，切换节奏请在源屏上调"))
+        self.lbl_split_switch_hint.setWordWrap(True)
+        self.lbl_split_switch_hint.setStyleSheet("color:#8a8a8a;font-size:11px;")
+        self.lbl_split_switch_hint.setVisible(False)
+        f.addWidget(self.lbl_split_switch_hint, 5, 0, 1, 4)
         self.btn_crop.setFixedSize(26, 22)          # #7：右上角**小**按钮（约 26×22）
         self.btn_crop.setText("✂")
         self.btn_crop.setVisible(False)             # 只在切分屏时出现（见 _fill_screen_setup）
@@ -4969,6 +4975,27 @@ class MainWindow(QMainWindow):
                         % _om.effective_color(cfg, _cur))
                 except Exception:                              # noqa: BLE001
                     rf.setStyleSheet("")
+                # ★ BUG-D 波2：**切分屏没有自己的素材流** ⇒「演出行为」四项置灰
+                #   （节奏/灵敏度/节拍网格），并给一行说明；「画面效果」保持可用。
+                #   ⚠ 选回 main/independent 必须恢复可用 —— 这里用 else 无条件恢复。
+                try:
+                    _is_split = str((_cur or {}).get("type") or "") == "split"
+                    for _w in (getattr(self.settings, "mode_combo", None),
+                               getattr(self.settings, "sens", None),
+                               getattr(self.settings, "chk_beat_grid", None)):
+                        if _w is not None:
+                            _w.setEnabled(not _is_split)
+                    _tip = ("切分屏的画面来自源屏，切换节奏请在源屏上调" if _is_split else "")
+                    for _w in (getattr(self.settings, "mode_combo", None),
+                               getattr(self.settings, "sens", None)):
+                        if _w is not None:
+                            _w.setToolTip(_tip or "")
+                    _hint = getattr(self, "lbl_split_switch_hint", None)
+                    if _hint is not None:
+                        _hint.setText(_tip)
+                        _hint.setVisible(bool(_tip))
+                except Exception:                              # noqa: BLE001
+                    pass
                 # #7：裁切入口只在**切分屏**出现（复制屏/主屏/独立屏没有可裁的源屏）
                 try:
                     self.btn_crop.setVisible(
