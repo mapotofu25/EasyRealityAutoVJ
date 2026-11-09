@@ -3189,6 +3189,16 @@ class MainWindow(QMainWindow):
                     return True
             except Exception:                                  # noqa: BLE001
                 pass
+        # ★ S5 #8（用户第 8 条）：「选中此屏」按钮删掉后，选中靠**点块体/标题**触发
+        _sid = getattr(obj, "_multi_screen_id", None)
+        if _sid and ev.type() == QEvent.MouseButtonPress:
+            st = getattr(self, "output_studio", None)
+            if st is not None:
+                try:
+                    st.select_screen(_sid)
+                except Exception:                              # noqa: BLE001
+                    pass
+            return True
         return super().eventFilter(obj, ev)
 
     def _build_ui(self):
@@ -3562,10 +3572,35 @@ class MainWindow(QMainWindow):
         #   每块只剩 ~580 ⇒ 块内还要横滚，变成三层滚动条套娃，现场没法用。
         #   纵向：每块**占满容器宽度**、高度按该块图层栈的自然高度，整区纵向滚动。
         holder = QWidget()
-        self._multi_blocks_lay = QVBoxLayout(holder)
+        # ★ S5 #10（用户第 10 条）：**左列 = 主屏（独占）**，**右列 = 各独立屏纵向排列**；
+        #   复制屏/切分屏跟着**源屏**所在的列（源屏是主屏 → 左列，源屏是独立屏 → 右列）。
+        self._multi_blocks_lay = QHBoxLayout(holder)
         self._multi_blocks_lay.setContentsMargins(2, 2, 2, 2)
-        self._multi_blocks_lay.setSpacing(6)      # 块与块之间 6px（3 块时省下的 4px 很关键）
-        self._multi_blocks_lay.addStretch(1)      # 块少时贴顶，不被拉高
+        self._multi_blocks_lay.setSpacing(6)
+        self._multi_col_left = QVBoxLayout()
+        self._multi_col_left.setContentsMargins(0, 0, 0, 0)
+        self._multi_col_left.setSpacing(6)
+        self._multi_col_left.addStretch(1)        # 块少时贴顶
+        self._multi_col_right = QVBoxLayout()
+        self._multi_col_right.setContentsMargins(0, 0, 0, 0)
+        self._multi_col_right.setSpacing(6)
+        self._multi_col_right.addStretch(1)
+        # 两个列各包一层容器控件：QHBoxLayout 里等拉伸 ⇒ 左右各占一半
+        self._multi_col_left_w = QWidget()
+        self._multi_col_left_w.setLayout(self._multi_col_left)
+        self._multi_col_left_w.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                             QSizePolicy.Policy.Preferred)
+        self._multi_col_right_w = QWidget()
+        self._multi_col_right_w.setLayout(self._multi_col_right)
+        self._multi_col_right_w.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                              QSizePolicy.Policy.Preferred)
+        # ⚠ 两列必须**等宽**（用户对照图是左右各一半）：用 Ignored 宽度策略让 QHBoxLayout
+        #   只按 stretch 分配，而不是按各自内容的 sizeHint（否则图层多的那一列会更宽）。
+        for _cw in (self._multi_col_left_w, self._multi_col_right_w):
+            _cw.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            _cw.setMinimumWidth(0)
+        self._multi_blocks_lay.addWidget(self._multi_col_left_w, 1)
+        self._multi_blocks_lay.addWidget(self._multi_col_right_w, 1)
         self._multi_blocks_scroll = QScrollArea()
         self._multi_blocks_scroll.setWidgetResizable(True)
         # 块是满宽的 ⇒ 正常窗口宽度下不该出现横向滚动条（只有在窗口被拖得极窄时才需要）
@@ -3703,67 +3738,104 @@ class MainWindow(QMainWindow):
         except Exception:                                          # noqa: BLE001
             pass
 
+    def _block_column(self, screen, cfg):
+        """S5 #10：这块屏该放左列还是右列。
+
+        左列 = 主屏那一列；右列 = 独立屏那一列。复制屏/切分屏跟着**源屏**走
+        （源屏是主屏 ⇒ 左列；源屏是独立屏 ⇒ 右列；源屏本身也是 copy/split 时递归）。
+        """
+        import output_model as _om
+        left = getattr(self, "_multi_col_left", None)
+        right = getattr(self, "_multi_col_right", None)
+        if left is None or right is None:
+            return left or right
+        s = screen or {}
+        main = _om.main_screen(cfg)
+        main_id = str((main or {}).get("id") or "")
+        seen = set()
+        cur = s
+        for _ in range(8):
+            t = str(cur.get("type") or "")
+            cid = str(cur.get("id") or "")
+            if cid in seen:
+                break
+            seen.add(cid)
+            if t == "main":
+                return left
+            if t == "independent":
+                return right
+            src = _om.source_screen(cfg, cur)
+            if not src or str(src.get("id")) == cid:
+                # 没有源屏（脏数据）⇒ 主屏的跟随者归左列，其余归右列
+                return left if cid == main_id else right
+            cur = src
+        return right
+
+    def _screen_block_info(self, cfg, screen):
+        """块头那一行：`名字 · 类型 · 分辨率`（S5 #9：挪到图层栈标题行上）。"""
+        try:
+            import output_model as _om
+            w, h = _om.effective_size(cfg, screen)
+            nm = str(screen.get("name") or screen.get("id") or "")
+            t = _om.TYPE_LABELS.get(screen.get("type"), "")
+            return "%s · %s · %dx%d" % (nm, t, w, h)
+        except Exception:                                          # noqa: BLE001
+            return str((screen or {}).get("name") or "")
+
     def _make_screen_block(self, s, cfg, all_ids, panel):
-        """一块 = 外框(该屏边框色) + 屏幕名/分辨率 + 「图层…」菜单 + 「⋯」设置 + 该屏图层栈。"""
+        """一块 = 外框(该屏边框色) + 该屏自己的图层栈（S5 #8/#9：不再有独立块头行）。
+
+        ★ #8：块头原来的「图层…」「选中此屏」都删了 —— 「使用的图层」挪进「⋯」打开的
+          屏幕设置对话框；选中改为**点块体/标题**触发。
+        ★ #9：`名字·类型·分辨率` 这一行挪到图层栈标题那一行（替换掉原来那句
+          "图层（越靠上显示越靠上）" 的提示）。
+        """
         import output_model as _om
         sid = str(s.get("id") or "")
         is_copy = str(s.get("type")) == "copy"
         blk = QFrame()
         blk.setObjectName("multiScreenBlock")
-        # 纵向堆叠 ⇒ 每块**占满容器宽度**（不再需要 380 的最小宽，那会逼出横向滚动条）
         blk.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         blk._screen_id = sid
+        blk._multi_screen_id = sid          # eventFilter：点块体 ⇒ 选中该屏
         v = QVBoxLayout(blk)
         v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(4)
-        head = QHBoxLayout()
-        head.setSpacing(6)
-        lab = QLabel("")
-        lab.setStyleSheet("font-weight:bold;")
-        blk._label = lab
-        head.addWidget(lab)
-        head.addStretch(1)
-        btn_layers = QToolButton()
-        btn_layers.setText("图层…")
-        btn_layers.setPopupMode(QToolButton.InstantPopup)
-        btn_layers.setToolTip("选择这块屏幕使用哪些图层（主屏/复制屏固定使用全部图层）")
-        menu = QMenu(btn_layers)
-        used = set(_om.effective_layers(cfg, s, all_ids))
-        for lay in self.engine.layers:
-            act = menu.addAction(lay.name)
-            act.setCheckable(True)
-            act.setChecked(lay.lid in used)
-            act.setEnabled(str(s.get("type")) in ("independent",))
-            act.triggered.connect(
-                lambda on, lid=lay.lid, sc=s: self._toggle_screen_layer(sc, lid, bool(on)))
-        btn_layers.setMenu(menu)
-        blk._btn_layers = btn_layers
-        head.addWidget(btn_layers)
-        # ★ 用户第 8 条的补偿：`ScreenSettingsPanel` 在多屏模式下藏了，屏幕名/边框色
-        #   只剩右键菜单能改 —— 这里给一个显眼的「⋯」，点开就是那个屏幕设置对话框。
-        btn_edit = QPushButton("⋯")
-        btn_edit.setFixedWidth(26)
-        btn_edit.setToolTip("屏幕设置：名称 / 分辨率 / 边框颜色")
-        btn_edit.setEnabled(not is_copy)
-        if is_copy:
-            btn_edit.setToolTip("复制屏幕跟随主屏，不能单独改；请选择原屏幕后再修改")
-        btn_edit.clicked.connect(
-            lambda _c=False, x=sid: self.output_studio.edit_screen(x))
-        blk._btn_edit = btn_edit
-        head.addWidget(btn_edit)
-        btn_pick = QPushButton("选中此屏")
-        btn_pick.setToolTip("把右侧设置的作用域切到这块屏幕")
-        btn_pick.clicked.connect(
-            lambda _c=False, x=sid: self.output_studio.select_screen(x))
-        head.addWidget(btn_pick)
-        v.addLayout(head)
+        v.setSpacing(2)
         body = QVBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         if panel is not None:
+            # ① 标题行改成"屏幕信息"（并删掉"越靠上显示越靠上"的提示）
+            try:
+                panel.title.setText(self._screen_block_info(cfg, s))
+                panel.title.setToolTip(T("点这里选中这块屏幕"))
+                panel.title._multi_screen_id = sid
+                panel.title.installEventFilter(self)
+                panel.title.setCursor(Qt.PointingHandCursor)
+            except Exception:                                     # noqa: BLE001
+                pass
+            # ② 「⋯」放进图层栈自己的工具条（靠右），复制屏置灰
+            btn_edit = QPushButton("⋯")
+            btn_edit.setFixedWidth(26)
+            btn_edit.setToolTip(T("屏幕设置：名称 / 分辨率 / 边框颜色 / 使用的图层"))
+            btn_edit.setEnabled(not is_copy)
+            if is_copy:
+                btn_edit.setToolTip(T("复制屏幕跟随主屏，不能单独改；请选择原屏幕后再修改"))
+            btn_edit.clicked.connect(
+                lambda _c=False, x=sid: self.output_studio.edit_screen(x))
+            try:
+                bar = panel.layout().itemAt(0).layout()
+                old_btn = getattr(panel, "_btn_edit", None)
+                if old_btn is not None:
+                    bar.removeWidget(old_btn)
+                    old_btn.deleteLater()
+                bar.addWidget(btn_edit)
+                panel._btn_edit = btn_edit
+            except Exception:                                     # noqa: BLE001
+                pass
             body.addWidget(panel, 1)
         else:
-            ph = QLabel("该屏没有可显示的图层（在「图层…」里勾选）")
+            ph = QLabel(T("该屏没有可显示的图层（在「⋯ → 使用的图层」里勾选）"))
             ph.setWordWrap(True)
             ph.setStyleSheet("color:#888;font-size:11px;")
             body.addWidget(ph)
@@ -3830,11 +3902,19 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             extra = 2
         gap = 6
-        n = len(self._multi_blocks)
-        # 间距 + 块区边框 + holder 的上下边距(2+2) —— 少算 4px 就会永远差一条滚动条
-        gap_total = gap * max(0, n - 1) + extra + 4
+        # 块现在是**两列** ⇒ need = max(左列总高, 右列总高) + 间距 + 边框 + 边距
+        def _col_need(lst):
+            if not lst:
+                return 0
+            hs = [max(1, int(b.height())) for b in lst]
+            return sum(hs) + gap * (len(hs) - 1)
+        left_lst = [b[1] for b in self._multi_blocks
+                    if getattr(b[1], "_multi_col", "right") == "left"]
+        right_lst = [b[1] for b in self._multi_blocks
+                     if getattr(b[1], "_multi_col", "right") == "right"]
+        gap_total = extra + 4
         hh = [max(1, int(b[1].height())) for b in self._multi_blocks]
-        need = sum(hh) + gap_total
+        need = max(_col_need(left_lst), _col_need(right_lst)) + gap_total
         # 预览至少留 35% 页面高（team-lead 验收口径）
         budget = avail - int(page_h * 0.35)
         cap_hard = int(avail * 0.62)
@@ -3931,20 +4011,29 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
         self._multi_blocks = []
-        while lay.count():
-            it = lay.takeAt(0)          # ⚠ 连末尾那个 stretch 也一起摘掉，下面统一补回
-            w = it.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+        for col in (getattr(self, "_multi_col_left", None),
+                    getattr(self, "_multi_col_right", None)):
+            if col is None:
+                continue
+            while col.count():
+                it = col.takeAt(0)      # ⚠ 连末尾那个 stretch 也一起摘掉，下面统一补回
+                w = it.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
         all_ids = [l.lid for l in self.engine.layers]
         for s in screens:
             panel = self._panel_for_screen(s, cfg)
             blk, body = self._make_screen_block(s, cfg, all_ids, panel)
             self._multi_blocks.append((str(s.get("id")), blk, body))
-            self._fit_block_height(blk, panel)      # ★ 纵向堆叠：高度=该块自然高度
-            lay.addWidget(blk, 0)                   # 0 = 不拉伸（高度由上面钉死）
-        lay.addStretch(1)                           # 块少时贴顶，剩余空间留在末尾
+            self._fit_block_height(blk, panel)      # ★ 高度=该块自然高度
+            col = self._block_column(s, cfg)
+            blk._multi_col = "left" if col is getattr(self, "_multi_col_left", None) else "right"
+            col.addWidget(blk, 0)                   # 0 = 不拉伸（高度由上面钉死）
+        for col in (getattr(self, "_multi_col_left", None),
+                    getattr(self, "_multi_col_right", None)):
+            if col is not None:
+                col.addStretch(1)                   # 块少时贴顶
         self._refresh_block_styles(cfg)
         # 新建的栈马上把行/高亮画出来（否则要等下一次广播）
         self._layers_call("refresh_playing")
@@ -3967,10 +4056,10 @@ class MainWindow(QMainWindow):
             except Exception:                                     # noqa: BLE001
                 pass
             try:
-                w, h = _om.effective_size(cfg, s)
-                nm = str(s.get("name") or s.get("id") or "")
-                t = _om.TYPE_LABELS.get(s.get("type"), "")
-                blk._label.setText(("✔ " if sel else "") + "%s · %s · %dx%d" % (nm, t, w, h))
+                info = self._screen_block_info(cfg, s)
+                ps = blk.findChildren(LayerStackPanel)
+                if ps:
+                    ps[0].title.setText(("✔ " if sel else "") + info)
             except Exception:                                     # noqa: BLE001
                 pass
 
