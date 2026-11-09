@@ -190,10 +190,25 @@ class OutputPreview(QWidget):
         # 不自动改用户已经摆好的位置；只给新屏幕排开
 
     def _world_rect(self):
-        """预览工作区的世界包围盒。"""
+        """预览工作区的世界包围盒。
+
+        ★ V1（用户第 2 条）：「我调整 Mapping 图里面的配置为什么会影响到预览呢？
+          我把屏幕拖到显示范围外，预览里也黑了。」
+          根因：预览按 `combined_size` 裁剪 ⇒ 屏一拖出画布就被裁没了。
+          现在取 **画布 ∪ 所有屏矩形** 的包围盒 ⇒ 画布外的屏照样在预览里可见；
+          `combined_size` 只影响"合成/导出"，不再决定预览取景。
+        """
         if self.mode == "single":
             cw, ch = OM.combined_size(self.cfg)
-            return QRectF(0, 0, cw, ch)
+            x0, y0, x1, y1 = 0.0, 0.0, float(cw), float(ch)
+            for sc in (self.cfg or {}).get("screens") or []:
+                try:
+                    sx, sy, sw, sh = OM.screen_rect(self.cfg, sc)
+                except Exception:                                  # noqa: BLE001
+                    continue
+                x0 = min(x0, float(sx)); y0 = min(y0, float(sy))
+                x1 = max(x1, float(sx + sw)); y1 = max(y1, float(sy + sh))
+            return QRectF(x0, y0, max(1.0, x1 - x0), max(1.0, y1 - y0))
         rects = []
         for s in self.screens:
             r = OM._normalize_preview_rect(s.get("preview_rect"))
@@ -693,6 +708,25 @@ class OutputPreview(QWidget):
             x, y, w, h = OM.screen_rect(self.cfg, s)
             sr = self._rect_screen(x, y, w, h)
             self._paint_frame(p, s, sr, content=None, transparent_center=True)
+        # ★ V1：画布**外**的屏 —— 灰虚线描边 + 名字，明确它没进合成但不该"消失"
+        for sc in (self.cfg or {}).get("screens") or []:
+            try:
+                x, y, w, h = OM.screen_rect(self.cfg, sc)
+            except Exception:                                      # noqa: BLE001
+                continue
+            if x >= 0 and y >= 0 and x + w <= cw and y + h <= ch:
+                continue                            # 在画布内：正常画过了
+            sr = self._rect_screen(x, y, w, h)
+            p.setPen(_dash_pen("#9aa0a6", 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(sr)
+            try:
+                p.setFont(QFont("Microsoft YaHei", 10))
+                p.setPen(QColor("#c8c8c8"))
+                p.drawText(sr.adjusted(6, 4, -6, -4), Qt.AlignLeft | Qt.AlignTop,
+                           "%s（画布外）" % (sc.get("name") or ""))
+            except Exception:                                  # noqa: BLE001
+                pass
         # 复制/切分标记
         for s in self.screens:
             if s.get("type") == "copy":
@@ -2474,9 +2508,47 @@ class _CanvasBoard(QWidget):
         """
         return OM.mapping_screens(self.cfg) if self.cfg else []
 
+    def _display_rect(self, s):
+        """画布上**显示用**的矩形。
+
+        ★ V2（用户第 1 条）：切分/复制屏的 `layout` 和源屏完全重叠（都 [0,0]），
+          画上去就是"屏中屏"，看着像少了两块。
+          这里只给**显示**一个偏移：排到源屏右侧、同类垂直堆叠；
+          `cfg` 里的 `layout` **一个字节都不改**（整合画布只合成 main+independent，
+          它们的 layout 本来就没有语义，不能为了显示去动数据）。
+        """
+        t = str(s.get("type") or "main")
+        x, y, w, h = OM.screen_rect(self.cfg, s)
+        if t not in ("split", "copy"):
+            return x, y, w, h
+        # 排到**所有源屏**（main/independent）的右侧，而不是紧贴某一块 —— 否则会和
+        # 紧挨着的独立屏撞在一起（实测：独立屏 x=1280、切分屏被放到 1320 就重叠了）。
+        right = 0.0
+        y0 = 0.0
+        first = True
+        for o in self._frames():
+            if str(o.get("type") or "main") in ("split", "copy"):
+                continue
+            try:
+                ox, oy, ow, oh = OM.screen_rect(self.cfg, o)
+            except Exception:                                      # noqa: BLE001
+                continue
+            right = max(right, float(ox + ow))
+            y0 = float(oy) if first else min(y0, float(oy))
+            first = False
+        # 序号按"所有辅助屏（切分+复制）"统一计：否则切分和复制各自从 0 数，会叠在
+        # 同一个 y 上互相压住（实测过）。
+        idx = 0
+        for o in self._frames():
+            if o is s:
+                break
+            if str(o.get("type") or "main") in ("split", "copy"):
+                idx += 1
+        return int(right + 40), int(y0 + idx * (h + 24)), w, h
+
     def _hit(self, pos):
         for s in reversed(self._frames()):
-            x, y, w, h = OM.screen_rect(self.cfg, s)
+            x, y, w, h = self._display_rect(s)
             r = self._rect_screen(x, y, w, h)
             if r.contains(pos):
                 return s, r
@@ -2595,7 +2667,7 @@ class _CanvasBoard(QWidget):
         p.setBrush(Qt.NoBrush)
         p.drawRect(canvas)
         for s in self._frames():
-            x, y, w, h = OM.screen_rect(self.cfg, s)
+            x, y, w, h = self._display_rect(s)
             r = self._rect_screen(x, y, w, h)
             col = _color(OM.effective_color(self.cfg, s))
             fill = QColor(col)
@@ -2665,7 +2737,8 @@ class _CanvasBoard(QWidget):
 class _CropCanvas(QWidget):
     """裁切示意画布：显示源屏画面 + 可拖动/可拖角缩放的裁切框（归一化 UV）。"""
 
-    changed = Signal(list)          # [u0, v0, u1, v1]
+    changed = Signal(list)          # [u0, v0, u1, v1]（拖动中每帧都发，只用于刷新数值）
+    committed = Signal(list)        # 松手后才发：V5 要求"拖动不写配置"，这一条用来落盘
 
     HANDLE = 12
 
@@ -2769,9 +2842,13 @@ class _CropCanvas(QWidget):
         self.changed.emit(list(self.uv))
 
     def mouseReleaseEvent(self, ev):
-        if self._drag is not None:
+        was_drag = self._drag is not None
+        if was_drag:
             self.changed.emit(list(self.uv))
         self._drag = None
+        if was_drag:
+            # ★ V5（用户第 6 条）：松手才提交 —— 拖动过程中写配置 + apply() 会卡。
+            self.committed.emit(list(self.uv))
 
     def paintEvent(self, _ev):
         p = QPainter(self)
@@ -2822,6 +2899,7 @@ class CropDialog(QDialog):
         lay = QVBoxLayout(self)
         self.canvas = _CropCanvas(self)
         self.canvas.changed.connect(self._on_rect)
+        self.canvas.committed.connect(self._on_commit)
         lay.addWidget(self.canvas, 1)
         self.lbl = QLabel("")
         self.lbl.setStyleSheet("color:#aaa;")
@@ -2840,6 +2918,14 @@ class CropDialog(QDialog):
         self.canvas.set_image(thumb, OM.effective_color(cfg, src))
         self.set_uv(screen.get("uv") or [0, 0, 1, 1])
 
+    def accept(self):
+        # 兜底：如果最后一次拖动没走 mouseRelease（比如在窗外松开），这里补一次提交
+        try:
+            self._on_commit(list(self.canvas.uv))
+        except Exception:                                          # noqa: BLE001
+            pass
+        super().accept()
+
     def set_uv(self, uv):
         """外部（右侧 UV 输入框）改了 UV ⇒ 框跟着动。"""
         self.canvas.set_uv(uv)
@@ -2853,11 +2939,16 @@ class CropDialog(QDialog):
                             int(round(self.src_h * (v1 - v0)))))
 
     def _on_rect(self, uv):
+        """拖动中：**只更新界面数值**（不写配置、不 apply）。"""
         u0, v0, u1, v1 = [round(float(x), 4) for x in uv]
         self.screen["uv"] = [u0, v0, u1, v1]
         self.screen["width"] = max(16, int(round(self.src_w * (u1 - u0))))
         self.screen["height"] = max(16, int(round(self.src_h * (v1 - v0))))
         self._update_label()
+
+    def _on_commit(self, uv):
+        """松手：写一次配置 + 一次全量刷新（V5：连拖 30 次也只会写 ≤1 次/次拖动）。"""
+        self._on_rect(uv)
         try:
             self.studio.apply()
         except Exception:                                          # noqa: BLE001
