@@ -448,6 +448,32 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
     return [x for x in layers if x in ids]
 
 
+def migrate_copy_screens(data):
+    """把老配置里的 `copy` 屏迁移成 `split`（源=主屏、UV 全幅），返回改动数。
+
+    ★ U4（用户第 4 条）：「复制屏幕」这个类型从新建对话框里去掉了——"切分 UV 全幅"
+      与它语义完全一致。老的 `copy` 屏必须继续能出画面，所以这里做**一次性迁移**：
+      type=copy → split，source_id 缺就补主屏，uv 设成全幅 [0,0,1,1]。
+      迁移后 `effective_layers`/`_route_frame` 对 split 的处理与原 copy 等价
+      （split 跟随源屏、裁切区域=全幅 ⇒ 帧与源屏一致）。
+    """
+    n = 0
+    for c in ((data or {}).get("output") or {}).get("configs") or []:
+        main = main_screen(c) or {}
+        main_id = str(main.get("id") or "")
+        for s in (c or {}).get("screens") or []:
+            if str(s.get("type")) != "copy":
+                continue
+            s["type"] = "split"
+            if not str(s.get("source_id") or ""):
+                s["source_id"] = main_id
+            s["uv"] = [0.0, 0.0, 1.0, 1.0]
+            s["follow_main"] = True
+            s["layers"] = None
+            n += 1
+    return n
+
+
 def bind_main_layers(cfg, all_layer_ids):
     """一次性：给主屏写入**显式**的 `layers`（老配置兼容），返回是否改动。
 

@@ -910,8 +910,9 @@ class ScreenDialog(QDialog):
         form.addRow("名称", self.name)
         self.type = QComboBox()
         # ★ S3 #5（用户第 5 条）：把「切分屏幕」加回来（三种类型都在）。
-        items = [("independent", "独立屏幕"), ("copy", "复制屏幕（跟随主屏）"),
-                 ("split", "切分屏幕（取源屏的一块）")]
+        # ★ U4（用户第 4 条）：只留 **独立屏幕 / 切分屏幕**——"切分 UV 全幅"就等于复制。
+        #   老配置里的 `copy` 屏由 output_model 迁移成 split（UV 全幅、源=主屏），不会变砖。
+        items = [("independent", "独立屏幕"), ("split", "切分屏幕（取源屏的一块）")]
         for k, label in items:
             self.type.addItem(label, k)
         form.addRow("类型", self.type)

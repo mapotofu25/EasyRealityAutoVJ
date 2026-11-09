@@ -384,6 +384,17 @@ class Config:
         # ★ 2026-11-08 多屏输出：图层稳定 id + 输出配置迁移。
         #   只做一次；之后用户增删屏幕/配置不再被覆盖。
         try:
+            # ★ U4：`copy` 屏幕类型已从对话框移除 ⇒ 老配置里的 copy 屏一次性迁移成
+            #   split（源=主屏、UV 全幅，语义等价），否则它们会变成"没有类型"的砖。
+            if not self.data.get("_copy_screen_migrated"):
+                try:
+                    import output_model as _omc
+                    if _omc.migrate_copy_screens(self.data):
+                        pass
+                except Exception:                                 # noqa: BLE001
+                    pass
+                self.data["_copy_screen_migrated"] = True
+                self.save()
             if not self.data.get("_output_configs_v1"):
                 import output_model
                 output_model.ensure_layer_ids(self.data)
