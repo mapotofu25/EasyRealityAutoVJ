@@ -383,6 +383,32 @@ def _output_backoff(fails):
     return min(_OUTPUT_BACKOFF_CAP, float(2 ** (n - 1)))
 
 
+#: 预览缩略图的最长边（V4：以前固定 480×270 + Fast 变换 ⇒ 放大后全是马赛克）
+PREVIEW_THUMB_MAX = 1280
+
+
+def _preview_thumb(frame):
+    """预览用缩略图：**只缩不裁**，最长边不超过 PREVIEW_THUMB_MAX，平滑缩放。
+
+    ★ V4（用户第 4 条）：以前是 `scaled(480, 270, FastTransformation)`——
+      1280×720 的屏只剩 480 宽，再放大到 800px 就是马赛克。
+    """
+    try:
+        if frame is None or frame.isNull():
+            return frame
+        w, h = frame.width(), frame.height()
+        if w <= 0 or h <= 0:
+            return frame
+        m = max(w, h)
+        if m <= PREVIEW_THUMB_MAX:
+            return frame.copy()
+        r = PREVIEW_THUMB_MAX / float(m)
+        return frame.scaled(max(1, int(round(w * r))), max(1, int(round(h * r))),
+                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    except Exception:                                              # noqa: BLE001
+        return frame
+
+
 def _locked(fn):
     """GUI 线程入口调用与 worker 线程主循环串行化（引擎已 moveToThread）。
 
@@ -6817,8 +6843,15 @@ class AutoVJEngine(QObject):
         if mode == "single":
             if main is None:
                 return []
+            # ★ V6（用户第 8 条）：单路下发送端名也要跟**屏名**走。
+            #   以前读遗留字段 `plan["spout_name"]`（永远是 EasyRealityAutoVJ），
+            #   用户把屏改名成 898 之后 Spout/NDI 名却不变 ⇒ 找不到输出。
+            try:
+                _nm = output_model.screen_output_names(plan).get(str(main.get("id") or ""))
+            except Exception:                                      # noqa: BLE001
+                _nm = None
             return [("__combined__", "combined",
-                     str(plan.get("spout_name") or "EasyRealityAutoVJ"),
+                     str(_nm or plan.get("spout_name") or "EasyRealityAutoVJ"),
                      bool(main.get("spout", False)), bool(main.get("ndi", False)))]
         names = output_model.screen_output_names(plan)
         out = []
@@ -7035,8 +7068,7 @@ class AutoVJEngine(QObject):
             if frame is not None:
                 frames[sid] = frame
                 if do_thumbs:
-                    thumbs[sid] = frame.scaled(480, 270, Qt.KeepAspectRatio,
-                                               Qt.FastTransformation)
+                    thumbs[sid] = _preview_thumb(frame)
             self._route_frames = frames
             self._route_thumbs = thumbs if do_thumbs else self._route_thumbs
             if self._gpu_frame_consumers and frame is not None:
@@ -7052,8 +7084,7 @@ class AutoVJEngine(QObject):
             if frame is not None:
                 frames[sid] = frame
                 if do_thumbs:
-                    thumbs[sid] = frame.scaled(480, 270, Qt.KeepAspectRatio,
-                                               Qt.FastTransformation)
+                    thumbs[sid] = _preview_thumb(frame)
         self._route_frames = frames
         if do_thumbs:
             self._route_thumbs = thumbs
