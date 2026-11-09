@@ -414,8 +414,13 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
     """返回该屏幕使用的图层 id 列表。
 
     ★ 2026-11-09（用户：「每一个图层、每一个屏幕的图层自己建」）：
-      · 主屏：认**自己的** `layers`（老配置没有/空 ⇒ 全量兼容）
+      · 主屏：认**自己的** `layers`
       · 独立屏：认自己的 `layers`
+
+    ⚠ 口径统一（与独立屏同款）：**`None`（没有这个键）= 老配置/未绑定 ⇒ 全量**；
+      **`[]`（用户明确清空）= 就是空**。旧实现对主屏写成 `if lay:`，
+      把"空列表"也当成"没有" ⇒ 用户把主屏的层删光后，别的屏的层会全部串回主屏
+      （就是用户报过的"主屏没有码表图层却显示码表"那一类现象）。
       · **复制屏 / 切分屏：跟随源屏**（递归求值，不是快照）——
         复制屏标签写的就是"跟随主屏"，若按自己的 layers 落回"全部"，
         它会把独立屏里新建的层也渲出来，与语义直接冲突。
@@ -426,7 +431,7 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
     t = screen.get("type")
     if t == "main":
         lay = screen.get("layers")
-        if lay:
+        if lay is not None:          # [] = 用户明确清空 ⇒ 空；只有 None 才退回全量
             return [x for x in lay if x in ids]
         return list(all_layer_ids)
     if t in ("copy", "split"):
