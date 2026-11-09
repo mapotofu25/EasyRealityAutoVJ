@@ -2123,15 +2123,21 @@ class OutputStudio(QWidget):
         xs = [r for r in xs if r]
         px = (max([r[0] + r[2] for r in xs]) + 28) if xs else 30
         s["preview_rect"] = [px, 30, 420, max(120, int(420 / max(0.2, (s["width"] / max(1, s["height"])))))]
-        if cfg.get("mode") == "single":
-            # 单路模式：接在布局末尾
-            srcs = OM.layout_sources(cfg)
-            lx = 0
-            for z in srcs[:-1]:
-                lx += OM.effective_size(cfg, z)[0]
-            s["layout"] = [lx, 0]
-            cfg["combined_size"] = [lx + OM.effective_size(cfg, s)[0],
-                                    max([OM.effective_size(cfg, z)[1] for z in srcs] or [720])]
+        # ★ U5-1（用户第 5 条）：新建屏的布局默认放到**已有屏的右边**——多路/单路都一样。
+        #   以前只有单路会排（多路全落在 [0,0]）⇒ Mapping 里所有新屏叠在原点，
+        #   看着像"只有一块屏"。这是"新建时的合理默认值"，不是事后偷改用户数据。
+        #   ⚠ 这里**不动** `combined_size`（画布尺寸只由用户/「适应窗口」改），
+        #   超出时画布窗口会显示超界提示。
+        try:
+            _lx = 0
+            for z in cfg.get("screens") or []:
+                if z is s:
+                    continue
+                zx, zy, zw, zh = OM.screen_rect(cfg, z)
+                _lx = max(_lx, zx + zw)
+            s["layout"] = [int(_lx), 0]
+        except Exception:                                          # noqa: BLE001
+            s["layout"] = [0, 0]
         self.selected_id = s["id"]
         self.apply()
         self.preview.fit_all()
@@ -2837,21 +2843,22 @@ class OutputCanvasWindow(QDialog):
 
     def reload(self):
         cfg = self.studio.active_config()
-        # ★ U5-1（用户第 5 条）：Mapping 里"只看到一块大屏"的根因是**新建屏的 layout 默认都是
-        #   [0,0]**（完全重叠，最后画的那块把前面的全盖住）。打开窗口时若检测到完全重叠，
-        #   自动横向排开一次（只改 layout 坐标、不动 combined_size），并在提示里说明。
+        # ★ U5-1（用户第 5 条）：纯提示，**不改任何数据**（用户对"没动手却变了"很敏感）。
+        #   新屏现在在**创建时**就排到已有屏右边（见 add_screen），重叠加只可能是老配置遗留。
         try:
             if cfg:
                 src = OM.layout_sources(cfg)
                 pos = [(int(x), int(y)) for x, y, _w, _h in
                        (OM.screen_rect(cfg, s) for s in src)]
                 if len(src) > 1 and len(set(pos)) < len(pos):
-                    OM.auto_layout(cfg, "h")
-                    self.studio.apply()
-                    cfg = self.studio.active_config()
                     self.hint.setText(
-                        "检测到多块屏幕叠在同一位置（新建屏默认都在原点），已自动横向排开；"
-                        "可再拖动调整。拖动不会改动画布尺寸，要改就点「适应窗口」。")
+                        "⚠ 检测到 %d 块屏幕位置完全重叠，Mapping 里会互相遮挡 —— "
+                        "点「自动排列」把它们横向排开（本窗口不会自己改你的布局）。"
+                        % (len(pos) - len(set(pos)) + 1))
+                else:
+                    self.hint.setText(
+                        "拖动屏幕摆位置；显示的是**输出坐标**（写回配置的 layout）。"
+                        "拖动不会改动画布尺寸，要改就点「适应窗口」。")
         except Exception:                                          # noqa: BLE001
             pass
         self.board.set_config(cfg)

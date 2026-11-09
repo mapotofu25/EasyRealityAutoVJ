@@ -958,6 +958,7 @@ class OutputPanel(QWidget):
         #   显示器窗口仍按黑底显示（物理显示器/HDMI 没有 alpha 通道）。
         self.chk_alpha = QCheckBox(T("Spout/NDI 输出 Alpha（透明通道）"))
         self.chk_alpha.setToolTip(T(
+            "【全局开关】透明通道是全局的：**任一屏**开启即输出 Alpha（引擎只有一个 Alpha 格式开关）。\n"
             "开启后，Spout 和 NDI 发送带透明通道（直通 Alpha）的画面。\n"
             "• 只影响 Spout / NDI；显示器窗口仍按不透明黑底显示（物理显示器没有 Alpha）。\n"
             "• 需要素材本身带 Alpha，且背景图层没有把整幅画面盖住；否则 Alpha 仍会是 255。\n"
