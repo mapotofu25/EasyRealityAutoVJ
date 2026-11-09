@@ -189,7 +189,15 @@ finally:
 #                                     访问 NDI 源用的，本软件不通过 DShow 收发
 #   Processing.NDI.Lib.UWP.dll        24MB    UWP/微软商店应用专用，Python 用不了
 # 另有 .cpp/.pyx/Linux 占位文件，运行时全用不上 → 共省约 80MB。
-if rc == 0:
+# ★ 判据用「exe 是否产出」，**不能**用 `rc == 0`：
+#   PyInstaller 收尾会删旧 dist 目录，被 safe-delete 钩子拦下后返回非 0（本机恒为 1），
+#   但 exe 其实已经打好了。以前按 rc 判 ⇒ 瘦身 + UI 冒烟 + 完成提示全被跳过（静默）。
+_EXE_PATH = os.path.join(DIST_ROOT, "EasyRealityAutoVJ", "EasyRealityAutoVJ.exe")
+_EXE_BUILT = os.path.isfile(_EXE_PATH)
+if rc != 0 and _EXE_BUILT:
+    print("[build] PyInstaller 返回 %d，但 exe 已产出（通常由 safe-delete 拦下清理步骤引起）"
+          " ⇒ 继续收尾" % rc)
+if _EXE_BUILT:
     internal = os.path.join(DIST_ROOT, "EasyRealityAutoVJ", "_internal", "cyndilib")
     removed = 0
     try:
