@@ -4375,10 +4375,16 @@ class MainWindow(QMainWindow):
             self.ss_uv.append(sp)
             f.addWidget(QLabel(T(lab)), 2 + i // 2, (i % 2) * 2)
             f.addWidget(sp, 2 + i // 2, (i % 2) * 2 + 1)
-        self.lbl_ss_hint = QLabel(T("切分屏幕取源屏的一块：改 UV 或直接在预览里拖裁切框。"))
+        # ★ U3（用户第 3 条）：真·裁切入口 —— 打开独立窗口拖框，自动写回 UV + 分辨率
+        self.btn_crop = QPushButton(T("裁切…"))
+        self.btn_crop.setToolTip(T("打开裁切窗口：在源屏画面上拖框选区域，"
+                                  "自动换算 UV 与分辨率（双向同步）"))
+        self.btn_crop.clicked.connect(self._open_crop_dialog)
+        f.addWidget(self.btn_crop, 4, 0, 1, 4)
+        self.lbl_ss_hint = QLabel(T("切分屏幕取源屏的一块：点「裁切…」拖框，或直接改 UV。"))
         self.lbl_ss_hint.setWordWrap(True)
         self.lbl_ss_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
-        f.addWidget(self.lbl_ss_hint, 4, 0, 1, 4)
+        f.addWidget(self.lbl_ss_hint, 5, 0, 1, 4)
         self._ss_loading = False
         g.setVisible(False)
         return g
@@ -4410,6 +4416,29 @@ class MainWindow(QMainWindow):
         finally:
             self._ss_loading = False
 
+    def _open_crop_dialog(self):
+        """打开「裁切…」窗口（只对切分屏有意义）。"""
+        st = getattr(self, "output_studio", None)
+        if st is None:
+            return
+        try:
+            import output_model as _om
+            cfg = st.active_config()
+            sc = _om.screen_by_id(cfg, getattr(st, "selected_id", ""))
+            if not sc or str(sc.get("type")) != "split":
+                QMessageBox.information(
+                    self, T("裁切"),
+                    T("只有「切分屏幕」需要裁切。先在预览里选中一块切分屏，或新建一块切分屏。"))
+                return
+            from output_studio import CropDialog
+            dlg = CropDialog(st, sc, self)
+            self._crop_dlg = dlg
+            dlg.finished.connect(lambda _r=0: setattr(self, "_crop_dlg", None))
+            dlg.show()
+            dlg.raise_()
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("_open_crop_dialog", e)
+
     def _on_screen_setup_changed(self, *_a):
         """「屏幕设置」栏被改动 ⇒ 写回当前切分屏并重建输出（S3 #5）。"""
         if getattr(self, "_ss_loading", False):
@@ -4432,6 +4461,13 @@ class MainWindow(QMainWindow):
             v1 = max(v0 + 0.002, float(self.ss_uv[3].value()))
             s["uv"] = [u0, v0, u1, v1]
             st.apply()
+            # ★ U3 双向同步：右侧改 UV ⇒ 裁切窗口里的框跟着动
+            _dlg = getattr(self, "_crop_dlg", None)
+            if _dlg is not None:
+                try:
+                    _dlg.set_uv(s["uv"])
+                except Exception:                                  # noqa: BLE001
+                    pass
         except Exception:                                         # noqa: BLE001
             pass
 

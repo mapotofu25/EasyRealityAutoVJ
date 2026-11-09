@@ -2573,6 +2573,208 @@ class _CanvasBoard(QWidget):
         p.end()
 
 
+class _CropCanvas(QWidget):
+    """裁切示意画布：显示源屏画面 + 可拖动/可拖角缩放的裁切框（归一化 UV）。"""
+
+    changed = Signal(list)          # [u0, v0, u1, v1]
+
+    HANDLE = 12
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(420, 260)
+        self.setMouseTracking(True)
+        self._img = None            # 源屏缩略图（可为 None）
+        self._fallback = QColor("#2FA8A8")
+        self.uv = [0.0, 0.0, 1.0, 1.0]
+        self._drag = None           # (mode, start_uv, start_pos)
+
+    def set_image(self, img, color=None):
+        self._img = img
+        if color is not None:
+            self._fallback = QColor(color)
+        self.update()
+
+    def set_uv(self, uv):
+        try:
+            u0, v0, u1, v1 = [float(x) for x in (uv or [0, 0, 1, 1])]
+        except Exception:                                          # noqa: BLE001
+            u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+        self.uv = [min(u0, u1 - 0.02), min(v0, v1 - 0.02),
+                   max(u1, u0 + 0.02), max(v1, v0 + 0.02)]
+        self.update()
+
+    # ---- 几何 ----
+    def _content_rect(self):
+        """源画面在窗口里的显示矩形（等比、留 8px 边距）。"""
+        r = self.rect().adjusted(8, 8, -8, -8)
+        if self._img is not None and not self._img.isNull():
+            iw, ih = self._img.width(), self._img.height()
+        else:
+            iw, ih = 16, 9
+        if iw <= 0 or ih <= 0:
+            return r
+        sc = min(r.width() / float(iw), r.height() / float(ih))
+        w, h = iw * sc, ih * sc
+        return QRectF(r.center().x() - w / 2, r.center().y() - h / 2, w, h)
+
+    def _uv_rect(self):
+        c = self._content_rect()
+        u0, v0, u1, v1 = self.uv
+        return QRectF(c.left() + c.width() * u0, c.top() + c.height() * v0,
+                      c.width() * (u1 - u0), c.height() * (v1 - v0))
+
+    def _hit(self, pos):
+        r = self._uv_rect()
+        h = self.HANDLE
+        corners = {
+            "tl": QRectF(r.left() - h, r.top() - h, 2 * h, 2 * h),
+            "tr": QRectF(r.right() - h, r.top() - h, 2 * h, 2 * h),
+            "bl": QRectF(r.left() - h, r.bottom() - h, 2 * h, 2 * h),
+            "br": QRectF(r.right() - h, r.bottom() - h, 2 * h, 2 * h),
+        }
+        for k, q in corners.items():
+            if q.contains(pos):
+                return k
+        return "move" if r.contains(pos) else None
+
+    def mousePressEvent(self, ev):
+        self._drag = (self._hit(ev.position()), list(self.uv), ev.position())
+        if self._drag[0] is None:
+            self._drag = None        # 点框外：不动（避免误改）
+
+    def mouseMoveEvent(self, ev):
+        if self._drag is None:
+            k = self._hit(ev.position())
+            self.setCursor(Qt.SizeFDiagCursor if k in ("tl", "tr", "bl", "br")
+                           else (Qt.SizeAllCursor if k == "move" else Qt.ArrowCursor))
+            return
+        mode, orig, start = self._drag
+        c = self._content_rect()
+        if c.width() <= 0 or c.height() <= 0:
+            return
+        du = (ev.position().x() - start.x()) / c.width()
+        dv = (ev.position().y() - start.y()) / c.height()
+        u0, v0, u1, v1 = orig
+        if mode == "move":
+            u0 += du; u1 += du; v0 += dv; v1 += dv
+            if u0 < 0:
+                u1 -= u0; u0 = 0.0
+            if u1 > 1:
+                u0 -= (u1 - 1); u1 = 1.0
+            if v0 < 0:
+                v1 -= v0; v0 = 0.0
+            if v1 > 1:
+                v0 -= (v1 - 1); v1 = 1.0
+        else:
+            if "l" in mode:
+                u0 = min(max(0.0, u0 + du), u1 - 0.02)
+            if "r" in mode:
+                u1 = max(min(1.0, u1 + du), u0 + 0.02)
+            if "t" in mode:
+                v0 = min(max(0.0, v0 + dv), v1 - 0.02)
+            if "b" in mode:
+                v1 = max(min(1.0, v1 + dv), v0 + 0.02)
+        self.uv = [u0, v0, u1, v1]
+        self.update()
+        self.changed.emit(list(self.uv))
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag is not None:
+            self.changed.emit(list(self.uv))
+        self._drag = None
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#151515"))
+        c = self._content_rect()
+        if self._img is not None and not self._img.isNull():
+            p.drawImage(c, self._img, QRectF(0, 0, self._img.width(), self._img.height()))
+        else:
+            p.fillRect(c, self._fallback)
+        # 框外压暗
+        r = self._uv_rect()
+        dim = QColor(0, 0, 0, 130)
+        p.fillRect(QRectF(c.left(), c.top(), c.width(), r.top() - c.top()), dim)
+        p.fillRect(QRectF(c.left(), r.bottom(), c.width(), c.bottom() - r.bottom()), dim)
+        p.fillRect(QRectF(c.left(), r.top(), r.left() - c.left(), r.height()), dim)
+        p.fillRect(QRectF(r.right(), r.top(), c.right() - r.right(), r.height()), dim)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#ffffff"), 2))
+        p.drawRect(r)
+        p.setBrush(QColor("#ffffff"))
+        for q in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()):
+            p.drawRect(QRectF(q.x() - 4, q.y() - 4, 8, 8))
+        p.setPen(QColor(230, 230, 230))
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(8, self.height() - 8,
+                   "UV %.3f,%.3f → %.3f,%.3f" % (self.uv[0], self.uv[1], self.uv[2], self.uv[3]))
+        p.end()
+
+
+class CropDialog(QDialog):
+    """「裁切…」窗口（用户第 3 条）：给切分屏拖出一个裁切框，实时写回 UV + 分辨率。
+
+    · 框 = 归一化 UV（0..1），拖动框体移动、拖四个角缩放
+    · 写回：`screen["uv"]` + `screen["width"/"height"] = 源分辨率 × 框占比`
+    · 外部改 UV（右侧输入框）时调 `set_uv()`，框会跟着动（双向同步）
+    """
+
+    def __init__(self, studio, screen, parent=None):
+        super().__init__(parent or studio)
+        self.studio = studio
+        self.screen = screen
+        self.setWindowTitle("裁切（拖框选择源屏上的区域）")
+        self.resize(720, 480)
+        cfg = studio.active_config()
+        src = OM.source_screen(cfg, screen) or OM.main_screen(cfg) or {}
+        self.src = src
+        self.src_w, self.src_h = OM.effective_size(cfg, src)
+        lay = QVBoxLayout(self)
+        self.canvas = _CropCanvas(self)
+        self.canvas.changed.connect(self._on_rect)
+        lay.addWidget(self.canvas, 1)
+        self.lbl = QLabel("")
+        self.lbl.setStyleSheet("color:#aaa;")
+        lay.addWidget(self.lbl)
+        btn = QHBoxLayout()
+        btn.addStretch(1)
+        b = QPushButton("完成")
+        b.clicked.connect(self.accept)
+        btn.addWidget(b)
+        lay.addLayout(btn)
+        thumb = None
+        try:
+            thumb = studio.preview.thumbs.get(str(src.get("id") or ""))
+        except Exception:                                          # noqa: BLE001
+            thumb = None
+        self.canvas.set_image(thumb, OM.effective_color(cfg, src))
+        self.set_uv(screen.get("uv") or [0, 0, 1, 1])
+
+    def set_uv(self, uv):
+        """外部（右侧 UV 输入框）改了 UV ⇒ 框跟着动。"""
+        self.canvas.set_uv(uv)
+        self._update_label()
+
+    def _update_label(self):
+        u0, v0, u1, v1 = self.canvas.uv
+        self.lbl.setText("源屏 %d×%d　裁出 ≈ %d×%d"
+                         % (self.src_w, self.src_h,
+                            int(round(self.src_w * (u1 - u0))),
+                            int(round(self.src_h * (v1 - v0)))))
+
+    def _on_rect(self, uv):
+        u0, v0, u1, v1 = [round(float(x), 4) for x in uv]
+        self.screen["uv"] = [u0, v0, u1, v1]
+        self.screen["width"] = max(16, int(round(self.src_w * (u1 - u0))))
+        self.screen["height"] = max(16, int(round(self.src_h * (v1 - v0))))
+        self._update_label()
+        try:
+            self.studio.apply()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+
 class OutputCanvasWindow(QDialog):
     """用户第 11 条：「输出画布…」独立窗口（多屏**单路**输出的 mapping 工具）。
 
