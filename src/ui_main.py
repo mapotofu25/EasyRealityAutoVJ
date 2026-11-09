@@ -4680,8 +4680,16 @@ class MainWindow(QMainWindow):
         self.btn_crop.setText("✂")
         self.btn_crop.setVisible(False)             # 只在切分屏时出现（见 _fill_screen_setup）
         self.btn_crop.setStyleSheet("QPushButton{padding:1px 6px;}")
-        f.addWidget(self.btn_crop, 0, 2, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
-        f.setColumnStretch(2, 1)
+        # ★ 位置：放到**「分辨率」那一行（行 1）的最右边**，垂直居中、右对齐。
+        #   行 1 的列占用：col0=「分辨率」label、col1=宽/×/高 的 HBox；
+        #   所以按钮放 col2（占 1 列），并把 col2 的 stretch 吃掉剩余宽度，
+        #   col1 的 stretch 归零 —— 否则那个 HBox 里带 addStretch(1) 会向右顶、把按钮挤到框外。
+        #   ⚠ 必须放**最后一列（col3）**：col2 被下面 UV 行的控件占着，放 col2 时按钮右边
+        #     还会剩一列宽（实测右间距 93px）；col3 在只占行 1，右对齐后正好贴框内右边。
+        f.addWidget(self.btn_crop, 1, 3, 1, 1, Qt.AlignRight | Qt.AlignVCenter)
+        f.setColumnStretch(1, 0)
+        f.setColumnStretch(2, 0)
+        f.setColumnStretch(3, 1)
         self.lbl_ss_hint = QLabel(T("切分屏幕取源屏的一块：点「裁切…」拖框，或直接改 UV。"))
         self.lbl_ss_hint.setWordWrap(True)
         self.lbl_ss_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
