@@ -7101,9 +7101,33 @@ class AutoVJEngine(QObject):
         return (max(1, int(self.canvas.width() * scale)),
                 max(1, int(self.canvas.height() * scale)))
 
+    def _main_screen_layers(self):
+        """主屏该画哪些层。
+
+        ★ 2026-11-09（用户反馈 #1）：以前 `_compose()` 直接画 `self.layers`（**全部**层）
+          ⇒ 挂在 B 屏的码表图层也会被画到主屏上（截图上主屏没有码表图层，画面却是码表内容）。
+          现在按输出计划取主屏的 `effective_layers`；没有计划（老单屏配置）时退回全量。
+        """
+        plan = getattr(self, "_out_cfg", None)
+        if not plan:
+            return self.layers                     # 老配置 / 单屏：保持原行为
+        main = None
+        for s in plan.get("screens") or []:
+            if s.get("type") == "main":
+                main = s
+                break
+        if main is None:
+            return self.layers
+        all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+        try:
+            ids = output_model.effective_layers(plan, main, all_ids)
+        except Exception:                                          # noqa: BLE001
+            return self.layers
+        return self._out_layers_by_ids(ids)
+
     def _compose(self, snap):
-        """主屏合成（保留旧入口）：主画布 + 全部图层，允许 GPU 合成。"""
-        self._compose_to(self.canvas, self.layers, snap, allow_gpu=True)
+        """主屏合成（保留旧入口）：主画布 + **主屏自己的**图层，允许 GPU 合成。"""
+        self._compose_to(self.canvas, self._main_screen_layers(), snap, allow_gpu=True)
 
     def _compose_to(self, canvas, layers, snap, allow_gpu=False):
         """把指定图层集合合成到指定画布。
