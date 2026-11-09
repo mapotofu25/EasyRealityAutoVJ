@@ -4673,6 +4673,8 @@ class MainWindow(QMainWindow):
         _row.setContentsMargins(0, 0, 0, 0)
         self.ss_w = QSpinBox(); self.ss_w.setRange(16, 16384); self.ss_w.setMinimumWidth(70)
         self.ss_h = QSpinBox(); self.ss_h.setRange(16, 16384); self.ss_h.setMinimumWidth(70)
+        # ★ BUG-C：用户截图里那个 1280×120 就是这两个框 —— 只回车/失焦提交
+        self.ss_w.setKeyboardTracking(False); self.ss_h.setKeyboardTracking(False)
         self.ss_w.valueChanged.connect(self._on_screen_setup_changed)
         self.ss_h.valueChanged.connect(self._on_screen_setup_changed)
         _row.addWidget(self.ss_w)
@@ -4687,6 +4689,7 @@ class MainWindow(QMainWindow):
             sp.setDecimals(4)
             sp.setSingleStep(0.001)
             sp.setMinimumWidth(80)
+            sp.setKeyboardTracking(False)      # ★ BUG-C：UV 同理
             sp.valueChanged.connect(self._on_screen_setup_changed)
             self.ss_uv.append(sp)
             f.addWidget(QLabel(T(lab)), 2 + i // 2, (i % 2) * 2)
@@ -4740,11 +4743,18 @@ class MainWindow(QMainWindow):
             self.ss_source.setCurrentIndex(max(0, idx))
             self.ss_source.blockSignals(False)
             w, h = _om.effective_size(cfg, screen)
+            # ★ BUG-C：用户正在这两个框里打字就不要回填（否则值被改成 config 里的旧值）
             self.ss_w.blockSignals(True); self.ss_h.blockSignals(True)
-            self.ss_w.setValue(int(w)); self.ss_h.setValue(int(h))
+            if not self.ss_w.lineEdit().hasFocus():
+                self.ss_w.setValue(int(w))
+            if not self.ss_h.lineEdit().hasFocus():
+                self.ss_h.setValue(int(h))
             self.ss_w.blockSignals(False); self.ss_h.blockSignals(False)
             uv = (screen or {}).get("uv") or [0, 0, 1, 1]
             for i, sp in enumerate(self.ss_uv):
+                # ★ BUG-C：UV 同理，正在输入就不回填
+                if sp.lineEdit().hasFocus():
+                    continue
                 sp.blockSignals(True)
                 sp.setValue(float(uv[i]))
                 sp.blockSignals(False)

@@ -1226,6 +1226,8 @@ class ScreenSettingsPanel(QWidget):
         v5 = QGridLayout(g5)
         self.lx = QSpinBox(); self.ly = QSpinBox()
         self.lx.setRange(-20000, 20000); self.ly.setRange(-20000, 20000)
+        # ★ BUG-C：布局 X/Y 也只回车/失焦提交
+        self.lx.setKeyboardTracking(False); self.ly.setKeyboardTracking(False)
         self.lx.valueChanged.connect(self._on_layout)
         self.ly.valueChanged.connect(self._on_layout)
         v5.addWidget(QLabel("布局 X"), 0, 0); v5.addWidget(self.lx, 0, 1)
@@ -1233,6 +1235,7 @@ class ScreenSettingsPanel(QWidget):
         self.uv = []
         for i, lab in enumerate(("左 U0", "上 V0", "右 U1", "下 V1")):
             sp = QDoubleSpinBox(); sp.setRange(0.0, 1.0); sp.setDecimals(4); sp.setSingleStep(0.001)
+            sp.setKeyboardTracking(False)      # ★ BUG-C
             sp.valueChanged.connect(self._on_uv)
             self.uv.append(sp)
             v5.addWidget(QLabel(lab), 1 + i // 2, (i % 2) * 2)
@@ -1314,10 +1317,14 @@ class ScreenSettingsPanel(QWidget):
         self.lx.setEnabled(single and t in ("main", "independent"))
         self.ly.setEnabled(single and t in ("main", "independent"))
         lay = (screen or {}).get("layout") or [0, 0]
-        self.lx.setValue(int(lay[0])); self.ly.setValue(int(lay[1]))
+        _set_spin_quiet(self.lx, int(lay[0])); _set_spin_quiet(self.ly, int(lay[1]))
         uv = (screen or {}).get("uv") or [0, 0, 1, 1]
         for i, sp in enumerate(self.uv):
-            sp.setValue(float(uv[i]))
+            # ★ BUG-C：回填不抢用户正在敲的字（UV 也是数字框）
+            if not _is_editing(sp):
+                sp.blockSignals(True)
+                sp.setValue(float(uv[i]))
+                sp.blockSignals(False)
             sp.setEnabled(single and t == "split")
         self.btn_export.setVisible(single)
         try:
@@ -1501,6 +1508,8 @@ class OutputStudio(QWidget):
         bar.addWidget(self.lbl_combined)
         self.comb_w = QSpinBox(); self.comb_w.setRange(16, 16384); self.comb_w.setValue(1920)
         self.comb_h = QSpinBox(); self.comb_h.setRange(16, 16384); self.comb_h.setValue(1080)
+        # ★ BUG-C：整合画布宽高也只回车/失焦提交
+        self.comb_w.setKeyboardTracking(False); self.comb_h.setKeyboardTracking(False)
         # ★ S2 #3（用户第 3 条）：整合画布这两个数字框**字号小一号**（原来和按钮一样大，
         #   在页签行里显得笨重）。
         for _sp in (self.comb_w, self.comb_h):
