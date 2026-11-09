@@ -93,6 +93,14 @@ class SpoutOut:
         h = int(h)
         if w <= 0 or h <= 0:
             return False
+        # ★ BUG-A（2026-11-10）：已 close 的发送端不能再假装成功。
+        #   以前 `close()` 只把 `_dead=True`，`send()` 照样入队并返回 True，
+        #   而发送线程 `_loop` 第一句 `while not self._dead` 直接退出
+        #   ⇒ 画面永久哑火、调用方毫不知情（OBS 里少一个 sender）。
+        if self._dead:
+            with self._lock:
+                self._err = "sender 已关闭（is_dead）"
+            return False
         need = w * 4
         total = need * h
         try:
@@ -150,6 +158,10 @@ class SpoutOut:
                 with self._lock:
                     self._free.append(buf)
         return True
+
+    def is_dead(self):
+        """发送端是否已被 close（close 后 send 永久失败，必须由调用方重建）。"""
+        return bool(self._dead)
 
     def last_error(self):
         """返回最近一次发送线程异常（字符串）；None = 正常。取走即清。"""

@@ -329,6 +329,18 @@ class NDIOutput:
         self._err_logged = None         # 视频侧同样只记第一条
         self._opened_at = 0.0           # sender 的 open() 时刻（算静默期用）
 
+    def is_dead(self):
+        """发送端是否已被 close（close 后视频线程 `_vstop=True`，需重建）。"""
+        return bool(getattr(self, "_vstop", False))
+
+    def last_error(self):
+        """返回并清空最近一次 NDI 错误（None = 正常）。与 SpoutOut 同名同语义。"""
+        e = str(getattr(self, "_last_err", "") or "")
+        if e:
+            self._last_err = ""
+            return e
+        return None
+
     def _ensure(self, w=None, h=None):
         """确保发送端按 (w, h) 就绪；成功返回 True。
 

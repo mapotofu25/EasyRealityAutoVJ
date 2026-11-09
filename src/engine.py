@@ -974,6 +974,7 @@ class AutoVJEngine(QObject):
         #   跑完立刻复位（None = 用全局 self.cfg）。
         self._cp_cfg = None
         self._screen_cp_calls = 0      # 统计"这帧额外跑了几次按屏调色"（性能判据用）
+        self._route_hb_t = 0.0         # 路由心跳上次落盘时刻（BUG-A 取证用，10s 一行）
         self._route_thumbs = {}
         self._route_frames = {}        # 发送端用（全分辨率，引用/裁切缓存）
         self._preview_route_id = ""
@@ -2525,8 +2526,12 @@ class AutoVJEngine(QObject):
             # ---- 多屏输出 ----
             mode = str(self._out_cfg.get("mode") or "multi")
             if mode == "single":
-                # ★ U7：各屏先套自己的 color/postfx，再拼整合画布
-                self._apply_screen_cp(snap)
+                # ★ BUG-B（2026-11-10）：单路下**必须先合成独立屏**，否则
+                #   `_build_combined()` 通过 `_route_frame()` 取到的独立屏画布
+                #   只有 `_rebuild_output_plan()` 里的一次 clear ⇒ 预览里永远黑。
+                #   顺序不能反：切分屏的源可能就是独立屏。
+                #   每屏 color/postfx 已在 `_compose_independent()` 里各套一次（B2）。
+                self._compose_independent(snap)
                 self._build_combined(snap)
             else:
                 self._compose_independent(snap)
@@ -6162,33 +6167,8 @@ class AutoVJEngine(QObject):
         kv.player = self._get_player(kv, clip)
 
     # ---------------- 合成渲染 ----------------
-    def _apply_screen_cp(self, snap):
-        """★ U7：单路模式下给「有 override 的屏」各自再套一遍 color/postfx。
-
-        · 没有 `screen["params"]` 的屏**一次都不多跑**（性能判据：3 屏都无 override ⇒ 额外 0 次）
-        · 独立屏若复用主画布（follow_main）则跳过（同一张画布不能套两套参数）
-        · 必须在 `_build_combined()` **之前**跑，整合画布贴上去的才是各屏调好色的帧
-        """
-        self._screen_cp_calls = 0
-        plan = self._out_cfg
-        if not plan or str(plan.get("mode") or "multi") != "single":
-            return
-        for s in output_model.layout_sources(plan):
-            if str(s.get("type")) != "independent":
-                continue
-            if not (s or {}).get("params"):
-                continue
-            cv = self._route_frame(plan, str(s.get("id") or ""), "independent")
-            if cv is None or cv.isNull() or cv is self.canvas:
-                continue
-            try:
-                self._cp_cfg = output_model.effective_params(self.cfg, s)
-                self._apply_color_postfx(snap, canvas=cv)
-                self._screen_cp_calls += 1
-            except Exception:                                      # noqa: BLE001
-                pass
-            finally:
-                self._cp_cfg = None
+    # （`_apply_screen_cp()` 已于 2026-11-10 删除：每屏 color/postfx 合进
+    #   `_compose_independent()`，否则单路会套两遍、颜色/特效叠加。）
 
     def _apply_color_postfx(self, snap, canvas=None):
         """颜色 + 后处理：**共用一次**全画布 BGR 读回 / 写回。
@@ -6755,14 +6735,30 @@ class AutoVJEngine(QObject):
             self._out_mode = str(self._out_cfg.get("mode") or "multi")
 
     def _close_legacy_output(self):
+        """关闭 legacy 单路发送端。**绝不关任何被路由表引用的对象**（双保险）。
+
+        ★ BUG-A：`self._spout` 曾被指向路由表里的主屏 sender —— 这里一关，
+          主屏那条路由就永久哑火（`_dead=True` 但 send() 仍返回 True）。
+        """
+        live = []
+        for st_ in (getattr(self, "_route_senders", None) or {}).values():
+            for key in ("spout", "ndi"):
+                obj = (st_ or {}).get(key)
+                if obj is not None:
+                    live.append(obj)
         for attr in ("_spout", "_ndi"):
             obj = getattr(self, attr, None)
             setattr(self, attr, None)
-            if obj is not None:
-                try:
-                    obj.close()
-                except Exception:                                 # noqa: BLE001
-                    pass
+            if obj is None:
+                continue
+            if any(obj is x for x in live):
+                _output_health_write(
+                    "跳过关闭 legacy %s：该对象仍被路由表引用（BUG-A 防线）" % attr)
+                continue
+            try:
+                obj.close()
+            except Exception:                                     # noqa: BLE001
+                pass
 
     def latest_route_thumbs(self):
         """无锁只读：{screen_id: QImage 缩略图}，给上方输出预览工作区。"""
@@ -6911,12 +6907,16 @@ class AutoVJEngine(QObject):
             self._route_state.setdefault(sid, {"spout_fail": 0, "spout_retry": 0.0,
                                                "ndi_fail": 0, "ndi_retry": 0.0,
                                                "log_t": 0.0})
-        # 兼容旧代码：NDI 音频喂给主屏/整合路由
-        main_sid = "__combined__" if str(plan.get("mode") or "multi") == "single" else (
-            (output_model.main_screen(plan) or {}).get("id") or "")
-        st = self._route_senders.get(main_sid)
-        self._ndi = (st or {}).get("ndi")
-        self._spout = (st or {}).get("spout")
+        # ★★ BUG-A 根因（2026-11-10）：这里原来把**主屏路由的发送端对象**
+        #   赋给了 legacy 字段 `self._spout` / `self._ndi`。而 `set_output_config()`
+        #   在多路下每次都会调 `_close_legacy_output()`（改分辨率/改名/选屏/裁切都会触发）
+        #   ⇒ 它把主屏那条 Spout 的 `SpoutOut.close()` 掉了（`_dead=True`、线程退出），
+        #   而 `send()` 仍返回 True、`_route_senders[main]["spout"]` 仍非 None
+        #   ⇒ **永久哑火且零报错**，OBS 里只剩一个 sender。
+        #   修法：多路模式下 legacy 字段**绝不指向路由发送端**，一律为 None
+        #   （`_spout_send()` / `_ndi_send()` 只在 `self._out_cfg is None` 的 legacy 分支被调用）。
+        self._ndi = None
+        self._spout = None
 
     def _close_route_spout(self, sid):
         st = self._route_senders.get(sid) or {}
@@ -6956,6 +6956,8 @@ class AutoVJEngine(QObject):
         if not plan:
             return
         all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+        # 每帧重置"按屏调色跑了几次"（原来在 `_apply_screen_cp()` 里重置，那边已删）
+        self._screen_cp_calls = 0
         for s in plan.get("screens") or []:
             if s.get("type") != "independent":
                 continue
@@ -6968,6 +6970,19 @@ class AutoVJEngine(QObject):
             ids = output_model.effective_layers(plan, s, all_ids)
             layers = self._out_layers_by_ids(ids)
             self._compose_to(cv, layers, snap, allow_gpu=False)
+            # ★ B2（2026-11-10）：每屏自己的 color/postfx —— 从 `_apply_screen_cp()`
+            #   合进来（那个方法只服务单路，删掉后多路也自动获得"每屏画面设置独立"）。
+            #   · 没有 `screen["params"]` 的屏**一次都不多跑**（性能判据不变）
+            #   · `_independent_reuses_main()` 命中的屏已 continue 跳过（同一张画布不能套两套参数）
+            if (s or {}).get("params"):
+                try:
+                    self._cp_cfg = output_model.effective_params(self.cfg, s)
+                    self._apply_color_postfx(snap, canvas=cv)
+                    self._screen_cp_calls += 1
+                except Exception:                              # noqa: BLE001
+                    pass
+                finally:
+                    self._cp_cfg = None
 
     def _independent_reuses_main(self, plan, s, all_ids=None):
         """“跟随主屏 + 图层集合与主屏一致 + 分辨率一致”时直接复用主屏画布。"""
@@ -7138,9 +7153,28 @@ class AutoVJEngine(QObject):
                             self._route_fail(sid, "spout", now, e)
                             sp = None
                     if sp is not None:
+                        # ★ BUG-A（2026-11-10）：发送端被关掉后必须重建，否则**永久哑火**
+                        #   （SpoutOut.close() 只置 _dead，send() 曾经照样返回 True）。
+                        _bad = None
                         try:
-                            sp.send(frame.bits(), frame.width(), frame.height(),
-                                    frame.bytesPerLine())
+                            if hasattr(sp, "is_dead") and sp.is_dead():
+                                _bad = "sender 已关闭（is_dead）"
+                            else:
+                                _e = sp.last_error() if hasattr(sp, "last_error") else None
+                                if _e:
+                                    _bad = _e
+                        except Exception:                          # noqa: BLE001
+                            pass
+                        if _bad:
+                            self._route_fail(sid, "spout", now, _bad)
+                            sp = None
+                    if sp is not None:
+                        try:
+                            ok = sp.send(frame.bits(), frame.width(), frame.height(),
+                                         frame.bytesPerLine())
+                            if not ok:
+                                _e = sp.last_error() if hasattr(sp, "last_error") else None
+                                raise RuntimeError(_e or "SpoutOut.send() 返回 False")
                         except Exception as e:                     # noqa: BLE001
                             self._route_fail(sid, "spout", now, e)
             if want_nd:
@@ -7157,6 +7191,21 @@ class AutoVJEngine(QObject):
                             self._route_fail(sid, "ndi", now, e)
                             nd = None
                     if nd is not None:
+                        # ★ BUG-A：NDI 也接上 last_error/is_dead（有就关掉重建）
+                        try:
+                            _bad = None
+                            if hasattr(nd, "is_dead") and nd.is_dead():
+                                _bad = "sender 已关闭（is_dead）"
+                            else:
+                                _e = nd.last_error() if hasattr(nd, "last_error") else None
+                                if _e:
+                                    _bad = _e
+                            if _bad:
+                                self._route_fail(sid, "ndi", now, _bad)
+                                nd = None
+                        except Exception:                          # noqa: BLE001
+                            pass
+                    if nd is not None:
                         try:
                             if not nd._ensure(frame.width(), frame.height()):
                                 raise RuntimeError("NDI _ensure(%dx%d) 返回 False"
@@ -7167,6 +7216,47 @@ class AutoVJEngine(QObject):
                             nd.send_video(bgra, frame.width(), frame.height())
                         except Exception as e:                     # noqa: BLE001
                             self._route_fail(sid, "ndi", now, e)
+        self._route_heartbeat(now)
+
+    def _route_heartbeat(self, now):
+        """每 10s 往 output_health.log 追加一行路由心跳（BUG-A 取证 / 规则 27）。
+
+        格式（追加式，不破坏既有 regex）：
+          `Spout 路由心跳：routes=2 → EasyRealityAutoVJ=sent:1200/err:- | dj=sent:900/err:-`
+        字段：路由名、累计 sent、last_error 文本（无则 `-`）。
+        """
+        if now - float(getattr(self, "_route_hb_t", 0.0) or 0.0) < 10.0:
+            return
+        self._route_hb_t = now
+        try:
+            segs = []
+            kinds = set()
+            for sid, kind, name, want_sp, want_nd in self._route_specs():
+                st = (self._route_senders.get(sid) or {})
+                for chan, key in (("spout", "spout"), ("ndi", "ndi")):
+                    obj = st.get(key)
+                    if obj is None:
+                        continue
+                    kinds.add(chan.upper())
+                    sent = 0
+                    err = "-"
+                    try:
+                        sent = int((obj.stats() or {}).get("sent", 0) or 0)
+                    except Exception:                              # noqa: BLE001
+                        pass
+                    try:
+                        _e = obj.last_error() if hasattr(obj, "last_error") else None
+                        if _e:
+                            err = str(_e)[:60]
+                    except Exception:                              # noqa: BLE001
+                        pass
+                    segs.append("%s[%s]=sent:%d/err:%s" % (name, chan, sent, err))
+            if segs:
+                _output_health_write("%s 路由心跳：routes=%d → %s"
+                                     % ("/".join(sorted(kinds)) or "ROUTE",
+                                        len(segs), " | ".join(segs)))
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _route_fail(self, sid, chan, now, exc):
         st = self._route_state.setdefault(sid, {})

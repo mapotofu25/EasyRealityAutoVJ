@@ -2212,6 +2212,16 @@ class OutputStudio(QWidget):
         self.apply()
 
     def _place_new_screen(self, s, cfg):
+        # ★ A5（2026-11-10）：新屏**继承主屏的输出开关**（spout / ndi）。
+        #   用户主屏开着 Spout ⇒ 新加的独立屏/复制屏/切分屏自动也输出，
+        #   不再出现"OBS 里只勾到一屏"的困惑。
+        try:
+            main = OM.main_screen(cfg) or {}
+            for _k in ("spout", "ndi"):
+                if _k not in s or s.get(_k) is None:
+                    s[_k] = bool(main.get(_k, False))
+        except Exception:                                          # noqa: BLE001
+            pass
         xs = [OM._normalize_preview_rect(x.get("preview_rect")) for x in cfg["screens"][:-1]]
         xs = [r for r in xs if r]
         px = (max([r[0] + r[2] for r in xs]) + 28) if xs else 30
