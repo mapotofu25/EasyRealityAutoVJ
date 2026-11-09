@@ -1114,23 +1114,13 @@ class OutputPanel(QWidget):
         源名 `EasyRealityAutoVJ` ⇒ 接收端 `6N4CZTM151UPP8Y (EasyRealityAutoVJ)`）。
         机器名取不到就只显示源名，绝不显示成 `(名)` 这种残缺串。
 
-        ⚠ 源名现在是**写死的常量**（用户 2026-10-30：「不要输入框 把名字写死」），
-          所以这里不再读输入框；名字以后要改就改 `config.DEFAULT_NDI_NAME`。
-
-        ⚠⚠ 配套删除：`MainWindow.set_spout_name` / `MainWindow.set_ndi_name` 已**故意删除**
-          （输入框没了，已无任何调用方）。`tools/_scan_removed_defs.py` 会报
-          「ui_main.py 丢失 2 个定义」—— 那是预期的，不是批量替换误删。
+        ★★ V6（2026-11-09，用户第 8 条真根因）：源名**不再**是写死常量 ——
+          多路下每块屏各有自己的发送端名，单路用主屏的名字。这里转调
+          `refresh_output_names()`（与 `lbl_spout_name` 同一份数据 ⇒ 两个标签不会打架）。
+          以前这里固定 `DEFAULT_NDI_NAME`，会在启动/换语言时把按屏刷好的名字**又改回常量**。
         """
         try:
-            nm = DEFAULT_NDI_NAME
-            comp = str(os.environ.get("COMPUTERNAME") or "").strip()
-            full = ("%s (%s)" % (comp, nm)) if comp else nm
-            try:
-                self.lbl_ndi_name.setText(full)      # 完整接收名（OBS 里就是它）
-            except Exception:                                    # noqa: BLE001
-                pass
-            # 名字长度变了 ⇒ 并排/另起一行要重新判一次（换了电脑机器名长度会变）
-            self._flow_ndi()
+            self.refresh_output_names(getattr(self, "_screen", None))
         except Exception:                                        # noqa: BLE001
             pass
 
@@ -4424,11 +4414,15 @@ class MainWindow(QMainWindow):
             f.addWidget(QLabel(T(lab)), 2 + i // 2, (i % 2) * 2)
             f.addWidget(sp, 2 + i // 2, (i % 2) * 2 + 1)
         # ★ U3（用户第 3 条）：真·裁切入口 —— 打开独立窗口拖框，自动写回 UV + 分辨率
+        # ★ 第六批 #7：入口从"底部一大条"挪到**屏幕设置区右上角**（小按钮，右对齐）
         self.btn_crop = QPushButton(T("裁切…"))
         self.btn_crop.setToolTip(T("打开裁切窗口：在源屏画面上拖框选区域，"
                                   "自动换算 UV 与分辨率（双向同步）"))
         self.btn_crop.clicked.connect(self._open_crop_dialog)
-        f.addWidget(self.btn_crop, 4, 0, 1, 4)
+        self.btn_crop.setMaximumWidth(86)
+        self.btn_crop.setStyleSheet("QPushButton{padding:1px 6px;}")
+        f.addWidget(self.btn_crop, 0, 2, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
+        f.setColumnStretch(2, 1)
         self.lbl_ss_hint = QLabel(T("切分屏幕取源屏的一块：点「裁切…」拖框，或直接改 UV。"))
         self.lbl_ss_hint.setWordWrap(True)
         self.lbl_ss_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
