@@ -3400,6 +3400,7 @@ class MainWindow(QMainWindow):
         #   原来这里有一个「码表（演出端）…」弹窗项，已删除 —— 不要再加回来。
         self.btn_more.setMenu(self._more_menu)
         tb.addWidget(self.btn_more)
+        self._stage_toolbar = tb            # #11：单屏时三开关要挂在它末尾
         self._sync_more_menu()
         mv.addLayout(tb)
 
@@ -3487,6 +3488,12 @@ class MainWindow(QMainWindow):
         self._stage_main_split = main_split
         self._build_pages(main_split)
         mv.addWidget(self.pages, 1)
+        # ★ #11：单屏启动即把三开关收进容器并挂到工具栏末尾
+        try:
+            self._build_preview_toggles()
+            self._place_preview_toggles(False)
+        except Exception:                                          # noqa: BLE001
+            pass
 
         # ---- 状态栏 ----
         sb = QStatusBar()
@@ -4855,10 +4862,10 @@ class MainWindow(QMainWindow):
                     # 会被顶到最左边（实测 x=380 vs 按钮右边缘 1131），所以直接 append。
                     lay.addWidget(box)
             else:
-                pv = getattr(self, "preview_panel", None)
-                lay = pv.layout().itemAt(0).layout() if pv is not None else None
-                if lay is not None:
-                    lay.addWidget(box)
+                # 单屏：挂到**演出台顶部工具栏末尾**（不新增按钮、不改既有顺序）
+                tb = getattr(self, "_stage_toolbar", None)
+                if tb is not None:
+                    tb.addWidget(box)
         except Exception:                                      # noqa: BLE001
             pass
 
