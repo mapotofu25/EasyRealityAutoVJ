@@ -340,6 +340,9 @@ def sync_legacy_output(data):
 
 
 def active_config(data):
+    data = getattr(data, "data", data)     # 兼容 Config 对象（同 effective_params）
+    if not isinstance(data, dict):
+        data = {}
     out = (data or {}).get("output") or {}
     configs = out.get("configs") or []
     if not configs:
@@ -469,6 +472,15 @@ _MISSING = object()
 
 
 def effective_params(data, screen):
+    # ★★★ 2026-11-10（一级问题）：`data` 要的是**根配置 dict**，但引擎/UI 有多处传的是
+    #   `Config` 对象 —— 它只有 `__getitem__`、**没有 `.get`** ⇒ 这里一 `.get` 就抛
+    #   AttributeError，而 6 处调用都在 try/except 里 ⇒ **静默回落全局**（波1/波2 全假生效），
+    #   更糟的是 `_compose_independent()` 里那句抛异常会把 `_compose_to()` 整段跳过 ⇒ **该屏黑屏**。
+    #   一处兼容，全修：Config 有 `.data` 就取出来。
+    data = getattr(data, "data", data)
+    if not isinstance(data, dict):
+        data = {}
+
     """某块屏实际生效的参数：**全局为底 + 该屏 override**（没有 override 就全继承全局）。
 
     ⚠ `data` 是**根配置**（`cfg.data`，里面才有 color/postfx/auto 三段），
@@ -568,6 +580,9 @@ def set_screen_param(screen, sec, key, val, data=None):
     """
     if not isinstance(screen, dict) or sec not in PARAM_SECTIONS:
         return False
+    data = getattr(data, "data", data)     # 兼容 Config 对象（同 effective_params）
+    if not isinstance(data, dict):
+        data = {}
     glob = ((data or {}).get(sec) or {}).get(key, _MISSING)
     params = screen.get("params")
     if not isinstance(params, dict):
@@ -780,6 +795,9 @@ def screen_uv(cfg, screen):
 
 
 def screen_output_names(cfg):
+    cfg = getattr(cfg, "data", cfg)
+    if not isinstance(cfg, dict):
+        cfg = {}
     """给每个 screen 分配唯一发送端名，返回 {screen_id: name}。
 
     ★ T4 #9（用户第 9 条）：多路下**每屏一个输出，名字 = 这块屏的名字**，

@@ -2523,8 +2523,9 @@ class AutoVJEngine(QObject):
                 _main = output_model.main_screen(self._out_cfg)
                 if _main and _main.get("params"):
                     self._cp_cfg = output_model.effective_params(self.cfg, _main)
-        except Exception:                                          # noqa: BLE001
+        except Exception as _e:                                    # noqa: BLE001
             self._cp_cfg = None
+            _output_health_write("读主屏参数失败（回落全局）：%s" % _e)
         self._compose(snap)
         # 颜色渲染 + 后处理特效链（合成后、输出前）。
         # ★ 2026-10-28（性能）：合并成一个入口，**整帧只读回/写回一次**。
@@ -3283,6 +3284,7 @@ class AutoVJEngine(QObject):
             f = E + TR * 0.15 + (-0.1, 0.0, 0.1)[max(0, min(2, sens))]
             f = max(0.0, min(1.0, f))
             trans_ms = int(meta["trans_ms"] * (1.3 - f * 0.3))
+            _n_sw = 0
             for lay in self._layers_of_screen(sc):
                 if lay.fixed >= 0 or not lay.clips:
                     continue
@@ -3290,6 +3292,26 @@ class AutoVJEngine(QObject):
                     continue
                 lay.trans_ms = trans_ms
                 self._switch_layer_random(lay, snap)
+                _n_sw += 1
+            # ★ 2026-11-10：override 通道**必须落日志**，否则"两屏节奏不同"无法取证
+            #   （QA 量到 B 屏 0 次切换，其实只是没写日志）。格式与全局那条一致，只在**行尾追加**字段
+            #   （规则 27：不破坏既有 regex）。节流按屏各自计时，避免一屏把另一屏的日志吃掉。
+            try:
+                st.setdefault("log_t", 0.0)
+                _now2 = time.perf_counter()
+                if _n_sw and (_now2 - float(st.get("log_t", 0.0) or 0.0) >= 10.0):
+                    st["log_t"] = _now2
+                    _w2 = float(self._align_width(snap))
+                    _res2 = (pos - float(self._bar_off(snap))) % _w2
+                    if _res2 > _w2 / 2.0:
+                        _res2 -= _w2
+                    _output_health_write(
+                        "拍位切换[屏] 栅格=%d拍 残差=%+.2f拍 模式=%s sid=%s 屏=%s 间隔=%.0f拍"
+                        % (int(round(_w2)), _res2, mode,
+                           snap.get("recognized_song_id", -1),
+                           str(sc.get("name") or sid), float(interval)))
+            except Exception:                                      # noqa: BLE001
+                pass
 
     def _current_interval(self, snap, screen=None):
         """当前生效的切换间隔（拍）；None 表示不自动切换。
@@ -7157,22 +7179,26 @@ class AutoVJEngine(QObject):
             layers = self._out_layers_by_ids(ids)
             _has_ov = bool((s or {}).get("params"))
             # ★ BUG-D 波1：**合成前**就把该屏参数挂上 —— `_compose_to()` 里的
-            #   "振幅强度(intensity)" 要读本屏的 auto 段（以前读全局 ⇒ 一屏改了全屏都变）。
-            #   只影响"读参数"，不额外套色。
+            #   "振幅强度(intensity)" 要读本屏的 auto 段。
+            # ★★ 2026-11-10（一级问题，规则 0）：**读参数失败绝不能跳过合成**。
+            #   以前这两句在同一个 try 里 ⇒ `effective_params` 抛异常时 `_compose_to()` 被跳过
+            #   ⇒ 带 params 的独立屏**整块黑屏**（用户"一改画面设置这屏就黑了"）。
+            #   现在：取参数单独 try，合成**无条件执行**。
             try:
                 self._cp_cfg = (output_model.effective_params(self.cfg, s)
                                 if _has_ov else None)
-                self._compose_to(cv, layers, snap, allow_gpu=False)
-            finally:
-                pass
+            except Exception as _e:                            # noqa: BLE001
+                self._cp_cfg = None
+                _output_health_write("读屏参数失败（已回落全局，合成继续）：%s" % _e)
+            self._compose_to(cv, layers, snap, allow_gpu=False)
             # ★ B2：每屏自己的 color/postfx（参数已挂好，这里只做一次调色/后期）
             if _has_ov:
                 try:
                     self._cp_cfg = output_model.effective_params(self.cfg, s)
                     self._apply_color_postfx(snap, canvas=cv)
                     self._screen_cp_calls += 1
-                except Exception:                              # noqa: BLE001
-                    pass
+                except Exception as _e:                        # noqa: BLE001
+                    _output_health_write("屏调色失败（跳过本屏调色）：%s" % _e)
             self._cp_cfg = None
 
     def _independent_reuses_main(self, plan, s, all_ids=None):
