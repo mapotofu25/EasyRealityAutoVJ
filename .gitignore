@@ -270,6 +270,10 @@ ERAVJ工具包*.zip
 #    （原规则 `tools/_*.py` 带斜杠 ⇒ 只锚定仓库根，嵌套那份一直漏网）。
 # ============================================================
 **/tools/_*.py
+# ★ 例外：UI 冒烟脚本是**常驻验收门**（不是一次性探针）——
+#   每次改完 UI 都要跑它，否则 `py_compile` 抓不到的导入/构造错误会漏到用户手上
+#   （2026-11-09 就漏过一次 QDoubleSpinBox 未导入导致 MainWindow 起不来）。
+!**/tools/_smoke_mainwindow.py
 **/tools/_*.png
 **/tools/_*.jpg
 **/tools/_*.json

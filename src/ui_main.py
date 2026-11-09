@@ -3652,12 +3652,13 @@ class MainWindow(QMainWindow):
         """选中屏幕变了：右侧设置换作用域 + 下方图层块重排（用户第 8/10/11 条）。"""
         try:
             self._rebuild_multi_blocks()
-        except Exception:                                         # noqa: BLE001
-            pass
+        except Exception as e:                                    # noqa: BLE001
+            # ★ 这里以前是裸 pass：块区自动分配挂掉时完全静默（P0 BUG-1 就是这么漏的）
+            self._log_ui_error("_on_studio_selection._rebuild_multi_blocks", e)
         try:
             self._sync_multi_right(sid)
-        except Exception:                                         # noqa: BLE001
-            pass
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_on_studio_selection._sync_multi_right", e)
 
     # ---------- 用户第 10 条：每屏一块图层配置块 ----------
     def _panel_for_screen(self, s, cfg):
@@ -3914,22 +3915,31 @@ class MainWindow(QMainWindow):
         right_lst = [b[1] for b in self._multi_blocks
                      if getattr(b[1], "_multi_col", "right") == "right"]
         gap_total = extra + 4
-        hh = [max(1, int(b[1].height())) for b in self._multi_blocks]
         need = max(_col_need(left_lst), _col_need(right_lst)) + gap_total
         # 预览至少留 35% 页面高（team-lead 验收口径）
         budget = avail - int(page_h * 0.35)
         cap_hard = int(avail * 0.62)
         if need > budget:
-            # 块数少时轻微压缩块高（189/188 这种，视觉无差），换取"全部可见"
-            per = (budget - gap_total) // max(1, n)
-            if 170 <= per < max(hh):
-                for (_sid, blk, _b), h0 in zip(self._multi_blocks, hh):
-                    try:
-                        blk.setFixedHeight(int(min(h0, per)))
-                    except Exception:                             # noqa: BLE001
-                        pass
-                hh = [max(1, int(b[1].height())) for b in self._multi_blocks]
-                need = sum(hh) + gap_total
+            # ★ P0 BUG-1 修复（原代码是单列时代的：`per = ...// max(1, n)` 里 n 从未定义，
+            #   且 `need = sum(hh)` 是单列求和口径）。改成**两列各自压缩**：
+            #   每列的可用高 = budget − 边框/边距 − 列内间距，按列内块数均分。
+            def _compress(lst):
+                cnt = len(lst)
+                if not cnt:
+                    return
+                per = (budget - gap_total - gap * (cnt - 1)) // cnt
+                if per < 170:                 # 压太狠就不压，交给纵向滚动
+                    return
+                for b in lst:
+                    h0 = max(1, int(b.height()))
+                    if h0 > per:
+                        try:
+                            b.setFixedHeight(int(per))
+                        except Exception:                     # noqa: BLE001
+                            pass
+            _compress(left_lst)
+            _compress(right_lst)
+            need = max(_col_need(left_lst), _col_need(right_lst)) + gap_total
         area = need if need <= budget else cap_hard
         # 块区最小高：1 块时就是它自己的自然高度（不硬撑 220），多块才用 220 兜底
         try:
@@ -4119,8 +4129,8 @@ class MainWindow(QMainWindow):
         # 多屏专属的屏幕参数面板重新打开（它是 OutputStudio 内部的）
         try:
             self.output_studio.settings.show()
-        except Exception:                                         # noqa: BLE001
-            pass
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_restore_stage_panels.settings.show", e)
 
     def _detach_library_from_float(self):
         """把素材库面板从浮动窗口的布局里摘掉（不销毁、不隐藏）。"""
@@ -4153,8 +4163,8 @@ class MainWindow(QMainWindow):
         try:
             self.layers_panel.setParent(None)
             self._rebuild_multi_blocks(force=True)
-        except Exception:                                         # noqa: BLE001
-            pass
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_move_panels_to_multi", e)
         # ★ 用户第 8 条：右侧改成"和单屏一样的设置分组" ⇒ 把单屏那列搬过来，
         #   同时藏掉多屏自己的屏幕参数表（名称/类型/源屏幕/分辨率/边框颜色/使用的图层）。
         try:
@@ -8776,6 +8786,30 @@ class MainWindow(QMainWindow):
         try:
             self.settings.sync_kv_section()
         except Exception:
+            pass
+
+    @staticmethod
+    def _log_ui_error(where, exc=None):
+        """把 UI 层被**吞掉**的异常写一行到 `ui_stall.log`（带函数名 + 堆栈）。
+
+        ★ P0 BUG-1 的教训：`_auto_size_blocks_split` 里一个 `NameError` 被外层
+        `except: pass` 吞了整整一轮，"块区高度不再自动分配"这种症状完全静默。
+        从此这几个调用点至少留一条日志，别再无声无息。
+        """
+        try:
+            import traceback
+            base = None
+            try:
+                base = config.app_base_dir()
+            except Exception:                                     # noqa: BLE001
+                base = tempfile.gettempdir()
+            path = os.path.join(str(base), "ui_stall.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("[%s] %s: %r\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                           where, exc))
+                if exc is not None:
+                    f.write(traceback.format_exc() + "\n")
+        except Exception:                                         # noqa: BLE001
             pass
 
     def _sync_multi_controls(self):
