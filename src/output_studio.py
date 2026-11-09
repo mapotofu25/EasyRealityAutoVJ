@@ -1771,23 +1771,11 @@ class OutputStudio(QWidget):
             for s in cfg.get("screens") or []:
                 if s.get("type") == "independent" and s.get("follow_main") and cfg.get("mode") == "multi":
                     s["width"], s["height"] = OM.effective_size(cfg, main)
-        # 单路模式：布局超出整合画布时自动扩大（绝不裁掉屏幕）
-        if cfg.get("mode") == "single":
-            bw = bh = 0
-            for s in OM.layout_sources(cfg):
-                x, y, w, h = OM.screen_rect(cfg, s)
-                bw, bh = max(bw, x + w), max(bh, y + h)
-            try:
-                cw, ch = cfg.get("combined_size") or [0, 0]
-                if bw > int(cw) or bh > int(ch):
-                    # ★ BUG-1（QA 抓到）：这里原来把**两个轴都**替换成包围盒
-                    #   ⇒ 用户刚输入的另一轴被抹掉（2345×1234 变 2560×720、4000×600 变
-                    #   2560×720）。语义应该是"布局超出时把画布扩到**至少**装得下包围盒"，
-                    #   所以**逐轴取 max**：溢出的轴被撑大，没溢出的轴保持用户的值。
-                    cfg["combined_size"] = [max(16, int(cw), int(bw)),
-                                            max(16, int(ch), int(bh))]
-            except (TypeError, ValueError):
-                cfg["combined_size"] = [max(16, bw), max(16, bh)]
+        # ★ 2026-11-09（用户：「这个输出的分辨率要求可以自定义，**随便设置多少**，
+        #   只要不超过 2 的 14 次方」）：这里**不再自动改** `combined_size`。
+        #   以前"布局超出就自动扩大"会让用户输 1920×1080 后变成 2560×1080，
+        #   用户会当成"这个框存不住数"。现在画布尺寸**只由用户输入 / 拖动 /
+        #   显式点「适应窗口」**改变；超出只做**提示**（见 OutputCanvasWindow._update_warn）。
         OM.sync_legacy_output(self.cfg.data)
         try:
             self.cfg.save()
@@ -2534,6 +2522,11 @@ class _CanvasBoard(QWidget):
             p.setPen(_text_color(col))
             p.drawText(r, Qt.AlignCenter, "%s\n%d × %d\nUV %.4f,%.4f → %.4f,%.4f"
                        % (s.get("name") or "", pw, ph, uv[0], uv[1], uv[2], uv[3]))
+            # ★ 超界的屏描红框（只提示，不改数据）：右/下边超出画布就是会被裁掉的那块
+            if x + w > cw or y + h > ch:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(QColor("#ff3b30"), 3))
+                p.drawRect(r)
             p.setFont(QFont("Segoe UI", 8))
             p.setPen(QColor(255, 255, 255, 200))
             p.drawText(r.adjusted(4, 2, -4, -2), Qt.AlignLeft | Qt.AlignTop,
@@ -2587,6 +2580,14 @@ class OutputCanvasWindow(QDialog):
         self.btn_export.clicked.connect(self._export)
         bar.addWidget(self.btn_export)
         lay.addLayout(bar)
+        # ★ 超界提示（只提示，不改数据）：画布小于布局包围盒时显示一行黄字
+        self.warn = QLabel("")
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet(
+            "color:#ffb300;font-size:12px;padding:2px 4px;"
+            "border:1px solid #6b4e00;border-radius:4px;")
+        self.warn.hide()
+        lay.addWidget(self.warn)
         self.board = _CanvasBoard(studio)
         self.board.moved.connect(self._on_moved)
         lay.addWidget(self.board, 1)
@@ -2606,10 +2607,60 @@ class OutputCanvasWindow(QDialog):
                 sp.blockSignals(True)
                 sp.setValue(int(max(16, min(self.MAX_SIDE, v))))
                 sp.blockSignals(False)
+        self._update_warn()
         self.board.fit()
 
     def _fit(self):
+        """★「适应窗口」= **显式**把画布改成"刚好装下当前布局"（包围盒），再自适应视图。
+
+        这是画布窗口里**唯一**会改 `combined_size` 的动作（用户主动点的）；
+        输入框改尺寸时系统绝不偷偷改（见 `apply()` 里那段说明）。
+        """
+        cfg = self.studio.active_config()
+        if cfg:
+            bw = bh = 0
+            for s in OM.layout_sources(cfg):
+                x, y, w, h = OM.screen_rect(cfg, s)
+                bw, bh = max(bw, x + w), max(bh, y + h)
+            if bw > 0 and bh > 0:
+                cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(bw))),
+                                        max(16, min(self.MAX_SIDE, int(bh)))]
+                self.studio.apply()
+                for sp, v in ((self.sp_w, bw), (self.sp_h, bh)):
+                    sp.blockSignals(True)
+                    sp.setValue(int(max(16, min(self.MAX_SIDE, v))))
+                    sp.blockSignals(False)
+                self.board.set_config(cfg)
+        self._update_warn()
         self.board.fit()
+
+    def _update_warn(self):
+        """画布 < 布局包围盒 ⇒ 显示一行黄字（**只提示，不改数据**）。"""
+        try:
+            cfg = self.studio.active_config()
+            if not cfg:
+                self.warn.hide()
+                return
+            cw, ch = OM.combined_size(cfg)
+            bw = bh = 0
+            for s in OM.layout_sources(cfg):
+                x, y, w, h = OM.screen_rect(cfg, s)
+                bw, bh = max(bw, x + w), max(bh, y + h)
+            if bw > int(cw) or bh > int(ch):
+                over = []
+                if bw > int(cw):
+                    over.append("宽 %d→%d" % (int(cw), int(bw)))
+                if bh > int(ch):
+                    over.append("高 %d→%d" % (int(ch), int(bh)))
+                self.warn.setText(
+                    "⚠ 画布 %d×%d 小于布局 %d×%d（%s），超出部分输出时会被裁掉。"
+                    "不想裁就点「适应窗口」把画布扩到刚好装下。"
+                    % (int(cw), int(ch), int(bw), int(bh), "、".join(over)))
+                self.warn.show()
+            else:
+                self.warn.hide()
+        except Exception:                                          # noqa: BLE001
+            self.warn.hide()
 
     def _on_size(self, *_):
         cfg = self.studio.active_config()
@@ -2617,9 +2668,10 @@ class OutputCanvasWindow(QDialog):
             return
         cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(self.sp_w.value()))),
                                 max(16, min(self.MAX_SIDE, int(self.sp_h.value())))]
-        self.studio.apply()          # apply 里会把超出的布局自动撑大，绝裁屏
+        self.studio.apply()          # ⚠ apply 现在**不会**再改 combined_size
         self.board.set_config(cfg)
         self.board.fit()
+        self._update_warn()          # 超界只提示，不改数据
 
     def _auto(self):
         cfg = self.studio.active_config()
@@ -2629,6 +2681,7 @@ class OutputCanvasWindow(QDialog):
         self.studio.apply()
         self.board.set_config(cfg)
         self.board.fit()
+        self._update_warn()          # 布局变了 ⇒ 超界提示跟着变
 
     def _on_moved(self):
         self.studio.apply()
