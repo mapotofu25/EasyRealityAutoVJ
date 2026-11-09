@@ -1700,7 +1700,7 @@ class AutoVJEngine(QObject):
         try:
             s = self._layer_screen(lay) if lay is not None else None
             if s is not None and (s.get("params") or {}).get("auto"):
-                return output_model.effective_params(self.cfg.data, s)["auto"]
+                return output_model.effective_params(self.cfg, s)["auto"]
         except Exception:                                          # noqa: BLE001
             pass
         return self.cfg["auto"]
@@ -2522,7 +2522,7 @@ class AutoVJEngine(QObject):
             if self._out_cfg:
                 _main = output_model.main_screen(self._out_cfg)
                 if _main and _main.get("params"):
-                    self._cp_cfg = output_model.effective_params(self.cfg.data, _main)
+                    self._cp_cfg = output_model.effective_params(self.cfg, _main)
         except Exception as _e:                                    # noqa: BLE001
             self._cp_cfg = None
             self._section_log("主屏参数读取失败（回落全局）：%s" % _e)
@@ -3185,7 +3185,7 @@ class AutoVJEngine(QObject):
         try:
             if not (screen.get("params") or {}).get("mode"):
                 return self.mode
-            md = output_model.effective_params(self.cfg.data, screen).get("mode") or {}
+            md = output_model.effective_params(self.cfg, screen).get("mode") or {}
             if bool(md.get("auto", True)):
                 return self.mode                    # 自动：仍用引擎实时判定的模式
             man = str(md.get("manual") or "")
@@ -3209,7 +3209,7 @@ class AutoVJEngine(QObject):
     def _screen_sensitivity(self, screen=None):
         try:
             if screen and (screen.get("params") or {}).get("mode"):
-                md = output_model.effective_params(self.cfg.data, screen).get("mode") or {}
+                md = output_model.effective_params(self.cfg, screen).get("mode") or {}
                 return int(md.get("sensitivity", 1))
         except Exception:                                          # noqa: BLE001
             pass
@@ -6393,21 +6393,14 @@ class AutoVJEngine(QObject):
             不会出现"颜色生效了但没上屏"的诡异半帧。
         """
         bgr = None
-        # ★★★ 2026-11-10（一级 bug，QA 实测到「独立屏偶尔显示主屏画面」）：
-        #   `_apply_color()` 里 `if bgr is None: bgr = _np_view_bgr(self.canvas)` ——
-        #   它读的是**主画布**。给独立屏调色时如果不管，就会「读主屏像素、写独立屏画布」
-        #   ⇒ 那块独立屏被主屏画面整块覆盖（症状：内容在"自己的画面"和"主屏画面"之间跳）。
-        #   ⇒ 非主画布必须**先把它自己的像素读回来**，后面两段就会接着这份 bgr 处理。
-        #   （主画布路径不变：`bgr` 仍是 None，由 `_apply_color` 自己读，零额外搬运。）
+        # ★★★ 2026-11-10（一级 bug，QA 实测到「独立屏内容跳成主屏画面」）：
+        #   `_apply_color()` 原来固定从 `self.canvas` 读回像素 ⇒ 给独立屏调色时变成
+        #   「读主屏像素、写独立屏画布」⇒ 那块独立屏被主屏画面整块覆盖。
+        #   现在把目标画布传进去（`canvas=tgt`），它读/写的都是**同一块**画布；
+        #   主画布（默认）行为与改动前逐字一致，且"没效果就不读回"的性能特性保留。
         tgt = canvas if canvas is not None else self.canvas
-        if tgt is not self.canvas:
-            try:
-                from postprocess import _np_view_bgr
-                bgr = _np_view_bgr(tgt)
-            except Exception:                                  # noqa: BLE001
-                bgr = None
         try:
-            bgr = self._apply_color(snap, bgr=bgr, write=False)
+            bgr = self._apply_color(snap, bgr=bgr, write=False, canvas=tgt)
         except Exception:
             pass
         try:
@@ -6470,12 +6463,17 @@ class AutoVJEngine(QObject):
             return True
         return False
 
-    def _apply_color(self, snap, bgr=None, write=True):
+    def _apply_color(self, snap, bgr=None, write=True, canvas=None):
         """颜色渲染器（一键调色）：合成后、后处理前跑一次。
 
         **铁律**：Kv 待机层激活时绝不染色（`kv_on>0.01` 时强度直接硬归零，连渐变都不走），
         旁路开启时也立即归零（Bypass 要"响应迅速、无延迟"）。
         频闪素材自动休眠：避免「画面在闪 + 颜色在变」叠加成视觉灾难。
+
+        ★★★ 2026-11-10（一级 bug）：`canvas` 参数**必须**传非主画布时，否则下面读回
+          会固定读 `self.canvas` ⇒ 给独立屏调色时变成「读主屏像素、写独立屏画布」，
+          那块独立屏会被主屏画面整块覆盖（QA 实测到的"内容在绿和红之间跳"）。
+          传 None（默认）时行为与改动前逐字一致（读 `self.canvas`）。
         """
         # ★ 码表接管期间跳整条调色链（与 Kv 同口径：码表里是 DJ 做好的成片，不能再染色）
         if self._cuesheet_on():
@@ -6497,16 +6495,17 @@ class AutoVJEngine(QObject):
         s = cfx.tick(cfg, snap, kv_on=kv_on, flicker=flick,
                      bypass=bool(cfg.get("bypass", False)), rotate_hint=_rot)
         if s > 0.004:
+            _tgt = canvas if canvas is not None else self.canvas
             try:
                 if bgr is None:
                     from postprocess import _np_view_bgr
-                    bgr = _np_view_bgr(self.canvas)
+                    bgr = _np_view_bgr(_tgt)
                 out = cfx.apply_to_bgr(bgr, cfg.get("mode", "lut"))
                 if out is not None:
                     bgr = out
                     if write:
                         from postprocess import write_back_bgr
-                        write_back_bgr(self.canvas, bgr)
+                        write_back_bgr(_tgt, bgr)
             except Exception:
                 pass   # 调色失败不影响出画面
         return bgr
@@ -7198,7 +7197,7 @@ class AutoVJEngine(QObject):
             #   ⇒ 带 params 的独立屏**整块黑屏**（用户"一改画面设置这屏就黑了"）。
             #   现在：取参数单独 try，合成**无条件执行**。
             try:
-                self._cp_cfg = (output_model.effective_params(self.cfg.data, s)
+                self._cp_cfg = (output_model.effective_params(self.cfg, s)
                                 if _has_ov else None)
             except Exception as _e:                            # noqa: BLE001
                 self._cp_cfg = None
@@ -7207,7 +7206,7 @@ class AutoVJEngine(QObject):
             # ★ B2：每屏自己的 color/postfx（参数已挂好，这里只做一次调色/后期）
             if _has_ov:
                 try:
-                    self._cp_cfg = output_model.effective_params(self.cfg.data, s)
+                    self._cp_cfg = output_model.effective_params(self.cfg, s)
                     self._apply_color_postfx(snap, canvas=cv)
                     self._screen_cp_calls += 1
                 except Exception as _e:                        # noqa: BLE001
