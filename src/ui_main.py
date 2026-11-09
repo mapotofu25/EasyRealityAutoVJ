@@ -3848,11 +3848,16 @@ class MainWindow(QMainWindow):
             #   所以下面 `else:` 里那句占位提示**永远走不到** ⇒ 新建独立屏是一块纯空框，
             #   只有标题、一个字都不解释。这里在图层栈**上方**加一条灰字提示，
             #   由 `_refresh_block_styles()` 按 rows 数决定显隐。
-            _hint = QLabel(T("该屏还没有图层 —— 点「⋯ → 使用的图层」勾选要显示的图层"))
+            _hint = QLabel(T("该屏还没有图层 —— 点「+ 新建图层」建一个"))
             _hint.setWordWrap(True)
             _hint.setStyleSheet("color:#8a8a8a;font-size:11px;padding:2px 4px;")
             _hint.setVisible(len(getattr(panel, "rows", []) or []) == 0)
             blk._empty_hint = _hint
+            # 这块栈属于哪块屏（「+ 图层」据此把新层只挂到这一屏）
+            try:
+                panel.screen_id = sid
+            except Exception:                                     # noqa: BLE001
+                pass
             body.addWidget(_hint)
             body.addWidget(panel, 1)
         else:
@@ -4052,6 +4057,14 @@ class MainWindow(QMainWindow):
                     w.setParent(None)
                     w.deleteLater()
         all_ids = [l.lid for l in self.engine.layers]
+        # ★ 主屏一次性绑定：老配置里主屏没有 `layers` ⇒ 把"当时全部图层"固化下来
+        #   （否则在独立屏新建的层会同时冒到主屏 —— 正是用户否掉的行为）
+        try:
+            import output_model as _om_b
+            if _om_b.bind_main_layers(cfg, all_ids):
+                self.cfg.save()
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_rebuild_multi_blocks.bind_main_layers", e)
         for s in screens:
             panel = self._panel_for_screen(s, cfg)
             blk, body = self._make_screen_block(s, cfg, all_ids, panel)
@@ -8706,7 +8719,13 @@ class MainWindow(QMainWindow):
             n += 1
         return Tf("图层 {}", n)
 
-    def layer_add(self):
+    def layer_add(self, target_sid=None):
+        """新建图层。`target_sid` = 在哪块屏里点的「+ 图层」（None=单屏演出台）。
+
+        ★ 2026-11-09（用户：「每一个图层、每一个屏幕的图层自己建」）：
+          新层**只归属目标屏**（写进该屏的 `layers`），其它屏不挂；
+          `target_sid=None`（单屏演出台）⇒ 归**主屏**，否则切到多屏就看不见它。
+        """
         default = self._next_layer_name()
         dlg = NewLayerDialog(self, default)
         if dlg.exec() != QDialog.Accepted:
@@ -8763,6 +8782,25 @@ class MainWindow(QMainWindow):
             self.engine._kv_last_t = time.perf_counter()
         # ★ KV 永远强制置顶（新建/复制/上移/删除/读档都会走这里兜底）
         self._enforce_kv_top()
+        # ★ 归属到目标屏（新建的层只属于这块屏；不再"引擎里有就等于所有屏都有"）
+        try:
+            import output_model as _om
+            _cfg = _om.active_config(self.cfg.data)
+            _tgt = _om.screen_by_id(_cfg, target_sid) if target_sid else None
+            if _tgt is None:
+                _tgt = _om.main_screen(_cfg)
+            if _tgt is not None:
+                _lst = _tgt.get("layers")
+                if _lst is None:                 # 老配置还没绑定 ⇒ 以"当前全部"为底再追加
+                    _lst = [l.lid for l in self.engine.layers]
+                _lst = [x for x in _lst if x != lay.lid]
+                _lst.append(lay.lid)
+                _tgt["layers"] = _lst
+                _tgt["layers_bound"] = True
+                self.cfg.save()
+                self._refresh_blocks_after_binding()   # 块要按新归属重算过滤集
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("layer_add.bind_screen", e)
         if auto:
             # 立即匹配一次（绕过 3s 间隔），让新建自动图层马上有画面
             self.engine._refresh_auto_layers(self.audio.state.snapshot(), force=True)
@@ -8801,11 +8839,45 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.warning(self, T(T("码表")), msg)
 
+    def _refresh_blocks_after_binding(self):
+        """图层的**屏幕归属**变了 ⇒ 各块的过滤集必须重算，否则新层/删掉的层不反映到块里。
+
+        ⚠ 必须推迟到事件循环下一轮：调用点常常是块里「+ 图层」按钮的 clicked 回调，
+          直接重建会把这个按钮（连同它的面板）在信号处理栈上销毁。
+        """
+        from PySide6.QtCore import QTimer as _QT
+        _QT.singleShot(0, self._refresh_blocks_after_binding_now)
+
+    def _refresh_blocks_after_binding_now(self):
+        try:
+            _multi = bool(getattr(self, "_multi_page", None) is not None
+                          and self.perf_stack.currentWidget() is self._multi_page)
+            if _multi:
+                self._rebuild_multi_blocks(force=True)
+            else:
+                self.refresh_all_layer_blocks()
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_refresh_blocks_after_binding_now", e)
+
+    def _unbind_layer_everywhere(self, lid):
+        """删除图层后，把它从**所有屏**的 `layers` 里摘掉（别留悬空 id）。"""
+        if lid is None:
+            return
+        try:
+            import output_model as _om
+            n = _om.unbind_layer(lid, data=self.cfg.data)
+            if n:
+                self.cfg.save()
+                self._refresh_blocks_after_binding()
+        except Exception as e:                                    # noqa: BLE001
+            self._log_ui_error("_unbind_layer_everywhere", e)
+
     def layer_del(self):
         if len(self.engine.layers) <= 1 or not (0 <= self._cur_layer < len(self.engine.layers)):
             return
         lay = self.engine.layers.pop(self._cur_layer)
         lay.close_all()
+        self._unbind_layer_everywhere(getattr(lay, "lid", None))
         self._cur_layer = 0
         self._enforce_kv_top()
         self._sync_layers()
@@ -8827,6 +8899,7 @@ class MainWindow(QMainWindow):
         while len(self.engine.layers) > 1:
             lay = self.engine.layers.pop()
             lay.close_all()
+            self._unbind_layer_everywhere(getattr(lay, "lid", None))
         self._cur_layer = 0
         self._sync_layers()
 

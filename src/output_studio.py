@@ -902,34 +902,9 @@ class ScreenDialog(QDialog):
         self.color.clicked.connect(self._pick_color)
         self._sync_color_btn()
         form.addRow("边框颜色", self.color)
-        # ★ S5 #8（用户第 8 条）：块头「图层…」删掉后，勾选入口挪到「⋯」打开的
-        #   屏幕设置对话框里（只对**独立屏幕**有意义：主屏/复制屏固定用全部图层，
-        #   切分屏跟随源屏）。
-        self.layers_box = None
-        self.lst_layers = None
-        if edit_screen is not None and str(edit_screen.get("type")) == "independent":
-            try:
-                self.layers_box = QGroupBox("使用的图层")
-                _lv = QVBoxLayout(self.layers_box)
-                _lv.setContentsMargins(8, 6, 8, 6)
-                self.lst_layers = QListWidget()
-                self.lst_layers.setMaximumHeight(150)
-                _cur = set(str(x) for x in (edit_screen.get("layers") or []))
-                for _lay in (getattr(studio.main.engine, "layers", None) or []):
-                    it = QListWidgetItem(_lay.name)
-                    it.setData(Qt.UserRole, _lay.lid)
-                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-                    it.setCheckState(Qt.Checked if str(_lay.lid) in _cur else Qt.Unchecked)
-                    self.lst_layers.addItem(it)
-                _lv.addWidget(self.lst_layers)
-                _h = QLabel("不勾 = 这块屏幕不显示任何图层（新独立屏默认就是空的）")
-                _h.setStyleSheet("color:#888;font-size:11px;")
-                _h.setWordWrap(True)
-                _lv.addWidget(_h)
-                form.addRow(self.layers_box)
-            except Exception:                                      # noqa: BLE001
-                self.layers_box = None
-                self.lst_layers = None
+        # ★ 2026-11-09（用户否掉"使用的图层"勾选那套）：「每一个图层、每一个屏幕的图层
+        #   自己建」⇒ 建层时按块归属（见 ui_main.layer_add(target_sid=…)），这里不再需要
+        #   勾选组。相关控件/回填逻辑整体删除，别留个能改归属的后门。
         self.uv = None
         self.hint = QLabel("")
         self.hint.setWordWrap(True)
@@ -975,13 +950,7 @@ class ScreenDialog(QDialog):
             screen["height"] = max(16, int(v["height"]))
             if t == "independent":
                 screen["follow_main"] = False     # 手填过尺寸 ⇒ 不再跟随主屏
-        if t == "independent" and getattr(self, "lst_layers", None) is not None:
-            ids = []
-            for i in range(self.lst_layers.count()):
-                it = self.lst_layers.item(i)
-                if it.checkState() == Qt.Checked:
-                    ids.append(it.data(Qt.UserRole))
-            screen["layers"] = ids
+        # （原"写回勾选结果"那段已删：图层的屏幕归属由「+ 图层」在建立时决定）
             screen["color"] = v["color"]
         return screen
 

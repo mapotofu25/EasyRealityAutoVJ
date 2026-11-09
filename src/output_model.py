@@ -415,9 +415,14 @@ def effective_layers(cfg, screen, all_layer_ids):
     if not screen:
         return list(all_layer_ids)
     t = screen.get("type")
-    if t == "main":
-        return list(all_layer_ids)
-    if t == "copy":
+    if t in ("main", "copy"):
+        # ★ 2026-11-09（用户：「每一个图层、每一个屏幕的图层自己建」）：
+        #   主屏/复制屏也**走自己的 `layers`** —— 在某块屏里新建的层只属于那块屏。
+        #   老配置没有这个键（或空）⇒ 退回"全部图层"，保证升级后画面不变。
+        lay = screen.get("layers")
+        if lay:
+            ids = set(all_layer_ids)
+            return [x for x in lay if x in ids]
         return list(all_layer_ids)
     if t == "split":
         src = source_screen(cfg, screen)
@@ -426,6 +431,48 @@ def effective_layers(cfg, screen, all_layer_ids):
     if layers is None:
         return list(all_layer_ids)
     return [x for x in layers if x in set(all_layer_ids)]
+
+
+def bind_main_layers(cfg, all_layer_ids):
+    """一次性：给主屏写入**显式**的 `layers`（老配置兼容），返回是否改动。
+
+    ★ 背景（用户：「每一个图层、每一个屏幕的图层自己建」）：`effective_layers()` 现在
+      主屏也认 `layers`；老配置里主屏没有这个键 ⇒ 若不写，主屏仍然"全量"，
+      在独立屏里新建的图层会同时冒出到主屏（正是用户否掉的行为）。
+      这里在**第一次打开多屏时**把"当时的全部图层"固化成主屏的归属集合，
+      并打 `layers_bound=True`；之后只有显式归属的层才进主屏。
+    """
+    main = main_screen(cfg)
+    if not main or main.get("layers_bound"):
+        return False
+    if main.get("layers") is None:
+        main["layers"] = list(all_layer_ids or [])
+    main["layers_bound"] = True
+    return True
+
+
+def unbind_layer(lid, cfg=None, data=None):
+    """把某个图层 id 从**所有屏幕**的 `layers` 里摘掉（删除图层时调用）。
+
+    留着悬空 id 会让 `effective_layers()` 过滤出一个不存在的层（行数对不上/空白块）。
+    """
+    lid = str(lid)
+    out = 0
+    cfgs = []
+    if cfg is not None:
+        cfgs.append(cfg)
+    if data is not None:
+        for c in ((data.get("output") or {}).get("configs") or []):
+            cfgs.append(c)
+    for c in cfgs:
+        for s in (c or {}).get("screens") or []:
+            lst = s.get("layers")
+            if isinstance(lst, list):
+                keep = [x for x in lst if str(x) != lid]
+                if len(keep) != len(lst):
+                    s["layers"] = keep
+                    out += 1
+    return out
 
 
 def layout_sources(cfg):

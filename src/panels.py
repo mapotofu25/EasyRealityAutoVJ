@@ -3453,6 +3453,9 @@ class LayerStackPanel(QWidget):
         #     所以下面所有"行位置 ↔ 引擎索引"的换算都走 `_pos_of` / `_idx_of`。
         self.layer_ids = (None if layer_ids is None
                           else set(str(x) for x in layer_ids))
+        #: 这块栈属于哪个屏幕（多屏块里由 `_make_screen_block()` 设；
+        #  单屏演出台那份保持 None ⇒ 「+ 图层」按"归主屏"处理）。
+        self.screen_id = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -3505,7 +3508,12 @@ class LayerStackPanel(QWidget):
         self.btn_h.clicked.connect(self._open_row_h_popup)
         bar.addWidget(self.btn_h)
         self.btn_add = QPushButton("+ 图层")
-        self.btn_add.clicked.connect(main.layer_add)
+        # ★ 2026-11-09（用户：「每一个图层、每一个屏幕的图层自己建」）：
+        #   在这里点「+ 图层」⇒ 新层只属于**这一块屏**（`screen_id` 由建块时设好）。
+        #   ⚠ 不能直接 `connect(main.layer_add)`：clicked 会把 `checked=False` 当第一个
+        #     位置参数传进去，正好落到 `target_sid` 上（那就全错了）。
+        self.btn_add.clicked.connect(
+            lambda _c=False: main.layer_add(target_sid=getattr(self, "screen_id", None)))
         bar.addWidget(self.btn_add)
         lay.addLayout(bar)
         theme.register(self, self.apply_theme)   # 主题切换：重设各图层头样式
