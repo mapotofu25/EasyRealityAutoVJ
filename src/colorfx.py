@@ -201,9 +201,16 @@ class ColorRenderer:
         #   `pending` 等内部状态。多屏下主屏（advance=True）推进一次，其余屏复用同一份，
         #   否则同一帧里第 2、3 块屏拿到的颜色和第一块不同，且换色速度按屏数翻倍。
         if not advance:
+            # ★★ 2026-11-10（③-3 根因）：这里必须返回**按本屏参数算出来的 `want`**，
+            #   而不是全局的 `self.s` —— `self.s` 是主屏那一遍的平滑强度，
+            #   主屏 on=False 时它=0 ⇒ 独立屏也被判成 0、整块不调色（QA 量到的 b 组回原色）。
+            #   返回 `want` 后：本屏的 on/strength/频闪/手动锁定都按自己那份 cfg 生效，
+            #   且仍然**不推进任何内部状态**（换色速度不会随屏数翻倍）。
+            #   ⚠ 已知代价：主屏用平滑后的 self.s、独立屏用 want，过渡的头 ~0.2s 内会有几帧差异，
+            #     这是刻意的取舍（相位仍共享，绝大多数帧一致）。
             if (not on) or bypass or kv_on > 0.01:
                 return 0.0
-            return float(self.s)
+            return float(want)
 
         # ---- 目标颜色 ----
         rotate = max(1.0, float(c.get("rotate_sec", 45) or 45))   # 1~60 秒（UI 滑块给的范围）
