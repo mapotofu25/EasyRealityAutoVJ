@@ -4419,7 +4419,9 @@ class MainWindow(QMainWindow):
         self.btn_crop.setToolTip(T("打开裁切窗口：在源屏画面上拖框选区域，"
                                   "自动换算 UV 与分辨率（双向同步）"))
         self.btn_crop.clicked.connect(self._open_crop_dialog)
-        self.btn_crop.setMaximumWidth(86)
+        self.btn_crop.setFixedSize(26, 22)          # #7：右上角**小**按钮（约 26×22）
+        self.btn_crop.setText("✂")
+        self.btn_crop.setVisible(False)             # 只在切分屏时出现（见 _fill_screen_setup）
         self.btn_crop.setStyleSheet("QPushButton{padding:1px 6px;}")
         f.addWidget(self.btn_crop, 0, 2, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
         f.setColumnStretch(2, 1)
@@ -4437,6 +4439,11 @@ class MainWindow(QMainWindow):
             return
         import output_model as _om
         self._ss_loading = True
+        # #7：裁切入口只在**切分屏**上有意义（复制屏是整块跟随、主屏/独立屏没有源屏可裁）
+        try:
+            self.btn_crop.setVisible(str((screen or {}).get("type") or "") == "split")
+        except Exception:                                          # noqa: BLE001
+            pass
         try:
             self.ss_source.blockSignals(True)
             self.ss_source.clear()
@@ -4602,6 +4609,12 @@ class MainWindow(QMainWindow):
                         % _om.effective_color(cfg, _cur))
                 except Exception:                              # noqa: BLE001
                     rf.setStyleSheet("")
+                # #7：裁切入口只在**切分屏**出现（复制屏/主屏/独立屏没有可裁的源屏）
+                try:
+                    self.btn_crop.setVisible(
+                        str((_cur or {}).get("type") or "") == "split")
+                except Exception:                              # noqa: BLE001
+                    pass
                 self._place_perf_section(True)
                 # ★ U7 性能提示（team-lead 要求：不加限制，但要告诉用户代价）
                 _n_ov = 0
