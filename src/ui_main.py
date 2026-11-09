@@ -3902,8 +3902,39 @@ class MainWindow(QMainWindow):
 
     # ---------- 块区高度：默认按块数自动分配 ----------
     def _on_blocks_split_moved(self, *_a):
-        """用户手拖过分隔条 ⇒ 记住"别再自动改"（屏幕数变化时才会强制重排）。"""
+        """用户手拖过分隔条 ⇒ 记住"别再自动改"（屏幕数变化时才会强制重排）。
+
+        ★ U1（用户第 1 条）：拖完**必须重算主屏块高度**，否则"铺满左列"只在重建时生效一次，
+          拖一下分隔条主屏块就只占左列上半、下面空着。
+        """
         self._blocks_split_user_set = True
+        self._fill_main_block()
+
+    def _fill_main_block(self):
+        """左列只有 1 块（主屏）时，把它撑到左列可视高度（U1）。
+
+        独立于 `_auto_size_blocks_split()`，因为它要在**任何高度变化**后都跑：
+        拖末尾分隔条 / 改行高 / 窗口 resize / 进出多屏。
+        """
+        try:
+            left = [b[1] for b in getattr(self, "_multi_blocks", [])
+                    if getattr(b[1], "_multi_col", "right") == "left"]
+            if len(left) != 1:
+                return
+            # ⚠ 这里必须用**块区可视高度**（scroll viewport），不能用列控件自身高度：
+            #   列的高度是由块高度撑出来的（循环依赖），窗口变大时它不会跟着变 ⇒
+            #   "铺满"永远停在第一次的值（实测窗口 720/900/1080 都是 624）。
+            sa = getattr(self, "_multi_blocks_scroll", None)
+            col_h = int(sa.viewport().height()) if sa is not None else 0
+            if col_h <= 0:
+                col_h = int(self._multi_col_left_w.height())
+            if col_h <= 0:
+                return
+            h = max(190, col_h - 4)          # 4px 给列内边距/分栏手柄取整
+            if abs(int(left[0].height()) - h) > 2:
+                left[0].setFixedHeight(h)
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("_fill_main_block", e)
 
     def _on_blocks_cols_moved(self, *_a):
         """用户拖动过左右分栏 ⇒ 之后不再自动等宽（切配置/进出多屏时复位）。"""
@@ -3994,6 +4025,8 @@ class MainWindow(QMainWindow):
                     left_lst[0].setFixedHeight(_fill)
         except Exception as e:                                    # noqa: BLE001
             self._log_ui_error("_auto_size_blocks_split.fill_main", e)
+        # U1：块区高度定完后再按"左列实际可视高"兜一次（等比/拖分隔条两种来源都覆盖）
+        self._fill_main_block()
         # 块区最小高：1 块时就是它自己的自然高度（不硬撑 220），多块才用 220 兜底
         try:
             sa.setMinimumHeight(min(220, max(120, area)))
