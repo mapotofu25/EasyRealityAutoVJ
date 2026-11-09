@@ -2733,6 +2733,15 @@ class _FloatingLibraryWindow(QWidget):
             self.main._save_library_float(False)
         except Exception:
             pass
+        # ★ BUG-C′：点右上角 X 走的是这条路，以前**绕过还原** ⇒ 单屏下素材库被"顺走"。
+        #   与 `toggle_library_float()` 的关窗分支共用同一个还原函数（单屏才还，多屏不动）。
+        try:
+            self.main._restore_library_from_float()
+        except Exception as e:                                     # noqa: BLE001
+            try:
+                self.main._log_ui_error("_FloatingLibraryWindow.closeEvent", e)
+            except Exception:
+                pass
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -4796,6 +4805,28 @@ class MainWindow(QMainWindow):
         #   从来没有被创建过**（4 处使用、0 处创建），整段被 try/except 吞掉。
         #   既然按钮不存在 ⇒ 方法与其调用一并删除，别再让人以为有这个入口。
 
+    def _restore_library_from_float(self):
+        """把素材库面板从浮窗**还给演出台**（单屏模式用；多屏下块区本来不放素材库）。
+
+        ★ BUG-C′（QA 抓到）：这段还原逻辑原来只写在 `toggle_library_float()` 的
+          `if win.isVisible(): win.hide(); …` 分支里，而 `_FloatingLibraryWindow.closeEvent()`
+          （用户点窗口右上角 **X**）走的是 `ev.ignore(); self.hide(); _save_library_float(False)`
+          —— **绕过还原** ⇒ 同一个缺陷两条关闭路径行为不一致：单屏下点 X 就把素材库丢了。
+          抽成函数给两条路径共用，以后加第三条关闭路径也不会再漏。
+        """
+        try:
+            _multi = bool(getattr(self, "_multi_page", None) is not None
+                          and self.perf_stack.currentWidget() is self._multi_page)
+            if _multi:
+                return          # 多屏：块区不放素材库，保持现状（下次打开由装回逻辑处理）
+            self._detach_library_from_float()
+            self.library_panel.setParent(None)
+            self._stage_bottom.addWidget(self.library_panel)
+            self._stage_bottom.setSizes([560, 520])
+            self.library_panel.setMinimumSize(0, 0)
+        except Exception as e:                                     # noqa: BLE001
+            self._log_ui_error("restore_library_from_float", e)
+
     def toggle_library_float(self):
         try:
             if getattr(self, "_lib_float", None) is None:
@@ -4803,21 +4834,9 @@ class MainWindow(QMainWindow):
             win = self._lib_float
             if win.isVisible():
                 win.hide()
-                # ★ BUG-C（QA 抓到）：关窗时素材库面板还挂在浮窗里 ⇒ **单屏模式下
-                #   "打开一次再关掉" = 素材库既不回演出台、也不在屏幕上（点一下就丢）。
-                #   单屏模式：关窗就把面板还回演出台原位置（多屏模式块区本来就不放素材库，
-                #   保持现状即可 —— 下次打开时 BUG-A 的装回逻辑会处理）。
-                try:
-                    _multi = bool(getattr(self, "_multi_page", None) is not None
-                                  and self.perf_stack.currentWidget() is self._multi_page)
-                    if not _multi:
-                        self._detach_library_from_float()
-                        self.library_panel.setParent(None)
-                        self._stage_bottom.addWidget(self.library_panel)
-                        self._stage_bottom.setSizes([560, 520])
-                        self.library_panel.setMinimumSize(0, 0)
-                except Exception as e:                             # noqa: BLE001
-                    self._log_ui_error("toggle_library_float.restore_stage", e)
+                # ★ BUG-C / BUG-C′：关窗时要把面板还回演出台（单屏），
+                #   具体逻辑在 `_restore_library_from_float()` 里，X 关窗那条路径也调它。
+                self._restore_library_from_float()
             else:
                 # ★ BUG-A（QA 抓到，`4da9c32` 起就有）：退出多屏时
                 #   `_restore_stage_panels()` → `_detach_library_from_float()` 会把
