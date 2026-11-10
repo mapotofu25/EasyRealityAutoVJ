@@ -4656,6 +4656,23 @@ class MainWindow(QMainWindow):
         except Exception:                                         # noqa: BLE001
             pass
 
+    def _debounce_commit(self, spin, slot):
+        """数字框"输入停顿 400ms"兜底提交（无头环境里失焦事件可能不派发）。
+
+        · 只做 `interpretText()` + 调 slot，**不回填控件** ⇒ 不会覆盖用户正在敲的字；
+        · 连打多次只提交最后一次（timer 每次 restart）。
+        """
+        try:
+            from PySide6.QtCore import QTimer
+            t = QTimer(spin)
+            t.setSingleShot(True)
+            t.setInterval(400)
+            t.timeout.connect(lambda: (spin.interpretText(), slot()))
+            spin.lineEdit().textEdited.connect(lambda *_a: t.start())
+            spin._debounce_timer = t
+        except Exception:                                          # noqa: BLE001
+            pass
+
     def _build_screen_setup_box(self):
         """★ S3 #5：选中「切分屏幕」时右侧出现的「屏幕设置」栏（UV / 源屏 / 分辨率）。"""
         g = QGroupBox(T("屏幕设置"))
@@ -4675,10 +4692,15 @@ class MainWindow(QMainWindow):
         self.ss_h = QSpinBox(); self.ss_h.setRange(16, 16384); self.ss_h.setMinimumWidth(70)
         # ★ BUG-C：用户截图里那个 1280×120 就是这两个框 —— 只回车/失焦提交
         self.ss_w.setKeyboardTracking(False); self.ss_h.setKeyboardTracking(False)
-        # ★ A（2026-11-10）：不回车也要提交（失焦触发 editingFinished）
+        # ★ A（2026-11-10）：不回车也要提交。
+        #   · `editingFinished` 负责"回车/失焦"；
+        #   · 另加 **400ms 输入停顿去抖**（`textEdited` → QTimer）：无头/远程环境里焦点事件
+        #     不一定派发（实测 `clearFocus()` 不触发 editingFinished），这条兜底保证"打完字
+        #     停一下就生效"。只提交、不回填，所以不会把用户正在敲的字改掉。
         for _sp in (self.ss_w, self.ss_h):
             _sp.valueChanged.connect(self._on_screen_setup_changed)
             _sp.editingFinished.connect(self._on_screen_setup_changed)
+            self._debounce_commit(_sp, self._on_screen_setup_changed)
         self.ss_w.valueChanged.connect(self._on_screen_setup_changed)
         self.ss_h.valueChanged.connect(self._on_screen_setup_changed)
         _row.addWidget(self.ss_w)
@@ -4695,6 +4717,7 @@ class MainWindow(QMainWindow):
             sp.setMinimumWidth(80)
             sp.setKeyboardTracking(False)      # ★ BUG-C：UV 同理
             sp.editingFinished.connect(self._on_screen_setup_changed)   # ★ A：失焦也提交
+            self._debounce_commit(sp, self._on_screen_setup_changed)     # ★ A：输入停顿兜底
             sp.valueChanged.connect(self._on_screen_setup_changed)
             self.ss_uv.append(sp)
             f.addWidget(QLabel(T(lab)), 2 + i // 2, (i % 2) * 2)
