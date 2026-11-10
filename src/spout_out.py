@@ -131,6 +131,18 @@ class SpoutOut:
                     buf = b
                     break
         if buf is None:
+            # ★★ 2026-11-10（性能：routes 偶发 271~278ms 尖峰）：
+            #   池被发送线程抽干（Spout `sendImage` 偶发阻塞，项目里量到过 14s）⇒
+            #   以前这里**每帧新分配 10.8MB**（3000×900×4），在渲染线程上造成尖峰。
+            #   现在：**只允许首次分配**，之后池空一律**丢这一帧**（队列本来只保留最新帧，
+            #   丢帧无害，下一帧还有）。
+            #   ⚠ 不能 `return False`：引擎把它当发送失败 ⇒ 触发 1s→30s 退避 + 关闭重建，
+            #     会把"丢一帧"放大成"停发几秒"。这里返回 True 并在 `dropped` 里计数。
+            if getattr(self, "_had_alloc", False):
+                self.dropped = int(getattr(self, "dropped", 0)) + 1
+                self._size = (w, h)
+                return True
+            self._had_alloc = True
             buf = bytearray(total)
         # 拷贝：`bits` 是画布的活动视图，渲染线程下一帧就会覆写（同 NDI 的坑）
         if bpl and bpl != need:

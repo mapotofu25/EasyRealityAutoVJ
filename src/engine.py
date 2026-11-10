@@ -2479,8 +2479,9 @@ class AutoVJEngine(QObject):
                                         key=lambda kv: -(kv[1]["bits"] + kv[1]["spout"]
                                                          + kv[1]["ndi"]))[:3]
                                     _extra += " | rt: " + " ; ".join(
-                                        "%s sp=%.0f nd=%.0f bits=%.0f n=%d"
-                                        % (_n, _v["spout"], _v["ndi"], _v["bits"], _v["n"])
+                                        "%s sp=%.0f nd=%.0f bits=%.0f n=%d dr=%d"
+                                        % (_n, _v["spout"], _v["ndi"], _v["bits"], _v["n"],
+                                           int(_v.get("dr", 0)))
                                         for _n, _v in _tops)
                             except Exception:                      # noqa: BLE001
                                 pass
@@ -7651,6 +7652,7 @@ class AutoVJEngine(QObject):
                             ok = sp.send(frame.bits(), frame.width(), frame.height(),
                                          frame.bytesPerLine())
                             _rs["spout"] += (time.perf_counter() - _ts) * 1000.0
+                            _rs["dr"] = int(getattr(sp, "dropped", 0) or 0)
                             if not ok:
                                 _e = sp.last_error() if hasattr(sp, "last_error") else None
                                 raise RuntimeError(_e or "SpoutOut.send() 返回 False")
