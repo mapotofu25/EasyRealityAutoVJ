@@ -1175,6 +1175,9 @@ class ScreenSettingsPanel(QWidget):
         #   不能再和 spout/ndi 那个 `_on_any` 绑在一起。
         self.w.valueChanged.connect(self._on_size)
         self.h.valueChanged.connect(self._on_size)
+        # ★ A：失焦也提交（keyboardTracking=False 后不回车不触发 valueChanged）
+        self.w.editingFinished.connect(self._on_size)
+        self.h.editingFinished.connect(self._on_size)
         row = QHBoxLayout(); row.addWidget(self.w); row.addWidget(QLabel("×")); row.addWidget(self.h)
         f.addRow("分辨率", row)
         self.color = QPushButton("选择颜色…")
@@ -1230,6 +1233,9 @@ class ScreenSettingsPanel(QWidget):
         self.lx.setKeyboardTracking(False); self.ly.setKeyboardTracking(False)
         self.lx.valueChanged.connect(self._on_layout)
         self.ly.valueChanged.connect(self._on_layout)
+        # ★ A：失焦也提交
+        self.lx.editingFinished.connect(self._on_layout)
+        self.ly.editingFinished.connect(self._on_layout)
         v5.addWidget(QLabel("布局 X"), 0, 0); v5.addWidget(self.lx, 0, 1)
         v5.addWidget(QLabel("布局 Y"), 0, 2); v5.addWidget(self.ly, 0, 3)
         self.uv = []
@@ -1515,7 +1521,10 @@ class OutputStudio(QWidget):
         for _sp in (self.comb_w, self.comb_h):
             _sp.setStyleSheet("QSpinBox{font-size:11px;padding:0 2px;}")
         self.comb_w.valueChanged.connect(self._on_combined)
+        # ★ A：失焦也提交
+        self.comb_w.editingFinished.connect(self._on_combined)
         self.comb_h.valueChanged.connect(self._on_combined)
+        self.comb_h.editingFinished.connect(self._on_combined)     # ★ A：失焦也提交
         bar.addWidget(self.comb_w)
         # ★ 用户第 3 条：「多路模式下孤零零剩一个 ×」——这个 × 原来是**匿名局部变量**，
         #   1360 行附近那组 setVisible(single) 里没人管它 ⇒ 多路模式下 comb_w/comb_h
@@ -1886,6 +1895,25 @@ class OutputStudio(QWidget):
         #   以前"布局超出就自动扩大"会让用户输 1920×1080 后变成 2560×1080，
         #   用户会当成"这个框存不住数"。现在画布尺寸**只由用户输入 / 拖动 /
         #   显式点「适应窗口」**改变；超出只做**提示**（见 OutputCanvasWindow._update_warn）。
+        # ★ C（2026-11-10）：`layout` 一次性迁移 —— 老配置里切分屏的 layout 可能落在
+        #   画布外（例如 `[2560, 0]` 而画布只有 2560 宽），默认"拖动只排版"之后它们在
+        #   输出里依然看不见。这里把"完全落在画布外"的屏顺次排到已有屏右侧，只做一次。
+        try:
+            if not cfg.get("layout_migrated"):
+                _cw, _ch2 = OM.combined_size(cfg)
+                _right = 0
+                for _s in cfg.get("screens") or []:
+                    _x, _y, _w, _h = OM.screen_rect(cfg, _s)
+                    if _x < _cw and _y < _ch2:
+                        _right = max(_right, int(_x + _w))
+                for _s in cfg.get("screens") or []:
+                    _x, _y, _w, _h = OM.screen_rect(cfg, _s)
+                    if int(_x) >= int(_cw) or int(_y) >= int(_ch2):
+                        _s["layout"] = [int(_right), 0]
+                        _right = int(_right + _w)
+                cfg["layout_migrated"] = True
+        except Exception:                                          # noqa: BLE001
+            pass
         OM.sync_legacy_output(self.cfg.data)
         try:
             self.cfg.save()
@@ -2608,16 +2636,33 @@ class _CanvasBoard(QWidget):
         return OM.mapping_screens(self.cfg) if self.cfg else []
 
     def _display_rect(self, s):
-        """画布上显示用的矩形（逻辑在模块级 `mapping_display_rect`，与导出 PNG 共用）。"""
+        """画布上显示用的矩形。
+
+        ★ C：默认"拖动只排版" ⇒ 优先用 `preview_rect`（纯 UI），没有才退回 `layout` 派生值；
+          勾了「摆放位置影响输出」时用老逻辑（与导出 PNG 共用 `mapping_display_rect`）。
+        """
+        try:
+            if not bool((self.cfg or {}).get("layout_affects_output", False)):
+                pr = (s or {}).get("preview_rect")
+                if pr and len(pr) == 4 and (s or {}).get("preview_dragged"):
+                    return int(pr[0]), int(pr[1]), int(pr[2]), int(pr[3])
+        except Exception:                                          # noqa: BLE001
+            pass
         return mapping_display_rect(self.cfg, s, self._frames())
 
-    def _hit(self, pos):
+    def _hit_all(self, pos):
+        """这一点的**所有**屏（从上到下）。重叠时用来做"点击循环选择"。"""
+        out = []
         for s in reversed(self._frames()):
             x, y, w, h = self._display_rect(s)
             r = self._rect_screen(x, y, w, h)
             if r.contains(pos):
-                return s, r
-        return None, None
+                out.append((s, r))
+        return out
+
+    def _hit(self, pos):
+        hits = self._hit_all(pos)
+        return hits[0] if hits else (None, None)
 
     # ---- 交互 ----
     def wheelEvent(self, ev):
@@ -2635,7 +2680,24 @@ class _CanvasBoard(QWidget):
     def mousePressEvent(self, ev):
         if ev.button() != Qt.LeftButton or not self.cfg:
             return
-        s, r = self._hit(ev.position())
+        # ★ B（2026-11-10）：重叠的屏点不中另一块 —— 同一位置连点时**循环选择**。
+        hits = self._hit_all(ev.position())
+        if len(hits) > 1:
+            pos = ev.position()
+            cyc = getattr(self, "_hit_cycle", None)
+            same = bool(cyc) and abs(cyc["pos"].x() - pos.x()) <= 2 \
+                and abs(cyc["pos"].y() - pos.y()) <= 2
+            sids = [str((s0 or {}).get("id") or "") for s0, _r0 in hits]
+            if same and cyc.get("sids") == sids:
+                cyc["idx"] = (int(cyc.get("idx", 0)) + 1) % len(hits)
+            else:
+                cyc = {"pos": QPointF(pos), "sids": sids, "idx": 0}
+            self._hit_cycle = cyc
+            s, r = hits[cyc["idx"]]
+            self.studio.select_screen(s.get("id"))
+        else:
+            self._hit_cycle = None
+            s, r = self._hit(ev.position())
         # 切分/复制屏的矩形是从源屏派生的，拖它们没有意义 ⇒ 当作空白拖动平移画布
         if s is not None and str(s.get("type") or "main") not in ("split", "copy"):
             x, y, _w, _h = OM.screen_rect(self.cfg, s)
@@ -2663,8 +2725,19 @@ class _CanvasBoard(QWidget):
                 nx, ny = d["orig"][0] + dx, d["orig"][1] + dy
                 # ★ S6 #11（后半）：输出画布窗口里拖屏幕**也要吸附**（画布边 + 其它屏幕边/中线）
                 nx, ny = self._snap(s.get("id"), nx, ny)
-                # 写回的是**画布像素坐标**（和单路模式的 layout 同一套坐标系）
-                s["layout"] = [int(round(nx)), int(round(ny))]
+                # ★ C（2026-11-10，用户选「只是排版，不影响输出画面」）：
+                #   `layout_affects_output` 默认 **False** ⇒ 只写 UI 用的 `preview_rect`，
+                #   绝不碰 `layout`（单路整合画布是按 layout 拼的 ⇒ 拖一下就改输出画面）。
+                #   勾上「摆放位置影响输出」才恢复老行为（写 layout）。
+                _affects = bool((self.cfg or {}).get("layout_affects_output", False))
+                if _affects:
+                    s["layout"] = [int(round(nx)), int(round(ny))]
+                else:
+                    _w2, _h2 = OM.effective_size(self.cfg, s)
+                    s["preview_rect"] = [int(round(nx)), int(round(ny)), int(_w2), int(_h2)]
+                    # 只有**用户拖过**才用 preview_rect 显示；`_new_screen` 自带的初始
+                    # preview_rect 是排版用的，不能盖掉 layout（否则初始显示位置全乱）
+                    s["preview_dragged"] = True
         self.update()
 
     def _snap(self, sid, x, y):
@@ -3047,6 +3120,10 @@ class OutputCanvasWindow(QDialog):
             sp.setRange(16, self.MAX_SIDE)
             sp.setToolTip("输出画布尺寸，最大 %d（2^14）" % self.MAX_SIDE)
             sp.valueChanged.connect(self._on_size)
+            # ★ A（2026-11-10）：`setKeyboardTracking(False)` 的副作用是"不回车不提交" ——
+            #   用户输完直接点别处，框里是新数字、配置没变、输出也没变。
+            #   `editingFinished`（失焦 **或** 回车）兜住这条。
+            sp.editingFinished.connect(self._on_size)
         bar.addWidget(self.sp_w)
         bar.addWidget(QLabel("×"))
         bar.addWidget(self.sp_h)
@@ -3058,6 +3135,13 @@ class OutputCanvasWindow(QDialog):
         self.btn_fit = QPushButton("适应窗口")
         self.btn_fit.clicked.connect(self._fit)
         bar.addWidget(self.btn_fit)
+        bar.addSpacing(10)
+        self.chk_affect = QCheckBox("摆放位置影响输出")
+        self.chk_affect.setToolTip(
+            "不勾（默认）：拖动只用于整理查看排版，不影响输出画面。\n"
+            "勾上：拖动会改变输出里各屏的位置（写回 layout）。")
+        self.chk_affect.toggled.connect(self._on_affect_toggled)
+        bar.addWidget(self.chk_affect)
         bar.addStretch(1)
         self.btn_export = QPushButton("导出 Mapping…")
         self.btn_export.setToolTip("导出 mapping JSON + PNG 到指定目录")
@@ -3076,8 +3160,10 @@ class OutputCanvasWindow(QDialog):
         self.board.moved.connect(self._on_moved)
         lay.addWidget(self.board, 1)
         self.hint = QLabel(
-            "拖动屏幕摆位置；显示的是**输出坐标**（写回配置的 layout），"
-            "画布尺寸不够时会自动放大，绝不裁屏。不要求每块屏幕都摆上来。")
+            "这里拖动只用于整理查看排版，**不影响输出画面**；"
+            "要改输出位置请勾选「摆放位置影响输出」。\n"
+            "画布尺寸不够时会提示，不会自动裁屏；不要求每块屏幕都摆上来。")
+        self.hint.setStyleSheet("color:#8a8a8a;font-size:11px;padding:1px 4px;")
         self.hint.setStyleSheet("color:#888;")
         self.hint.setWordWrap(True)
         lay.addWidget(self.hint)
@@ -3164,6 +3250,21 @@ class OutputCanvasWindow(QDialog):
                 self.warn.hide()
         except Exception:                                          # noqa: BLE001
             self.warn.hide()
+
+    def _on_affect_toggled(self, on):
+        """「摆放位置影响输出」开关：写进活动配置（默认 False = 只排版）。"""
+        try:
+            cfg = self.studio.active_config()
+            if cfg is not None:
+                cfg["layout_affects_output"] = bool(on)
+                self.studio.cfg.save()
+                self.studio.apply()
+        except Exception:                                          # noqa: BLE001
+            pass
+        try:
+            self.board.update()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _on_size(self, *_):
         cfg = self.studio.active_config()

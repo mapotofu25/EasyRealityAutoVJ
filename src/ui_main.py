@@ -4675,6 +4675,10 @@ class MainWindow(QMainWindow):
         self.ss_h = QSpinBox(); self.ss_h.setRange(16, 16384); self.ss_h.setMinimumWidth(70)
         # ★ BUG-C：用户截图里那个 1280×120 就是这两个框 —— 只回车/失焦提交
         self.ss_w.setKeyboardTracking(False); self.ss_h.setKeyboardTracking(False)
+        # ★ A（2026-11-10）：不回车也要提交（失焦触发 editingFinished）
+        for _sp in (self.ss_w, self.ss_h):
+            _sp.valueChanged.connect(self._on_screen_setup_changed)
+            _sp.editingFinished.connect(self._on_screen_setup_changed)
         self.ss_w.valueChanged.connect(self._on_screen_setup_changed)
         self.ss_h.valueChanged.connect(self._on_screen_setup_changed)
         _row.addWidget(self.ss_w)
@@ -4690,6 +4694,7 @@ class MainWindow(QMainWindow):
             sp.setSingleStep(0.001)
             sp.setMinimumWidth(80)
             sp.setKeyboardTracking(False)      # ★ BUG-C：UV 同理
+            sp.editingFinished.connect(self._on_screen_setup_changed)   # ★ A：失焦也提交
             sp.valueChanged.connect(self._on_screen_setup_changed)
             self.ss_uv.append(sp)
             f.addWidget(QLabel(T(lab)), 2 + i // 2, (i % 2) * 2)
