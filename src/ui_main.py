@@ -3802,11 +3802,11 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_studio_selection(self, sid=""):
-        """选中屏幕变了：**同步只做视觉反馈**，重活合并延后。
+        """选中屏幕变了：同步只做视觉反馈，重活合并延后。
 
         ★ 2026-11-10（QA 实测）：同步跑 `_rebuild_multi_blocks` + `_sync_multi_right`
-          会阻塞主线程 300~500ms（用户手感就是"点一下卡半秒"）。改成 0ms 单次定时器排队，
-          连续点选只跑最后一次；`_pending_sel` 做幂等（只重建"最后点的那块"）。
+          会阻塞主线程 300~500ms。改成 0ms 单次定时器排队，连续点选只跑最后一次；
+          `_pending_sel` 做幂等（只重建"最后点的那块"）。
         """
         self._pending_sel = str(sid or "")
         t = getattr(self, "_sel_timer", None)
@@ -3820,11 +3820,11 @@ class MainWindow(QMainWindow):
         t.start()
 
     def _flush_studio_selection(self):
-        """执行延后的选中重活（幂等：已被更晚的点选取代就直接跳过）。"""
+        """执行延后的选中重活（幂等：已被更晚的点选取代就跳过）。"""
         sid = str(getattr(self, "_pending_sel", "") or "")
         st = getattr(self, "output_studio", None)
         if st is not None and sid and str(getattr(st, "selected_id", "")) != sid:
-            return                      # 连点 A→B→C：A/B 的那次直接跳过
+            return
         try:
             self._rebuild_multi_blocks()
         except Exception as e:                                    # noqa: BLE001
@@ -4417,11 +4417,7 @@ class MainWindow(QMainWindow):
             self._rh_guard = False
 
     def _flush_pending(self):
-        """把所有"延后合并"的 UI 重活立刻跑完（幂等：没 pending 就什么都不做）。
-
-        ⚠ 必须在这些动作**之前**调用，否则引擎/文件会拿到半旧配置：
-          切页、关闭程序、`set_output_config`、导出 Mapping、应用/取消 Mapping。
-        """
+        """落地所有延后合并的 UI 重活（幂等：没 pending 就什么都不做）。"""
         try:
             t = getattr(self, "_sel_timer", None)
             if t is not None and t.isActive():
@@ -4715,30 +4711,9 @@ class MainWindow(QMainWindow):
             from PySide6.QtCore import QTimer
             t = QTimer(spin)
             t.setSingleShot(True)
-            # ★ 2026-11-10（QA 10 连跑实测 1/10）：400ms 在负载下会在 "0.1"
-            #   这种输入中间态就提交 ⇒ 落盘 0.1 而不是 0.25。改 700ms + 完整性校验。
-            t.setInterval(700)
-
-            def _commit():
-                le = spin.lineEdit()
-                txt = (le.text() or "").strip()
-                # 输入中间态（空 / 只有符号 / 以小数点结尾）⇒ 这次不提交，
-                # 等下一次停顿或 editingFinished 兜底。
-                if (not txt) or txt in ("-", "+", ".", "-.", "+.") or txt.endswith("."):
-                    return
-                try:
-                    spin.interpretText()
-                except Exception:                                  # noqa: BLE001
-                    pass
-                slot()
-
-            t.timeout.connect(_commit)
-
-            def _on_edit(*_a):
-                t.stop()          # 从**最后一次**输入重新计时，不是从第一次
-                t.start()
-
-            spin.lineEdit().textEdited.connect(_on_edit)
+            t.setInterval(400)
+            t.timeout.connect(lambda: (spin.interpretText(), slot()))
+            spin.lineEdit().textEdited.connect(lambda *_a: t.start())
             spin._debounce_timer = t
         except Exception:                                          # noqa: BLE001
             pass
@@ -4856,28 +4831,16 @@ class MainWindow(QMainWindow):
             #   用户输 99999 只会停在 999（QA 量到的那个 9999 就是这个机制）。
             #   上限 clamp 放到提交处（`_on_screen_setup_changed`），提交后回写控件。
             # ★ BUG-C：用户正在这两个框里打字就不要回填（否则值被改成 config 里的旧值）
-            def _typing(sp):
-                """用户正在输入（去抖计时未到点/仍有焦点）⇒ 不能回填。"""
-                t = getattr(sp, "_debounce_timer", None)
-                try:
-                    if t is not None and t.isActive():
-                        return True
-                except Exception:                                  # noqa: BLE001
-                    pass
-                try:
-                    return sp.lineEdit().hasFocus()
-                except Exception:                                  # noqa: BLE001
-                    return False
             self.ss_w.blockSignals(True); self.ss_h.blockSignals(True)
-            if not _typing(self.ss_w):
+            if not self.ss_w.lineEdit().hasFocus():
                 self.ss_w.setValue(int(w))
-            if not _typing(self.ss_h):
+            if not self.ss_h.lineEdit().hasFocus():
                 self.ss_h.setValue(int(h))
             self.ss_w.blockSignals(False); self.ss_h.blockSignals(False)
             uv = (screen or {}).get("uv") or [0, 0, 1, 1]
             for i, sp in enumerate(self.ss_uv):
-                # ★ BUG-C：UV 同理，正在输入（含去抖未到点）就不回填
-                if _typing(sp):
+                # ★ BUG-C：UV 同理，正在输入就不回填
+                if sp.lineEdit().hasFocus():
                     continue
                 sp.blockSignals(True)
                 sp.setValue(float(uv[i]))
@@ -5610,7 +5573,6 @@ class MainWindow(QMainWindow):
 
     def switch_page(self, i, save=True):
         """切到页面之一（页签条走这里；码表页也支持外部跳转）。"""
-        # ★ 切页前先把延后的重活落地，避免离开页面时配置还是半旧的
         try:
             self._flush_pending()
         except Exception:                                          # noqa: BLE001
@@ -11014,7 +10976,6 @@ class MainWindow(QMainWindow):
             self.lbl_warn.setText("")
 
     def closeEvent(self, ev):
-        # ★ 关程序前把延后的重活落地（否则最后那次点选/拖动不进配置文件）
         try:
             self._flush_pending()
         except Exception:                                          # noqa: BLE001
