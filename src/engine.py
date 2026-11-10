@@ -384,7 +384,10 @@ def _output_backoff(fails):
 
 
 #: 预览缩略图的最长边（V4：以前固定 480×270 + Fast 变换 ⇒ 放大后全是马赛克）
-PREVIEW_THUMB_MAX = 1280
+# ★ 2026-11-10 性能：预览卡片只有几百像素宽，1280 会让 1280×720 的帧走
+#   `frame.copy()` 全幅拷贝（7 屏 × 3.7MB × 15fps ≈ 388MB/s）。降到 512：
+#   预览卡片只有几百像素宽，清晰度仍够，拷贝字节降 >70%。
+PREVIEW_THUMB_MAX = 512
 
 
 def _preview_thumb(frame):
@@ -401,7 +404,7 @@ def _preview_thumb(frame):
             return frame
         m = max(w, h)
         if m <= PREVIEW_THUMB_MAX:
-            return frame.copy()
+            return frame.copy()          # 本来就不大于上限，无需缩放
         r = PREVIEW_THUMB_MAX / float(m)
         return frame.scaled(max(1, int(round(w * r))), max(1, int(round(h * r))),
                             Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -2513,6 +2516,7 @@ class AutoVJEngine(QObject):
 
         # 合成
         self._phase = "compose"
+        self._split_cache = {}       # ★ 性能：split 裁切按帧缓存，帧首清空
         # ★ 多屏输出：配置变更必须先重建画布/发送端，再合成主屏（主屏分辨率可能变了）
         if self._out_cfg is not None and self._plan_rev != getattr(self, "_plan_rev_ready", -1):
             self._phase = "output_plan"
@@ -7306,8 +7310,18 @@ class AutoVJEngine(QObject):
         p.end()
 
     def _split_frame(self, plan, screen):
-        """切分屏幕：把源画布按 UV 裁到复用缓冲。"""
+        """切分屏幕：把源画布按 UV 裁到复用缓冲。
+
+        ★ 性能：同一块 split 一帧内会被 `_build_combined()` 和 `_publish_multi_frame()`
+          各调一次（实测 4 块 split → 8 次/帧）。这里按 sid 缓存本帧结果，帧首清空。
+        """
         sid = str(screen.get("id") or "")
+        _cache = getattr(self, "_split_cache", None)
+        if _cache is None:
+            _cache = {}
+            self._split_cache = _cache
+        if sid in _cache:
+            return _cache[sid]
         cv = self._screen_canvases.get(sid)
         if cv is None:
             w, h = output_model.effective_size(plan, screen)
@@ -7320,6 +7334,7 @@ class AutoVJEngine(QObject):
             source_frame = self.canvas if src_screen.get("type") == "main" else self._screen_canvases.get(ssid)
         if source_frame is None or source_frame.isNull():
             self._clear_canvas(cv)
+            _cache[sid] = cv
             return cv
         u0, v0, u1, v1 = screen.get("uv") or [0, 0, 1, 1]
         sw, sh = source_frame.width(), source_frame.height()
@@ -7338,6 +7353,7 @@ class AutoVJEngine(QObject):
         p.setCompositionMode(QPainter.CompositionMode_Source)
         p.drawImage(0, 0, source_frame, sx, sy, tw, th)
         p.end()
+        _cache[sid] = cv
         return cv
 
     def _route_frame(self, plan, sid, kind):
