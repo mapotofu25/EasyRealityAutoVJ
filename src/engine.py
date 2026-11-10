@@ -383,6 +383,50 @@ def _output_backoff(fails):
     return min(_OUTPUT_BACKOFF_CAP, float(2 ** (n - 1)))
 
 
+#: ---- 慢帧取证：GC 停顿累加（2026-11-10）---------------------------------
+# 用 `gc.callbacks` 只累加两个整数 + 两个 float，回调里**不做任何格式化/分配**，
+# 开销可忽略；慢帧那行日志读出"自上次慢帧以来"的 gen2/gen1 次数与总停顿。
+_GC_ACC = {"g2_n": 0, "g2_ms": 0.0, "g1_n": 0, "g1_ms": 0.0, "_t0": 0.0}
+
+
+def _gc_probe_cb(phase, info):
+    try:
+        if phase == "start":
+            _GC_ACC["_t0"] = time.perf_counter()
+            return
+        dt = (time.perf_counter() - _GC_ACC["_t0"]) * 1000.0
+        gen = int(info.get("generation", 0))
+        if gen >= 2:
+            _GC_ACC["g2_n"] += 1
+            _GC_ACC["g2_ms"] += dt
+        elif gen == 1:
+            _GC_ACC["g1_n"] += 1
+            _GC_ACC["g1_ms"] += dt
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+try:
+    import gc as _gc_mod
+    if _gc_probe_cb not in _gc_mod.callbacks:
+        _gc_mod.callbacks.append(_gc_probe_cb)
+except Exception:                                              # noqa: BLE001
+    pass
+
+
+def _gc_take():
+    """取走并清零累加值（返回 (g2_n, g2_ms, g1_n, g1_ms)）。"""
+    try:
+        out = (_GC_ACC["g2_n"], _GC_ACC["g2_ms"], _GC_ACC["g1_n"], _GC_ACC["g1_ms"])
+        _GC_ACC["g2_n"] = 0
+        _GC_ACC["g2_ms"] = 0.0
+        _GC_ACC["g1_n"] = 0
+        _GC_ACC["g1_ms"] = 0.0
+        return out
+    except Exception:                                          # noqa: BLE001
+        return (0, 0.0, 0, 0.0)
+
+
 #: 预览缩略图的最长边（V4：以前固定 480×270 + Fast 变换 ⇒ 放大后全是马赛克）
 # ★ 2026-11-10 性能：预览卡片只有几百像素宽，1280 会让 1280×720 的帧走
 #   `frame.copy()` 全幅拷贝（7 屏 × 3.7MB × 15fps ≈ 388MB/s）。降到 512：
@@ -2373,16 +2417,60 @@ class AutoVJEngine(QObject):
                 if now - self._tick_log_t >= 2.0:
                     self._tick_log_t = now
                     import stallwatch
+                    _extra = ""
+                    try:
+                        # 分段耗时（只在本分支组装；正常帧零成本）
+                        _tr = getattr(self, "_ptrace", None) or []
+                        if len(_tr) >= 2:
+                            _segs = {}
+                            for (_n0, _t0), (_n1, _t1) in zip(_tr, _tr[1:]):
+                                _segs[_n0] = _segs.get(_n0, 0.0) + (_t1 - _t0) * 1000.0
+                            _last = (time.perf_counter() - _tr[-1][1]) * 1000.0
+                            _segs[_tr[-1][0]] = _segs.get(_tr[-1][0], 0.0) + _last
+                            _abbr = {"section": "sec", "compose": "comp",
+                                     "output_plan": "plan", "postfx": "post",
+                                     "copy": "copy", "routes": "routes",
+                                     "spout": "spout", "ndi": "ndi",
+                                     "ui_snap": "ui", "tick": "tick"}
+                            _order = ("section", "compose", "output_plan", "postfx",
+                                      "copy", "routes", "spout", "ndi", "ui_snap")
+                            _parts = ["%s=%.0f" % (_abbr.get(_k, _k), _segs[_k])
+                                      for _k in _order if _k in _segs]
+                            if _parts:
+                                _extra += " | seg: " + " ".join(_parts)
+                        # GC：自上次慢帧以来
+                        _g2n, _g2ms, _g1n, _g1ms = _gc_take()
+                        _extra += " | gc: g2=%d/%.0fms g1=%d/%.0fms" % (
+                            _g2n, _g2ms, _g1n, _g1ms)
+                    except Exception:                              # noqa: BLE001
+                        pass
                     stallwatch.log_line(
-                        "[ENG] tick 间隔 %.0fms / 处理 %.0fms 阶段=%s 图层=%d fps=%s"
+                        "[ENG] tick 间隔 %.0fms / 处理 %.0fms 阶段=%s 图层=%d fps=%s%s"
                         % (self._tick_gap_ms, self._tick_ms,
                            getattr(self, "_phase", "?"), len(self.layers),
-                           getattr(self, "_effective_fps", "?")))
+                           getattr(self, "_effective_fps", "?"), _extra))
         except Exception:
             pass
 
+    def _phase_set(self, name):
+        """记一次阶段切换（同时打点），供慢帧日志拼 `seg:` 分段耗时。
+
+        ★ 2026-11-10：只做 `_phase` 赋值 + 一次 `perf_counter()`，正常帧成本 ~1µs；
+          分段字符串**只在 `_tick_ms > 100ms` 时**才组装（见 `_tick_locked` 尾部）。
+        """
+        self._phase = name
+        try:
+            tr = getattr(self, "_ptrace", None)
+            if tr is None:
+                tr = []
+                self._ptrace = tr
+            tr.append((name, time.perf_counter()))
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _tick_locked(self):
-        self._phase = "tick"
+        self._ptrace = []
+        self._phase_set("tick")
         snap = self.audio.snapshot()
         self._auto_fps_tick()
         if self.freeze:
@@ -2510,18 +2598,18 @@ class AutoVJEngine(QObject):
         # ★ 2026-10-28（能量段落）：按曲库预设的段落表推进档位。
         #   必须放在 `_cue_auto_position()` **之后** —— 它要先有可信的原曲秒。
         #   改到前面会让段落判定永远晚 0.2s（用的是上一次的位置）。
-        self._phase = "section"
+        self._phase_set("section")
         self._section_tick(snap)
         self._cuesheet_tick(snap)
 
         # 合成
-        self._phase = "compose"
+        self._phase_set("compose")
         self._split_cache = {}       # ★ 性能：split 裁切按帧缓存，帧首清空
         # ★ 多屏输出：配置变更必须先重建画布/发送端，再合成主屏（主屏分辨率可能变了）
         if self._out_cfg is not None and self._plan_rev != getattr(self, "_plan_rev_ready", -1):
-            self._phase = "output_plan"
+            self._phase_set("output_plan")
             self._rebuild_output_plan()
-            self._phase = "compose"
+            self._phase_set("compose")
         # ★ BUG-D 波1：主屏合成前先把**主屏**的生效参数挂上（有 override 才挂；
         #   没有 ⇒ None ⇒ 读全局 ⇒ 与改动前逐字等价）。
         self._cp_cfg = None
@@ -2539,10 +2627,10 @@ class AutoVJEngine(QObject):
         #   原来两段各做一次 `_np_view_bgr` + `write_back_bgr`（1280×720 共 3.7 MB），
         #   实测每帧白搬 1.43 ms ≈ 4.3% 单核（用户报 5800X 30%）。
         #   顺序不变：颜色先、后处理后 —— 辉光/色差等仍吃到调色后的画面。
-        self._phase = "postfx"
+        self._phase_set("postfx")
         self._apply_color_postfx(snap)
         self._cp_cfg = None      # ★ BUG-D：主屏这段用完就复位，别漏到别的屏
-        self._phase = "copy"
+        self._phase_set("copy")
         if self._out_cfg is not None:
             # ---- 多屏输出 ----
             mode = str(self._out_cfg.get("mode") or "multi")
@@ -2557,7 +2645,7 @@ class AutoVJEngine(QObject):
             else:
                 self._compose_independent(snap)
             self._publish_multi_frame()
-            self._phase = "routes"
+            self._phase_set("routes")
             self._send_multi_routes()
         else:
             # ---- 旧的单路输出（没有配置时保持原逻辑）----
@@ -2582,11 +2670,11 @@ class AutoVJEngine(QObject):
             # ★ 2026-11-08（用户：显示器输出码表演出仍掉帧）：把 "copy" 拆开记录。
             #   `copy` 同时覆盖帧拷贝 / Spout 入队 / NDI 发送，现场 `阶段=copy` 无法定位；
             #   Spout 发送线程的 sendImage 有可能偶发持 GIL ⇒ 单独标成 spout/ndi 便于取证。
-            self._phase = "spout"
+            self._phase_set("spout")
             self._spout_send()
-            self._phase = "ndi"
+            self._phase_set("ndi")
             self._ndi_send()
-        self._phase = "ui_snap"
+        self._phase_set("ui_snap")
         # ★ 算好「GUI 状态快照」放 `self._ui_snap`，供 GUI 无锁读取（`ui_snapshot`）。
         #   见 FINAL_REPORT P1-1：GUI 的 `_update_status`（500ms）原先把 4 个 @_locked 方法全调
         #   一遍 ⇒ 每 500ms 抢一次渲染锁，慢帧时会等满超时、界面一秒一顿。现改为引擎线程算好、
