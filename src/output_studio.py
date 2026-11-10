@@ -2672,11 +2672,14 @@ class _CanvasBoard(QWidget):
         else:
             self._hit_cycle = None
             s, r = self._hit(ev.position())
-        # 切分/复制屏的矩形是从源屏派生的，拖它们没有意义 ⇒ 当作空白拖动平移画布
-        if s is not None and str(s.get("type") or "main") not in ("split", "copy"):
-            x, y, _w, _h = OM.screen_rect(self.cfg, s)
+        # ★ 2026-11-10（QA A）：切分/复制屏**也要能拖** —— 显示位置已经改用它们自己的
+        #   layout（`mapping_display_rect`），所以拖动必须对它们生效。
+        #   `orig` 取 `_display_rect()`（自己的 layout），不能用 `OM.screen_rect()`
+        #   （那个对切分屏返回源屏裁切区，拖动会跳）。
+        if s is not None:
+            _dx, _dy, _dw, _dh = self._display_rect(s)
             self._drag = {"sid": s.get("id"), "start": ev.position(),
-                          "orig": [x, y]}
+                          "orig": [int(_dx), int(_dy)]}
             self.setCursor(Qt.ClosedHandCursor)
         else:
             self._drag = {"sid": None, "start": ev.position(),
@@ -3338,9 +3341,8 @@ class OutputCanvasWindow(QDialog):
         self._update_warn()          # 布局变了 ⇒ 超界提示跟着变
 
     def _on_moved(self):
-        self.studio.apply()
-        self.board.set_config(self.studio.active_config())
-        self.board.update()
+        """拖动结束：★ 只暂存，不写盘不下发（点「应用」才生效）。"""
+        self._stage()
 
     def _export(self):
         self.studio.export_mapping()
