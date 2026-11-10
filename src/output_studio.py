@@ -10,6 +10,7 @@
 数据模型在 `output_model.py`，引擎合成/发送在 `engine.py`。
 """
 
+import copy
 import json
 import os
 import time
@@ -2548,50 +2549,27 @@ def fit_block(lines, avail_w, avail_h, hi=28, lo=10, shorten=None):
 def mapping_display_rect(cfg, screen, screens=None):
     """Mapping **显示用**矩形（画布窗口与导出 PNG 共用这一套）。
 
-    ★ V2（用户第 1 条）：「切分出来的屏幕也要把它单独显示到 Mapping 图里面」。
-      切分/复制屏的 `layout` 和源屏完全重叠（都 [0,0]）⇒ 画出来是"屏中屏"。
-      这里只给**显示**偏移：排到所有源屏（main/independent）右侧，辅助屏统一序号垂直堆叠。
-
-    ⚠ **不动 `cfg` 里的 `layout`**（整合画布只合成 main+independent，辅助屏 layout 无意义）；
-      **也不改屏自己的 UV / 分辨率 / 名字** —— 换的只是画在哪。
+    ★ 2026-11-10（用户）：**切分/复制屏也要能独立摆放**。以前这里给辅助屏算"排到源屏
+      右侧 + 垂直堆叠"的显示偏移 ⇒ 每次重画都重算，用户拖了下一帧又被算回去（"拖不动"）。
+      现在一律返回它自己的 `layout`（= `OM.screen_rect`）；`layout` 已被迁移夹进画布内，
+      所以它们会正常出现在画布里、可拖可放。
+      ⚠ 保留 `screens` 参数以兼容旧调用（导出 PNG 也用它）。
     """
-    t = str((screen or {}).get("type") or "main")
-    x, y, w, h = OM.screen_rect(cfg, screen)
-    if t not in ("split", "copy"):
-        return x, y, w, h
-    lst = list(screens if screens is not None else OM.mapping_screens(cfg))
-    right = 0.0
-    y0 = 0.0
-    first = True
-    for o in lst:
-        if str(o.get("type") or "main") in ("split", "copy"):
-            continue
+    if str((screen or {}).get("type") or "main") in ("split", "copy"):
+        # ⚠ `OM.screen_rect()` 对切分/复制屏返回的是**源屏的裁切区**，不反映它自己的
+        #   `layout`；这里必须用"自己的 layout + 自己的实际尺寸"，否则拖了也画在原地。
+        lay = (screen or {}).get("layout") or [0, 0]
         try:
-            ox, oy, ow, oh = OM.screen_rect(cfg, o)
-        except Exception:                                          # noqa: BLE001
-            continue
-        right = max(right, float(ox + ow))
-        y0 = float(oy) if first else min(y0, float(oy))
-        first = False
-    idx = 0
-    for o in lst:
-        if o is screen:
-            break
-        if str(o.get("type") or "main") in ("split", "copy"):
-            idx += 1
-    return int(right + 40), int(y0 + idx * (h + 24)), w, h
+            _x, _y = int(lay[0]), int(lay[1])
+        except (TypeError, IndexError, ValueError):
+            _x, _y = 0, 0
+        _w, _h = OM.effective_size(cfg, screen)
+        return _x, _y, int(_w), int(_h)
+    return OM.screen_rect(cfg, screen)
 
 
 class _CanvasBoard(QWidget):
-    """输出画布：把每块屏幕按 mapping 坐标摆在一张画布上，**拖动即可排布**。
-
-    ★ 用户第 11 条：多屏单路输出要有一个"输出画布"窗口，在里面设分辨率、拖放排布
-      每块屏幕、导出 mapping。坐标就是配置里的 `screen["layout"]`（画布像素），
-      所以拖完直接写回配置 → 输出/mapping/预览用的是同一份数据。
-    ⚠ 这个画布只是"排布工具"，**不参与预览渲染**（左边预览仍走多屏多路那套）。
-    """
-
-    moved = Signal()          # 拖动结束（写回配置后由 studio.apply 落盘）
+    moved = Signal()
 
     def __init__(self, studio, parent=None):
         super().__init__(parent)
@@ -2643,18 +2621,7 @@ class _CanvasBoard(QWidget):
         return OM.mapping_screens(self.cfg) if self.cfg else []
 
     def _display_rect(self, s):
-        """画布上显示用的矩形。
-
-        ★ C：默认"拖动只排版" ⇒ 优先用 `preview_rect`（纯 UI），没有才退回 `layout` 派生值；
-          勾了「摆放位置影响输出」时用老逻辑（与导出 PNG 共用 `mapping_display_rect`）。
-        """
-        try:
-            if not bool((self.cfg or {}).get("layout_affects_output", False)):
-                pr = (s or {}).get("preview_rect")
-                if pr and len(pr) == 4 and (s or {}).get("preview_dragged"):
-                    return int(pr[0]), int(pr[1]), int(pr[2]), int(pr[3])
-        except Exception:                                          # noqa: BLE001
-            pass
+        """画布上显示用的矩形（= 该屏自己的 `layout`；导出 PNG 也走同一套）。"""
         return mapping_display_rect(self.cfg, s, self._frames())
 
     def _hit_all(self, pos):
@@ -2736,16 +2703,34 @@ class _CanvasBoard(QWidget):
                 #   `layout_affects_output` 默认 **False** ⇒ 只写 UI 用的 `preview_rect`，
                 #   绝不碰 `layout`（单路整合画布是按 layout 拼的 ⇒ 拖一下就改输出画面）。
                 #   勾上「摆放位置影响输出」才恢复老行为（写 layout）。
-                _affects = bool((self.cfg or {}).get("layout_affects_output", False))
-                if _affects:
-                    s["layout"] = [int(round(nx)), int(round(ny))]
-                else:
-                    _w2, _h2 = OM.effective_size(self.cfg, s)
-                    s["preview_rect"] = [int(round(nx)), int(round(ny)), int(_w2), int(_h2)]
-                    # 只有**用户拖过**才用 preview_rect 显示；`_new_screen` 自带的初始
-                    # preview_rect 是排版用的，不能盖掉 layout（否则初始显示位置全乱）
-                    s["preview_dragged"] = True
+                # ★ B（2026-11-10）：拖动**一律写 layout** —— 已改成"点应用才生效"，
+                #   不再有"拖动影响预览"的问题；`preview_rect` 那套保留字段但不再使用。
+                s["layout"] = [int(round(nx)), int(round(ny))]
         self.update()
+
+    def contextMenuEvent(self, ev):
+        """右键屏幕 ⇒「参与输出」开关（★ C）。只改内存，等窗口「应用」才生效。"""
+        if not self.cfg:
+            return
+        s, _r = self._hit(ev.pos())
+        if s is None:
+            return
+        m = QMenu(self)
+        a = m.addAction("参与输出（拼进整合画布并发送）")
+        a.setCheckable(True)
+        a.setChecked(s.get("include", True) is not False)
+        a.toggled.connect(lambda on, sid=s.get("id"): self._set_include(sid, on))
+        m.exec(ev.globalPos())
+
+    def _set_include(self, sid, on):
+        try:
+            sc = OM.screen_by_id(self.cfg, sid)
+            if sc is not None:
+                sc["include"] = bool(on)
+                self.update()
+                self.moved.emit()      # 让窗口走 _stage()（仍不写盘）
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _snap(self, sid, x, y):
         """把要落下的 (x, y) 吸到画布边 / 其它屏幕的边与中线（阈值 8 画布像素）。"""
@@ -3114,6 +3099,13 @@ class OutputCanvasWindow(QDialog):
     def __init__(self, studio, parent=None):
         super().__init__(parent or studio)
         self.studio = studio
+        # ★ B（2026-11-10，用户：「mapping 只负责摆位置…不要联动」）：
+        #   窗口内所有编辑**只改内存**，点「应用」才 `studio.apply()`（写盘 + 下发引擎）；
+        #   点「取消」/直接关窗 ⇒ 用这份备份把排版字段恢复回去。
+        try:
+            self._backup = copy.deepcopy(self.studio.active_config() or {})
+        except Exception:                                          # noqa: BLE001
+            self._backup = None
         self.setWindowTitle("输出画布（Mapping）")
         self.resize(940, 640)
         lay = QVBoxLayout(self)
@@ -3142,13 +3134,6 @@ class OutputCanvasWindow(QDialog):
         self.btn_fit = QPushButton("适应窗口")
         self.btn_fit.clicked.connect(self._fit)
         bar.addWidget(self.btn_fit)
-        bar.addSpacing(10)
-        self.chk_affect = QCheckBox("摆放位置影响输出")
-        self.chk_affect.setToolTip(
-            "不勾（默认）：拖动只用于整理查看排版，不影响输出画面。\n"
-            "勾上：拖动会改变输出里各屏的位置（写回 layout）。")
-        self.chk_affect.toggled.connect(self._on_affect_toggled)
-        bar.addWidget(self.chk_affect)
         bar.addStretch(1)
         self.btn_export = QPushButton("导出 Mapping…")
         self.btn_export.setToolTip("导出 mapping JSON + PNG 到指定目录")
@@ -3166,10 +3151,21 @@ class OutputCanvasWindow(QDialog):
         self.board = _CanvasBoard(studio)
         self.board.moved.connect(self._on_moved)
         lay.addWidget(self.board, 1)
+        # ★ B：底部「应用 / 取消」——只有点「应用」才写盘 + 下发引擎
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_apply = QPushButton("应用")
+        self.btn_apply.setToolTip("把这里的排版写入配置并立即生效")
+        self.btn_apply.clicked.connect(self._apply_changes)
+        btns.addWidget(self.btn_apply)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.setToolTip("丢弃本次改动，恢复打开窗口时的排版")
+        self.btn_cancel.clicked.connect(self._cancel_changes)
+        btns.addWidget(self.btn_cancel)
+        lay.addLayout(btns)
         self.hint = QLabel(
-            "这里拖动只用于整理查看排版，**不影响输出画面**；"
-            "要改输出位置请勾选「摆放位置影响输出」。\n"
-            "画布尺寸不够时会提示，不会自动裁屏；不要求每块屏幕都摆上来。")
+            "这里改的是**输出排版**，点「应用」才生效；取消则全部丢弃（预览不会实时联动）。\n"
+            "拖动摆位置；右键屏幕可开关「参与输出」；画布尺寸不够时只提示，不会自动裁屏。")
         self.hint.setStyleSheet("color:#8a8a8a;font-size:11px;padding:1px 4px;")
         self.hint.setStyleSheet("color:#888;")
         self.hint.setWordWrap(True)
@@ -3223,12 +3219,74 @@ class OutputCanvasWindow(QDialog):
             if bw > 0 and bh > 0:
                 cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(bw))),
                                         max(16, min(self.MAX_SIDE, int(bh)))]
-                self.studio.apply()
+                self._stage()          # ★ B：只改内存，点「应用」才下发
                 _set_spin_quiet(self.sp_w, max(16, min(self.MAX_SIDE, bw)))
                 _set_spin_quiet(self.sp_h, max(16, min(self.MAX_SIDE, bh)))
                 self.board.set_config(cfg)
         self._update_warn()
         self.board.fit()
+
+    # ---- ★ B：暂存 / 应用 / 取消 ----
+    _STAGE_KEYS = ("combined_size", "layout_migrated")
+
+    def _stage(self):
+        """窗口内编辑：只改内存 + 刷新本窗口，**不写盘、不下发引擎**（预览/输出保持原样）。"""
+        try:
+            cfg = self.studio.active_config()
+            if cfg is not None:
+                self.board.set_config(cfg)
+            self._update_warn()
+            _set_spin_quiet(self.sp_w, max(16, min(self.MAX_SIDE,
+                                                    int((cfg or {}).get("combined_size", [1920, 1080])[0]))))
+            _set_spin_quiet(self.sp_h, max(16, min(self.MAX_SIDE,
+                                                    int((cfg or {}).get("combined_size", [1920, 1080])[1]))))
+            self.board.update()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _apply_changes(self):
+        """「应用」：写盘 + 下发引擎（这才是真正让预览/输出变化的时刻）。"""
+        try:
+            self.studio.apply()
+        except Exception:                                          # noqa: BLE001
+            pass
+        self._backup = None
+        self.accept()
+
+    def _cancel_changes(self):
+        """「取消」：把排版字段恢复回打开窗口时的快照，再下发一次。"""
+        try:
+            cfg = self.studio.active_config()
+            if cfg is not None and isinstance(self._backup, dict):
+                for _k in self._STAGE_KEYS:
+                    if _k in self._backup:
+                        cfg[_k] = copy.deepcopy(self._backup[_k])
+                    else:
+                        cfg.pop(_k, None)
+                _bak = {str(s0.get("id") or ""): s0
+                        for s0 in (self._backup.get("screens") or [])}
+                for s0 in cfg.get("screens") or []:
+                    b = _bak.get(str(s0.get("id") or ""))
+                    if not b:
+                        continue
+                    for _k in ("layout", "preview_rect", "include"):
+                        if _k in b:
+                            s0[_k] = copy.deepcopy(b[_k])
+                        else:
+                            s0.pop(_k, None)
+                self.studio.apply()
+        except Exception:                                          # noqa: BLE001
+            pass
+        self._backup = None
+
+    def reject(self):
+        # 关窗（X / Esc）等同「取消」：丢弃未应用的改动
+        try:
+            if self._backup is not None:
+                self._cancel_changes()
+        except Exception:                                          # noqa: BLE001
+            pass
+        super().reject()
 
     def _update_warn(self):
         """画布 < 布局包围盒 ⇒ 显示一行黄字（**只提示，不改数据**）。"""
@@ -3258,28 +3316,13 @@ class OutputCanvasWindow(QDialog):
         except Exception:                                          # noqa: BLE001
             self.warn.hide()
 
-    def _on_affect_toggled(self, on):
-        """「摆放位置影响输出」开关：写进活动配置（默认 False = 只排版）。"""
-        try:
-            cfg = self.studio.active_config()
-            if cfg is not None:
-                cfg["layout_affects_output"] = bool(on)
-                self.studio.cfg.save()
-                self.studio.apply()
-        except Exception:                                          # noqa: BLE001
-            pass
-        try:
-            self.board.update()
-        except Exception:                                          # noqa: BLE001
-            pass
-
     def _on_size(self, *_):
         cfg = self.studio.active_config()
         if not cfg:
             return
         cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(self.sp_w.value()))),
                                 max(16, min(self.MAX_SIDE, int(self.sp_h.value())))]
-        self.studio.apply()          # ⚠ apply 现在**不会**再改 combined_size
+        self._stage()                # ★ B：只改内存（点「应用」才写盘 + 下发引擎）
         self.board.set_config(cfg)
         self.board.fit()
         self._update_warn()          # 超界只提示，不改数据
@@ -3289,7 +3332,7 @@ class OutputCanvasWindow(QDialog):
         if not cfg:
             return
         OM.auto_layout(cfg, "h")
-        self.studio.apply()
+        self._stage()
         self.board.set_config(cfg)
         self.board.fit()
         self._update_warn()          # 布局变了 ⇒ 超界提示跟着变

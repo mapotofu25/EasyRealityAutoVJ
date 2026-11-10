@@ -7111,6 +7111,10 @@ class AutoVJEngine(QObject):
             sid = str(s.get("id") or "")
             if not sid:
                 continue
+            # ★ C（2026-11-10）：「参与输出」关掉的屏**不发送**（也不拼进整合画布，
+            #   整合画布那边由 `layout_sources()` 过滤）。
+            if s.get("include", True) is False:
+                continue
             out.append((sid, str(s.get("type") or "independent"),
                         names.get(sid) or s.get("name") or sid,
                         bool(s.get("spout", False)), bool(s.get("ndi", False))))

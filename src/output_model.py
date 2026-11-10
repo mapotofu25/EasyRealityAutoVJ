@@ -131,6 +131,7 @@ def _new_screen(name, stype, width, height, color, source_id=""):
         "layers": None if stype in ("main", "copy", "split") else [],
         "layout": [0, 0],
         "uv": [0.0, 0.0, 1.0, 1.0],
+        "include": True,          # ★ C：是否参与输出（Mapping 里可逐屏开关）
         "spout": False,
         "ndi": False,
         "follow_main": True,
@@ -188,6 +189,8 @@ def _ensure_screen(s, cfg, index, all_layer_ids, used_colors):
     s["color"] = str(s.get("color") or SCREEN_PALETTE[0])
     used_colors.add(s["color"])
 
+    if "include" not in s:
+        s["include"] = True       # ★ C：老配置补默认值（参与输出）
     if stype in ("main", "copy", "split"):
         s["layers"] = None
     else:
@@ -690,9 +693,14 @@ def unbind_layer(lid, cfg=None, data=None):
 
 
 def layout_sources(cfg):
-    """单路模式需要摆到整合画布上的源屏幕：主屏 + 独立屏。"""
+    """单路模式需要摆到整合画布上的源屏幕：主屏 + 独立屏（且 `include` 不为 False）。
+
+    ★ C（2026-11-10）：新增「参与输出」开关 —— `include=False` 的屏**不拼进整合画布、
+      也不作为输出路由发送**（用户要求"把哪些屏幕要放进来"可选）。
+    """
     return [s for s in (cfg or {}).get("screens") or []
-            if s.get("type") in ("main", "independent")]
+            if s.get("type") in ("main", "independent")
+            and s.get("include", True) is not False]
 
 
 def mapping_screens(cfg):
