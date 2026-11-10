@@ -3259,9 +3259,11 @@ class OutputCanvasWindow(QDialog):
     def _apply_changes(self):
         """「应用」：把副本里的三样东西合并回**真配置**，再写盘 + 下发引擎。"""
         try:
-            real = self._real_cfg
+            # ⚠ 必须用**当前**的 active_config()：`studio.apply()` 之后配置对象可能被替换，
+            #   窗口打开时抓的 `_real_cfg` 会变成孤儿 ⇒ 合并写了等于没写（include 失效的真因）。
+            real = self.studio.active_config()
             if real is None:
-                real = self.studio.active_config()
+                real = self._real_cfg
             if real is not None and isinstance(self.cfg, dict):
                 _cp_by_id = {str(s0.get("id") or ""): s0
                              for s0 in (self.cfg.get("screens") or [])}
