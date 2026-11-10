@@ -652,6 +652,25 @@ class MediaItem:
             except Exception:
                 pass
 
+    #: 缩略图存在性缓存：path -> (ts, 结果)。每次点选屏会查上百次，
+    #: 缓存 5 秒足够（转码完成后的新缩略图最多 5 秒内可见）。
+    _THUMB_CACHE = {}
+    _THUMB_TTL = 5.0
+
+    def _exists_cached(self, path):
+        import time as _t
+        if not path:
+            return False
+        now = _t.monotonic()
+        hit = MediaItem._THUMB_CACHE.get(path)
+        if hit is not None and now - hit[0] < MediaItem._THUMB_TTL:
+            return hit[1]
+        ok = os.path.exists(path)
+        if len(MediaItem._THUMB_CACHE) > 4096:
+            MediaItem._THUMB_CACHE.clear()
+        MediaItem._THUMB_CACHE[path] = (now, ok)
+        return ok
+
     def resolve_thumb(self):
         """返回**磁盘上确实存在**的缩略图路径（没有则 None），并顺手修正 self.thumb。
 
@@ -662,11 +681,11 @@ class MediaItem:
         实测用户素材库：164 个里 49 个 alpha .mov 就是这种情况（用户报「部分素材的图不见了」）。
         """
         t = self.thumb
-        if t and os.path.exists(t):
+        if t and self._exists_cached(t):
             return t
         for ext in (".png", ".jpg"):
             p = self._thumb_path(ext)
-            if os.path.exists(p):
+            if self._exists_cached(p):
                 self.thumb = p
                 return p
         return None

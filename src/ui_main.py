@@ -3802,7 +3802,27 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_studio_selection(self, sid=""):
-        """选中屏幕变了：右侧设置换作用域 + 下方图层块重排（用户第 8/10/11 条）。"""
+        """选中屏幕变了：右侧设置换作用域 + 下方图层块重排（用户第 8/10/11 条）。
+
+        ★ 2026-11-10 性能：这里原来**同步**跑 `_rebuild_multi_blocks()`（重刷 N 块样式）
+          + `_sync_multi_right()`（重建右侧面板），实测点一下屏要 250~800ms。
+          现在改成"立刻返回 + 下一轮事件循环再做重活"：
+            · 选中态的**视觉反馈**（预览高亮 / 下拉框 / 悬浮胶囊）已经在 `select_screen`
+              里同步更新过了，用户点下去立刻有反应；
+            · 重活用合并的 `QTimer.singleShot(0)` 排队，连续点选只跑最后一次。
+          这样点击响应不再被面板重建阻塞。
+        """
+        self._pending_sel = str(sid or "")
+        if getattr(self, "_sel_timer", None) is None:
+            self._sel_timer = QTimer(self)
+            self._sel_timer.setSingleShot(True)
+            self._sel_timer.setInterval(0)
+            self._sel_timer.timeout.connect(self._flush_studio_selection)
+        self._sel_timer.start()
+
+    def _flush_studio_selection(self):
+        """延后执行的重活（点选后的面板/块刷新）。"""
+        sid = str(getattr(self, "_pending_sel", "") or "")
         try:
             self._rebuild_multi_blocks()
         except Exception as e:                                    # noqa: BLE001
@@ -4529,17 +4549,23 @@ class MainWindow(QMainWindow):
             s = _om.screen_by_id(cfg, bid) or {}
             col = _om.effective_color(cfg, s)
             sel = (bid == sid)
-            try:
-                blk.setStyleSheet(
-                    "QFrame#multiScreenBlock{border:%dpx solid %s;border-radius:5px;"
+            # ★ 2026-11-10 性能：`setStyleSheet()` 会让 Qt 重新 polish 整棵子树
+            #   （7 块 × 11 行 ≈ 200ms/次点选）。样式串没变就不再设一次。
+            _css = ("QFrame#multiScreenBlock{border:%dpx solid %s;border-radius:5px;"
                     "background:%s;}" % (3 if sel else 1, col, theme.V("panel")))
+            try:
+                if getattr(blk, "_css_cache", None) != _css:
+                    blk._css_cache = _css
+                    blk.setStyleSheet(_css)
             except Exception:                                     # noqa: BLE001
                 pass
             try:
                 info = self._screen_block_info(cfg, s)
                 ps = blk.findChildren(LayerStackPanel)
                 if ps:
-                    ps[0].title.setText(("✔ " if sel else "") + info)
+                    _t = ("✔ " if sel else "") + info
+                    if ps[0].title.text() != _t:      # ★ 文本没变就别 setText（触发重排）
+                        ps[0].title.setText(_t)
                 # ★ BUG-B：0 行时显示"还没有图层"的灰字提示，有行就藏起来
                 _h = getattr(blk, "_empty_hint", None)
                 if _h is not None:

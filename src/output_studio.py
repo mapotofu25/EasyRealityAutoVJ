@@ -2258,7 +2258,27 @@ class OutputStudio(QWidget):
             pass
 
     def _on_preview_geometry(self):
-        self.apply()
+        """拖动/缩放**松手**。
+
+        ★ 2026-11-10 性能：这里原来直接 `apply()`（sync_engine + refresh_all + save），
+          实测 p50 888ms / p95 1454ms —— 拖一下就卡 1.5 秒。改成 250ms 合并延后：
+          松手立刻返回（拖动过程中画面已跟手），连续拖动只落一次 apply。
+        """
+        t = getattr(self, "_geo_apply_timer", None)
+        if t is None:
+            from PySide6.QtCore import QTimer
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(250)
+            t.timeout.connect(self._flush_geometry_apply)
+            self._geo_apply_timer = t
+        t.start()
+
+    def _flush_geometry_apply(self):
+        try:
+            self.apply()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _on_preview_action(self, action, sid):
         if action == "select":
