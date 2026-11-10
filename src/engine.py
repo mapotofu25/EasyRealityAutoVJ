@@ -386,6 +386,9 @@ def _output_backoff(fails):
 #: ---- 慢帧取证：GC 停顿累加（2026-11-10）---------------------------------
 # 用 `gc.callbacks` 只累加两个整数 + 两个 float，回调里**不做任何格式化/分配**，
 # 开销可忽略；慢帧那行日志读出"自上次慢帧以来"的 gen2/gen1 次数与总停顿。
+#: 慢帧取证：颜色/后处理链细分（ms）。由 `_apply_color_postfx` 累加，慢帧日志读取后清零。
+_POST_ACC = {"post": 0.0, "mode": "", "s": 0.0}
+
 _GC_ACC = {"g2_n": 0, "g2_ms": 0.0, "g1_n": 0, "g1_ms": 0.0, "_t0": 0.0}
 
 
@@ -2442,6 +2445,30 @@ class AutoVJEngine(QObject):
                         _g2n, _g2ms, _g1n, _g1ms = _gc_take()
                         _extra += " | gc: g2=%d/%.0fms g1=%d/%.0fms" % (
                             _g2n, _g2ms, _g1n, _g1ms)
+                        # 颜色/后处理链细分（view/tick/lut/apply/post/write + mode/s）
+                        try:
+                            import colorfx as _cfx_mod
+                            import postprocess as _pp_mod
+                            _cs = getattr(_cfx_mod, "SEG", {}) or {}
+                            _ps = getattr(_pp_mod, "SEG", {}) or {}
+                            _extra += (" | post: view=%.0f tick=%.0f lut=%.0f apply=%.0f"
+                                       " post=%.0f write=%.0f"
+                                       % (_ps.get("view", 0.0), _cs.get("tick", 0.0),
+                                          _cs.get("lut", 0.0), _cs.get("apply", 0.0),
+                                          _POST_ACC.get("post", 0.0), _ps.get("write", 0.0)))
+                            _extra += (" | c: mode=%s s=%.2f lut_rebuilt=%d bits_copy=%d"
+                                       % (_POST_ACC.get("mode") or "?",
+                                          float(_POST_ACC.get("s", 0.0)),
+                                          1 if _cs.get("lut_n", 0) else 0,
+                                          int(_ps.get("bits_copy", 0))))
+                            # 清零（下次慢帧重新计）
+                            for _k in list(_cs.keys()):
+                                _cs[_k] = 0
+                            for _k in list(_ps.keys()):
+                                _ps[_k] = 0
+                            _POST_ACC["post"] = 0.0
+                        except Exception:                          # noqa: BLE001
+                            pass
                     except Exception:                              # noqa: BLE001
                         pass
                     stallwatch.log_line(
@@ -6525,8 +6552,18 @@ class AutoVJEngine(QObject):
         except Exception:
             pass
         try:
+            _t_p = time.perf_counter()
             bgr = self._apply_postfx(snap, bgr=bgr, write=False)
+            _POST_ACC["post"] += (time.perf_counter() - _t_p) * 1000.0
         except Exception:
+            pass
+        try:
+            _cfx = self.color_fx
+            if _cfx is not None:
+                _POST_ACC["s"] = float(getattr(_cfx, "s", 0.0) or 0.0)
+                _POST_ACC["mode"] = str(((self._cp_cfg or self.cfg).get("color") or {})
+                                        .get("mode", "lut"))
+        except Exception:                                          # noqa: BLE001
             pass
         if bgr is None:
             return                      # 两段都没跑（或都没生效）⇒ 一次都不用搬

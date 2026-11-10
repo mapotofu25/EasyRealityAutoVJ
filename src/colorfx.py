@@ -16,6 +16,11 @@ import math
 import time
 
 import numpy as np
+import time as _time_mod
+
+#: 慢帧取证：颜色链分段累加（ms）+ 本帧是否重建过 LUT。
+SEG = {"tick": 0.0, "lut": 0.0, "apply": 0.0, "lut_n": 0}
+
 
 from i18n import T, Tf
 
@@ -323,3 +328,43 @@ class ColorRenderer:
             return False
         write_back_bgr(canvas, out)
         return True
+
+
+# ---- 慢帧取证：给 tick / build_lut / apply_to_bgr 各挂一个累加计时（2026-11-10）----
+try:
+    _orig_tick = ColorRenderer.tick
+
+    def _seg_tick(self, *a, **k):
+        _t0 = _time_mod.perf_counter()
+        try:
+            return _orig_tick(self, *a, **k)
+        finally:
+            SEG["tick"] += (_time_mod.perf_counter() - _t0) * 1000.0
+
+    ColorRenderer.tick = _seg_tick
+
+    _orig_build = globals().get("build_lut")
+
+    if _orig_build is not None:
+        def _seg_build(*a, **k):
+            _t0 = _time_mod.perf_counter()
+            try:
+                return _orig_build(*a, **k)
+            finally:
+                SEG["lut"] += (_time_mod.perf_counter() - _t0) * 1000.0
+                SEG["lut_n"] += 1
+        globals()["build_lut"] = _seg_build
+
+    _orig_apply = ColorRenderer.apply_to_bgr
+
+    def _seg_apply(self, *a, **k):
+        _l0 = SEG["lut"]
+        _t0 = _time_mod.perf_counter()
+        try:
+            return _orig_apply(self, *a, **k)
+        finally:
+            SEG["apply"] += max(0.0, (_time_mod.perf_counter() - _t0) * 1000.0
+                                - (SEG["lut"] - _l0))
+    ColorRenderer.apply_to_bgr = _seg_apply
+except Exception:                                              # noqa: BLE001
+    pass

@@ -12,6 +12,11 @@
 """
 import math
 import numpy as np
+import time as _time_mod
+
+#: 慢帧取证：颜色/后处理分段累加（ms）。只在慢帧日志里读取并清零。
+SEG = {"view": 0.0, "write": 0.0, "bits_copy": 0}
+
 import cv2
 
 
@@ -240,11 +245,29 @@ def _np_view_bgr(img):
       `cv2.cvtColor` 走 SIMD：720p 0.74ms / 1080p 1.14ms（快 6~8 倍），
       且输出**逐像素完全一致**（见 tools/_perf_bgr_view.py 的 array_equal 断言）。
     """
+    _t = _time_mod.perf_counter()
+    _t = _time_mod.perf_counter()
     w, h = img.width(), img.height()
     bpl = img.bytesPerLine()
+    _det_before = False
+    try:
+        _det_before = bool(img.isDetached())
+    except Exception:                                          # noqa: BLE001
+        pass
     arr = np.frombuffer(img.bits(), dtype=np.uint8, count=bpl * h).reshape(h, bpl)
+    try:
+        # bits() 返回非 const ⇒ 若原本被共享引用，Qt 会先整幅 detach（10.8MB 拷贝）
+        if _det_before and not bool(img.isDetached()):
+            SEG["bits_copy"] = 1
+    except Exception:                                          # noqa: BLE001
+        pass
     v4 = arr[:, :w * 4].reshape(h, w, 4)
-    return cv2.cvtColor(v4, cv2.COLOR_BGRA2BGR)
+    _out = cv2.cvtColor(v4, cv2.COLOR_BGRA2BGR)
+    try:
+        SEG["view"] += (_time_mod.perf_counter() - _t) * 1000.0
+    except Exception:                                          # noqa: BLE001
+        pass
+    return _out
 
 
 def write_back_bgr(img, bgr):
@@ -256,6 +279,7 @@ def write_back_bgr(img, bgr):
       —— alpha 必须保留：码表图层的透明区就靠它，写成 255 会把透明变黑。
       逐像素等价性由 tools/_perf_bgr_view.py 断言。
     """
+    _t = _time_mod.perf_counter()
     w, h = img.width(), img.height()
     bpl = img.bytesPerLine()
     dst = np.frombuffer(img.bits(), dtype=np.uint8, count=bpl * h).reshape(h, bpl)
@@ -263,6 +287,10 @@ def write_back_bgr(img, bgr):
     alpha = v4[:, :, 3].copy()          # 1 通道，1080p ≈ 2MB，约 0.2ms
     cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA, dst=v4)
     v4[:, :, 3] = alpha
+    try:
+        SEG["write"] += (_time_mod.perf_counter() - _t) * 1000.0
+    except Exception:                                          # noqa: BLE001
+        pass
 
 
 def _level01(e):
