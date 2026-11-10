@@ -2186,13 +2186,6 @@ class OutputStudio(QWidget):
         except Exception:
             pass
 
-    def on_show(self):
-        """切到输出页时刷新一次（配置可能被旧输出面板/其它页改过）。"""
-        try:
-            self.reload()
-        except Exception:
-            pass
-
     def layer_names_for(self, screen):
         try:
             ids = OM.effective_layers(self.active_config(), screen,

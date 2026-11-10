@@ -233,6 +233,35 @@ def main():
     win.show()
     if splash is not None:
         splash.finish(win)
+
+    # ★ 诊断入口（2026-11-10）：`--open-output-window` / `AUTOVJ_OPEN_OUT_WIN=1`
+    #   启动后自动把「输出显示器」切成**窗口模式**并显示输出窗口，用于真机 A/B 取证
+    #   （对比"开着输出窗口"与"关闭输出窗口"的 ui_stall.log）。
+    #   ⚠ 必须延后到首次事件循环之后：在 __init__ 里同步开窗会卡启动、也会和恢复配置抢顺序。
+    #   不带参数时行为与之前**完全一致**（零副作用）。
+    try:
+        _open_out = ("--open-output-window" in sys.argv
+                     or str(os.environ.get("AUTOVJ_OPEN_OUT_WIN", "")).strip() in ("1", "true", "yes"))
+    except Exception:                                             # noqa: BLE001
+        _open_out = False
+    if _open_out:
+        def _do_open_out_window():
+            try:
+                ow = getattr(win, "out_win", None)
+                if ow is None:
+                    return
+                ow.show_windowed()
+                ow.show()
+                ow.raise_()
+                try:
+                    win.engine.set_frame_consumers(
+                        bool(win.preview_panel.preview_on()) or ow.isVisible())
+                except Exception:                                 # noqa: BLE001
+                    pass
+            except Exception:                                     # noqa: BLE001
+                pass
+        from PySide6.QtCore import QTimer as _QT
+        _QT.singleShot(0, _do_open_out_window)
     mark("合计", t_all)
     _log_startup(marks)
     sys.exit(app.exec())
