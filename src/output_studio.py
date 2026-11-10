@@ -1900,8 +1900,11 @@ class OutputStudio(QWidget):
         #   输出里依然看不见。这里把"完全落在画布外"的屏顺次排到已有屏右侧，只做一次。
         try:
             if not cfg.get("layout_migrated"):
-                # ⚠ 必须读**原始 layout**：`OM.screen_rect()` 对切分/复制屏返回的是
-                #   源屏的裁切区，压根不反映它自己的 layout（用它做迁移永远不成立）。
+                # ★ 2026-11-10（QA ④）：**夹取到画布内**，不要"往后排"也不要扩画布。
+                #   用户真实配置横排总和 3502 > 2560 ⇒ 根本排不下，"排到右侧"会把屏推到画布外。
+                #   规则：x 夹在 [0, cw-w]（w>cw 时贴左 0），y 同理；允许重叠（用户可用
+                #   「连点切换」选中、勾「摆放位置影响输出」后自己拖开）。
+                #   ⚠ 必须读**原始 layout**：`OM.screen_rect()` 对切分/复制屏返回的是源屏裁切区。
                 def _raw_xy(sc):
                     lay = sc.get("layout") or [0, 0]
                     try:
@@ -1909,18 +1912,12 @@ class OutputStudio(QWidget):
                     except (TypeError, IndexError, ValueError):
                         return 0, 0
                 _cw, _ch2 = OM.combined_size(cfg)
-                _right = 0
                 for _s in cfg.get("screens") or []:
                     _x, _y = _raw_xy(_s)
-                    _w = int(OM.effective_size(cfg, _s)[0])
-                    if _x < _cw and _y < _ch2:
-                        _right = max(_right, _x + _w)
-                for _s in cfg.get("screens") or []:
-                    _x, _y = _raw_xy(_s)
-                    _w = int(OM.effective_size(cfg, _s)[0])
-                    if _x >= _cw or _y >= _ch2:
-                        _s["layout"] = [int(_right), 0]
-                        _right += _w
+                    _w, _h = OM.effective_size(cfg, _s)
+                    _x = max(0, min(int(_cw) - int(_w), int(_x)))
+                    _y = max(0, min(int(_ch2) - int(_h), int(_y)))
+                    _s["layout"] = [int(_x), int(_y)]
                 cfg["layout_migrated"] = True
         except Exception:                                          # noqa: BLE001
             pass
