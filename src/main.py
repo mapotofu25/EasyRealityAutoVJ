@@ -255,14 +255,17 @@ def main():
     if _auto_start:
         def _do_auto_start():
             try:
+                # 真正的入口是 `MainWindow.toggle_run()`（没有 btn_start 这种东西，
+                # 我上一版按 btn_start 找 ⇒ 永远点不到，A/B 才一直是 0 行）
+                _fn = getattr(win, "toggle_run", None)
+                if callable(_fn) and not bool(getattr(win.engine, "running", False)):
+                    _fn()
+                    return
                 for _name in ("btn_start", "_btn_start", "btn_play"):
                     _b = getattr(win, _name, None)
                     if _b is not None and hasattr(_b, "click"):
                         _b.click()
                         return
-                _fn = getattr(win, "start", None) or getattr(win, "on_start", None)
-                if callable(_fn):
-                    _fn()
             except Exception:                                     # noqa: BLE001
                 pass
         from PySide6.QtCore import QTimer as _QT2
