@@ -7364,22 +7364,25 @@ class AutoVJEngine(QObject):
                 frames[sid] = frame
                 if do_thumbs:
                     thumbs[sid] = _preview_thumb(frame)
-                # ★ 2026-11-10：单路预览卡片仍按 screen id 取 `_route_frames`，
-                #   以前这里只有 `__combined__` ⇒ 卡片画的是上一帧/旧内容（图4 全串）。
-                #   现在按每块屏自己的 rect 从整合画布裁一份给它。
-                for _sc in output_model.layout_sources(plan):
+                # ★★ 2026-11-10（用户）：**预览卡片与输出画布解耦**。
+                #   Mapping 只负责摆位置 / 定分辨率 / 选哪些屏参与输出；
+                #   预览里每块屏必须显示它**自己的完整画面**，与它在整合画布里摆在哪无关。
+                #   ⚠ 绝不从这里按 `screen_rect()` 去 `_combined_canvas.copy(...)`：
+                #     那会让拖动 layout 改变预览内容，布局超出画布时还会 clamp 截短 ⇒
+                #     用户看到"预览画面被裁掉"（上一版就是这个错）。
+                #   · 遍历 **plan["screens"] 全部屏**：`include=False` 的屏不进输出，
+                #     但预览里仍应能看到它自己的画面。
+                for _sc in plan.get("screens") or []:
                     _sid2 = str(_sc.get("id") or "")
                     if not _sid2:
                         continue
-                    _x, _y, _w, _h = output_model.screen_rect(plan, _sc)
-                    _x = max(0, min(frame.width() - 1, int(_x)))
-                    _y = max(0, min(frame.height() - 1, int(_y)))
-                    _w = max(1, min(int(_w), frame.width() - _x))
-                    _h = max(1, min(int(_h), frame.height() - _y))
-                    _part = frame.copy(_x, _y, _w, _h)
-                    frames[_sid2] = _part
+                    _f2 = self._route_frame(plan, _sid2,
+                                            str(_sc.get("type") or "independent"))
+                    if _f2 is None or _f2.isNull():
+                        continue
+                    frames[_sid2] = _f2
                     if do_thumbs:
-                        thumbs[_sid2] = _preview_thumb(_part)
+                        thumbs[_sid2] = _preview_thumb(_f2)
             self._route_frames = frames
             self._route_thumbs = thumbs if do_thumbs else self._route_thumbs
             if self._gpu_frame_consumers and frame is not None:
