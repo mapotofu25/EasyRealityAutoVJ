@@ -386,6 +386,9 @@ def _output_backoff(fails):
 #: ---- 慢帧取证：GC 停顿累加（2026-11-10）---------------------------------
 # 用 `gc.callbacks` 只累加两个整数 + 两个 float，回调里**不做任何格式化/分配**，
 # 开销可忽略；慢帧那行日志读出"自上次慢帧以来"的 gen2/gen1 次数与总停顿。
+#: 慢帧取证：routes 逐屏累计（按屏名）。name -> {"spout":ms,"ndi":ms,"bits":ms,"n":n}
+_ROUTE_SEG = {}
+
 #: 慢帧取证：颜色/后处理链细分（ms）。由 `_apply_color_postfx` 累加，慢帧日志读取后清零。
 _POST_ACC = {"post": 0.0, "mode": "", "s": 0.0}
 
@@ -2466,6 +2469,21 @@ class AutoVJEngine(QObject):
                                           float(_POST_ACC.get("s", 0.0)),
                                           1 if _cs.get("lut_n", 0) else 0,
                                           int(_ps.get("bits_copy", 0))))
+                            # routes 逐屏（top3 按总耗时），并清空
+                            try:
+                                _rt = dict(_ROUTE_SEG)
+                                _ROUTE_SEG.clear()
+                                if _rt:
+                                    _tops = sorted(
+                                        _rt.items(),
+                                        key=lambda kv: -(kv[1]["bits"] + kv[1]["spout"]
+                                                         + kv[1]["ndi"]))[:3]
+                                    _extra += " | rt: " + " ; ".join(
+                                        "%s sp=%.0f nd=%.0f bits=%.0f n=%d"
+                                        % (_n, _v["spout"], _v["ndi"], _v["bits"], _v["n"])
+                                        for _n, _v in _tops)
+                            except Exception:                      # noqa: BLE001
+                                pass
                             # 清零（下次慢帧重新计）
                             for _k in list(_cs.keys()):
                                 _cs[_k] = 0
@@ -7588,7 +7606,12 @@ class AutoVJEngine(QObject):
         for sid, kind, name, want_sp, want_nd in self._route_specs():
             if not (want_sp or want_nd):
                 continue
+            _rs = _ROUTE_SEG.setdefault(str(name or sid),
+                                        {"spout": 0.0, "ndi": 0.0, "bits": 0.0, "n": 0})
+            _rs["n"] += 1
+            _tb = time.perf_counter()
             frame = self._route_frame(plan, sid, kind)
+            _rs["bits"] += (time.perf_counter() - _tb) * 1000.0
             if frame is None or frame.isNull():
                 continue
             st = self._route_state.setdefault(sid, {})
@@ -7624,8 +7647,10 @@ class AutoVJEngine(QObject):
                             sp = None
                     if sp is not None:
                         try:
+                            _ts = time.perf_counter()
                             ok = sp.send(frame.bits(), frame.width(), frame.height(),
                                          frame.bytesPerLine())
+                            _rs["spout"] += (time.perf_counter() - _ts) * 1000.0
                             if not ok:
                                 _e = sp.last_error() if hasattr(sp, "last_error") else None
                                 raise RuntimeError(_e or "SpoutOut.send() 返回 False")
@@ -7665,9 +7690,13 @@ class AutoVJEngine(QObject):
                                 raise RuntimeError("NDI _ensure(%dx%d) 返回 False"
                                                    % (frame.width(), frame.height()))
                             bpl = frame.bytesPerLine()
+                            _tb2 = time.perf_counter()
                             bgra = np.frombuffer(frame.bits(), dtype=np.uint8,
                                                  count=bpl * frame.height())
+                            _rs["bits"] += (time.perf_counter() - _tb2) * 1000.0
+                            _tn = time.perf_counter()
                             nd.send_video(bgra, frame.width(), frame.height())
+                            _rs["ndi"] += (time.perf_counter() - _tn) * 1000.0
                         except Exception as e:                     # noqa: BLE001
                             self._route_fail(sid, "ndi", now, e)
         self._route_heartbeat(now)
