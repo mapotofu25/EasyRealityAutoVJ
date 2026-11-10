@@ -244,6 +244,30 @@ def main():
                      or str(os.environ.get("AUTOVJ_OPEN_OUT_WIN", "")).strip() in ("1", "true", "yes"))
     except Exception:                                             # noqa: BLE001
         _open_out = False
+    # ★ 诊断入口 2（2026-11-10）：`--auto-start` / `AUTOVJ_AUTO_START=1`
+    #   启动后延后触发"开始"，让引擎真的出帧（A/B 取证必须有帧）。
+    #   不带参数时行为与之前完全一致。
+    try:
+        _auto_start = ("--auto-start" in sys.argv
+                       or str(os.environ.get("AUTOVJ_AUTO_START", "")).strip() in ("1", "true", "yes"))
+    except Exception:                                             # noqa: BLE001
+        _auto_start = False
+    if _auto_start:
+        def _do_auto_start():
+            try:
+                for _name in ("btn_start", "_btn_start", "btn_play"):
+                    _b = getattr(win, _name, None)
+                    if _b is not None and hasattr(_b, "click"):
+                        _b.click()
+                        return
+                _fn = getattr(win, "start", None) or getattr(win, "on_start", None)
+                if callable(_fn):
+                    _fn()
+            except Exception:                                     # noqa: BLE001
+                pass
+        from PySide6.QtCore import QTimer as _QT2
+        _QT2.singleShot(0, _do_auto_start)
+
     if _open_out:
         def _do_open_out_window():
             try:

@@ -4711,9 +4711,27 @@ class MainWindow(QMainWindow):
             from PySide6.QtCore import QTimer
             t = QTimer(spin)
             t.setSingleShot(True)
-            t.setInterval(400)
-            t.timeout.connect(lambda: (spin.interpretText(), slot()))
-            spin.lineEdit().textEdited.connect(lambda *_a: t.start())
+            # ★ 2026-11-10（QA 10 连跑实测 1/10 落在 "0.1" 中间态）：400ms→700ms，
+            #   每次输入都重置计时，并在提交前拦掉"还在输入"的文本形态。
+            t.setInterval(700)
+
+            def _commit():
+                _txt = (spin.lineEdit().text() or "").strip()
+                if (not _txt) or _txt in ("-", "+", ".", "-.", "+.") or _txt.endswith("."):
+                    return                      # 中间态：等下一次停顿或 editingFinished
+                try:
+                    spin.interpretText()
+                except Exception:                                  # noqa: BLE001
+                    pass
+                slot()
+
+            t.timeout.connect(_commit)
+
+            def _on_edit(*_a):
+                t.stop()                        # 从**最后一次**输入重新计时
+                t.start()
+
+            spin.lineEdit().textEdited.connect(_on_edit)
             spin._debounce_timer = t
         except Exception:                                          # noqa: BLE001
             pass
@@ -4914,16 +4932,6 @@ class MainWindow(QMainWindow):
                 _h = max(16, min(int(src_h), _h))
             s["width"] = _w
             s["height"] = _h
-            # 提交后把控件回写成 clamp 后的值（用户输 99999 ⇒ 显示源屏宽）
-            try:
-                if int(self.ss_w.value()) != _w:
-                    self.ss_w.blockSignals(True); self.ss_w.setValue(int(_w))
-                    self.ss_w.blockSignals(False)
-                if int(self.ss_h.value()) != _h:
-                    self.ss_h.blockSignals(True); self.ss_h.setValue(int(_h))
-                    self.ss_h.blockSignals(False)
-            except Exception:                                  # noqa: BLE001
-                pass
             if src_w > 0:
                 u1 = max(u0 + 0.002, min(1.0, u0 + _w / float(src_w)))
             else:
@@ -4933,6 +4941,18 @@ class MainWindow(QMainWindow):
             else:
                 v1 = max(v0 + 0.002, float(self.ss_uv[3].value()))
             s["uv"] = [u0, v0, u1, v1]
+            # ★★ 2026-11-10（QA ④i 确定性 11/11）：**必须在 UV 更新之后**再用
+            #   `effective_size()` 回写控件 —— 顺序反了就会用旧 UV 算出错误尺寸
+            #   （我上一次就是这么写坏的：585 被算成别的值，一次红 7 条）。
+            #   超限输入（99999）被 clamp 到 1600、UV 反算实际 1440 ⇒ 控件显示 1440。
+            try:
+                _ew, _eh = _om.effective_size(cfg, s)
+                for _sp, _val in ((self.ss_w, int(_ew)), (self.ss_h, int(_eh))):
+                    if int(_sp.value()) != int(_val):
+                        _sp.blockSignals(True); _sp.setValue(int(_val))
+                        _sp.blockSignals(False)
+            except Exception:                                  # noqa: BLE001
+                pass
             st.apply()
             # ★ U3 双向同步：右侧改 UV ⇒ 裁切窗口里的框跟着动
             _dlg = getattr(self, "_crop_dlg", None)
