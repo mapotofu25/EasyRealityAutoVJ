@@ -3102,13 +3102,18 @@ class OutputCanvasWindow(QDialog):
     def __init__(self, studio, parent=None):
         super().__init__(parent or studio)
         self.studio = studio
-        # ★ B（2026-11-10，用户：「mapping 只负责摆位置…不要联动」）：
-        #   窗口内所有编辑**只改内存**，点「应用」才 `studio.apply()`（写盘 + 下发引擎）；
-        #   点「取消」/直接关窗 ⇒ 用这份备份把排版字段恢复回去。
+        # ★★ 2026-11-10（副本方案，team-lead 定案）：
+        #   `_real_cfg` = **真配置对象，从头到尾只读**；`self.cfg` = 它的**深拷贝副本**，
+        #   窗口内所有编辑只改这份副本 ⇒ 「取消」天然回滚（真配置一个字都没动），
+        #   「应用」时只把三样东西（combined_size / 每屏 layout / include）合并回真配置再下发。
+        self._real_cfg = self.studio.active_config()      # 真对象，只读
         try:
-            self._backup = copy.deepcopy(self.studio.active_config() or {})
+            self._snapshot = copy.deepcopy(self._real_cfg or {})
+            self.cfg = copy.deepcopy(self._real_cfg or {})
         except Exception:                                          # noqa: BLE001
-            self._backup = None
+            self._snapshot = {}
+            self.cfg = {}
+        self._backup = None      # 旧字段保留为 None（外面若还有人读，不会炸）
         self.setWindowTitle("输出画布（Mapping）")
         self.resize(940, 640)
         lay = QVBoxLayout(self)
@@ -3152,6 +3157,8 @@ class OutputCanvasWindow(QDialog):
         self.warn.hide()
         lay.addWidget(self.warn)
         self.board = _CanvasBoard(studio)
+        # ★ 副本模型：board 直接持有**同一份副本对象**（不 deepcopy，否则改的和看的不是一份）
+        self.board.set_config(self.cfg)
         self.board.moved.connect(self._on_moved)
         lay.addWidget(self.board, 1)
         # ★ B：底部「应用 / 取消」——只有点「应用」才写盘 + 下发引擎
@@ -3175,7 +3182,7 @@ class OutputCanvasWindow(QDialog):
         lay.addWidget(self.hint)
 
     def reload(self):
-        cfg = self.studio.active_config()
+        cfg = self.cfg
         # ★ U5-1（用户第 5 条）：纯提示，**不改任何数据**（用户对"没动手却变了"很敏感）。
         #   新屏现在在**创建时**就排到已有屏右边（见 add_screen），重叠加只可能是老配置遗留。
         try:
@@ -3183,15 +3190,17 @@ class OutputCanvasWindow(QDialog):
                 src = OM.layout_sources(cfg)
                 pos = [(int(x), int(y)) for x, y, _w, _h in
                        (OM.screen_rect(cfg, s) for s in src)]
+                _base_hint = ("这里改的是**输出排版**，点「应用」才生效；取消则全部丢弃"
+                              "（预览不会实时联动）。\n"
+                              "拖动摆位置；右键屏幕可开关「参与输出」；画布尺寸不够时只提示，"
+                              "不会自动裁屏。")
                 if len(src) > 1 and len(set(pos)) < len(pos):
                     self.hint.setText(
                         "⚠ 检测到 %d 块屏幕位置完全重叠，Mapping 里会互相遮挡 —— "
-                        "点「自动排列」把它们横向排开（本窗口不会自己改你的布局）。"
-                        % (len(pos) - len(set(pos)) + 1))
+                        "点「自动排列」把它们横向排开（本窗口不会自己改你的布局）。\n"
+                        % (len(pos) - len(set(pos)) + 1) + _base_hint)
                 else:
-                    self.hint.setText(
-                        "拖动屏幕摆位置；显示的是**输出坐标**（写回配置的 layout）。"
-                        "拖动不会改动画布尺寸，要改就点「适应窗口」。")
+                    self.hint.setText(_base_hint)
         except Exception:                                          # noqa: BLE001
             pass
         self.board.set_config(cfg)
@@ -3213,7 +3222,7 @@ class OutputCanvasWindow(QDialog):
         这是画布窗口里**唯一**会改 `combined_size` 的动作（用户主动点的）；
         输入框改尺寸时系统绝不偷偷改（见 `apply()` 里那段说明）。
         """
-        cfg = self.studio.active_config()
+        cfg = self.cfg
         if cfg:
             bw = bh = 0
             for s in OM.layout_sources(cfg):
@@ -3235,7 +3244,7 @@ class OutputCanvasWindow(QDialog):
     def _stage(self):
         """窗口内编辑：只改内存 + 刷新本窗口，**不写盘、不下发引擎**（预览/输出保持原样）。"""
         try:
-            cfg = self.studio.active_config()
+            cfg = self.cfg
             if cfg is not None:
                 self.board.set_config(cfg)
             self._update_warn()
@@ -3248,44 +3257,45 @@ class OutputCanvasWindow(QDialog):
             pass
 
     def _apply_changes(self):
-        """「应用」：写盘 + 下发引擎（这才是真正让预览/输出变化的时刻）。"""
+        """「应用」：把副本里的三样东西合并回**真配置**，再写盘 + 下发引擎。"""
         try:
-            self.studio.apply()
+            real = self._real_cfg
+            if real is None:
+                real = self.studio.active_config()
+            if real is not None and isinstance(self.cfg, dict):
+                _cp_by_id = {str(s0.get("id") or ""): s0
+                             for s0 in (self.cfg.get("screens") or [])}
+                for s0 in real.get("screens") or []:
+                    cp = _cp_by_id.get(str(s0.get("id") or ""))
+                    if cp is None:
+                        continue
+                    s0["layout"] = list(cp.get("layout") or [0, 0])
+                    s0["include"] = bool(cp.get("include", True))
+                real["combined_size"] = list(self.cfg.get("combined_size")
+                                             or [1280, 720])
+            self.studio.apply()          # 写盘 + 下发引擎
         except Exception:                                          # noqa: BLE001
             pass
         self._backup = None
         self.accept()
 
     def _cancel_changes(self):
-        """「取消」/关窗：把真配置**整份**恢复成打开窗口时的快照。
+        """「取消」/关窗：**什么都不用做** —— 真配置从头到尾没被改过（编辑都在副本里）。
 
-        ★ 2026-11-10（QA B-8/B-9）：窗口改的就是 `studio.active_config()` 的**同一个对象**
-          （暂存=没下发引擎，但配置字段已经被改了）⇒ 取消必须原地整份还原。
-          ⚠ 还原后**绝对不能再调 `studio.apply()`** —— 引擎从头到尾没被下发过（画布逐字节没变），
-            再 apply 一次反而会把"当前（可能已脏）"的状态重新写出去。
+        只把窗口内的视图刷回快照，防止界面上还留着未应用的排版；绝不动真配置、绝不下发引擎。
         """
         try:
-            cfg = self.studio.active_config()
-            if cfg is not None and isinstance(self._backup, dict):
-                bak = copy.deepcopy(self._backup)
-                cfg.clear()
-                cfg.update(bak)
-        except Exception:                                          # noqa: BLE001
-            pass
-        self._backup = None
-        # 只刷新本窗口，不下发引擎
-        try:
-            self.board.set_config(self.studio.active_config())
+            self.cfg = copy.deepcopy(self._snapshot or {})
+            self.board.set_config(self.cfg)
             self._update_warn()
             self.board.update()
         except Exception:                                          # noqa: BLE001
             pass
 
     def reject(self):
-        # 关窗（X / Esc）等同「取消」：丢弃未应用的改动
+        # 关窗（X / Esc）等同「取消」
         try:
-            if self._backup is not None:
-                self._cancel_changes()
+            self._cancel_changes()
         except Exception:                                          # noqa: BLE001
             pass
         super().reject()
@@ -3293,7 +3303,7 @@ class OutputCanvasWindow(QDialog):
     def _update_warn(self):
         """画布 < 布局包围盒 ⇒ 显示一行黄字（**只提示，不改数据**）。"""
         try:
-            cfg = self.studio.active_config()
+            cfg = self.cfg
             if not cfg:
                 self.warn.hide()
                 return
@@ -3319,7 +3329,7 @@ class OutputCanvasWindow(QDialog):
             self.warn.hide()
 
     def _on_size(self, *_):
-        cfg = self.studio.active_config()
+        cfg = self.cfg
         if not cfg:
             return
         cfg["combined_size"] = [max(16, min(self.MAX_SIDE, int(self.sp_w.value()))),
@@ -3330,7 +3340,7 @@ class OutputCanvasWindow(QDialog):
         self._update_warn()          # 超界只提示，不改数据
 
     def _auto(self):
-        cfg = self.studio.active_config()
+        cfg = self.cfg
         if not cfg:
             return
         OM.auto_layout(cfg, "h")
