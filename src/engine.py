@@ -2519,8 +2519,24 @@ class AutoVJEngine(QObject):
         except Exception:                                      # noqa: BLE001
             pass
 
+    def _seg_reset(self):
+        """每帧开始清零所有慢帧取证累加器 ⇒ 慢帧读到的一定是**本帧**值。"""
+        try:
+            import colorfx as _cm
+            import postprocess as _pm
+            for _d in (getattr(_cm, "SEG", None), getattr(_pm, "SEG", None)):
+                if isinstance(_d, dict):
+                    for _k in list(_d.keys()):
+                        _d[_k] = 0
+            for _k in list(_POST_ACC.keys()):
+                _POST_ACC[_k] = 0 if _k != "mode" else ""
+            _ROUTE_SEG.clear()
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _tick_locked(self):
         self._ptrace = []
+        self._seg_reset()
         self._phase_set("tick")
         snap = self.audio.snapshot()
         self._auto_fps_tick()
@@ -6575,6 +6591,19 @@ class AutoVJEngine(QObject):
         #   现在把目标画布传进去（`canvas=tgt`），它读/写的都是**同一块**画布；
         #   主画布（默认）行为与改动前逐字一致，且"没效果就不读回"的性能特性保留。
         tgt = canvas if canvas is not None else self.canvas
+        # ★ 2026-11-10（口径闭合）：`seg post` 只覆盖**主画布**这一段
+        #   （各独立屏的调色发生在 `copy` 段的 `_compose_independent` 里）。
+        #   所以给分屏调用时，把六段的累加值**快照/还原**掉，不计入 ⇒
+        #   `seg post ≈ view+tick+lut+apply+post+write` 才能 ±2ms 闭合。
+        _seg_snap = None
+        if canvas is not None:
+            try:
+                import colorfx as _cm0
+                import postprocess as _pm0
+                _seg_snap = (dict(_cm0.SEG), dict(_pm0.SEG),
+                             float(_POST_ACC.get("post", 0.0)))
+            except Exception:                                  # noqa: BLE001
+                _seg_snap = None
         try:
             bgr = self._apply_color(snap, bgr=bgr, write=False, canvas=tgt)
         except Exception:
@@ -6600,6 +6629,15 @@ class AutoVJEngine(QObject):
             write_back_bgr(tgt, bgr)
         except Exception:
             pass                        # 写回失败不影响下一帧（下一帧会重新读回）
+        if _seg_snap is not None:
+            try:
+                import colorfx as _cm1
+                import postprocess as _pm1
+                _cm1.SEG.clear(); _cm1.SEG.update(_seg_snap[0])
+                _pm1.SEG.clear(); _pm1.SEG.update(_seg_snap[1])
+                _POST_ACC["post"] = _seg_snap[2]
+            except Exception:                                  # noqa: BLE001
+                pass
 
     def _color_rotate_due(self, snap, cfg):
         """「这一帧该不该换颜色」——按**八拍**判定（用户 2026-10-28）。
