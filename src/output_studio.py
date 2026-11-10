@@ -3257,30 +3257,29 @@ class OutputCanvasWindow(QDialog):
         self.accept()
 
     def _cancel_changes(self):
-        """「取消」：把排版字段恢复回打开窗口时的快照，再下发一次。"""
+        """「取消」/关窗：把真配置**整份**恢复成打开窗口时的快照。
+
+        ★ 2026-11-10（QA B-8/B-9）：窗口改的就是 `studio.active_config()` 的**同一个对象**
+          （暂存=没下发引擎，但配置字段已经被改了）⇒ 取消必须原地整份还原。
+          ⚠ 还原后**绝对不能再调 `studio.apply()`** —— 引擎从头到尾没被下发过（画布逐字节没变），
+            再 apply 一次反而会把"当前（可能已脏）"的状态重新写出去。
+        """
         try:
             cfg = self.studio.active_config()
             if cfg is not None and isinstance(self._backup, dict):
-                for _k in self._STAGE_KEYS:
-                    if _k in self._backup:
-                        cfg[_k] = copy.deepcopy(self._backup[_k])
-                    else:
-                        cfg.pop(_k, None)
-                _bak = {str(s0.get("id") or ""): s0
-                        for s0 in (self._backup.get("screens") or [])}
-                for s0 in cfg.get("screens") or []:
-                    b = _bak.get(str(s0.get("id") or ""))
-                    if not b:
-                        continue
-                    for _k in ("layout", "preview_rect", "include"):
-                        if _k in b:
-                            s0[_k] = copy.deepcopy(b[_k])
-                        else:
-                            s0.pop(_k, None)
-                self.studio.apply()
+                bak = copy.deepcopy(self._backup)
+                cfg.clear()
+                cfg.update(bak)
         except Exception:                                          # noqa: BLE001
             pass
         self._backup = None
+        # 只刷新本窗口，不下发引擎
+        try:
+            self.board.set_config(self.studio.active_config())
+            self._update_warn()
+            self.board.update()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def reject(self):
         # 关窗（X / Esc）等同「取消」：丢弃未应用的改动
