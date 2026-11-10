@@ -31,9 +31,53 @@ import theme
 
 
 # ---------------------------------------------------------------- 通用小工具
+_COLOR_CACHE = {}
+
+
 def _color(v, fallback="#7B2FF7"):
+    """颜色字符串 → QColor（带缓存）。
+
+    ★ 性能：输出页预览每帧要为 7 块屏各解析一次颜色串，
+      以前每次 `QColor(str)` 都重新解析 ⇒ 现在按字符串缓存。
+    """
+    key = (str(v or fallback), fallback)
+    c = _COLOR_CACHE.get(key)
+    if c is not None:
+        return c
     c = QColor(str(v or fallback))
-    return c if c.isValid() else QColor(fallback)
+    if not c.isValid():
+        c = QColor(fallback)
+    if len(_COLOR_CACHE) > 256:
+        _COLOR_CACHE.clear()
+    _COLOR_CACHE[key] = c
+    return c
+
+
+#: 预览绘制用的字体缓存（QFont 构造不便宜，每帧 7 屏 × 2~3 个）
+_F_TITLE = None
+_F_SUB = None
+_F_ZOOM = None
+
+
+def _font_title():
+    global _F_TITLE
+    if _F_TITLE is None:
+        _F_TITLE = QFont("Microsoft YaHei", 8, QFont.Bold)
+    return _F_TITLE
+
+
+def _font_sub():
+    global _F_SUB
+    if _F_SUB is None:
+        _F_SUB = QFont("Segoe UI", 7)
+    return _F_SUB
+
+
+def _font_zoom():
+    global _F_ZOOM
+    if _F_ZOOM is None:
+        _F_ZOOM = QFont("Segoe UI", 8)
+    return _F_ZOOM
 
 
 def _luma(c):
@@ -143,6 +187,9 @@ class OutputPreview(QWidget):
         self._drag_orig = None
         self._guides = []
         self._hover = None
+        # ★ 预览设置接线（2026-11-10）：`ui.preview.on/fps` 也作用到输出页卡片
+        self._preview_off = False
+        self._last_thumb_key = None
 
     # ---------- 数据 ----------
     def set_context(self, mode, screens, cfg, selected_id=""):
@@ -161,7 +208,28 @@ class OutputPreview(QWidget):
         self.update()
 
     def set_thumbs(self, thumbs):
-        self.thumbs = dict(thumbs or {})
+        """喂缩略图。★ 内容（图对象 + 尺寸）没变就不 update()，
+        避免"引擎每帧产新 dict ⇒ 每帧重画 7 张图"的空转。"""
+        thumbs = dict(thumbs or {})
+        key = tuple(sorted((str(k), (v.cacheKey() if v is not None else 0),
+                            v.width() if v is not None else 0,
+                            v.height() if v is not None else 0)
+                           for k, v in thumbs.items()))
+        if key == self._last_thumb_key and thumbs.keys() == self.thumbs.keys():
+            return
+        self._last_thumb_key = key
+        self.thumbs = thumbs
+        self.update()
+
+    def set_preview_off(self, off):
+        """★ 用户关掉「显示预览画面」⇒ 输出页卡片也停更并显示占位（不再停在最后一帧）。"""
+        off = bool(off)
+        if off == self._preview_off:
+            return
+        self._preview_off = off
+        if off:
+            self.thumbs = {}
+            self._last_thumb_key = None
         self.update()
 
     def set_selected(self, sid):
@@ -657,6 +725,18 @@ class OutputPreview(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         p.fillRect(self.rect(), QColor("#151515"))
         p.fillRect(self.rect(), QBrush(_CheckerTile.pixmap()))
+        if getattr(self, "_preview_off", False):
+            # ★ 用户关掉「显示预览画面」：给明确占位，别停在最后一帧（否则像"设置没生效"）
+            p.setPen(QColor(200, 200, 200, 220))
+            p.setFont(QFont("Microsoft YaHei", 13, QFont.Bold))
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       "预览已关闭")
+            p.setFont(QFont("Microsoft YaHei", 9))
+            p.setPen(QColor(160, 160, 160, 220))
+            p.drawText(self.rect().adjusted(0, 26, 0, 0), Qt.AlignCenter,
+                       "「设置 ▸ 预览画面设置」里勾选「显示预览画面」可恢复")
+            p.end()
+            return
         if self._fit_pending:
             self._fit_pending = False
             QTimer.singleShot(0, self.fit_all)
@@ -675,7 +755,7 @@ class OutputPreview(QWidget):
                 p.drawLine(QPointF(0, y), QPointF(self.width(), y))
         # 左下角缩放提示
         p.setPen(QColor(220, 220, 220, 180))
-        p.setFont(QFont("Segoe UI", 8))
+        p.setFont(_font_zoom())
         p.drawText(8, self.height() - 8, "%d%%" % int(round(self.zoom * 100)))
         p.end()
 
@@ -808,6 +888,10 @@ class OutputPreview(QWidget):
                     tgt = QRectF(sr.center().x() - tw / 2, sr.center().y() - th / 2, tw, th)
                     p.save()
                     p.setClipRect(sr)
+                    # ⚠ 2026-11-10 实测否决：这里曾尝试"预缩放 QPixmap 缓存"，
+                    #   结果 paintEvent p95 从 6.0ms 涨到 95ms —— 缩略图内容每帧都变，
+                    #   缓存必然 miss，而 `QPixmap.fromImage()` 每次都要走一遍 GPU 上传，
+                    #   比直接 drawImage 更贵。**保持 drawImage**，别再"顺手优化"回来。
                     p.drawImage(tgt, content, QRectF(0, 0, iw, ih))
                     p.restore()
         if transparent_center:
@@ -823,14 +907,14 @@ class OutputPreview(QWidget):
         bg.setAlpha(210)
         p.fillRect(bar, bg)
         p.setPen(_text_color(bg))
-        p.setFont(QFont("Microsoft YaHei", 8, QFont.Bold))
+        p.setFont(_font_title())
         p.drawText(bar.adjusted(5, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft,
                    str(s.get("name") or ""))
         # 右下角分辨率/类型
         txt = "%dx%d · %s" % (OM.effective_size(self.cfg, s)[0],
                               OM.effective_size(self.cfg, s)[1],
                               OM.TYPE_LABELS.get(s.get("type"), s.get("type")))
-        p.setFont(QFont("Segoe UI", 7))
+        p.setFont(_font_sub())
         p.setPen(QColor(255, 255, 255, 220))
         p.drawText(sr.adjusted(5, 0, -5, -4), Qt.AlignRight | Qt.AlignBottom, txt)
         # 缩放把手（多路预览框）
@@ -2063,9 +2147,37 @@ class OutputStudio(QWidget):
                 w.update()
 
     def on_frame(self):
+        """引擎出新帧时刷新输出页预览。
+
+        ★ 2026-11-10（用户：「预览设置没有生效」+「还是很卡」）：
+          `ui.preview` 的 `on/fps` 以前只作用于主界面左上角那个 PreviewPanel，
+          输出页这 7 块屏完全不吃 ⇒ 用户改设置看不到任何变化。现在这里也吃：
+            · `on=False` ⇒ 卡片画"预览已关闭"占位并**停止刷新**（一次都不 update）
+            · `fps`     ⇒ 按单调时钟节流，最快不超过设定值
+          另外 `set_thumbs()` 自己会判"内容没变就不重绘"，避免空转。
+        """
         if not self.isVisible():
             return
         try:
+            ui = ((self.cfg.data.get("ui") or {}).get("preview") or {})
+            on = bool(ui.get("on", True))
+            if not on:
+                if not getattr(self, "_pv_off", False):
+                    self._pv_off = True
+                    self.preview.set_preview_off(True)
+                return
+            if getattr(self, "_pv_off", False):
+                self._pv_off = False
+                self.preview.set_preview_off(False)
+            try:
+                fps = float(ui.get("fps", 60) or 60)
+            except (TypeError, ValueError):
+                fps = 60.0
+            interval = 1.0 / max(1.0, fps)
+            now = time.perf_counter()
+            if now - float(getattr(self, "_pv_last_t", 0.0) or 0.0) < interval:
+                return
+            self._pv_last_t = now
             th = self.main.engine.latest_route_thumbs()
             if th is getattr(self, "_last_thumbs", None):
                 return
