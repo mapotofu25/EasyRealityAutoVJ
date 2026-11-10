@@ -2439,6 +2439,11 @@ class AutoVJEngine(QObject):
                                       "copy", "routes", "spout", "ndi", "ui_snap")
                             _parts = ["%s=%.0f" % (_abbr.get(_k, _k), _segs[_k])
                                       for _k in _order if _k in _segs]
+                            # copy 段细分（单路：indep=独立屏合成 comb=整合 pub=发布）
+                            for _k, _ab in (("copy_indep", "ci"), ("copy_comb", "cc"),
+                                            ("copy_pub", "cp")):
+                                if _k in _segs:
+                                    _parts.append("%s=%.0f" % (_ab, _segs[_k]))
                             if _parts:
                                 _extra += " | seg: " + " ".join(_parts)
                         # GC：自上次慢帧以来
@@ -2662,15 +2667,19 @@ class AutoVJEngine(QObject):
             # ---- 多屏输出 ----
             mode = str(self._out_cfg.get("mode") or "multi")
             if mode == "single":
+                self._phase_set("copy_indep")
                 # ★ BUG-B（2026-11-10）：单路下**必须先合成独立屏**，否则
                 #   `_build_combined()` 通过 `_route_frame()` 取到的独立屏画布
                 #   只有 `_rebuild_output_plan()` 里的一次 clear ⇒ 预览里永远黑。
                 #   顺序不能反：切分屏的源可能就是独立屏。
                 #   每屏 color/postfx 已在 `_compose_independent()` 里各套一次（B2）。
                 self._compose_independent(snap)
+                self._phase_set("copy_comb")
                 self._build_combined(snap)
             else:
                 self._compose_independent(snap)
+                self._phase_set("copy_comb")
+            self._phase_set("copy_pub")
             self._publish_multi_frame()
             self._phase_set("routes")
             self._send_multi_routes()
