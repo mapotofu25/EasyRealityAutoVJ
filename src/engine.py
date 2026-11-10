@@ -1167,7 +1167,10 @@ class AutoVJEngine(QObject):
             self.canvas = QImage(w, h, self._canvas_format())
             self._clear_canvas(self.canvas)
             self._latest_frame = None
-            # 多屏：独立屏幕画布也要按新格式重建
+            # ★ 单路 alpha：整合画布 / 各屏画布也必须按新格式重建（尺寸没变时
+            #   `_rebuild_output_plan` 靠 format 比较兜底，这里再清空一次双保险）
+            self._combined_canvas = None
+            self._screen_canvases.clear()
             self._plan_rev = int(getattr(self, "_plan_rev", 0)) + 1
             self._plan_rev_ready = -1
 
@@ -7041,7 +7044,8 @@ class AutoVJEngine(QObject):
         main = output_model.main_screen(plan)
         if main is not None:
             mw, mh = output_model.effective_size(plan, main)
-            if self.canvas.width() != mw or self.canvas.height() != mh:
+            if (self.canvas.width() != mw or self.canvas.height() != mh
+                    or self.canvas.format() != fmt):
                 self.canvas = QImage(mw, mh, fmt)
                 self._clear_canvas(self.canvas)
                 self._latest_frame = None
@@ -7055,7 +7059,8 @@ class AutoVJEngine(QObject):
             if st == "independent":
                 w, h = output_model.effective_size(plan, s)
                 cv = self._screen_canvases.get(sid)
-                if cv is None or cv.width() != w or cv.height() != h:
+                if (cv is None or cv.width() != w or cv.height() != h
+                        or cv.format() != fmt):
                     cv = QImage(w, h, fmt)
                     self._screen_canvases[sid] = cv
                 self._clear_canvas(cv)
@@ -7063,8 +7068,11 @@ class AutoVJEngine(QObject):
             elif st == "split":
                 w, h = output_model.effective_size(plan, s)
                 cv = self._screen_canvases.get(sid)
-                if cv is None or cv.width() != w or cv.height() != h:
-                    self._screen_canvases[sid] = QImage(w, h, fmt)
+                if (cv is None or cv.width() != w or cv.height() != h
+                        or cv.format() != fmt):
+                    cv = QImage(w, h, fmt)
+                    self._screen_canvases[sid] = cv
+                self._clear_canvas(cv)
                 keep.add(sid)
         for sid in list(self._screen_canvases.keys()):
             if sid not in keep:
@@ -7074,7 +7082,8 @@ class AutoVJEngine(QObject):
             cw, ch = output_model.combined_size(plan)
             if (self._combined_canvas is None
                     or self._combined_canvas.width() != cw
-                    or self._combined_canvas.height() != ch):
+                    or self._combined_canvas.height() != ch
+                    or self._combined_canvas.format() != fmt):
                 self._combined_canvas = QImage(cw, ch, fmt)
                 self._clear_canvas(self._combined_canvas)
             self._combined_key = (cw, ch)
@@ -7279,6 +7288,9 @@ class AutoVJEngine(QObject):
             return
         self._clear_canvas(cv)
         p = QPainter(cv)
+        # ★ alpha 输出：用 Source 直接覆盖（含 alpha），别用默认 SourceOver
+        #   把透明底与半透明内容叠出不正确的 alpha；不透明区域仍是 255。
+        p.setCompositionMode(QPainter.CompositionMode_Source)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         for s in output_model.layout_sources(plan):
             sid = str(s.get("id") or "")

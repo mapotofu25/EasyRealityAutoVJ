@@ -2418,6 +2418,19 @@ class OutputStudio(QWidget):
         if win is None:
             win = OutputCanvasWindow(self)
             self._canvas_win = win
+        else:
+            # ★ 单例窗口关闭后再次打开 ⇒ 从**当前真配置**重新初始化副本/快照，
+            #   否则窗口里还是上一次打开时的旧值；窗口仍可见时只前置，别丢未应用的编辑。
+            try:
+                if not win.isVisible():
+                    _real = self.active_config()
+                    win._real_cfg = _real
+                    win._snapshot = copy.deepcopy(_real or {})
+                    win.cfg = copy.deepcopy(_real or {})
+                    win.board.set_config(win.cfg)
+                    win._applied = False
+            except Exception:                                      # noqa: BLE001
+                pass
         try:
             win.reload()
             win.show()
@@ -3147,6 +3160,7 @@ class OutputCanvasWindow(QDialog):
             self._snapshot = {}
             self.cfg = {}
         self._backup = None      # 旧字段保留为 None（外面若还有人读，不会炸）
+        self._applied = False    # ★ 本次窗口是否已经「应用」过（应用后不再回退快照）
         self.setWindowTitle("输出画布（Mapping）")
         self.resize(940, 640)
         lay = QVBoxLayout(self)
@@ -3309,6 +3323,10 @@ class OutputCanvasWindow(QDialog):
                 real["combined_size"] = list(self.cfg.get("combined_size")
                                              or [1280, 720])
             self.studio.apply()          # 写盘 + 下发引擎
+            # ★ 单例窗口复用：应用成功后必须把**快照推进到应用后的值**，
+            #   否则之后任何"取消/关窗"都会把视图拉回打开前的旧排版（用户重开看到旧值）。
+            self._snapshot = copy.deepcopy(self.cfg)
+            self._applied = True
         except Exception:                                          # noqa: BLE001
             pass
         self._backup = None
@@ -3319,6 +3337,9 @@ class OutputCanvasWindow(QDialog):
 
         只把窗口内的视图刷回快照，防止界面上还留着未应用的排版；绝不动真配置、绝不下发引擎。
         """
+        if getattr(self, "_applied", False):
+            # 已经应用过了 ⇒ 真配置就是新值，不该再回退（否则用户重开看到旧排版）
+            return
         try:
             self.cfg = copy.deepcopy(self._snapshot or {})
             self.board.set_config(self.cfg)
