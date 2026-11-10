@@ -1955,6 +1955,11 @@ class OutputStudio(QWidget):
 
     # ---------- 引擎/主窗同步 ----------
     def sync_engine(self):
+        # ★ 落地前先把"拖动待应用"的排版刷一次（幂等；schema 无 pending 时零成本）
+        try:
+            self._flush_geometry_apply()
+        except Exception:                                          # noqa: BLE001
+            pass
         cfg = self.active_config()
         if not cfg:
             return
@@ -2251,7 +2256,39 @@ class OutputStudio(QWidget):
             pass
 
     def _on_preview_geometry(self):
-        self.apply()
+        """拖动/缩放**松手**：只打标记 + 250ms 合并延后，真正 apply 交给定时器。
+
+        ★ 2026-11-10：同步 `apply()`（sync_engine + refresh_all + save）实测 300~700ms，
+          拖一下卡半秒以上。连续拖动只落一次。
+          幂等：`_geo_pending` 保证"没 pending 时 flush 什么都不做"。
+        """
+        self._geo_pending = True
+        t = getattr(self, "_geo_apply_timer", None)
+        if t is None:
+            from PySide6.QtCore import QTimer
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(250)
+            t.timeout.connect(self._flush_geometry_apply)
+            self._geo_apply_timer = t
+        t.stop()
+        t.start()
+
+    def _flush_geometry_apply(self):
+        """立刻执行尚未落地的拖动结果（幂等：没有 pending 就直接返回）。"""
+        if not getattr(self, "_geo_pending", False):
+            return
+        self._geo_pending = False
+        t = getattr(self, "_geo_apply_timer", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+        try:
+            self.apply()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _on_preview_action(self, action, sid):
         if action == "select":
@@ -2546,6 +2583,10 @@ class OutputStudio(QWidget):
 
     # ---------- mapping ----------
     def export_mapping(self, cfg=None):
+        try:
+            self._flush_geometry_apply()
+        except Exception:                                          # noqa: BLE001
+            pass
         """导出 mapping。★ 传入 `cfg` 时用它（Mapping 窗口传自己的**副本**），
         否则才回落到真配置 —— 保证"没点应用就导出"导出的也是窗口里看到的那份排版。"""
         cfg = cfg if isinstance(cfg, dict) and cfg else self.active_config()
@@ -3409,6 +3450,10 @@ class OutputCanvasWindow(QDialog):
             pass
 
     def _apply_changes(self):
+        try:
+            self.studio._flush_geometry_apply()
+        except Exception:                                          # noqa: BLE001
+            pass
         """「应用」：把副本里的三样东西合并回**真配置**，再写盘 + 下发引擎。"""
         try:
             # ⚠ 必须用**当前**的 active_config()：`studio.apply()` 之后配置对象可能被替换，
