@@ -1922,6 +1922,21 @@ class OutputStudio(QWidget):
                 cfg["layout_migrated"] = True
         except Exception:                                          # noqa: BLE001
             pass
+        # ★ 2026-11-10（用户图5）：切分屏 UV 一改，实际尺寸（`effective_size`）就变；
+        #   预览卡片的 `preview_rect` 若还是旧宽高比 ⇒ 内容按 fit 缩放后左右/上下留黑边。
+        #   这里在每次 apply() 时按新比例同步预览框高度（x/y/宽保持不变）。
+        try:
+            for _s in cfg.get("screens") or []:
+                if str(_s.get("type") or "") != "split":
+                    continue
+                _r = OM._normalize_preview_rect(_s.get("preview_rect"))
+                if not _r:
+                    continue
+                _w, _h = OM.effective_size(cfg, _s)
+                _s["preview_rect"] = [_r[0], _r[1], _r[2],
+                                      max(30, int(_r[2] * _h / max(1, _w)))]
+        except Exception:                                          # noqa: BLE001
+            pass
         OM.sync_legacy_output(self.cfg.data)
         try:
             self.cfg.save()
@@ -2412,8 +2427,10 @@ class OutputStudio(QWidget):
             pass
 
     # ---------- mapping ----------
-    def export_mapping(self):
-        cfg = self.active_config()
+    def export_mapping(self, cfg=None):
+        """导出 mapping。★ 传入 `cfg` 时用它（Mapping 窗口传自己的**副本**），
+        否则才回落到真配置 —— 保证"没点应用就导出"导出的也是窗口里看到的那份排版。"""
+        cfg = cfg if isinstance(cfg, dict) and cfg else self.active_config()
         if not cfg:
             return
         d = QFileDialog.getExistingDirectory(self, "选择 mapping 导出目录")
@@ -2437,7 +2454,8 @@ class OutputStudio(QWidget):
             "screens": [],
         }
         for s in cfg.get("screens") or []:
-            x, y, w, h = OM.screen_rect(cfg, s)
+            # ★ 与 PNG 用同一套 `mapping_display_rect`（不再用 screen_rect，两者以前不一致）
+            x, y, w, h = mapping_display_rect(cfg, s)
             uv = OM.screen_uv(cfg, s)
             data["screens"].append({
                 "id": s.get("id"), "name": s.get("name"), "type": s.get("type"),
@@ -2449,8 +2467,7 @@ class OutputStudio(QWidget):
         with open(os.path.join(folder, base + ".json"), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         # PNG 可视化（1:1，太大时按比例缩到 <=4096）
-        # ★ V2：导出 PNG 也要按**显示位置**画（切分/复制屏排到源屏右侧），
-        #   否则导出的图里它们仍然叠在源屏上 = 用户看到的"屏中屏"。
+        # 位置一律取 `mapping_display_rect`（与上面 JSON 的 pixel_rect 同口径）
         _disps = []
         _x0 = _y0 = 0
         _x1, _y1 = cw, ch
@@ -2483,16 +2500,36 @@ class OutputStudio(QWidget):
             #   ⚠ 两行用两种字号 ⇒ 先量高度再整体居中，否则 UV 行会往下漂、小格里被裁。
             pw, ph = OM.effective_size(cfg, s)
             uv = OM.screen_uv(cfg, s)
-            fs = int(max(12, min(40, min(max(24.0, r.width()), max(24.0, r.height())) / 6.5)))
+            # ★ 小框自适应：框太小就**只画名字一行**，别让三行叠在一起（用户图1）
+            _small = (r.width() < 120 or r.height() < 60)
+            fs = int(max(8, min(40, min(max(12.0, r.width()),
+                                        max(12.0, r.height())) / 6.5)))
+            if _small:
+                fs = max(8, min(fs, int(r.height() / 2.2)))
             f_head = QFont("Microsoft YaHei", fs, QFont.Bold)
-            f_uv = QFont("Consolas", max(10, int(fs * 0.62)))
-            head = "%s\n%d × %d" % (s.get("name") or "", pw, ph)
-            uvline = "UV %.4f,%.4f → %.4f,%.4f" % (uv[0], uv[1], uv[2], uv[3])
+            f_uv = QFont("Consolas", max(7, int(fs * 0.62)))
+            head = (str(s.get("name") or "") if _small
+                    else "%s\n%d × %d" % (s.get("name") or "", pw, ph))
+            uvline = ("UV %.4f,%.4f → %.4f,%.4f" % (uv[0], uv[1], uv[2], uv[3])
+                      if not _small else "")
             fm1 = QFontMetrics(f_head)
             fm2 = QFontMetrics(f_uv)
-            h1 = fm1.lineSpacing() * 2
-            h2 = fm2.lineSpacing()
-            top = r.center().y() - (h1 + h2 + 4) / 2.0
+            # 小框只画一行 ⇒ 高度也按一行算，且整体 clamp 在 r 内（drawText 不越界）
+            _lines = 1 if _small else 2
+            h1 = fm1.lineSpacing() * _lines
+            h2 = 0 if _small else fm2.lineSpacing()
+            total = h1 + h2 + 4
+            if total > r.height():
+                # 再降级：缩小字号直到放得下（最少 8px）
+                while fs > 8 and total > r.height():
+                    fs -= 1
+                    f_head = QFont("Microsoft YaHei", fs, QFont.Bold)
+                    fm1 = QFontMetrics(f_head)
+                    h1 = fm1.lineSpacing() * _lines
+                    total = h1 + h2 + 4
+                h1 = min(h1, max(8, int(r.height())))
+                total = h1 + h2 + 4
+            top = max(r.y(), r.center().y() - total / 2.0)
             p.setFont(f_head)
             p.setPen(QColor("#ffffff"))
             p.drawText(QRectF(r.x(), top, r.width(), h1), Qt.AlignCenter, head)
@@ -2857,13 +2894,9 @@ class _CanvasBoard(QWidget):
             p.setPen(QColor(255, 255, 255, 200))
             p.drawText(r.adjusted(4, 2, -4, -2), Qt.AlignLeft | Qt.AlignTop,
                        "%d,%d" % (x, y))
-        p.setPen(QColor(220, 220, 220, 180))
-        p.setFont(QFont("Segoe UI", 8))
-        _hint = "画布 %d×%d · %d%%" % (cw, ch, int(round(self.zoom * 100)))
-        if any(str(x.get("type")) in ("split", "copy")
-               for x in (self.cfg or {}).get("screens") or []):
-            _hint += "　·　整合画布只合成主屏与独立屏；切分/复制屏是各自独立的输出"
-        p.drawText(8, self.height() - 8, _hint)
+        # ★ 2026-11-10：底部提示统一由窗口的 QLabel（`self.hint`）显示，
+        #   画布里不再 drawText，避免两行文字视觉重叠；"整合画布只合成主屏与独立屏"
+        #   这句话也已过时（现在所有参与输出的屏都会被合成）。
         p.end()
 
 
@@ -3356,7 +3389,8 @@ class OutputCanvasWindow(QDialog):
         self._stage()
 
     def _export(self):
-        self.studio.export_mapping()
+        # ★ 导出窗口里**当前看到的副本**（没点应用也能导出对的排版）
+        self.studio.export_mapping(self.cfg)
 
 
 # ---------------------------------------------------------------- 浮动素材库占位

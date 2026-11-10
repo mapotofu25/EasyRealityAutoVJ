@@ -4734,8 +4734,8 @@ class MainWindow(QMainWindow):
         self.lbl_split_switch_hint.setStyleSheet("color:#8a8a8a;font-size:11px;")
         self.lbl_split_switch_hint.setVisible(False)
         f.addWidget(self.lbl_split_switch_hint, 5, 0, 1, 4)
-        self.btn_crop.setFixedSize(26, 22)          # #7：右上角**小**按钮（约 26×22）
-        self.btn_crop.setText("✂")
+        # ★ 用户：小图标看不懂 ⇒ 改成「文字 + 图标」；不再 setFixedSize（让 sizeHint 生效）
+        self.btn_crop.setText("✂ 裁切…")
         self.btn_crop.setVisible(False)             # 只在切分屏时出现（见 _fill_screen_setup）
         self.btn_crop.setStyleSheet("QPushButton{padding:1px 6px;}")
         # ★ 位置：放到**「分辨率」那一行（行 1）的最右边**，垂直居中、右对齐。
@@ -4751,7 +4751,7 @@ class MainWindow(QMainWindow):
         self.lbl_ss_hint = QLabel(T("切分屏幕取源屏的一块：点「裁切…」拖框，或直接改 UV。"))
         self.lbl_ss_hint.setWordWrap(True)
         self.lbl_ss_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
-        f.addWidget(self.lbl_ss_hint, 5, 0, 1, 4)
+        f.addWidget(self.lbl_ss_hint, 6, 0, 1, 4)   # ★ 与 row5 的 lbl_split_switch_hint 错开
         self._ss_loading = False
         g.setVisible(False)
         return g
@@ -5115,6 +5115,12 @@ class MainWindow(QMainWindow):
                 except Exception:                                  # noqa: BLE001
                     self._reload_screen_params_ui()
                 lbl.show()
+                # ★ 单路下切屏也要回填「屏幕设置」（否则分辨率显示 16×16、UV 全 0）
+                try:
+                    _sel = _om2.screen_by_id(cfg, str(getattr(st, "selected_id", "") or ""))
+                    self._fill_screen_setup(cfg, _sel)
+                except Exception:                              # noqa: BLE001
+                    pass
                 # ★★ BUG-F（2026-11-10）：**多路下切屏也要回填**。
                 #   以前 `_reload_screen_params_ui()` 只在单路分支里调 ⇒ 多路切屏后
                 #   面板一直显示上一次/全局的值，看起来"所有屏都一样"。

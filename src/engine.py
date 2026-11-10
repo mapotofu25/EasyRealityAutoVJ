@@ -7364,6 +7364,22 @@ class AutoVJEngine(QObject):
                 frames[sid] = frame
                 if do_thumbs:
                     thumbs[sid] = _preview_thumb(frame)
+                # ★ 2026-11-10：单路预览卡片仍按 screen id 取 `_route_frames`，
+                #   以前这里只有 `__combined__` ⇒ 卡片画的是上一帧/旧内容（图4 全串）。
+                #   现在按每块屏自己的 rect 从整合画布裁一份给它。
+                for _sc in output_model.layout_sources(plan):
+                    _sid2 = str(_sc.get("id") or "")
+                    if not _sid2:
+                        continue
+                    _x, _y, _w, _h = output_model.screen_rect(plan, _sc)
+                    _x = max(0, min(frame.width() - 1, int(_x)))
+                    _y = max(0, min(frame.height() - 1, int(_y)))
+                    _w = max(1, min(int(_w), frame.width() - _x))
+                    _h = max(1, min(int(_h), frame.height() - _y))
+                    _part = frame.copy(_x, _y, _w, _h)
+                    frames[_sid2] = _part
+                    if do_thumbs:
+                        thumbs[_sid2] = _preview_thumb(_part)
             self._route_frames = frames
             self._route_thumbs = thumbs if do_thumbs else self._route_thumbs
             if self._gpu_frame_consumers and frame is not None:

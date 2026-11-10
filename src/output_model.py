@@ -693,14 +693,15 @@ def unbind_layer(lid, cfg=None, data=None):
 
 
 def layout_sources(cfg):
-    """单路模式需要摆到整合画布上的源屏幕：主屏 + 独立屏（且 `include` 不为 False）。
+    """单路模式要拼到整合画布上的屏：**所有 `include` 不为 False 的屏**（含切分屏）。
 
-    ★ C（2026-11-10）：新增「参与输出」开关 —— `include=False` 的屏**不拼进整合画布、
-      也不作为输出路由发送**（用户要求"把哪些屏幕要放进来"可选）。
+    ★ 2026-11-10（用户：「整合画布要包含所有的屏幕输出」）：以前只返回 main/independent
+      ⇒ 切分屏根本不进整合画布。现在按 `mapping_screens()` 的顺序（源屏先、split 后，
+      保证 split 不会被源屏盖掉）返回；`copy` 类型用户确认已废弃，兜底过滤掉。
     """
-    return [s for s in (cfg or {}).get("screens") or []
-            if s.get("type") in ("main", "independent")
-            and s.get("include", True) is not False]
+    return [s for s in mapping_screens(cfg)
+            if s.get("include", True) is not False
+            and str(s.get("type") or "main") != "copy"]
 
 
 def mapping_screens(cfg):
@@ -762,24 +763,22 @@ def auto_layout(cfg, direction="h"):
 
 
 def screen_rect(cfg, screen):
-    """单路模式：该屏幕在整合画布上的像素矩形；复制/切分返回其裁切区域。"""
+    """单路模式：该屏幕在整合画布上的像素矩形（**一律用自己的 layout + 实际尺寸**）。
+
+    ★ 2026-11-10：切分屏以前返回"源屏 rect × UV 的裁切区" ⇒ 把 split 加进
+      `layout_sources` 后会被画到源屏内部，单路预览画面全串。现在和
+      `mapping_display_rect()` 口径一致：所有屏都按自己的 layout 摆放。
+      ⚠ `_split_frame()` 是自己按 UV 裁画布的，不依赖这里的裁切区语义。
+    """
     if not screen:
         return (0, 0, 0, 0)
-    t = screen.get("type")
-    if t in ("main", "independent"):
-        w, h = effective_size(cfg, screen)
-        x, y = _normalize_layout(screen.get("layout"))
-        return (int(x), int(y), int(w), int(h))
-    src = source_screen(cfg, screen)
+    t = str(screen.get("type") or "main")
     if t == "copy":
-        return screen_rect(cfg, src)
-    sx, sy, sw, sh = screen_rect(cfg, src)
-    u0, v0, u1, v1 = screen.get("uv") or [0, 0, 1, 1]
-    x = sx + int(round(sw * u0))
-    y = sy + int(round(sh * v0))
-    w = max(1, int(round(sw * (u1 - u0))))
-    h = max(1, int(round(sh * (v1 - v0))))
-    return (x, y, w, h)
+        src = source_screen(cfg, screen)
+        return screen_rect(cfg, src) if src else (0, 0, 0, 0)
+    w, h = effective_size(cfg, screen)
+    x, y = _normalize_layout(screen.get("layout"))
+    return (int(x), int(y), int(w), int(h))
 
 
 def screen_uv(cfg, screen):
@@ -788,12 +787,6 @@ def screen_uv(cfg, screen):
     if screen and screen.get("type") == "copy":
         src = source_screen(cfg, screen)
         return screen_uv(cfg, src)
-    if screen and screen.get("type") == "split":
-        src = source_screen(cfg, screen)
-        sx, sy, sw, sh = screen_rect(cfg, src)
-        u0, v0, u1, v1 = screen.get("uv") or [0, 0, 1, 1]
-        return _normalize_uv([(sx + sw * u0) / cw, (sy + sh * v0) / ch,
-                              (sx + sw * u1) / cw, (sy + sh * v1) / ch])
     x, y, w, h = screen_rect(cfg, screen)
     return _normalize_uv([x / cw, y / ch, (x + w) / cw, (y + h) / ch])
 
