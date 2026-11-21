@@ -2803,6 +2803,32 @@ class AutoVJEngine(QObject):
         except Exception:                                      # noqa: BLE001
             pass
 
+    def _output_layer_ids(self):
+        """当前真正参与输出的图层 id 集合。
+
+        单屏：只算主屏那份配置（其他屏的图层不合成、不解码）；
+        多屏：所有主屏/独立屏的并集（复制/切分跟随源屏）。
+        """
+        all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+        try:
+            plan = getattr(self, "_out_cfg", None)
+            if plan:
+                ids = set()
+                for s in (plan.get("screens") or []):
+                    if not isinstance(s, dict):
+                        continue
+                    if s.get("type") not in ("main", "independent"):
+                        continue
+                    ids.update(str(x) for x in output_model.effective_layers(
+                        plan, s, all_ids))
+                return ids
+            active = output_model.active_config(self.cfg)
+            if active is not None:
+                return set(output_model.main_output_layers(active, all_ids))
+        except Exception:                                      # noqa: BLE001
+            pass
+        return set(all_ids)
+
     def _tick_locked(self):
         self._ptrace = []
         self._seg_reset()
@@ -2926,6 +2952,7 @@ class AutoVJEngine(QObject):
         # ★ 静音判据统一读防抖结果（`_tick_locked` 开头 `_silent_hide_tick` 已算好）：
         #   与 `_compose` 里的 `hide_silent` 同帧同值，避免 hide 和 pause 的时机不一致。
         silent_now = self._silent_now_debounced
+        out_ids = self._output_layer_ids()
         for lay in self.layers:
             # ★★ 活跃标记必须按**身份**遍历 `cache ∪ {lay.player, lay.prev_player}`，
             #   不能只遍历 `lay.cache`：`lay.player` 并不保证在缓存里（自动匹配换池、
@@ -2949,6 +2976,9 @@ class AutoVJEngine(QObject):
                     pass
             vis_now = (bool(getattr(lay, "visible", True))
                        or bool(getattr(lay, "trans_active", False)))
+            # 不在这份输出配置里的层（单屏下属于其他屏幕）既不合成也不解码。
+            if str(getattr(lay, "lid", "")) not in out_ids:
+                vis_now = False
             # ★★★ 2026-11-12（用户：只显示一张图，CPU 仍 30%+）：
             #   `hide_silent` 的图层在静音时**合成端已经不再画**，但活跃标记只看
             #   `visible` ⇒ 解码器继续满速跑。现场 config 里 L5/L6/L9 都是
@@ -9213,34 +9243,21 @@ class AutoVJEngine(QObject):
           现在按输出计划取主屏的 `effective_layers`；没有计划（老单屏配置）时退回全量。
         """
         plan = getattr(self, "_out_cfg", None)
+        all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
         if not plan:
-            # ★ 2026-11-12（普通演出台仍显示独立屏内容）：多屏关闭时
-            #   `_out_cfg=None`，旧实现直接返回 self.layers（全部层）
-            #   ⇒ 独立屏的 图层5/7/码表 也会混进主屏。
-            #   这里仍按当前多屏配置的 main 屏图层集合合成；没有配置才回退全部。
             try:
                 active = output_model.active_config(self.cfg)
-                main = output_model.main_screen(active) if active else None
-                if main is not None and main.get("layers") is not None:
-                    all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
-                    ids = output_model.effective_layers(active, main, all_ids)
+                if active is not None:
+                    ids = output_model.main_output_layers(active, all_ids)
                     return self._pin_kv_order(self._out_layers_by_ids(ids))
             except Exception:                                  # noqa: BLE001
                 pass
-            return self.layers                     # 无多屏配置 / 无主屏图层限制
-        main = None
-        for s in plan.get("screens") or []:
-            if s.get("type") == "main":
-                main = s
-                break
-        if main is None:
             return self.layers
-        all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
         try:
-            ids = output_model.effective_layers(plan, main, all_ids)
-        except Exception:                                          # noqa: BLE001
+            ids = output_model.main_output_layers(plan, all_ids)
+            return self._pin_kv_order(self._out_layers_by_ids(ids))
+        except Exception:                                      # noqa: BLE001
             return self.layers
-        return self._pin_kv_order(self._out_layers_by_ids(ids))
 
     def _compose(self, snap):
         """主屏合成（保留旧入口）：主画布 + **主屏自己的**图层，允许 GPU 合成。"""

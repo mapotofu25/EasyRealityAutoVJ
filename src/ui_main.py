@@ -3583,10 +3583,9 @@ class MainWindow(QMainWindow):
                 return
             import output_model as _om
             cfg = _om.active_config(self.cfg.data)
-            main = _om.main_screen(cfg) if cfg else None
             all_ids = [str(l.lid) for l in self.engine.layers]
-            if main is not None and main.get("layers") is not None:
-                used = [str(x) for x in _om.effective_layers(cfg, main, all_ids)]
+            if cfg is not None:
+                used = [str(x) for x in _om.main_output_layers(cfg, all_ids)]
                 self.layers_panel.set_layer_ids(
                     None if len(used) >= len(all_ids) else used)
             else:
@@ -4076,6 +4075,11 @@ class MainWindow(QMainWindow):
         # 下方图层块也跟着选中屏走（用户第 10 条）
         try:
             self.output_studio.selection_changed.connect(self._on_studio_selection)
+        except Exception:                                         # noqa: BLE001
+            pass
+        # 多屏里增删改配置后，单屏那条下拉必须同步（否则删掉的配置还留在列表里）。
+        try:
+            self.output_studio.configs_changed.connect(self._refresh_single_cfg_combo)
         except Exception:                                         # noqa: BLE001
             pass
         # ★ 用户第 5 条：多屏模式下**不再内嵌素材库**，
@@ -5066,6 +5070,15 @@ class MainWindow(QMainWindow):
 
     def _restore_stage_panels(self):
         """把图层栈/素材库/右侧设置放回正常演出台的原始位置。"""
+        # ★ 2026-11-21（用户：浮动素材库偶尔自己关掉）：
+        #   退出多屏时 `_detach_library_from_float()` 会顺手 hide 浮窗。
+        #   浮窗此刻若是开着的，退出多屏后必须原样留着，不能替用户关。
+        _keep_float = False
+        try:
+            _lf = getattr(self, "_lib_float", None)
+            _keep_float = bool(_lf is not None and _lf.isVisible())
+        except Exception:                                          # noqa: BLE001
+            _keep_float = False
         # ★ 用户第 5 条：素材库可能正躺在浮动窗口里 ⇒ 先从那个布局里摘出来，
         #   否则它会被"加到第二个布局"而残留在浮动窗口（关窗后素材库就没了）。
         self._detach_library_from_float()
@@ -5107,8 +5120,24 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.library_panel.setParent(None)
-            self._stage_bottom.addWidget(self.library_panel)
-            self._stage_bottom.setSizes([560, 520])
+            if _keep_float:
+                _lf = getattr(self, "_lib_float", None)
+                if _lf is not None and _lf.layout() is not None:
+                    _lf.layout().addWidget(self.library_panel, 1)
+                    self.library_panel.setMinimumSize(380, 240)
+                    try:
+                        self.grid.setMinimumHeight(240)
+                    except Exception:                              # noqa: BLE001
+                        pass
+                    _lf.layout().activate()
+                    _lf.show()
+                    _lf.raise_()
+                else:
+                    self._stage_bottom.addWidget(self.library_panel)
+                    self._stage_bottom.setSizes([560, 520])
+            else:
+                self._stage_bottom.addWidget(self.library_panel)
+                self._stage_bottom.setSizes([560, 520])
         except Exception:
             pass
         # ★ 用户第 8 条：右侧设置搬回单屏那一列（同一个对象），并清掉描边/置灰
@@ -5615,10 +5644,24 @@ class MainWindow(QMainWindow):
             self.single_cfg_combo.currentIndexChanged.connect(
                 self._on_single_config_combo)
             lay.addWidget(self.single_cfg_combo)
+            # ★ 2026-11-21（用户）：单屏也要有明确的「应用」入口。
+            #   下拉切换本来就即时生效，这个按钮用于"重新应用当前选择"，
+            #   多屏里删/改了配置后回到单屏也能一键对齐。
+            self.single_cfg_apply = QToolButton()
+            self.single_cfg_apply.setText("应用")
+            self.single_cfg_apply.setToolTip("重新应用当前输出配置到单屏输出")
+            self.single_cfg_apply.clicked.connect(
+                lambda _c=False: self._on_single_config_combo(
+                    self.single_cfg_combo.currentIndex()))
+            lay.addWidget(self.single_cfg_apply)
             self.single_cfg_menu = QToolButton()
-            self.single_cfg_menu.setText("配置 ▾")
+            self.single_cfg_menu.setText("配置")
             self.single_cfg_menu.setToolTip("配置管理：新建 / 复制当前 / 重命名 / 删除当前")
             self.single_cfg_menu.setPopupMode(QToolButton.InstantPopup)
+            # 菜单按钮只保留 Qt 自带的弹出指示；文字里不要再写 ▾，
+            # 否则会和下拉框的箭头叠成两个（用户 2026-11-21 截图）。
+            self.single_cfg_menu.setStyleSheet(
+                "QToolButton::menu-indicator{image:none;width:0px;}")
             menu = QMenu(self.single_cfg_menu)
             act = menu.addAction("新建配置…")
             act.triggered.connect(lambda _c=False: self._single_cfg_new())
@@ -5749,6 +5792,11 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._sync_frame_consumers()
+        except Exception:                                      # noqa: BLE001
+            pass
+        # 单屏下拉跟真配置对齐（多屏里删/改过配置后，这里要立即反映）
+        try:
+            self._refresh_single_cfg_combo()
         except Exception:                                      # noqa: BLE001
             pass
 

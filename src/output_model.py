@@ -481,6 +481,30 @@ def effective_layers(cfg, screen, all_layer_ids, _seen=None):
     return [x for x in layers if x in ids]
 
 
+def main_output_layers(cfg, all_layer_ids):
+    """单屏演出台实际使用的图层：**只取主屏那份配置**。
+
+    · 主屏显式绑定了 `layers`（含 `[]`）⇒ 严格按它；
+    · 老配置主屏 `layers=None` ⇒ 全量里**排除只属于独立屏**的图层；
+      复制/切分屏跟随源屏，不参与排除。
+    """
+    ids = [str(x) for x in (all_layer_ids or [])]
+    main = main_screen(cfg)
+    if main is None:
+        return ids
+    if main.get("layers") is not None:
+        return effective_layers(cfg, main, ids)
+    used_elsewhere = set()
+    for s in (cfg.get("screens") or []):
+        if not isinstance(s, dict) or s.get("type") != "independent":
+            continue
+        lay = s.get("layers")
+        if lay is None:
+            continue
+        used_elsewhere.update(str(x) for x in lay)
+    return [x for x in ids if x not in used_elsewhere]
+
+
 #: U7：可按屏 override 的参数段（性能/屏幕设置不在此列，仍全局）
 #: 可以**按屏各存一份**的配置段（其余段如 perf/output 始终全局一份）
 #: ★ BUG-D（2026-11-10）：加入 `"mode"`（素材切换节奏/灵敏度）——

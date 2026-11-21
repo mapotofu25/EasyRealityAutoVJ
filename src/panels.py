@@ -1981,11 +1981,19 @@ class MusicLibraryPanel(QWidget):
             except (TypeError, ValueError):
                 du = 0.0
             dup = bool(sid and sid in local_sids)
-            if not dup and du > 0.0:
-                for ld in local_names.get(norm(r.get("file_name") or ""), ()):
-                    if ld > 0.0 and abs(du - ld) <= tol:
+            if not dup:
+                lds = local_names.get(norm(r.get("file_name") or ""), ())
+                if lds:
+                    # ★ 2026-11-21（用户：本机 > 导入包 > 码表）：同名时本机优先。
+                    #   本机刚导入还没扫描 ⇒ 时长未知（0），也要隐去导入行；
+                    #   两边都有时长时才按 0.5s 容差判。
+                    if du <= 0.0:
                         dup = True
-                        break
+                    else:
+                        for ld in lds:
+                            if ld <= 0.0 or abs(du - ld) <= tol:
+                                dup = True
+                                break
             if dup:
                 merged += 1
                 continue

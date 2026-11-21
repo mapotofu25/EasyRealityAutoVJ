@@ -1737,6 +1737,7 @@ class OutputStudio(QWidget):
 
     open_library = Signal()          # 请求打开独立素材库窗口（ui_main 接）
     selection_changed = Signal(str)  # 选中的屏幕变了（多屏模式下右侧设置要跟着换作用域）
+    configs_changed = Signal()       # 配置列表增删改（ui_main 的单屏下拉要同步）
 
     def __init__(self, main, parent=None, compact=False):
         super().__init__(parent)
@@ -1773,9 +1774,12 @@ class OutputStudio(QWidget):
         bar.addWidget(self.cfg_combo)
         self.btn_cfg_menu = QToolButton()
         self.btn_cfg_menu.setObjectName("btnCfgMenu")
-        self.btn_cfg_menu.setText("配置 ▾")
+        self.btn_cfg_menu.setText("配置")
         self.btn_cfg_menu.setToolTip("配置管理：新建 / 复制当前 / 重命名 / 删除当前")
         self.btn_cfg_menu.setPopupMode(QToolButton.InstantPopup)
+        # 文字里不再写 ▾，并隐藏 Qt 自带的菜单指示，避免与左边下拉框叠成两个箭头。
+        self.btn_cfg_menu.setStyleSheet(
+            "QToolButton::menu-indicator{image:none;width:0px;}")
         self._cfg_menu = QMenu(self.btn_cfg_menu)
         self.act_cfg_new = self._cfg_menu.addAction("新建配置…")
         self.act_cfg_new.triggered.connect(lambda _c=False: self.add_config())
@@ -2554,6 +2558,7 @@ class OutputStudio(QWidget):
         self.cfg.data.setdefault("output", {})["active_config"] = cid
         self.selected_id = ""
         self.apply()
+        self.configs_changed.emit()
 
     def _on_mode(self, idx):
         if self._loading:
@@ -2652,6 +2657,8 @@ class OutputStudio(QWidget):
         self.cfg.data["output"]["active_config"] = cfg["id"]
         self.selected_id = OM.main_screen(cfg)["id"]
         self.apply()
+        self.reload()
+        self.configs_changed.emit()
 
     def duplicate_config(self):
         cfg = self.active_config()
@@ -2665,6 +2672,8 @@ class OutputStudio(QWidget):
         self.cfg.data["output"]["active_config"] = nc["id"]
         self.selected_id = ""
         self.apply()
+        self.reload()
+        self.configs_changed.emit()
 
     def rename_config(self):
         cfg = self.active_config()
@@ -2675,6 +2684,8 @@ class OutputStudio(QWidget):
         if ok and name.strip():
             cfg["name"] = name.strip()
             self.apply()
+            self.reload()
+            self.configs_changed.emit()
 
     def delete_config(self):
         cfg = self.active_config()
@@ -2692,6 +2703,8 @@ class OutputStudio(QWidget):
         self.cfg.data["output"]["active_config"] = configs[0]["id"]
         self.selected_id = ""
         self.apply()
+        self.reload()
+        self.configs_changed.emit()
 
     # ---------- 屏幕 ----------
     def add_screen(self):

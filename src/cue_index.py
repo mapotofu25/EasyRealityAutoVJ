@@ -377,7 +377,7 @@ class _LocalIndex:
     这里把本机曲库压成集合/字典 ⇒ 每条 track 只做 O(1) 查表。
     """
 
-    __slots__ = ("fp", "md5", "meta", "names", "same")
+    __slots__ = ("fp", "md5", "meta", "names", "same", "files")
 
     def __init__(self):
         # ★ 2026-10-30：四个容器都**存"本机路径"**（原来只存值/集合）。
@@ -390,6 +390,10 @@ class _LocalIndex:
         self.md5 = {}              # {32 hex 文件内容 md5: 本机路径}
         self.meta = {}             # {meta_id: 本机路径}（只收"有名或艺人"的，与判定口径一致）
         self.names = {}            # (归一化艺人, 归一化曲名) -> [(时长秒 | None, 路径)]
+        # ★ 2026-11-21：文件名兜底。本机刚导入、还没扫描时 `music_meta` 里没有
+        #   标题/艺人/时长，只有 `music_library` 的路径；用 basename 也能认出
+        #   码表里的同一首，避免"码表一行 + 本机一行"。
+        self.files = {}            # 归一化文件名（basename, 小写） -> 本机路径
         # ★★ 0 级：`cfg["cue"]["fp_same"]`（`fp_id → 本机路径`）—— 由
         #   `cue_fp_pack.match_pack_local()` 在导入时用**指纹内容重合率**算出来的。
         #   为什么它必须排在 `fp_id` 相等之前（用户 2026-10-30：「我期望的是用指纹对比」
@@ -407,6 +411,16 @@ class _LocalIndex:
         if not isinstance(rec, dict):
             return self
         p = str(path or "")
+        base = ""
+        if p and not p.startswith("@"):
+            base = os.path.basename(p.replace("\\", "/")).strip().lower()
+            if base:
+                self.files.setdefault(base, p)
+        else:
+            fn = os.path.basename(str(rec.get("file_name") or "")
+                                 .replace("\\", "/")).strip().lower()
+            if fn:
+                self.files.setdefault(fn, p)
         fp = str(rec.get("fp_id") or "")
         if fp:
             self.fp.setdefault(fp, p)
@@ -414,6 +428,8 @@ class _LocalIndex:
         if m:
             self.md5.setdefault(m, p)
         r_title = str(rec.get("title") or "")
+        if not r_title and base:
+            r_title = os.path.splitext(base)[0]
         r_artist = str(rec.get("artist") or "")
         if r_title or r_artist:
             mid = str(rec.get("meta_id") or "") or _meta_key(
@@ -455,6 +471,10 @@ class _LocalIndex:
             title, artist, track.get("duration_sec"))
         if mid and mid in self.meta:
             return self.meta[mid]
+        # ③.5 文件名兜底（本机刚导入、还没扫描时没有标题/时长）
+        fn = str(track.get("file_name") or "").replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
+        if fn and fn in self.files:
+            return self.files[fn]
         # ④ 名 + 艺人 + 时长差 ≤2 秒
         d1 = _dur(track.get("duration_sec"))
         if d1 is not None:
@@ -507,6 +527,7 @@ def _add_imported_coverage(local):
             local.add({
                 "title": str(_r.get("title") or ""),
                 "artist": str(_r.get("artist") or ""),
+                "file_name": str(_r.get("file_name") or ""),
                 # `_LocalIndex.add` 的时长口径是 `grid.dur`；只给 duration 会变成 None。
                 "grid": {"dur": _dur},
                 "duration": _dur,
@@ -553,6 +574,15 @@ def library_rows(cfg, index=None):
     if isinstance(mm, dict):
         for _path, rec in mm.items():
             local.add(rec, _path)
+    # ★ 2026-11-21：刚导入、还没扫描的本机歌只在 `music_library` 里，没有
+    #   `music_meta` 记录。也加进索引（add 会拿文件名兜底），否则码表派生行
+    #   会一直和本机行并排显示。
+    try:
+        for _path in (cfg["music_library"] or []):
+            if _path and _path not in mm:
+                local.add({}, _path)
+    except Exception:                                            # noqa: BLE001
+        pass
     # ★ 导入库也算“本机已有”：避免同一首出现“导入库一行 + 码表派生一行”。
     _add_imported_coverage(local)
     # ★ 0 级：导入码表时用**指纹内容重合率**算好的对账表（`fp_id → 本机路径`）。
@@ -639,6 +669,13 @@ def covered_paths(cfg, index=None, require_file=True):
     if isinstance(mm, dict):
         for _path, rec in mm.items():
             local.add(rec, _path)
+    # 刚导入、还没扫描的本机歌也参与匹配（文件名兜底）
+    try:
+        for _path in (cfg["music_library"] or []):
+            if _path and _path not in mm:
+                local.add({}, _path)
+    except Exception:                                            # noqa: BLE001
+        pass
     # ★ 0 级：导入码表时用**指纹内容重合率**算好的对账表（`fp_id → 本机路径`）。
     #   `fp_id` 相等只能判"完全同一个 PCM"，判不了"同一首的不同压制版本"（用户 2026-10-30）。
     try:
