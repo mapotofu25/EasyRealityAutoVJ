@@ -144,8 +144,20 @@ def now_playing_query(engine):
     if engine is None:
         return {}, ""
     try:
-        st = getattr(getattr(engine, "audio", None), "state", None)
-        sid = int(getattr(st, "recognized_song_id", -1))
+        # ★ 2026-11-18：`engine.audio` **就是** AudioState（构造时传的是
+        #   `self.audio.state`，见 ui_main 创建引擎处）。原来又取 `.state`
+        #   ⇒ 恒 None ⇒ 这里的 `match_track()` 永远不执行，导入码表只能靠
+        #   “单曲目”兜底。与 engine 内部 2026-10 的同款修复保持一套写法。
+        st = getattr(engine, "audio", None)
+        try:
+            sid = int(getattr(st, "recognized_song_id", -1))
+        except (TypeError, ValueError):
+            sid = -1
+        if sid < 0:
+            _ae = getattr(engine, "_audio_engine", None)
+            _cur = getattr(_ae, "current_song_id", None)
+            if _cur is not None:
+                sid = int(_cur)
     except (TypeError, ValueError, AttributeError):
         return {}, ""
     if sid < 0:
@@ -475,9 +487,9 @@ class CueSheetDialog(QDialog):
         # ★ `cuesheet.load()` 不认识"本程序版本"（它不 import 版本信息），所以
         #   「这张码表要求 X 以上版本」那条告警必须**由 UI 侧补**一次 —— 否则用户永远看不到。
         try:
-            from version import APP_VERSION
+            from version import APP_VERSION_NUM
             _w, _ = cuesheet.capability_report(
-                sheet, app_version=str(APP_VERSION),
+                sheet, app_version=str(APP_VERSION_NUM),
                 missing_media=info.get("missing_media") or [])
             for x in _w:
                 if x not in self.warnings:
@@ -522,6 +534,17 @@ class CueSheetDialog(QDialog):
                             by_id[m.clip_id] = found[m.name]
                     self.media_paths.update(by_id)
                     self.missing = [n for n in self.missing if n not in found]
+
+        # ★ 2026-11-18：`load()` 的 warnings 是在**解包/找素材之前**算的，里面
+        #   必然带一条“有 N 个素材没找到”。解包成功后如果不重算，界面会一直显示
+        #   假的缺素材警告（实测内嵌包首次导入必现）。这里按最终 self.missing 重算。
+        try:
+            from version import APP_VERSION_NUM as _AV
+            _w, _ = cuesheet.capability_report(
+                sheet, app_version=str(_AV), missing_media=self.missing)
+            self.warnings = list(_w)
+        except Exception:                                        # noqa: BLE001
+            pass
 
         # 认歌：**用此刻正在播放的那首歌**（`recognized_song_id`）走表里的五级链。
         # ★ 认不出 / 多曲目 ⇒ track=None：**装表不绑曲目**（安全降级），之后放歌时引擎会
@@ -611,6 +634,27 @@ class CueSheetDialog(QDialog):
             except OSError:
                 have = set()
         need = [n for n in names if n not in have]
+        # ★ 2026-11-18：同名素材可能已经被上一次导入解过（用户重新导出了同一
+        #   文件名的新版本）。只看"文件名存在"会永远播旧素材 ⇒ 用包内 member
+        #   的 file_size 做一次廉价指纹；大小不同就重解。
+        try:
+            import zipfile
+            _sizes = {}
+            with zipfile.ZipFile(pkg) as _z:
+                for _zi in _z.infolist():
+                    _nm = _zi.filename
+                    if _nm.startswith(cuesheet.MEDIA_DIR + "/"):
+                        _base = _nm.split("/", 1)[1]
+                        if _base and "/" not in _base:
+                            _sizes[_base] = int(_zi.file_size)
+            if _sizes:
+                need = [n for n in names
+                        if n not in have
+                        or (n in _sizes
+                            and os.path.isfile(os.path.join(dest, n))
+                            and os.path.getsize(os.path.join(dest, n)) != _sizes[n])]
+        except Exception:                                        # noqa: BLE001
+            pass
 
         if not need:
             # 已经解过：只把现成文件补进 media_paths（不再碰磁盘）
@@ -1046,9 +1090,9 @@ def load_and_bind(owner, path, layer, parent=None, ask_media_dir=True, ask_track
     #     （`cuesheet.load` 内部的 capability_report 只知道 load 那一刻的结果）。
     warnings = []
     try:
-        from version import APP_VERSION
+        from version import APP_VERSION_NUM
         _w, _ = cuesheet.capability_report(
-            sheet, app_version=str(APP_VERSION), missing_media=missing)
+            sheet, app_version=str(APP_VERSION_NUM), missing_media=missing)
         warnings = list(_w or [])
     except Exception:                                            # noqa: BLE001
         warnings = list(info.get("warnings") or [])

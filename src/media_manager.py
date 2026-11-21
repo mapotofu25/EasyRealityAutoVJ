@@ -41,6 +41,69 @@ VIDEO_EXT = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 GIF_EXT = (".gif",)
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
+# ★ 2026-11-11（用户：CPU 占用 30%+）：解码 1080p→720p 用 INTER_AREA 实测
+#   7~10ms/帧/路（3-4 通道），INTER_LINEAR 只要 2ms 左右，0.67× 缩放下画质
+#   几乎没有可见差别。默认 LINEAR；想回到 AREA 设 AUTO_VJ_RESIZE_AREA=1。
+_RESIZE_INTERP = cv2.INTER_LINEAR
+try:
+    if os.environ.get("AUTO_VJ_RESIZE_AREA", "0") == "1":
+        _RESIZE_INTERP = cv2.INTER_AREA
+except Exception:                                              # noqa: BLE001
+    pass
+
+
+# ★ 2026-11-11（现场：多屏预览卡 / CPU 13 核）：解码器原来一律按**素材帧率**
+#   出帧（30fps），而多屏合成/预览实际只消费 ~10fps ⇒ 2/3 的解码 CPU 是白烧的，
+#   还把 GIL/内存带宽抢走，反过来拖慢引擎和 GUI。
+#   这里提供一个全局上限；`0` = 不限制（保持旧行为）。引擎会在运行中按实际
+#   合成帧率动态设置（见 engine._auto_fps_tick），给输出留 3~5fps 余量。
+DECODE_FPS_CAP = 0.0
+try:
+    DECODE_FPS_CAP = float(os.environ.get("AUTOVJ_DECODE_FPS", "0") or 0)
+except (TypeError, ValueError):
+    DECODE_FPS_CAP = 0.0
+
+
+def set_decode_fps_cap(fps):
+    """设置解码器出帧上限（0=不限制）。线程安全：只写一个 float，GIL 原子。"""
+    global DECODE_FPS_CAP
+    try:
+        DECODE_FPS_CAP = max(0.0, float(fps or 0.0))
+    except (TypeError, ValueError):
+        pass
+
+
+def _pace_fps(src_fps):
+    """解码节拍 = min(素材 fps, 全局上限)。上限为 0 时逐值同改前。"""
+    try:
+        f = float(src_fps or 0.0)
+    except (TypeError, ValueError):
+        f = 30.0
+    cap = float(DECODE_FPS_CAP or 0.0)
+    if cap > 0.0:
+        f = min(f, cap)
+    return max(1.0, f)
+
+
+
+def _qimage_owned(arr, w, h, qfmt):
+    """用 numpy 像素缓冲区建 QImage，**不再整幅 copy**。
+
+    ★ 2026-11-11（用户：多屏播放音乐时预览很卡）：解码线程原来每帧
+      `QImage(arr.data, ...).copy()`，720p 一次 3.7MB、1080p 8.3MB 的 memcpy，
+      4 路解码每秒 120 次 ⇒ GIL 被这些拷贝切得很碎，GUI/识别线程都跟着抖。
+      QImage 不持有外部缓冲区的所有权，所以把 numpy 数组挂到 `img._buf` 上，
+      让 QImage 活着期间数组不会被 GC 回收；解码器下一帧会换一个新数组，
+      旧帧内容不会被原地改写（消费端拿到的仍是当时的完整帧）。
+    """
+    img = QImage(arr.data, int(w), int(h), 4 * int(w), qfmt)
+    try:
+        img._buf = arr
+    except Exception:                                          # noqa: BLE001
+        return img.copy()
+    return img
+
+
 from config import app_base_dir
 THUMB_DIR = os.path.join(app_base_dir(), "thumbs")
 os.makedirs(THUMB_DIR, exist_ok=True)
@@ -57,13 +120,22 @@ def kind_of(path: str) -> str:
     return ""
 
 
+def _is_proxy_path(path: str) -> bool:
+    """代理目录 `已转码` 里的文件不能再被导入/扫描成新素材。"""
+    try:
+        parts = os.path.normpath(path).split(os.sep)
+        return "已转码" in parts
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 def scan_folder(folder: str):
     """递归扫描文件夹，返回素材路径列表。子文件夹名作为标签。"""
     out = []
     for root, _dirs, files in os.walk(folder):
         for f in files:
             p = os.path.join(root, f)
-            if kind_of(p):
+            if kind_of(p) and not _is_proxy_path(p):
                 out.append(p)
     return out
 
@@ -176,38 +248,62 @@ def cleanup_stale_ascii_copies(ttl_hours=6.0, logger=None, directory=None):
         import glob as _glob
         now = _time.time()
         cutoff = now - ttl_hours * 3600.0
-        base = directory if directory is not None else tempfile.gettempdir()
-        pattern = os.path.join(base, _COPY_PREFIX + "*")
-        for p in _glob.glob(pattern):
+        bases = []
+        if directory is not None:
+            bases.append(directory)
+        else:
+            # 旧副本在系统 Temp；新版本按“源盘根/_ascii_cache”分散存放 ⇒ 两处都要清。
+            bases.append(tempfile.gettempdir())
+            bases.append(os.path.join(tempfile.gettempdir(), _ASCII_CACHE_DIRNAME))
             try:
-                if not os.path.isfile(p):        # 跳过目录（测试残留不归这里管）
+                import string
+                for _d in string.ascii_uppercase:
+                    _root = "%s:\\" % _d
+                    if not os.path.isdir(_root):
+                        continue
+                    bases.append(os.path.join(_root, _ASCII_CACHE_DIRNAME))
+            except Exception:                                  # noqa: BLE001
+                pass
+        seen_dirs = set()
+        for base in bases:
+            try:
+                _b = os.path.normcase(os.path.abspath(base))
+                if _b in seen_dirs:
                     continue
-                if p in _TMP_COPIES:             # 本进程在用的，不碰
-                    continue
-                try:
-                    mtime = os.path.getmtime(p)
-                except OSError:
-                    continue
-                # ★ 原子写的中间文件 `xxx.tmp<pid>`：进程都不在了 ⇒ 立刻删（不等 TTL）。
-                #   这类是"复制到一半被杀"的残留，按 TTL 等 6 小时纯属浪费空间。
-                _tp = _tmp_pid_of(p)
-                if _tp is not None and not _pid_alive(_tp):
+                seen_dirs.add(_b)
+                pattern = os.path.join(base, _COPY_PREFIX + "*")
+                for p in _glob.glob(pattern):
                     try:
-                        os.remove(p)
-                        removed += 1
+                        if not os.path.isfile(p):        # 跳过目录（测试残留不归这里管）
+                            continue
+                        if p in _TMP_COPIES:             # 本进程在用的，不碰
+                            continue
+                        try:
+                            mtime = os.path.getmtime(p)
+                        except OSError:
+                            continue
+                        # ★ 原子写的中间文件 `xxx.tmp<pid>`：进程都不在了 ⇒ 立刻删（不等 TTL）。
+                        #   这类是"复制到一半被杀"的残留，按 TTL 等 6 小时纯属浪费空间。
+                        _tp = _tmp_pid_of(p)
+                        if _tp is not None and not _pid_alive(_tp):
+                            try:
+                                os.remove(p)
+                                removed += 1
+                                continue
+                            except OSError:
+                                skipped_locked += 1
+                                continue
+                        if mtime > cutoff:
+                            kept_recent += 1             # 太新：可能是别的实例刚建的，保留
+                            continue
+                        try:
+                            os.remove(p)
+                            removed += 1
+                        except OSError:
+                            skipped_locked += 1          # 被占用/无权限：优雅跳过
+                    except Exception:
                         continue
-                    except OSError:
-                        skipped_locked += 1
-                        continue
-                if mtime > cutoff:
-                    kept_recent += 1             # 太新：可能是别的实例刚建的，保留
-                    continue
-                try:
-                    os.remove(p)
-                    removed += 1
-                except OSError:
-                    skipped_locked += 1          # 被占用/无权限：优雅跳过
-            except Exception:
+            except Exception:                                  # noqa: BLE001
                 continue
     except Exception:
         pass
@@ -397,7 +493,7 @@ class MediaItem:
         # ★ 2026-11-06（拖行高闪退）：图标/像素缓存按 (w,h) 做键，**行高每变 1px 就多一条**。
         #   拖动时能攒几百条（每条一张缩放后的图）⇒ 内存猛涨 + 反复分配。
         #   这里封顶：超过上限就整体丢弃（下一帧按需重建，代价只有几毫秒）。
-        self._CACHE_MAX = 24
+        self._CACHE_MAX = 128
         # 每素材独立的大小/位置（图片摆位用，默认铺满）
         self.img_scale = 1.0
         self.img_x = 0.0
@@ -415,6 +511,13 @@ class MediaItem:
         self._has_alpha = None               # 视频 alpha 探测缓存（None=未探测，避免每次切换重复打开文件）
         self._codec = None                   # 视频编码名缓存（后台普查填；决定能否走 GPU 解码）
         self._is_dxv = None                  # 是否 DXV（同上）
+        # ★ 2026-11-12：引用导入的代理路径（copy/move 模式覆盖原路径，此值为 None）
+        self.proxy_path = None
+
+    def playback_path(self):
+        """实际播放文件：有代理用代理，否则原文件。"""
+        p = getattr(self, "proxy_path", None)
+        return p if (p and os.path.exists(p)) else self.path
 
     def all_tags(self):
         """生效标签 = (自动 + 手动) - 被取消的自动，去重（显示/筛选用）
@@ -823,12 +926,12 @@ class ImportWorker(QThread):
                     for root, _dirs, files in os.walk(p):
                         for f in files:
                             q = os.path.join(root, f)
-                            if kind_of(q):
+                            if kind_of(q) and not _is_proxy_path(q):
                                 found.append(q)
                                 n += 1
                                 if n % self.BATCH == 0:
                                     self.scanned.emit(n)
-                elif kind_of(p):
+                elif kind_of(p) and not _is_proxy_path(p):
                     found.append(p)
                     n += 1
             self.scanned.emit(n)
@@ -1231,7 +1334,7 @@ class VideoPlayer(_DecoderHealth):
             if self._dead:                 # 打开期间就被关掉了
                 self._release()
                 return
-            interval = 1.0 / max(self.fps, 1.0)
+            interval = 1.0 / _pace_fps(self.fps)
             # ★ 绝对时间表节拍器（见 `_Pacer`）—— 旧写法每轮白丢 ~1.7% 速率
             pacer = _Pacer()
             pacer.reset()
@@ -1276,7 +1379,7 @@ class VideoPlayer(_DecoderHealth):
                             if sc < 1.0:
                                 frame = cv2.resize(
                                     frame, (max(1, int(fw * sc)), max(1, int(fh * sc))),
-                                    interpolation=cv2.INTER_AREA)
+                                    interpolation=_RESIZE_INTERP)
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
                         h, w, _ = rgb.shape
                         # ★ 2026-11-08：输出 BGRA/RGB32，而不是 RGB888。
@@ -1287,9 +1390,9 @@ class VideoPlayer(_DecoderHealth):
                         if os.environ.get("AUTO_VJ_RGB888") == "1":
                             rgb = cv2.cvtColor(rgb, cv2.COLOR_BGRA2RGB)
                             img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+                            self._img = img.copy()
                         else:
-                            img = QImage(rgb.data, w, h, 4 * w, QImage.Format_RGB32)
-                        self._img = img.copy()
+                            self._img = _qimage_owned(rgb, w, h, QImage.Format_RGB32)
                         # ★ pts 与 _img 同源（position() 只读它；取不到就给 None）
                         try:
                             self._pts = float(
@@ -1555,7 +1658,7 @@ class AvAlphaPlayer(_DecoderHealth):
                     pass
                 self.c = None
                 return
-            interval = 1.0 / max(self.fps, 1.0)
+            interval = 1.0 / _pace_fps(self.fps)
             # ★ 绝对时间表节拍器（见 `_Pacer`）—— 旧写法每轮白丢 ~1.7% 速率
             pacer = _Pacer()
             pacer.reset()
@@ -1573,7 +1676,15 @@ class AvAlphaPlayer(_DecoderHealth):
                     self._seek_req = None
                     try:
                         tb = float(self.st.time_base)
-                        self.c.seek(int(float(req) / tb), backward=True)
+                        # ★★ 2026-11-17（用户：码表在 1:50 没画面）——**必须带 `stream`**：
+                        #   `Container.seek(offset)` 在不给 `stream=` 时把 offset 当作
+                        #   **AV_TIME_BASE 微秒**；这里却按 `st.time_base`（本文件 1/15360）
+                        #   换算 ⇒ 实际落点只有目标的 1/15360（110.5s 落到 1.67s），
+                        #   随后 `_skip_until` 要前向解几千帧才到目标。策略层等不到落地
+                        #   就再次 seek（1.2s 冷却）⇒ **永远追不上**，`dmax` 卡在 90~120s。
+                        #   直接给 `stream=self.st` ⇒ offset 单位就是该流的 time_base。
+                        self.c.seek(int(round(float(req) / tb)), stream=self.st,
+                                    backward=True)
                         self._skip_until = float(req)
                         frames = self._iter_frames()     # seek 之后重新取生成器
                     except Exception:                    # noqa: BLE001
@@ -1610,10 +1721,10 @@ class AvAlphaPlayer(_DecoderHealth):
                         if sc < 1.0:
                             arr = cv2.resize(
                                 arr, (max(1, int(w * sc)), max(1, int(h * sc))),
-                                interpolation=cv2.INTER_AREA)
+                                interpolation=_RESIZE_INTERP)
                             h, w = arr.shape[:2]
                     img = QImage(arr.data, w, h, 4 * w, self._qfmt)
-                    self._img = img.copy()
+                    self._img = _qimage_owned(arr, w, h, self._qfmt)
                     self._pts = fsec                      # ★ 与 _img 同源（可 None）
                     ok = True
                 except Exception:                              # noqa: BLE001
@@ -1825,10 +1936,8 @@ class AlphaMigrationWorker(QThread):
                     it._has_alpha = bool(has)
                     it._av_no_alpha = (not has)
                     if changed:
-                        try:
-                            it.drop_icon_cache()
-                        except Exception:
-                            pass
+                        # 图标缓存由主线程在迁移完成后统一丢弃（跨线程碰 QPixmap/QIcon 会崩）
+                        pass
                     if has:
                         it._alpha_recheck = True      # 让引擎丢掉按旧判定建的解码器
             except Exception:
@@ -2098,7 +2207,9 @@ class GpuDxvPlayer(_DecoderHealth):
         self._seek_req = None
         try:
             tb = float(self.st.time_base)
-            self.c.seek(int(float(req) / tb), backward=True)
+            # ★ 2026-11-17：同 `AvAlphaPlayer` —— `Container.seek` 不给 `stream=`
+            #   时 offset 是**微秒**，按 `time_base` 换算会小 1/15360 ⇒ 码表永远到不了位。
+            self.c.seek(int(round(float(req) / tb)), stream=self.st, backward=True)
             self._skip_until = float(req)
         except Exception:
             # Container seek may fail / land at 0 for some DXV files; the
@@ -2325,6 +2436,8 @@ class GpuDxvPlayer(_DecoderHealth):
                         continue
                     produced += 1
                     self._pts = pts
+                    # ⚠ GPU 回读缓冲是 **worker 内部复用**的（glctx._buf，下一帧会原地覆盖），
+                    #   必须整幅 copy；不能像软解那样借缓冲。
                     yield QImage(arr.data, dw, dh, 4 * dw, self._qfmt).copy()
             except Exception:                                          # noqa: BLE001
                 pass
@@ -2401,7 +2514,7 @@ class GpuDxvPlayer(_DecoderHealth):
                         s = min(self._max_w / w, self._max_h / h)
                         if s < 1.0:
                             arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))),
-                                             interpolation=cv2.INTER_AREA)
+                                             interpolation=_RESIZE_INTERP)
                             h, w = arr.shape[:2]
                     try:
                         _pts = getattr(frame, "pts", None)
@@ -2409,7 +2522,7 @@ class GpuDxvPlayer(_DecoderHealth):
                                      if _pts is not None else None)
                     except Exception:
                         self._pts = None
-                    yield QImage(arr.data, w, h, 4 * w, self._qfmt).copy()
+                    yield _qimage_owned(arr, w, h, self._qfmt)
                     now = time.perf_counter()
                     if now >= next_probe:
                         next_probe = now + self._GPU_REPROBE_SECS
@@ -2469,7 +2582,7 @@ class GpuDxvPlayer(_DecoderHealth):
                         s = min(self._max_w / w, self._max_h / h)
                         if s < 1.0:
                             arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))),
-                                             interpolation=cv2.INTER_AREA)
+                                             interpolation=_RESIZE_INTERP)
                             h, w = arr.shape[:2]
                     got += 1                       # ★ 只有真正要 yield 一帧才算"出帧"
                     try:
@@ -2478,7 +2591,7 @@ class GpuDxvPlayer(_DecoderHealth):
                                      if _pts is not None else None)
                     except Exception:
                         self._pts = None
-                    yield QImage(arr.data, w, h, 4 * w, self._qfmt).copy()
+                    yield _qimage_owned(arr, w, h, self._qfmt)
             except Exception:                                      # noqa: BLE001
                 pass
             if seeked:
@@ -2561,13 +2674,13 @@ class GpuDxvPlayer(_DecoderHealth):
                     s = min(self._max_w / w, self._max_h / h)
                     if s < 1.0:
                         bgr = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))),
-                                         interpolation=cv2.INTER_AREA)
+                                         interpolation=_RESIZE_INTERP)
                         h, w = bgr.shape[:2]
                 # cv2 给的是 BGR；QImage 的 Format_ARGB32/RGB32 在内存里都是 BGRA 字节序 ⇒ 补 alpha
                 bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
                 got += 1
                 self._pts = pts
-                yield QImage(bgra.data, w, h, 4 * w, self._qfmt).copy()
+                yield _qimage_owned(bgra, w, h, self._qfmt)
             if self._dead:
                 return
             empty = 0 if got else empty + 1
@@ -2610,7 +2723,7 @@ class GpuDxvPlayer(_DecoderHealth):
                 continue
             if self._dead:                 # 打开期间就被关掉了
                 break
-            interval = 1.0 / max(self.fps, 1.0)
+            interval = 1.0 / _pace_fps(self.fps)
             # ★ 绝对时间表节拍器（见 `_Pacer`）—— 旧写法每轮白丢 ~1.7% 速率
             pacer = _Pacer()
             pacer.reset()
@@ -2738,15 +2851,16 @@ def create_video_player(item, cue=False):
     # `out_alpha` 传「按现状这个素材会不会输出 alpha 通道」，保证画面与改动前一致。
     # ★ 2026-11-08：GpuDxvPlayer 已补 position()/seek()（demux pts + 容器 seek），
     #   码表图层也能走 GPU 解码；不再对 cue 强行回退软解。
+    _pp = item.playback_path() if hasattr(item, "playback_path") else item.path
     if gpu_decode_enabled() and avmod is not None:
         dxv = getattr(item, "_is_dxv", None)
         if dxv is None:
             _probe_codec_async(item)
         elif dxv:
-            return GpuDxvPlayer(item.path, avmod, out_alpha=bool(has))
+            return GpuDxvPlayer(_pp, avmod, out_alpha=bool(has))
     if has and avmod is not None:
-        return AvAlphaPlayer(item.path, avmod)          # 构造不再阻塞（容器在解码线程开）
-    return VideoPlayer(item.path)
+        return AvAlphaPlayer(_pp, avmod)          # 构造不再阻塞（容器在解码线程开）
+    return VideoPlayer(_pp)
 
 
 class GifPlayer:
@@ -2777,7 +2891,37 @@ class GifPlayer:
         self._t0 = time.perf_counter()
 
     def set_speed(self, s: float):
+        # ★ 2026-11-18：变速时保持**当前显示帧**不跳（否则每次调速都会从
+        #   新的 (elapsed × speed) 位置突然跳一下）。
+        try:
+            pos = self.position()
+        except Exception:                                        # noqa: BLE001
+            pos = 0.0
         self.speed = max(0.1, min(3.0, s))
+        try:
+            self._t0 = time.perf_counter() - (pos / max(0.1, self.speed))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    # ★ 2026-11-18：GIF 也提供 position/seek —— 码表 policy 只有看到
+    #   `position()` 才会执行“落地 seek / 变速对齐”；之前 GIF 直接跳过整段
+    #   ⇒ 编排里的 `speed`、`src_in_sec`、片段内定位全部失效。
+    def position(self) -> float:
+        if not self.frames:
+            return 0.0
+        try:
+            el = (time.perf_counter() - self._t0) * self.speed
+            return float(el % max(1e-6, self.total))
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+
+    def seek(self, sec: float) -> bool:
+        try:
+            s = max(0.0, min(float(sec), max(0.0, self.total)))
+            self._t0 = time.perf_counter() - (s / max(0.1, self.speed))
+            return True
+        except (TypeError, ValueError):
+            return False
 
     def set_active(self, a: bool):
         pass  # GIF 按需取帧，无需挂起
@@ -2804,6 +2948,30 @@ class GifPlayer:
 class ImagePlayer:
     def __init__(self, path):
         self.img = QImage(path)
+
+    def set_max_size(self, w, h):
+        """静态图只缩一次（不是每帧）。
+
+        ★ 2026-11-11（用户：多屏播放音乐时界面/预览卡）：图层里的封面/LOGO 常见
+          1920×1080、2500×2500 的 PNG，旧实现没有 `set_max_size`，引擎每帧都要用
+          QPainter SmoothPixmapTransform 把它缩到画布 —— 一张 6MP 图实测 5~10ms/帧，
+          三四张静态层就把 compose 顶到 30ms。这里在取播放器时按画布尺寸预缩一次，
+          之后引擎是 1:1 或小幅缩放。
+        """
+        try:
+            w, h = int(w), int(h)
+            if w <= 0 or h <= 0 or self.img is None or self.img.isNull():
+                return
+            if getattr(self, "_max_key", None) == (w, h):
+                return                     # 同一画布尺寸只处理一次（缓存命中会被反复调用）
+            self._max_key = (w, h)
+            if self.img.width() <= w and self.img.height() <= h:
+                return
+            # KeepAspectRatioByExpanding：短边也覆盖画布，避免引擎再放大变糊
+            self.img = self.img.scaled(w, h, Qt.KeepAspectRatioByExpanding,
+                                       Qt.SmoothTransformation)
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def set_speed(self, s):
         pass

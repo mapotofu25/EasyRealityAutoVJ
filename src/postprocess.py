@@ -124,29 +124,27 @@ def fx_softfocus(bgr, strength):
     return cv2.addWeighted(bgr, 1.0, blur, strength * 0.7, 0)
 
 
-_TRAIL = {"buf": None}
+_TRAILS = {}
 
 
-def fx_trails(bgr, strength, reset=False):
+def fx_trails(bgr, strength, reset=False, key=None):
     """拖影：上一帧衰减后与本帧取 max（不叠白）。强度越大残影越久。
 
-    ⚠ `bgr=None` 是**清空拖影缓冲**的约定（引擎在「效果关闭 / 被 Kv 接管」时
-      调 `fx_trails(None, 0.0, reset=True)`）。旧实现直接 `bgr.copy()` ⇒
-      `AttributeError` ⇒ 被上层 `except Exception: pass` 吞掉 ⇒ **缓冲永远清不掉**，
-      下次再开拖影会闪一下上一场的残影（症状很隐蔽，日志里什么都没有）。
+    ★ 2026-11-10（多屏）：`key` 区分每块屏的拖影缓冲；不传 = 旧单路默认缓冲。
     """
+    k = key or "__main__"
     if bgr is None:
-        _TRAIL["buf"] = None
+        _TRAILS[k] = None
         return None
-    prev = _TRAIL["buf"]
+    prev = _TRAILS.get(k)
     if reset or prev is None or prev.shape != bgr.shape:
-        _TRAIL["buf"] = bgr.copy()
+        _TRAILS[k] = bgr.copy()
         return bgr
     decay = 1.0 - max(0.05, min(0.9, strength * 0.75))     # 每帧保留比例
     lut = np.clip(np.arange(256, dtype=np.float32) * decay, 0, 255).astype(np.uint8)
     scaled = cv2.LUT(prev, lut)
     out = cv2.max(bgr, scaled)
-    _TRAIL["buf"] = out
+    _TRAILS[k] = out
     return out
 
 
@@ -246,7 +244,6 @@ def _np_view_bgr(img):
       且输出**逐像素完全一致**（见 tools/_perf_bgr_view.py 的 array_equal 断言）。
     """
     _t = _time_mod.perf_counter()
-    _t = _time_mod.perf_counter()
     w, h = img.width(), img.height()
     bpl = img.bytesPerLine()
     _det_before = False
@@ -257,7 +254,7 @@ def _np_view_bgr(img):
     arr = np.frombuffer(img.bits(), dtype=np.uint8, count=bpl * h).reshape(h, bpl)
     try:
         # bits() 返回非 const ⇒ 若原本被共享引用，Qt 会先整幅 detach（10.8MB 拷贝）
-        if _det_before and not bool(img.isDetached()):
+        if (not _det_before) and bool(img.isDetached()):
             SEG["bits_copy"] = 1
     except Exception:                                          # noqa: BLE001
         pass
@@ -268,6 +265,26 @@ def _np_view_bgr(img):
     except Exception:                                          # noqa: BLE001
         pass
     return _out
+
+
+def _np_view_bgra(img):
+    """QImage(RGB32/ARGB32) → (h, w, 4) BGRA **视图**（不拷贝，供原地 LUT 用）。
+
+    ★ 2026-11-11：颜色 LUT 的原地快路径需要直接写 QImage 的像素缓冲。
+      32 位格式的 `bytesPerLine` 恒等于 `w*4`，所以这里可以无拷贝 reshape；
+      不是该布局就返回 None（调用方回退旧路径，绝不错写）。
+    """
+    try:
+        w, h = int(img.width()), int(img.height())
+        if w <= 0 or h <= 0:
+            return None
+        bpl = int(img.bytesPerLine())
+        if bpl != w * 4:
+            return None
+        arr = np.frombuffer(img.bits(), dtype=np.uint8, count=bpl * h)
+        return arr.reshape(h, w, 4)
+    except Exception:                                          # noqa: BLE001
+        return None
 
 
 def write_back_bgr(img, bgr):
@@ -310,7 +327,7 @@ def _level01(e):
 
 
 def postfx_effects_bgr(canvas, bgr, postfx_cfg, seed=0, mods=None, spectrum=None,
-                       reset_trails=False, effects_override=None):
+                       reset_trails=False, effects_override=None, trail_key=None):
     """在**已有的 BGR 缓冲**上跑后处理特效链。返回 `(bgr, changed)`。
 
     ★ 2026-10-28（性能，用户实测 5800X 30%）：从 `apply_postfx` 拆出来，目的是让
@@ -323,7 +340,7 @@ def postfx_effects_bgr(canvas, bgr, postfx_cfg, seed=0, mods=None, spectrum=None
     changed: True = bgr 内容已被改动，调用方**必须**负责写回画布。
     """
     if reset_trails:
-        fx_trails(None, 0.0, reset=True)
+        fx_trails(None, 0.0, reset=True, key=trail_key)
     if not postfx_cfg or not postfx_cfg.get("enabled", True):
         return bgr, False
     effects = effects_override if effects_override is not None else (postfx_cfg.get("effects") or {})
@@ -346,6 +363,8 @@ def postfx_effects_bgr(canvas, bgr, postfx_cfg, seed=0, mods=None, spectrum=None
                 bgr = fn(bgr, strength, spectrum or [])
             elif name == "deform":
                 bgr = fn(bgr, strength, spectrum or [], seed)
+            elif name == "trails":
+                bgr = fn(bgr, strength, key=trail_key)
             else:
                 bgr = fn(bgr, strength)
         except Exception:
@@ -354,7 +373,7 @@ def postfx_effects_bgr(canvas, bgr, postfx_cfg, seed=0, mods=None, spectrum=None
 
 
 def apply_postfx(canvas, postfx_cfg, seed=0, mods=None, spectrum=None, reset_trails=False,
-                 effects_override=None):
+                 effects_override=None, trail_key=None):
     """对合成画布应用启用的后处理特效（原地写回 canvas）。
 
     postfx_cfg: {"enabled": bool, "effects": {name: {"on": bool, "level": 0~100, ...}}}
@@ -369,6 +388,7 @@ def apply_postfx(canvas, postfx_cfg, seed=0, mods=None, spectrum=None, reset_tra
     """
     bgr, changed = postfx_effects_bgr(
         canvas, None, postfx_cfg, seed=seed, mods=mods, spectrum=spectrum,
-        reset_trails=reset_trails, effects_override=effects_override)
+        reset_trails=reset_trails, effects_override=effects_override,
+        trail_key=trail_key)
     if changed and bgr is not None:
         write_back_bgr(canvas, bgr)   # 写回画布（跳过 alpha 通道）

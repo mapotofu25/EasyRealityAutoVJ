@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
-r"""打「工具集」压缩包 —— ERLIB / 音频发送端 / NDI自检 / 音源诊断 合成一个 zip。
+r"""打「工具集」1.0 压缩包 —— ERLIB / 音频发送端 / NDI自检 / 音源诊断 合成一个 zip。
 
-为什么合成一个包：从 RC1 起就是「主程序一个包、CUE 一个包、剩下的小工具合一个包」，
-分开传会让 Release 附件列表长得没法看，也容易下漏。
-
-包内结构（与 RC3 的 `EasyReality_工具集_RC3.zip` 一致）：
+包内结构：
     工具集/
       EasyReality_音频发送端.exe
       ERLIB曲库分析.exe
@@ -13,7 +10,7 @@ r"""打「工具集」压缩包 —— ERLIB / 音频发送端 / NDI自检 / 音
       NDI防火墙放行.bat
       音源诊断.exe
       音源排查说明.txt
-      使用说明_工具集.txt      ← 新增：一页说明每个工具干什么
+      使用说明_工具集.txt
 
 用法：venv\Scripts\python.exe -u tools/make_tools_zip.py
 """
@@ -22,15 +19,16 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WS = os.path.dirname(ROOT)                      # P:\ERAVJ
+WORKSPACE = os.path.dirname(ROOT)
+LEGACY = r"P:\ERAVJ"
 OUT_DIR = os.path.join(ROOT, "发行版")
-OUT = os.path.join(OUT_DIR, "EasyReality_工具集_RC4.zip")
+OUT = os.path.join(OUT_DIR, "EasyReality_Tools_1.0.zip")
 TOP = "工具集"
 
-README_TXT = """Easy Reality — 工具集 RC4（2026.11.08）
+README_TXT = """Easy Reality — 工具集 1.0（2026.11.21）
 ================================================================
 主程序 EasyRealityAutoVJ 和码表编辑器 EasyRealityCue 有各自独立的包，
-这个包里是剩下的三个配合工具。四个软件怎么配合：
+这个包里是配套工具。四个软件怎么配合：
 
     ERLIB曲库分析  ->  扫曲库、导出 .eravjlib（认歌用）
     EasyRealityCue  ->  拿曲库包逐首编码表 .ercue（在另一个包里）
@@ -63,19 +61,26 @@ README_TXT = """Easy Reality — 工具集 RC4（2026.11.08）
 - 有画面没声音 / 有声音没画面：分别用 NDI接收自检 和 音源诊断 定位是哪一段断了。
 
 反馈：QQ 1793170435    测试群：ERAVJ测试 543643838
+项目：https://github.com/mapotofu25/EasyRealityAutoVJ
 """
 
 # (源路径, 包内名字)
 ITEMS = [
-    (os.path.join(ROOT, "dist_sender", "EasyReality_音频发送端.exe"),
+    (os.path.join(LEGACY, "EasyReality_音频发送端", "dist_sender",
+                  "EasyReality_音频发送端.exe"),
      "EasyReality_音频发送端.exe"),
-    (os.path.join(ROOT, "dist_erlib_rc4", "ERLIB曲库分析.exe"),
+    (os.path.join(WORKSPACE, "ERLIB曲库分析_单文件_2026.11.20_8线程.exe"),
      "ERLIB曲库分析.exe"),
-    (os.path.join(ROOT, "NDI局域网测试", "NDI接收自检.exe"), "NDI接收自检.exe"),
-    (os.path.join(ROOT, "NDI局域网测试", "NDI局域网测试说明.txt"), "NDI局域网测试说明.txt"),
-    (os.path.join(ROOT, "NDI局域网测试", "NDI防火墙放行.bat"), "NDI防火墙放行.bat"),
-    (os.path.join(ROOT, "音源排查", "音源诊断.exe"), "音源诊断.exe"),
-    (os.path.join(WS, "音源诊断", "音源排查说明.txt"), "音源排查说明.txt"),
+    (os.path.join(LEGACY, "AutoVJ", "NDI局域网测试", "NDI接收自检.exe"),
+     "NDI接收自检.exe"),
+    (os.path.join(LEGACY, "AutoVJ", "NDI局域网测试", "NDI局域网测试说明.txt"),
+     "NDI局域网测试说明.txt"),
+    (os.path.join(LEGACY, "AutoVJ", "NDI局域网测试", "NDI防火墙放行.bat"),
+     "NDI防火墙放行.bat"),
+    (os.path.join(LEGACY, "AutoVJ", "音源排查", "音源诊断.exe"),
+     "音源诊断.exe"),
+    (os.path.join(LEGACY, "音源诊断", "音源排查说明.txt"),
+     "音源排查说明.txt"),
 ]
 
 

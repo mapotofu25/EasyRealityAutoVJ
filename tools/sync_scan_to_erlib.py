@@ -173,7 +173,10 @@ def main():
                 #   AutoVJ 再导入时也会按"分段网格"消费 —— 而 AutoVJ 的 sections
                 #   只有 `{t0,t1,energy,tier,name}`，没有每段的 bpm/beat_len/anchor，
                 #   格式根本不是那种东西。⇒ `manual` 留空，段落走**独立列**。
-                "manual": None,
+                # ★ 2026-11-18：`grid_manual` 是**网格**的手动覆盖（BPM/锚点/多 BPM
+                #   分段），与 `sections` 是两回事。以前一律写 None，把用户在
+                #   AutoVJ 里做的 BPM/八拍修正全丢了。sections 仍走独立列。
+                "manual": m.get("grid_manual") or None,
                 # ★★ 2026-10-31（用户「erlib 的扫描要和 eravj 一样」）：
                 #   能量段落与主程序扫描产出**同一份**数据，落 `songs.sections` /
                 #   `songs.sections_raw`（新列）。导入到演出机后由

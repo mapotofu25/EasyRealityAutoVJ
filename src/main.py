@@ -20,6 +20,15 @@ if _blas_t and _blas_t != "0":
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ★ 2026-11-11（用户：「软件正在运行 操作非常卡」）：缩短 Python 线程切换间隔。
+#   引擎/解码/音频/识别都是同进程线程，默认 5ms 的 GIL 切换粒度在多线程满载时
+#   会让 GUI 线程一次等上百毫秒（现场 ui_stall.log 里大量 [UI] 主线程停顿就发生在
+#   引擎 tick 的 Python 段）。1ms 的代价是少量吞吐，换来界面明显更跟手。
+try:
+    sys.setswitchinterval(0.001)
+except Exception:                                              # noqa: BLE001
+    pass
+
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QFont
 from PySide6.QtCore import Qt, QLockFile
@@ -105,14 +114,27 @@ def _make_splash(theme_name):
 
 
 def _log_startup(rows):
-    """把启动各阶段耗时追加到启动日志（保留最近 30 次），便于下次直接看数据。"""
+    """把启动各阶段耗时追加到启动日志（保留最近 30 次），便于下次直接看数据。
+
+    ★ 2026-11-17：行尾追加 `版本=` 与 `exe=`。现场经常分不清用户跑的是哪一版
+      （同一个桌面快捷方式可能指向旧 dist），排障时只能靠猜。
+    """
     try:
         path = os.path.join(config.app_base_dir(), "startup_time.log")
         old = []
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 old = f.read().splitlines()
-        old.append("[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), "   ".join(rows)))
+        try:
+            import version as _ver
+            _vk = str(getattr(_ver, "APP_VERSION", "")
+                      or getattr(_ver, "VERSION", "")
+                      or getattr(_ver, "VER", "") or "")
+        except Exception:                                      # noqa: BLE001
+            _vk = ""
+        old.append("[%s] %s   版本=%s   exe=%s"
+                   % (time.strftime("%Y-%m-%d %H:%M:%S"), "   ".join(rows),
+                      _vk or "?", sys.executable))
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(old[-30:]) + "\n")
     except Exception:
@@ -121,14 +143,32 @@ def _log_startup(rows):
 
 def main():
     t_all = time.perf_counter()
+    # ★ 2026-11-11（现场：主线程 150~600ms 停顿）：GIL 默认 5ms 切换一次。
+    #   10 层 QPainter + 解码线程每帧大量短 Python/C 调用时，GUI 要等 5ms 的整数倍
+    #   才能拿到 GIL。降到 1ms，让 GUI/预览线程更及时插进来（吞吐损失 <1%）。
+    try:
+        sys.setswitchinterval(0.001)
+    except Exception:                                          # noqa: BLE001
+        pass
     marks = []
     _install_crash_log()      # ★ 必须在最前面：后面任何 import/构造崩了才有栈可查
 
     def mark(label, t0):
         marks.append("%s %.2fs" % (label, time.perf_counter() - t0))
 
+    # ★ 2026-11-12（用户：Windows 任务栏看不见软件图标）：显式设置
+    #   AppUserModelID。Windows 任务栏按 AUMID 归组/取图标；不设置时，
+    #   尤其是从快捷方式/不同启动器启动，容易出现“没有图标/白色图标/归到 Python”。
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p("EasyReality.AutoVJ"))
+    except Exception:                                          # noqa: BLE001
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("Easy Reality AutoVJ")
+    app.setApplicationDisplayName("Easy Reality AutoVJ")
     app.setStyle("Fusion")
     font = QFont("Microsoft YaHei UI", 9)
     app.setFont(font)

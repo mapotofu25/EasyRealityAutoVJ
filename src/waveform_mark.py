@@ -539,6 +539,7 @@ class WaveformMarkWidget(QWidget):
         _esec = [x for x in (getattr(self, "_energy_sections", None) or [])
                  if isinstance(x, dict)]
         if _esec and d > 0:
+            _bl0 = self._beat_len()
             _tc = {"low": (74, 132, 214), "mid": (222, 190, 90),
                    "high": (232, 96, 76)}
             _by0 = float(plot_bot) + 3.0
@@ -600,6 +601,13 @@ class WaveformMarkWidget(QWidget):
                     p.drawText(QRectF(_x0 + 3.0, _ty - 11.0, _bw - 5.0, 12.0),
                                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                                _txt)
+                elif _bw >= 9.0 and _bl0 > 0 and (_a1 - _a0) <= 4.6 * _bl0:
+                    p.setPen(QColor(255, 255, 255, 235))
+                    _f = p.font()
+                    _f.setPointSizeF(6.5)
+                    p.setFont(_f)
+                    p.drawText(QRectF(_x0 - 2.0, _ty - 10.0, _bw + 4.0, 11.0),
+                               int(Qt.AlignmentFlag.AlignCenter), "4\u62cd")
 
         # ---- 3b) 拍网（浅灰）/ 八拍头（更亮）—— 画在波形**之上**，否则会被彩色填充盖住
         bl = self._beat_len()
@@ -657,7 +665,27 @@ class WaveformMarkWidget(QWidget):
                     pairs.extend(grid_times_range(_san + _fl * _sbl, _sbl,
                                                   _s0, _s1))
             else:
-                pairs = grid_times(a, bl, d)
+                _shift_t = None
+                if bl > 0:
+                    for _s in _esec:
+                        try:
+                            _t = float(_s.get("t0") or 0.0)
+                        except (TypeError, ValueError):
+                            continue
+                        if _t <= 0.5:
+                            continue
+                        _q8 = (_t - a) / (8.0 * bl)
+                        if abs(_q8 - round(_q8)) <= 0.12:
+                            continue
+                        _q4 = (_t - a) / (4.0 * bl)
+                        if abs(_q4 - round(_q4)) <= 0.12:
+                            _shift_t = _t
+                            break
+                if _shift_t is not None and _shift_t > 0.5:
+                    pairs = list(grid_times_range(a, bl, 0.0, _shift_t))
+                    pairs += list(grid_times_range(_shift_t, bl, _shift_t, d))
+                else:
+                    pairs = grid_times(a, bl, d)
             for _k, t in pairs:
                 x = self._x_of_sec(t)
                 if -2.0 <= x <= w + 2.0:

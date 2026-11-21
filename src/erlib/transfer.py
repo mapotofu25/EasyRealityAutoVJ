@@ -167,7 +167,9 @@ def export_subset(work, out_path, sids, on_progress=None, app_ver="erlib"):
         w = LibWriter(tmp_path, root="", resume=False, app_ver=app_ver)
         try:
             n, total = 0, len(sids)
-            for s in src.songs():
+            # ★ 2026-11-18：`src.songs()` 是 import_seq DESC（新→旧）；新 writer 会
+            #   按迭代顺序重新编号。原来直接迭代 ⇒ 导出包再打开变成旧→新（顺序反转）。
+            for s in reversed(list(src.songs())):
                 sid = int(s["song_id"])
                 if sid not in sids:
                     continue
@@ -459,6 +461,15 @@ def import_into(pkg_path, base_dir, on_progress=None, clear_first=False,
                         n_cover += 1
                 except Exception:                                # noqa: BLE001
                     cp = ""
+                if not cp:
+                    # ★ 2026-11-18：新包没封面 ⇒ 清掉旧 sidecar，否则重导入后
+                    #   还显示上一版封面。
+                    try:
+                        _oldc = os.path.join(cd, "%d.jpg" % sid)
+                        if os.path.isfile(_oldc):
+                            os.remove(_oldc)
+                    except OSError:
+                        pass
                 IL.add_song(conn, sid, s, cp, pack=pack,
                             waveform=src.waveform(sid))
                 n_song += 1

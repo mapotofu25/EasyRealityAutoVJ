@@ -50,10 +50,16 @@ MIN_BEATS = 16                      # 少于这个拍数认为"这段没鼓"，�
 
 _MODEL_REL = ("assets", "models", "beat_this", "small0_fixed.onnx")
 
-_LOCK = threading.Lock()            # 串行化推理（扫描是并行的，别让多线程一起抢 CPU）
+_LOCK = threading.Lock()            # ⚠ 已不再包住推理（保留给外部引用；见 _SESS_LOCAL）
 _SESS = None                        # 延迟创建
 _SESS_ERR = ""
 _BT_LOCK = threading.Lock()
+# ★ 2026-11-14（用户「扫描速度太慢了」）：每个扫描线程一条独立 ORT 会话。
+#   以前全局 `_LOCK` 把 `_one_pass` 串起来，多线程并行扫描时 BT 仍逐个跑；
+#   现在按线程各建会话（模型只有 9.9 MB，关掉 arena 后一条会话 ~35 MB），
+#   并发推理互不阻塞。
+_SESS_LOCAL = threading.local()
+_SESS_GEN = 0
 
 
 # ======================================================================
@@ -81,23 +87,25 @@ def available() -> tuple[bool, str]:
 
 def set_threads(n: int):
     """设置推理线程数（下一会话生效；演出中应设小一些）。"""
-    global _THREADS, _SESS
+    global _THREADS, _SESS_GEN
     n = max(1, int(n))
     with _BT_LOCK:
         if n != _THREADS:
             _THREADS = n
-            _SESS = None            # 重建会话以应用线程数
+            _SESS_GEN += 1          # 所有线程的旧会话失效，各自重建
 
 
 _THREADS = max(1, min(4, (os.cpu_count() or 4) // 2))
 
 
 def _session():
-    """延迟创建 + 复用（onnxruntime 会话较贵，别每首新建）。"""
-    global _SESS, _SESS_ERR
+    """延迟创建 + 复用（onnxruntime 会话较贵，别每首新建）。**每线程一条**。"""
+    global _SESS_ERR
+    gen = _SESS_GEN
+    pair = getattr(_SESS_LOCAL, "pair", None)
+    if pair is not None and pair[0] == gen:
+        return pair[1]
     with _BT_LOCK:
-        if _SESS is not None:
-            return _SESS
         if _SESS_ERR:
             return None
         try:
@@ -105,18 +113,27 @@ def _session():
             so = ort.SessionOptions()
             so.intra_op_num_threads = _THREADS
             so.inter_op_num_threads = 1
+            # ★★ 2026-11-12「重新分析卡 0%」：必须关掉 CPU 内存 arena。
+            #   默认 arena=True 时，每次 `sess.run` 都会从 OS 再要一大块（实测
+            #   1500×128 一次推理 +1191 MB，第二次再 +1058 MB，且**永不归还**）
+            #   ⇒ 一首歌 60~180 秒窗口要跑 2~3 个 chunk，单首峰值 3~4 GB；
+            #   本机 commit 只剩 0.27 GB 时整轮扫描必然 MemoryError。
+            #   arena=False 实测同一会话峰值 ≈ 80 MB，单 chunk 0.94s vs 0.55s
+            #   （第二块 0.61s），对扫描总耗时影响可忽略。
+            so.enable_cpu_mem_arena = False
             # 关掉池线程自旋 —— 否则空闲时也在烧核（audio_genre 踩过同样的坑）
             try:
                 so.add_session_config_entry("session.intra_op.allow_spinning", "0")
                 so.add_session_config_entry("session.inter_op.allow_spinning", "0")
             except Exception:                                   # noqa: BLE001
                 pass
-            _SESS = ort.InferenceSession(model_path(), sess_options=so,
-                                         providers=["CPUExecutionProvider"])
+            sess = ort.InferenceSession(model_path(), sess_options=so,
+                                        providers=["CPUExecutionProvider"])
         except Exception as e:                                  # noqa: BLE001
             _SESS_ERR = "%s: %s" % (type(e).__name__, str(e)[:160])
             return None
-        return _SESS
+    _SESS_LOCAL.pair = (gen, sess)
+    return sess
 
 
 # ======================================================================
@@ -365,8 +382,7 @@ def analyze(mono, sr, maxsec=WIN_DEFAULT):
     for w in wins:
         m = mono[:min(len(mono), int(w * sr))] if w else mono
         x = _resample_to_22k(m, sr)
-        with _LOCK:
-            r = _one_pass(sess, x)
+        r = _one_pass(sess, x)          # 每线程独立会话，可并发
         if r is None:
             continue
         last = r
@@ -438,8 +454,7 @@ def selftest():
     x = np.zeros(SR * 8, np.float32)        # 8 秒静音，只验证形状
     sp = logmel(x)
     print("[phrase_bt] log-mel 形状:", sp.shape, "（期望约 (400, 128)）")
-    with _LOCK:
-        b, d = _frames(sess, sp)
+    b, d = _frames(sess, sp)            # 每线程独立会话，可并发
     print("[phrase_bt] 前向输出:", b.shape, d.shape,
           "| 输入名=%s 输出=%s" % (sess.get_inputs()[0].name,
                                    [o.name for o in sess.get_outputs()]))

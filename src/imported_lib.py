@@ -43,7 +43,10 @@ _SCHEMA = (
     # ★★ 2026-10-31（用户「erlib 的扫描要和 eravj 一样」）：能量段落表随包导入。
     #   没有它 ⇒ 导入的歌没有段落色带、也不按段落切素材（本机扫的歌有，所以"不一样"）。
     #   ⚠ 必须是**独立列**，不能塞 `manual.segments`（那是多 BPM 分段网格）。
-    " sections TEXT DEFAULT '', sections_raw TEXT DEFAULT '')",
+    " sections TEXT DEFAULT '', sections_raw TEXT DEFAULT '',"
+    # ★ 2026-11-18：身份字段与段落来源标记随包导入（ERLIB format 新增列）。
+    " fp_id TEXT DEFAULT '', file_md5 TEXT DEFAULT '',"
+    " sections_auto INTEGER DEFAULT 1)",
     "CREATE INDEX IF NOT EXISTS idx_imp_name ON songs(file_name)",
     # ★ 2026-10-27 曲库识别增强：导入歌的波形（zlib 压缩 JSON BLOB）。
     "CREATE TABLE IF NOT EXISTS waveforms ("
@@ -92,7 +95,10 @@ def _migrate(conn):
     # ★ 2026-10-31：改成**通用补列**（以后再加列只往这个列表里加一项）。
     for _col, _ddl in (("manual", " manual TEXT DEFAULT ''"),
                        ("sections", " sections TEXT DEFAULT ''"),
-                       ("sections_raw", " sections_raw TEXT DEFAULT ''")):
+                       ("sections_raw", " sections_raw TEXT DEFAULT ''"),
+                       ("fp_id", " fp_id TEXT DEFAULT ''"),
+                       ("file_md5", " file_md5 TEXT DEFAULT ''"),
+                       ("sections_auto", " sections_auto INTEGER DEFAULT 1")):
         if _col in cols:
             continue
         try:
@@ -177,15 +183,17 @@ def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None
         "INSERT OR REPLACE INTO songs ("
         " song_id, file_name, file_size, duration, artist, title, rel_path,"
         " genres, styles, source, level, ai_zh, grid, cover_path, imported_at,"
-        " pack, manual, sections, sections_raw)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " pack, manual, sections, sections_raw, fp_id, file_md5, sections_auto)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (int(sid), m.get("file_name", ""), int(m.get("file_size") or 0),
          float(m.get("duration") or 0.0), m.get("artist", ""),
          m.get("title", ""), m.get("rel_path", ""),
          _j(m.get("genres")), _j(m.get("styles")), m.get("source", ""),
          m.get("level", ""), _j(m.get("ai_zh")), _j(m.get("grid")),
          cover_path or "", time.time(), str(pack or ""),
-         _j(manual_val), _j(m.get("sections")), _j(m.get("sections_raw"))))
+         _j(manual_val), _j(m.get("sections")), _j(m.get("sections_raw")),
+         str(m.get("fp_id") or ""), str(m.get("file_md5") or ""),
+         int(m.get("sections_auto", 1) or 0)))
     if waveform is not None:
         try:
             import waveform as _wf
@@ -193,6 +201,12 @@ def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None
             if blob:
                 conn.execute("INSERT OR REPLACE INTO waveforms VALUES (?,?)",
                              (int(sid), sqlite3.Binary(blob)))
+        except Exception:                                        # noqa: BLE001
+            pass
+    else:
+        # ★ 2026-11-18：新包没有波形 ⇒ 删旧 BLOB，避免重导入后仍显示上一版。
+        try:
+            conn.execute("DELETE FROM waveforms WHERE song_id=?", (int(sid),))
         except Exception:                                        # noqa: BLE001
             pass
 
@@ -216,22 +230,39 @@ def lookup_grids(base_dir):
                 g = _p(g)
                 if not isinstance(g, dict):
                     continue
-                if g.get("src") not in ("vdj", "bt"):
-                    continue
+                manual = _p(manual)
+                if not isinstance(manual, dict):
+                    manual = None
+                user_marked = bool(
+                    manual and (manual.get("bpm_manual")
+                                or manual.get("anchors")
+                                or manual.get("segments")))
+                if user_marked:
+                    # ★ 2026-11-18：ERLIB 的手动 BPM/锚点/分段必须先生效，
+                    #   否则 src/conf 门槛会把用户的修正整条丢掉。
+                    try:
+                        import beatgrid as _bg
+                        g = _bg.effective_grid(g, manual, {}) or g
+                    except Exception:                        # noqa: BLE001
+                        pass
+                if not user_marked:
+                    if g.get("src") not in ("vdj", "bt"):
+                        continue
                 try:
                     bl = float(g.get("beat_len") or 0.0)
                     anchor = float(g.get("anchor"))
                     conf = float(g.get("conf") or 0.0)
                 except Exception:                                # noqa: BLE001
                     continue
-                if conf < 0.6 or not (0.2 < bl < 1.5):
+                if (not user_marked) and conf < 0.6:
                     continue
-                manual = _p(manual)
-                if not isinstance(manual, dict):
-                    manual = None
+                if not (0.2 < bl < 1.5):
+                    continue
                 out[int(sid)] = {"bpm": g.get("bpm"), "beat_len": bl,
                                  "anchor": anchor, "conf": conf,
                                  "src": g.get("src"), "dur": g.get("dur"),
+                                 "segments": list(g.get("segments") or []),
+                                 "anchors": list(g.get("anchors") or []),
                                  "flip": 0.0, "manual": manual}
         finally:
             c.close()
@@ -370,9 +401,11 @@ def display_rows(base_dir):
         # ⚠ 必须走 open_meta（内含 _migrate）——直连会在未迁移的旧库上因 pack 列缺失而抛
         c = open_meta(base_dir)
         try:
-            for (sid, name, dur, artist, title, gen, grid, pack, manual) in c.execute(
+            for (sid, name, dur, artist, title, gen, grid, pack, manual,
+                 fp_id, file_md5, sec_auto) in c.execute(
                     "SELECT song_id, file_name, duration, artist, title, "
-                    "genres, grid, pack, manual FROM songs ORDER BY song_id"):
+                    "genres, grid, pack, manual, fp_id, file_md5, sections_auto "
+                    "FROM songs ORDER BY song_id"):
                 g = _p(grid)
                 if not isinstance(g, dict):
                     g = {}
@@ -400,6 +433,9 @@ def display_rows(base_dir):
                     "cover": cp if os.path.isfile(cp) else "",
                     "pack": pack or "",
                     "manual": manual,
+                    "fp_id": str(fp_id or ""),
+                    "file_md5": str(file_md5 or ""),
+                    "sections_auto": int(sec_auto if sec_auto is not None else 1),
                 })
         finally:
             c.close()

@@ -318,6 +318,29 @@ def _local_fp_ids(cfg):
     return out
 
 
+def _local_md5s(cfg):
+    """本机曲库已有的 `file_md5` 集合（32 hex）。
+
+    ★ 2026-11-18：`fp_id` 是**解码后 PCM**算的；ERCUE 用 PyAV 解码、ERAVJ 用
+      soundfile，极端情况下同一文件会算出不同签名 ⇒ 只按 fp_id 去重会让同一
+      首歌在指纹库里有两套 id，投票被拆半。文件字节 md5 与解码器无关，必须
+      一起作为去重判据。
+    """
+    out = set()
+    try:
+        meta = cfg["music_meta"] or {}
+    except Exception:                                            # noqa: BLE001
+        meta = {}
+    if not isinstance(meta, dict):
+        return out
+    for _p, rec in meta.items():
+        if isinstance(rec, dict):
+            md5 = str(rec.get("file_md5") or rec.get("md5") or "").strip().lower()
+            if len(md5) == 32:
+                out.add(md5)
+    return out
+
+
 def _save_cfg(cfg):
     """落盘配置（Config.save() 自带进程内锁与原子替换 ⇒ 后台线程调也安全）。"""
     try:
@@ -377,6 +400,7 @@ def _read_tracks(pkg_path):
             bpm = 0.0
         out.append({
             "fp_id": fp_id,
+            "file_md5": str(idn.get("file_md5") or "").strip().lower(),
             "title": str(idn.get("title") or ""),
             "artist": str(idn.get("artist") or ""),
             "duration": dur,
@@ -727,6 +751,7 @@ def ingest_sheet(cfg, db, pkg_path) -> dict:
         return res
 
     local_fp = _local_fp_ids(cfg)
+    local_md5 = _local_md5s(cfg)
     # ★ 先对账一次（撞车的合成指纹清掉）：用户可能"先导过这张包、后来才把歌加进曲库"，
     #   那种残留只靠下面的逐首判据是清不掉的（它只看本包，不看历史）。
     #   幂等且零成本：没有撞车时它不碰数据库、也不写配置。
@@ -745,6 +770,10 @@ def ingest_sheet(cfg, db, pkg_path) -> dict:
             fp_id = tr["fp_id"]
             if fp_id in local_fp:
                 continue                     # ★ 去重守卫：本机曲库优先
+            # ★ 2026-11-18：同一文件但解码路径不同导致 fp_id 不同 —— 用文件 md5
+            #   再挡一次，避免同曲两套指纹把票拆半。
+            if tr.get("file_md5") and tr["file_md5"] in local_md5:
+                continue
             hashes = read_from_package(pkg, fp_id)
             if not hashes:
                 continue                     # 老包 / 坏包 / 空指纹 ⇒ 跳过

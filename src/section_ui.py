@@ -23,6 +23,10 @@ from PySide6.QtWidgets import (QButtonGroup, QRadioButton,
 import sections as S
 
 TIER_LABEL = {"low": "低 (low)", "mid": "中 (mid)", "high": "高 (high)"}
+# ★ 2026-11-13：「档位覆盖」列。空字符串 = 自动（由能量算），其余 = 锁定为该档。
+TIER_CHOICES = ("", "low", "mid", "high")
+TIER_CHOICE_LABEL = {"": "自动", "low": "低 (low)", "mid": "中 (mid)",
+                     "high": "高 (high)"}
 TIER_ORDER = ("low", "mid", "high")
 
 
@@ -51,6 +55,9 @@ class EnergySectionDialog(QDialog):
         self._rows = S.normalize(sections or [], self._dur, self._grid or None)
         if not self._rows:
             self._rows = S.make_default(self._dur, grid=self._grid or None)
+            # ★ 2026-11-18：没有已存段落时表格显示的是**默认 4 段**；`_orig`
+            #   必须同步成这 4 段，否则第一次切“八拍/小节”就把整张表清空。
+            self._orig = [dict(x) for x in self._rows]
         self._result = []
 
         root = QVBoxLayout(self)
@@ -64,11 +71,12 @@ class EnergySectionDialog(QDialog):
         head.setStyleSheet("color:#9fb3c8;")
         root.addWidget(head)
 
-        self.tbl = QTableWidget(0, 5, self)
+        self.tbl = QTableWidget(0, 6, self)
         # ★ 2026-10-30 用户要求：「能量 改成该段平均能量」「依据输入的能量数值自动确定挡位」
         #   ⇒ 表头直接写清楚：能量是**该段平均**，档位是**自动**算的（不再手动选）。
         self.tbl.setHorizontalHeaderLabels(
-            ["起点 (秒)", "终点 (秒)", "档位（自动）", "该段平均能量", "名称"])
+            ["起点 (秒)", "终点 (秒)", "档位（自动）", "该段平均能量", "名称",
+             "档位覆盖"])
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -78,10 +86,12 @@ class EnergySectionDialog(QDialog):
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         self.tbl.setColumnWidth(0, 110)
         self.tbl.setColumnWidth(1, 110)
         self.tbl.setColumnWidth(2, 120)
         self.tbl.setColumnWidth(3, 110)
+        self.tbl.setColumnWidth(5, 130)
         root.addWidget(self.tbl, 1)
 
         self.lbl_grid = QLabel()
@@ -156,7 +166,10 @@ class EnergySectionDialog(QDialog):
         #   为什么：档位本来就是能量的函数，两处各写一份会打架（用户把能量改成 0.9
         #   而档位还挂着手选的 low ⇒ 演出时按 low 换池，与看到的数字对不上）。
         _e0 = float(r.get("energy") or 0.0)
-        it_tier = QTableWidgetItem(TIER_LABEL.get(S.tier_from_energy(_e0), ""))
+        _auto = S.tier_from_energy(_e0)
+        _cur = str(r.get("tier") or "").strip().lower()
+        _locked = (_cur in S.TIERS) and (_cur != _auto)
+        it_tier = QTableWidgetItem(TIER_LABEL.get(_cur if _locked else _auto, ""))
         it_tier.setFlags(it_tier.flags() & ~Qt.ItemFlag.ItemIsEditable)
         it_tier.setForeground(Qt.GlobalColor.gray)
         self.tbl.setItem(i, 2, it_tier)
@@ -168,6 +181,13 @@ class EnergySectionDialog(QDialog):
         sp.valueChanged.connect(self._on_cell_changed)
         self.tbl.setCellWidget(i, 3, sp)
         self.tbl.setItem(i, 4, QTableWidgetItem(str(r.get("name") or "")))
+        # ★ 2026-11-13：档位覆盖（默认“自动”= 仍由能量算）。只在用户明确改过时才锁档位。
+        cb = QComboBox()
+        for _t in TIER_CHOICES:
+            cb.addItem(TIER_CHOICE_LABEL[_t], _t)
+        cb.setCurrentIndex(TIER_CHOICES.index(_cur) if _locked else 0)
+        cb.currentIndexChanged.connect(self._on_cell_changed)
+        self.tbl.setCellWidget(i, 5, cb)
 
     def _read_table(self):
         """从表格收集成 raw（不做校验，交给 `sections.normalize`）。"""
@@ -178,11 +198,12 @@ class EnergySectionDialog(QDialog):
                 t0 = float(it0.text()) if it0 is not None else 0.0
             except (TypeError, ValueError):
                 t0 = 0.0
-            cb = self.tbl.cellWidget(i, 2)
             sp = self.tbl.cellWidget(i, 3)
             energy = sp.value() if isinstance(sp, QDoubleSpinBox) else 0.5
-            # ★ 2026-10-30：档位一律由能量算（不再读手动下拉，也没有下拉了）
-            tier = S.tier_from_energy(float(energy))
+            # ★ 2026-10-30：默认档位由能量算；2026-11-13 起允许「档位覆盖」手动锁档。
+            cb = self.tbl.cellWidget(i, 5)
+            ovr = str(cb.currentData() or "") if isinstance(cb, QComboBox) else ""
+            tier = ovr if ovr in S.TIERS else S.tier_from_energy(float(energy))
             it4 = self.tbl.item(i, 4)
             rec = {"t0": t0, "energy": float(energy),
                    "tier": str(tier or "mid"),
@@ -197,8 +218,25 @@ class EnergySectionDialog(QDialog):
 
     def _commit(self):
         """读表格 → normalize → 存回 `self._rows`（表格不自动重铺，避免打字被打断）。"""
-        self._rows = S.normalize(self._read_table(), self._dur,
-                                 self._grid or None, beats=self.snap_beats())
+        old = [str(x.get("tier") or "") for x in (self._rows or [])]
+        rows = S.normalize(self._read_table(), self._dur,
+                           self._grid or None, beats=self.snap_beats())
+        new = [str(x.get("tier") or "") for x in rows]
+        # ★ 2026-11-18：normalize 可能因 t0 太近丢行/重排；继续按旧行号写名字
+        #   会把名字写到错误行、表格还留下幽灵行。行数/顺序变了就整体重铺。
+        if len(rows) != self.tbl.rowCount():
+            self._rows = rows
+            self._rebuild()
+            return self._rows
+        if old and new != old:
+            # ★ 2026-11-13：档位被手动改过 ⇒ 段名跟着档位重编
+            #   （与自动扫描同一套命名：高=drop n / 中=中段 n / 低=过渡 n）。
+            S._renumber_names(rows)
+            for i, r in enumerate(rows):
+                it = self.tbl.item(i, 4)
+                if it is not None and it.text() != r["name"]:
+                    it.setText(r["name"])
+        self._rows = rows
         return self._rows
 
     def _on_cell_changed(self, *_a):
@@ -219,7 +257,9 @@ class EnergySectionDialog(QDialog):
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 it.setForeground(Qt.GlobalColor.gray)
                 self.tbl.setItem(i, 2, it)
-            want = TIER_LABEL.get(S.tier_from_energy(e), "")
+            cb = self.tbl.cellWidget(i, 5)
+            ovr = str(cb.currentData() or "") if isinstance(cb, QComboBox) else ""
+            want = TIER_LABEL.get(ovr if ovr in S.TIERS else S.tier_from_energy(e), "")
             if it.text() != want:
                 it.setText(want)
 
@@ -297,6 +337,7 @@ class EnergySectionDialog(QDialog):
             QMessageBox.information(self, "恢复默认模板", "曲长未知，无法生成模板。")
             return
         self._rows = tpl
+        self._orig = [dict(x) for x in tpl]
         self._rebuild()
 
     def _on_ok(self):

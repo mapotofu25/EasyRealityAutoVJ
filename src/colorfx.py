@@ -146,9 +146,8 @@ class ColorRenderer:
         E = max(0.0, min(1.0, float(snap.get("energy", 0.0) or 0.0)))
 
         # 近 0.6s 能量轨迹（突变检测）
-        self.e_hist.append((now, E))
-        while self.e_hist and now - self.e_hist[0][0] > 0.6:
-            self.e_hist.pop(0)
+        # ⚠ 只在 advance=True（主屏推进）时记录；advance=False 必须真正只读，
+        #   否则每块独立屏都会往同一个 e_hist 里再塞一条，突变检测会按屏数翻倍。
 
         auto = bool(c.get("auto", True))
         manual = str(c.get("manual_color", "") or "")
@@ -171,35 +170,35 @@ class ColorRenderer:
         # 频闪休眠管不到手动锁定的颜色——用户点色卡就是要看到那个颜色。
         if not on or bypass or kv_on > 0.01:
             want = 0.0
-            self.last_state = (T("已旁路") if bypass else
-                               T("待机（Kv）不染色") if kv_on > 0.01 else T("已关闭"))
+            _state = (T("已旁路") if bypass else
+                      T("待机（Kv）不染色") if kv_on > 0.01 else T("已关闭"))
         elif manual_active:
             # 手动锁定优先：全强度染色，不管频闪；10 秒后自动回到自动模式
             want = max(0.35, gain)
-            self.last_state = Tf("手动锁定「{}」（{}s 后回自动）", T(manual),
-                                 f"{max(0.0, hold - _elapsed):.0f}")
+            _state = Tf("手动锁定「{}」（{}s 后回自动）", T(manual),
+                        f"{max(0.0, hold - _elapsed):.0f}")
         elif flicker and auto and str(c.get("flicker_mode", "on")) != "off":
             # 频闪休眠只在自动模式下生效；手动锁定在上一条已经返回，不受影响。
             # flicker_mode=off（用户选了「不休眠」）时这里也不拦——双保险，
             # 免得将来某一侧判断漏了又变成"勾了不休眠还是休眠"。
             want = 0.0
-            self.last_state = T("频闪素材，颜色休眠")
+            _state = T("频闪素材，颜色休眠")
         elif not auto:
             want = 0.0
-            self.last_state = T("手动模式：请点色卡选色")
+            _state = T("手动模式：请点色卡选色")
         elif E < TIER_LOW:
             want = 0.0
-            self.last_state = T("能量过低，颜色渲染已休眠")
+            _state = T("能量过低，颜色渲染已休眠")
         elif E < TIER_HIGH:
             # 2026-10-23：中段从 0.20~0.40 抬到 0.35~0.60。
             # 理由：绝大多数舞曲常态落在 0.45~0.60，旧公式乘上「染色强度 60%」后只剩
             # 0.12~0.18，实测平均像素差仅 7/255（tools/_verify_color_postfx.py），
             # 用户看到的就是"开了也没变"。下限 0.40 以下的休眠保持不变（用户 09-22 明确要求）。
             want = (0.35 + 0.25 * (E - TIER_LOW) / (TIER_HIGH - TIER_LOW)) * gain
-            self.last_state = T("辅助染色（中低能量）")
+            _state = T("辅助染色（中低能量）")
         else:
             want = (0.80 + 0.20 * min(1.0, (E - TIER_HIGH) / 0.35)) * gain
-            self.last_state = T("强制染色（高能量）")
+            _state = T("强制染色（高能量）")
 
         # ★ 2026-11-10（多屏颜色漂移）：`advance=False` 时**只读不写** ——
         #   返回"当前已推进到的那一档强度"，绝不改 `e_hist` / `palette_i` / `self.s` /
@@ -216,6 +215,12 @@ class ColorRenderer:
             if (not on) or bypass or kv_on > 0.01:
                 return 0.0
             return float(want)
+
+        # 只有主屏推进时记录能量轨迹 / 状态文字
+        self.e_hist.append((now, E))
+        while self.e_hist and now - self.e_hist[0][0] > 0.6:
+            self.e_hist.pop(0)
+        self.last_state = _state
 
         # ---- 目标颜色 ----
         rotate = max(1.0, float(c.get("rotate_sec", 45) or 45))   # 1~60 秒（UI 滑块给的范围）
@@ -291,23 +296,98 @@ class ColorRenderer:
             self.color = rgb
 
     # -------- 应用 --------
-    def apply_to_bgr(self, bgr, mode="lut"):
+    def color_for_cfg(self, cfg):
+        """该屏本帧应使用的颜色（不推进状态）。用于多屏 advance=False 的只读染色。
+
+        自动/跟随全局 ⇒ 返回主渲染器当前颜色；本屏手动锁定 ⇒ 返回该色卡颜色。
+        """
+        try:
+            c = cfg or {}
+            manual = str(c.get("manual_color", "") or "")
+            hold = float(c.get("manual_hold", 10.0) or 0.0)
+            t_manual = float(c.get("manual_t", 0.0) or 0.0)
+            elapsed = time.time() - t_manual
+            if manual and (0.0 <= elapsed < hold):
+                return tuple(float(v) for v in PALETTE_BY_NAME.get(
+                    manual, PALETTES[0])[1])
+        except Exception:                                      # noqa: BLE001
+            pass
+        return tuple(self.color)
+
+    def apply_bgra_inplace(self, bgra, mode="lut", color=None, strength=None):
+        """在 QImage 的 **BGRA 缓冲**上原地染色（保留 alpha），返回是否已生效。
+
+        ★ 2026-11-11（用户：多屏播放音乐时界面/预览卡）：旧链路每帧都要
+          `_np_view_bgr()`（BGRA→BGR 整幅拷贝 2ms）+ `cv2.LUT` 新数组（3.7ms）
+          + `write_back_bgr()`（BGR→BGRA + alpha 恢复 7ms），3000×900 实测 **~13ms/帧**。
+          这里用 4 通道 LUT（第 3 通道 alpha = 恒等表）原地写，实测 **~1.8ms/帧**。
+          ⚠ 仅处理 `mode=lut`（用户当前配置）；duotone 需要灰度转换，仍走旧路径。
+        """
+        s = self.s if strength is None else max(0.0, min(1.0, float(strength)))
+        if cv2 is None or s <= 0.004 or bgra is None:
+            return False
+        if str(mode) == "duotone":
+            return False
+        try:
+            if (int(getattr(bgra, "ndim", 0)) != 3 or int(bgra.shape[2]) != 4
+                    or not bool(bgra.flags["C_CONTIGUOUS"])):
+                return False
+        except Exception:                                      # noqa: BLE001
+            return False
+        col = tuple(self.color) if color is None else tuple(float(x) for x in color)
+        key = (round(col[0]), round(col[1]), round(col[2]), round(s * 100))
+        cache = getattr(self, "_lut4_cache", None)
+        if cache is None:
+            cache = {}
+            self._lut4_cache = cache
+        lut4 = cache.get(key)
+        if lut4 is None:
+            lut3, _ = build_lut(col, s, "lut")
+            lut4 = np.empty((1, 256, 4), dtype=np.uint8)
+            lut4[0, :, :3] = np.asarray(lut3).reshape(256, 3)
+            lut4[0, :, 3] = np.arange(256, dtype=np.uint8)
+            if len(cache) > 32:
+                cache.clear()
+            cache[key] = lut4
+            self._lut4_builds = int(getattr(self, "_lut4_builds", 0) or 0) + 1
+        try:
+            cv2.LUT(bgra, lut4, dst=bgra)
+            self._lut4_key = key
+            return True
+        except Exception:                                      # noqa: BLE001
+            return False
+
+    def apply_to_bgr(self, bgr, mode="lut", color=None, strength=None):
         """在**已有 BGR 缓冲**上染色，返回新数组；`None` = 本帧不染色。
 
         ★ 2026-10-28（性能，用户实测 5800X 30%）：从 `apply` 拆出来，让
           「颜色」与「后处理」共用同一次 `_np_view_bgr()` / `write_back_bgr()`。
           原来两段各做一次全画布读回+写回（1280×720 共 3.7 MB），
           实测每帧白搬 1.43 ms ≈ **4.3% 单核**。
+
+        ★ 2026-11-10（多屏）：`color/strength` 可显式传入，供独立屏在
+          `advance=False` 时按**自己的**强度/手动色卡染色，而不改共享状态。
+          LUT 用 key 缓存（最多 32 个），不会因为多屏来回切而每帧重建。
         """
-        if cv2 is None or self.s <= 0.004:
+        s = self.s if strength is None else max(0.0, min(1.0, float(strength)))
+        if cv2 is None or s <= 0.004:
             return None
+        col = tuple(self.color) if color is None else tuple(float(x) for x in color)
         mode = "duotone" if mode == "duotone" else "lut"
-        key = (round(self.color[0]), round(self.color[1]), round(self.color[2]),
-               round(self.s * 100), mode)
-        if self._lut_key != key:
-            # 只在「颜色/强度/方式」变化时才重建 LUT（每帧重建也能跑，但没必要）
-            self._lut, self._lut_gray = build_lut(self.color, self.s, mode)
-            self._lut_key = key
+        key = (round(col[0]), round(col[1]), round(col[2]), round(s * 100), mode)
+        cache = getattr(self, "_lut_cache", None)
+        if cache is None:
+            cache = {}
+            self._lut_cache = cache
+        lut = cache.get(key)
+        if lut is None:
+            lut3, lut_gray = build_lut(col, s, mode)
+            if len(cache) > 32:
+                cache.clear()
+            cache[key] = (lut3, lut_gray)
+            lut = (lut3, lut_gray)
+        self._lut, self._lut_gray = lut
+        self._lut_key = key
         if mode == "duotone" and self._lut_gray is not None:
             g = cv2.LUT(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), self._lut_gray)
             return cv2.LUT(cv2.cvtColor(g, cv2.COLOR_GRAY2BGR), self._lut)

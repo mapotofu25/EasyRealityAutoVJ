@@ -74,7 +74,9 @@ def _app_version() -> str:
         return "0.0.0-dev"
 
 
-APP_VERSION = (_app_version()) + "-RC4"
+APP_VERSION = "1.0"
+# 内部比较/写包用日期构建号（码表包 min_app_version 是日期串，不能用 "1.0" 比）
+APP_VERSION_NUM = _app_version()
 UNDO_CAP = 50
 # 滑杆 seek 防抖：拖动停止这么久之后才真正给音频重定位一次（P1，避免每帧重启音频）
 SEEK_DEBOUNCE_MS = 100
@@ -998,7 +1000,7 @@ class MainWindow(QMainWindow):
         identity_scan.clear_hash_cache()               # ★ C3：缓存只属于"当前这张表"
         self._remount_media()
         # ★ 兼容提示（规格书 §3.2）：接上 capability_report，**一律不阻断导入**。
-        warn, _miss_dir = ercue_io.capability_report(sheet, app_version=APP_VERSION,
+        warn, _miss_dir = ercue_io.capability_report(sheet, app_version=APP_VERSION_NUM,
                                                      media_dir=sess.dir or None)
         miss = [m.name for m in sheet.media
                 if not os.path.isfile(sess.media_paths.get(m.clip_id) or "")]

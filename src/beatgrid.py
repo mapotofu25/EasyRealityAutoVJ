@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """节拍网格（Beat Grid）：BPM / 锚点 / 八拍乐句相位。
 
 ★ 设计前提（用户 2026-09-27 明确的硬约束：**一切为实时演出服务**）：
@@ -101,7 +101,7 @@ DEFAULT_VDJ = ""           # 不硬编码路径，统一由 vdj_db_path() 自动
 # 只对过期 / 缺失的网格重算（见 ui_main 扫描），而不用整库全量重扫。
 #   1 = 初版（隐式，未写入 grid dict）
 #   2 = 2026-09-27：_assemble 输出显式带 grid_ver；配合增量补网格
-GRID_VER = 7          # 3 = 新增 Beat This 小节头来源（无 VDJ 数据的曲目改为 src="bt"）
+GRID_VER = 8          # 8 = 2026-11-18 八拍相位/结构分段同步；存量网格需重算
                       # 4 = 2026-10-30：BPM 分析长度 180 秒 → `GRID_MAXSEC`(600)。
                       #     长曲里 1% 级别的双 BPM 歧义（Crescent Horizon 298 秒：
                       #     前 120 秒 ≈145、后 178 秒 ≈143.5）在 180 秒窗上分不开 ⇒
@@ -816,9 +816,11 @@ def phrase_scores(bf, ks, nbeat=8, w=None):
 
 #: 全 8 槽搜索时，"胜出槽"要比 0/4 里较好的那个强多少倍才采纳（见 `phrase_phase`）
 PHRASE_ALL_MIN = 1.30
+#: 0/4 候选附近 ±1 拍的最小得分倍数（只允许局部一拍，不做全 8 槽乱跳）
+PHRASE_LOCAL_MIN = 1.50
 
 
-def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
+def phrase_phase(f, anchor, period, maxsec=None, nbeat=8, slots=None):
     """在给定锚点（**视作干净的第 1 拍**）下，定「哪一个八拍头才是乐句头」。
 
     ★ `anchor` 必须传**原始锚点**（不要先折叠到 [0, period)）——
@@ -826,8 +828,15 @@ def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
       （2026-09-27 实测：折叠后 Outburst 的八拍头落到 VDJ 第 3 拍上）。
       这里让拍号 k=0 恰好对应 anchor，拍网向两侧铺满全曲。
 
+    :param slots: 可选，限定候选拍偏移，如 `(0, 4)`。**当锚点是小节头时
+        （Beat This 的 downbeat）只应传 `(0, 4)`** —— 八拍头必然落在小节线上，
+        相对小节头的偏移只可能是 0 或 4；放开到全 8 槽会让弱证据把网格推 1~3 拍
+        （2026-11-12 实测 89 首生产库里有 7 首存了 `phrase ∈ {1,2,3,5,7}`，
+        数学上不可能，八拍线因此整体偏 1~3 拍）。传 None 保持旧的 8 槽行为。
+        锚点不是小节头（纯相位估计）时不要传，否则会错误地排除合法相位。
+
     返回 (phrase, contrast, scores)：
-      phrase   ∈ {0, 4}（八拍头相对锚点的拍偏移）
+      phrase   ∈ slots（默认 {0, 4} 为典型结果，见上面 slots 说明）
       contrast = 首选/次选的得分比（≥PHRASE_MAX 视为证据足够）
     """
     dt = f["dt"]
@@ -843,6 +852,28 @@ def phrase_phase(f, anchor, period, maxsec=None, nbeat=8):
     bf = per_beat_feats(f, beats)
     sc = phrase_scores(bf, ks % nbeat, nbeat=nbeat)
     s0, s4 = float(sc[0]), float(sc[4])
+    # ★★★ 2026-11-12：**限定候选槽**（锚点是小节头时只允许 0/4）。
+    #   来源：审计 89 首生产库发现 7 首存了不可能的 phrase（{1,2,3,5,7}），
+    #   都是下面的"全 8 槽 argmax + 1.30 倍门槛"在弱证据下过线造成的；
+    #   限定到 {0,4} 后这 7 首回到小节线上，而其余 82 首结论一首不变
+    #   （因为它们的 argmax 本来就落在 0/4，或非 0/4 槽没过门槛被回退）。
+    if slots:
+        _cand = [int(s) % nbeat for s in slots]
+        phrase = int(max(_cand, key=lambda p: float(sc[p])))
+        # ★ 2026-11-18：BT 的 bar anchor 可能整体早/晚一拍。先在 0/4 里选，
+        #   再只检查相邻 ±1 拍；相邻槽得分必须 ≥ 1.5× 当前槽才移动。
+        #   这是局部相位细化，不是全 8 槽搜索，也不是按歌曲特判。
+        _base_phrase = phrase
+        _base_sc = float(sc[_base_phrase])
+        for _p in ((_base_phrase - 1) % nbeat, (_base_phrase + 1) % nbeat):
+            if (float(sc[_p]) >= _base_sc * PHRASE_LOCAL_MIN
+                    and float(sc[_p]) > float(sc[phrase])):
+                phrase = int(_p)
+        _cur = float(sc[phrase])
+        _oth = sorted((float(sc[p]) for p in _cand if p != phrase), reverse=True)
+        _second = _oth[0] if _oth else 0.0
+        contrast = (_cur / _second) if _second > 1e-9 else 99.0
+        return phrase, contrast, [float(x) for x in sc]
     # ★★★ 2026-11-06（用户：「这个位置也错了一拍 —— 你这个八拍切分它偏了一拍」）：
     #   **原来只在 {0, 4} 里二选一**，等于假设"底层拍的锚点必然是小节头或半小节头"。
     #   实测 `Erebos`：八个槽的得分是
@@ -1256,7 +1287,14 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True,
     #   phrase=0、anchor=0.3595 —— **差 3.47 拍，正是用户听到的"偏四拍"**。
     #   ⇒ 改判过 BPM 就退回纯相位估计（`phrase_phase` 的 contrast=1.264 足够高，
     #     说明八拍头证据充分，不需要 bt 兜底）。
-    if anchor_hint is not None and not _bpm_changed_by_fit:
+    # ★ 2026-11-12（真实 ERLIB 库 `Liminal Link`）：`disambiguate_by_fit` 把扫描的
+    #   假 BPM 152 改判成 190 —— **正好落回 Beat This 自己那一族**（189.94），说明
+    #   节奏假设其实没换，BT 的小节头仍然有效。不能按"连假设都换了"处理：否则退回
+    #   纯相位估计，八拍头偏 3 拍（base 0.0740 + 3*0.3158 = 1.0214，而 BT downbeat
+    #   实测在 1.08）—— 正是用户报的「八拍线偏 1 拍/整体偏几拍」。
+    _bt_family_ok = bool(bt_used and anchor_hint is not None and _bt_bpm > 0
+                         and abs(bpm - _bt_bpm) <= 0.03 * _bt_bpm)
+    if anchor_hint is not None and (not _bpm_changed_by_fit or _bt_family_ok):
         # ★ 不要折叠到 [0, period)：锚点本身就是「小节第 1 拍」，
         #   折叠会丢掉这个信息，使八拍头整体平移（实测踩过）。
         base = float(anchor_hint)
@@ -1284,7 +1322,14 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True,
     else:
         base, conc = phase_of(f, env, period)
 
-    phrase, contrast, _ = phrase_phase(f, base, period)
+    # ★ 2026-11-12：锚点来源决定候选槽。Beat This 的 downbeat 是**小节头**，
+    #   八拍头只可能落在小节线上 ⇒ 只允许 {0,4}；纯相位估计得到的 base 只是
+    #   普通拍格（可能是小节第 2/3/4 拍），必须保留全 8 槽，否则会排除合法相位。
+    #   `_bpm_changed_by_fit` 时 BT 的相位假设已失效（见 2026-10-30 注释），也不算小节头。
+    _slot04 = (0, 4) if (bt_used and anchor_hint is not None
+                         and (not _bpm_changed_by_fit or _bt_family_ok)) else None
+
+    phrase, contrast, _ = phrase_phase(f, base, period, slots=_slot04)
     anchor = base + phrase * period
 
     # ★ 2026-10-28：**倍速消歧**。只在"没有外部 BPM"时做（VDJ 给了 bpm_hint 就不动）。
@@ -1303,7 +1348,7 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True,
                 conc = 0.0
             else:
                 base, conc = phase_of(f, env, period)
-            phrase, contrast, _ = phrase_phase(f, base, period)
+            phrase, contrast, _ = phrase_phase(f, base, period, slots=_slot04)
             anchor = base + phrase * period
 
     # ★★ 2026-10-30（用户 `9 無邪気弾`「这首是 220」）：**半速检测（往上纠）**。
@@ -1318,7 +1363,7 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True,
             bpm_auto = bpm
             period = 60.0 / bpm
             base = anchor
-            phrase, contrast, _ = phrase_phase(f, base, period)
+            phrase, contrast, _ = phrase_phase(f, base, period, slots=_slot04)
             anchor = base + phrase * period
     except Exception:                                            # noqa: BLE001
         pass
@@ -1334,10 +1379,23 @@ def analyze_signal(mono, sr, anchor_hint=None, bpm_hint=None, do_scan=True,
             bpm_auto = bpm
             period = 60.0 / bpm
             base = anchor
-            phrase, contrast, _ = phrase_phase(f, base, period)
+            phrase, contrast, _ = phrase_phase(f, base, period, slots=_slot04)
             anchor = base + phrase * period
     except Exception:                                            # noqa: BLE001
         pass
+
+    # ★★ 2026-11-13：±1 拍相位校正（只在小节头可信、证据够强时启用；见 ACC_PHASE_FIX）
+    if ACC_PHASE_FIX and _slot04 is not None:
+        try:
+            _ap, _ar = _accent_phase_offset(f, anchor, period, dur)
+            if _ap in (1, 7) and _ar >= ACC_PHASE_RATIO_MIN:
+                _d = 1 if _ap == 1 else -1
+                anchor = float(anchor) + _d * period
+                if anchor < 0.0:
+                    anchor += 8.0 * period
+                phrase = int(round((anchor - base) / period)) % 8
+        except Exception:                                    # noqa: BLE001
+            pass
 
     # ★★ 2026-10-28：多 BPM 段检测（用户问「一首歌有多个 BPM 段怎么办」）。
     #   恒速歌在 `detect_segments` 的预检里就返回 [] ⇒ 零额外成本、结果与以前完全一致；
@@ -1687,6 +1745,50 @@ def compute_grid(path, vdj=None, maxsec=GRID_MAXSEC, allow_local=True, do_scan=N
     return _assemble(mono, sr, e, dur, do_scan=do_scan, allow_local=allow_local)
 
 
+# --------------------------------------------------------------------------
+# ★★ 2026-11-13：±1 拍相位校正（用户 7 例里「八拍线整体提前/晚了一拍」）
+#   Trauma 2.1240→听感应 +1 拍、Cothurnus 0.0505→应 -1 拍；Beat This 的 downbeat
+#   与听感差 1 拍时，低音重音/通量会一致落在相邻拍上（全库审计里这两首的比值
+#   1.19 是最强一档）。只在「小节头可信 + 证据 ≥1.15 倍 + 恰好 ±1 拍」时动。
+ACC_PHASE_FIX = True
+ACC_PHASE_RATIO_MIN = 1.15
+
+
+def _accent_phase_offset(f, anchor, period, dur=0.0):
+    """用「低音重音 + 通量」在 8 槽上投票，返回 `(最佳偏移 0..7, 相对 0 槽倍数)`。"""
+    try:
+        nf = int(f["nf"])
+        dt = float(f["dt"])
+        if nf < 64 or dur <= 0 or period <= 1e-6:
+            return 0, 0.0
+        n = int((float(dur) - float(anchor)) / period)
+        if n < 32:
+            return 0, 0.0
+        t = np.arange(nf) * dt
+        beats = float(anchor) + np.arange(n) * period
+        i0 = np.minimum(np.searchsorted(t, beats), nf - 1)
+        i1 = np.minimum(np.searchsorted(t, beats + 0.9 * period), nf)
+        elow = np.zeros(n, dtype=np.float64)
+        flux = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            a, b = int(i0[i]), int(max(i1[i], i0[i] + 1))
+            elow[i] = float(np.max(f["Elow"][a:b]))
+            flux[i] = float(np.max(f["flux"][a:b]))
+        idx8 = np.arange(n) % 8
+        ml = float(np.median(elow)) + 1e-9
+        mf = float(np.median(flux)) + 1e-9
+        acc = np.zeros(8, dtype=np.float64)
+        for p in range(8):
+            q = idx8 == p
+            if not q.any():
+                return 0, 0.0
+            acc[p] = (elow[q] / ml).mean() + 0.6 * (flux[q] / mf).mean()
+        best = int(np.argmax(acc))
+        return best, float(acc[best] / (acc[0] + 1e-9))
+    except Exception:                                        # noqa: BLE001
+        return 0, 0.0
+
+
 def grid_from_signal(mono, sr, vdj=None, path="", maxsec=GRID_MAXSEC, dur=None,
                      allow_local=True, do_scan=None, use_vdj=True, out_feats=None):
     """从**已解码**的单声道整曲信号算网格。
@@ -1710,8 +1812,10 @@ def grid_from_signal(mono, sr, vdj=None, path="", maxsec=GRID_MAXSEC, dur=None,
     n = min(len(mono), int(maxsec * sr))
     sig = np.ascontiguousarray(mono[:n], dtype=np.float32)
     sig, sr2 = resample(sig, sr, SR_TARGET)
-    return _assemble(sig, sr2, e, dur, do_scan=do_scan, allow_local=allow_local,
-                     out_feats=out_feats)
+    g = _assemble(sig, sr2, e, dur, do_scan=do_scan, allow_local=allow_local,
+                  out_feats=out_feats)
+    # 2026-11-18（用户要求）：去掉相位校准表，八拍相位只由算法决定。
+    return g
 
 
 def store_grid(cfg, path, grid):

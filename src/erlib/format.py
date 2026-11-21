@@ -208,8 +208,11 @@ class LibWriter:
         #   ⚠ 写入侧目前是**单线程串行**（`scan_tree` 的 for 循环），
         #     所以关掉线程检查是安全的；将来若改成并行写，**必须自己加锁**。
         #   （主程序的 `fp.FingerprintDB` 早就是 `check_same_thread=False` —— 同一个坑。）
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
         try:
+            # ★ 2026-11-16（ERLIB 同步）：两个连接同时写同一个库时，默认 5s busy
+            #   超时会直接 "database is locked"；30s + busy_timeout 宁可等也不丢歌。
+            self.conn.execute("PRAGMA busy_timeout=30000")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA synchronous=NORMAL")
         except Exception:                                        # noqa: BLE001

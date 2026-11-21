@@ -14,14 +14,60 @@ try:
 except Exception:                      # 源码模式 / 未经打包
     BUILD_DATE, BUILD_SEQ, BUILD_VER, ZIP_NAME = "", 0, "dev", ""
 
-# ★ 2026-11-08：RC3 → RC4。自动段落重做（8 拍乐句对齐 / 边界搬去真台阶）、
-#   图层行高可压到 38、BPM 双行显示（原曲 + 变速倍率）、第三方署名全面校正。
-#   打包版显示 2026.11.08.xx-RC4；源码运行显示 dev-RC4。
-APP_CHANNEL = "RC4"
-APP_VERSION = ((BUILD_VER + "-RC4") if BUILD_VER and BUILD_VER != "dev" else "dev-RC4")
-APP_BUILD = BUILD_DATE or ""           # 2026-09-23
-APP_SEQ = BUILD_SEQ                    # 7
-APP_ZIP_NAME = ZIP_NAME                # EasyRealityAutoVJ_测试版092307.zip
+# ★ 2026-11-21：1.0 正式版。对外只显示「1.0」；
+#   内部兼容比较（码表包 min_app_version）用 APP_VERSION_NUM（仍是构建日期号）。
+APP_OFFICIAL = True
+APP_CHANNEL = ""
+APP_VERSION = "1.0"
+APP_VERSION_NUM = BUILD_VER or "dev"     # 仅供版本比较/日志，不直接展示
+APP_BUILD = BUILD_DATE or ""
+APP_SEQ = BUILD_SEQ
+APP_ZIP_NAME = ZIP_NAME
+
+TAGLINE = ("把音乐变成画面的实时 VJ 引擎。",
+           "A real-time VJ engine that turns music into visuals.")
+
+INTRO = ("它听正在放的歌，认出是哪一首，再按提前做好的码表，以及曲库里预分析的节拍和"
+         "能量段落，决定“现在该是什么画面”。素材切换、跟拍、跟情绪都由它自己完成——"
+         "DJ 只管放歌，你不用整场盯着电脑点下一首。",
+         "It listens to the track that is playing, recognizes it, and uses your cue sheet "
+         "together with the pre-analyzed beat grid and energy sections to decide what should "
+         "be on screen. Clip changes, beat sync and mood are handled for you — the DJ just "
+         "plays, and you are not glued to the laptop cueing the next clip.")
+
+# 「关于」里的 5 条能力：(中文标题, 英文标题, 中文说明, 英文说明)
+ABOUT_FEATURES = [
+    ("跟着歌走", "Follows the track",
+     "用音频指纹认出正在播放的曲目，读出 BPM、八拍网格和能量段落。进 drop 的那一帧就换"
+     "素材池，不用等能量慢慢爬，也不用你手动卡点；歌中途变速也跟得住。",
+     "Identifies the playing track by audio fingerprint and reads its BPM, 8-beat grid and "
+     "energy sections. The clip pool switches on the exact frame you enter the drop — no "
+     "waiting for measured energy, no manual cueing — and tempo changes are followed."),
+    ("自动选素材", "Picks clips for you",
+     "素材先按动态强弱、前景/背景、铺满度打好标。现场按当前能量和角色自动挑：高动态留给 "
+     "drop，背景素材铺底，前景元素叠在上面，不用提前给每首歌排片。",
+     "Clips are tagged by motion level, foreground/background role and coverage. At show time "
+     "the right pool is chosen from the current energy and role: high-motion for drops, "
+     "backgrounds as a base, foreground elements on top — no per-track programming needed."),
+    ("稳定输出", "Solid output",
+     "画面作为 NDI 源或 Spout 源直出，OBS、Resolume 里直接选，不用采集卡。DXV 素材走 GPU "
+     "解码，4K 也不靠 CPU 硬扛；带透明通道的素材保留 Alpha，多屏输出各走各的分辨率。",
+     "Publishes the picture as an NDI or Spout source — pick it directly in OBS or Resolume, "
+     "no capture card. DXV clips are decoded on the GPU, so 4K does not hammer the CPU; alpha "
+     "is preserved, and each screen in multi-screen mode keeps its own resolution."),
+    ("现场可控", "Stay in control",
+     "自动之外，KV 主视觉、调色、多屏、黑场/冻结/下一素材、手动接管都在。想自己来的时候"
+     "随时接手，松手再交回自动。",
+     "Beyond automation: KV main visual, color grading, multi-screen, blackout/freeze/next "
+     "clip and manual takeover are all there. Step in whenever you want, hand it back to "
+     "auto when you are done."),
+    ("素材准备", "Prep tools",
+     "导入、扫描打标、悬浮胶片预览、码表、曲库 BPM 与段落分析都在一个软件里。哪些素材参与"
+     "自动匹配、哪些只当 logo 固定不动，也能单独设。",
+     "Import, scanning/tagging, hover filmstrip previews, cue sheets, library BPM and "
+     "section analysis — all in one app. You can also choose which clips join auto matching "
+     "and which stay as fixed logos."),
+]
 
 # 作者与反馈渠道
 AUTHOR = "麻婆豆腐"

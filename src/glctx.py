@@ -504,7 +504,13 @@ class GLDecoder:
         n = (src_w // 4) * (src_h // 4) * (8 if int(fmt) == 1 else 16)
         if len(blocks) < n:
             return None
-        buf = (ctypes.c_char * n).from_buffer_copy(bytes(blocks[:n]))
+        # ★ 2026-11-11：`dxvnative.unpack` 现在返回**可写的复用缓冲 memoryview**。
+        #   能用 `from_buffer` 零拷贝就直接把地址交给 GL；只有 bytes/只读缓冲
+        #   （测试或旧调用）才退回 `from_buffer_copy`。
+        try:
+            buf = (ctypes.c_char * n).from_buffer(blocks)
+        except (TypeError, ValueError):
+            buf = (ctypes.c_char * n).from_buffer_copy(blocks[:n])
         gl("glBindTexture", None, ctypes.c_uint, ctypes.c_uint)(GL_TEXTURE_2D, self._tex)
         if first:
             gl("glCompressedTexImage2D", None, ctypes.c_uint, ctypes.c_int, ctypes.c_uint,

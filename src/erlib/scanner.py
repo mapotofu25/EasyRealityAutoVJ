@@ -27,7 +27,10 @@ r"""erlib **扫描核心** —— 复用 ERAVJ 主程序的模块，产出**只�
 （瓶颈是磁盘 IO + 内存带宽）。erlib 默认 `min(4, 核数//4)` —— 够用且不抢机器资源。
 """
 
+import io
 import os
+import sqlite3
+import threading
 import time
 
 import numpy as np
@@ -40,6 +43,17 @@ AUDIO_EXT = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".aiff", ".aif",
 
 # 与主程序一致的解码上限：网格只取前 180s 分析（`beatgrid.grid_from_signal` 默认）
 _GRID_MAXSEC = 180.0
+
+
+def _write_retry(fn, tries=6, delay=0.8):
+    """写库遇到 `database is locked` 时退避重试（另一个实例/连接在写）。"""
+    for k in range(tries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or k == tries - 1:
+                raise
+            time.sleep(delay * (k + 1))
 
 
 def find_audio(root, follow=True):
@@ -143,6 +157,8 @@ class Scanner:
         self.use_online = False        # 废弃参数，恒 False（见 docstring）
         self.app_ver = app_ver
         self._stop = False
+        # ★ 2026-11-14：并行扫描时 worker 会累加 t_* 计时，加锁避免丢更新
+        self._stats_lock = threading.Lock()
         self.stats = {"ok": 0, "fail": 0, "skip": 0, "t_decode": 0.0,
                       "t_fp": 0.0, "t_meta": 0.0, "t_grid": 0.0,
                       "t_wave": 0.0, "t_cover": 0.0}
@@ -191,6 +207,40 @@ class Scanner:
             g = _bg.grid_from_signal(sig, sr, None, path=path, dur=dur,
                                      use_vdj=False, out_feats=_feats)
             if g:
+                # ★ 2026-11-18（用户：八拍线整首偏 4 拍）：
+                #   用「不吸附网格」的分段边界反推八拍相位 —— 真实段落边界落在
+                #   ±4 拍外时，说明整首网格晚了半句，这里把 anchor 挪回对齐位置。
+                #   只在证据一致（边界相位离散度 ≤1 拍、偏移 ≥1.5 拍、边界数 ≥6）时生效。
+                try:
+                    import sections as _sec0
+                    _fr = _feats.get("f")
+                    _dr = float(_feats.get("dur") or 0.0)
+                    _bl = float((g or {}).get("beat_len") or 0.0)
+                    _an = float((g or {}).get("anchor") or 0.0)
+                    if _fr is not None and _dr > 0 and _bl > 0:
+                        _raw = _sec0.auto_segments(_fr, dur=_dr, grid=None) or []
+                        _ts = [float(x["t0"]) for x in _raw[1:]]
+                        if len(_ts) >= 6:
+                            _mods = np.array([((t - _an) / _bl) % 8.0 for t in _ts])
+                            _cand = np.arange(0.0, 8.0, 0.25)
+
+                            def _cd(x, c):
+                                return (x - c + 4.0) % 8.0 - 4.0
+
+                            _best = min(_cand, key=lambda c: float(np.mean(np.abs(_cd(_mods, c)))))
+                            _dev = float(np.mean(np.abs(_cd(_mods, _best))))
+                            if abs(_best) >= 1.5 and _dev <= 1.0:
+                                _sh = -int(round(_best))
+                                _new = (_an + _sh * _bl) % (8.0 * _bl)
+                                g["anchor"] = round(float(_new), 4)
+                                g["phase_fix"] = int(_sh)
+                                _b = float(g.get("base_anchor") or 0.0)
+                                g["phrase"] = int(round((_new - _b) / _bl)) % 8
+                                for _sg in (g.get("segments") or []):
+                                    if isinstance(_sg, dict) and "anchor" in _sg:
+                                        _sg["anchor"] = round(float(_sg["anchor"]) + _sh * _bl, 4)
+                except Exception:                        # noqa: BLE001
+                    pass
                 grid = g
             # ★ 能量分段（drop 段落）也照抄主程序：同一份 STFT 复用，不重新解码。
             try:
@@ -198,18 +248,96 @@ class Scanner:
                 _f2 = _feats.get("f")
                 _d2 = float(_feats.get("dur") or 0.0)
                 if _f2 is not None and _d2 > 0 and grid:
-                    _sg = _sec.auto_segments(
-                        _f2, dur=_d2,
-                        grid=_sec.grid_from_meta({"grid": grid, "grid_manual": {}}) or None)
+                    # ★ 2026-11-16（用户：「用音色分段 能量还是我们之前的算法」）：
+                    #   `ERLIB_SEG_MODE=timbre` 时边界来自音色变化（`timbre_seg`），
+                    #   能量/档位仍由 `sections.segments_from_edges()` 用老口径算；
+                    #   默认（energy）完全走原来的能量分段，互不影响。
+                    # 优先级：环境变量 > %LOCALAPPDATA%\AutoVJ\erlib_settings.json 的 seg_mode > 默认 timbre
+                    _seg_mode = (os.environ.get("ERLIB_SEG_MODE") or "").strip().lower()
+                    if not _seg_mode:
+                        try:
+                            import json as _json
+                            _sp = os.path.join(os.environ.get("LOCALAPPDATA") or "",
+                                               "AutoVJ", "erlib_settings.json")
+                            with io.open(_sp, "r", encoding="utf-8") as _sf:
+                                _seg_mode = str((_json.load(_sf) or {}).get("seg_mode")
+                                                or "").strip().lower()
+                        except Exception:                    # noqa: BLE001
+                            _seg_mode = ""
+                    if not _seg_mode:
+                        _seg_mode = "structure"
+                    _sg = None
+                    _sg_from_timbre = False
+                    if _seg_mode == "structure":
+                        # ★ 2026-11-16（The Gravelord）：8 拍块级 DP 结构分段。
+                        #   第一段 drop 之前沿用旧能量分段边界，drop 之后按
+                        #   8/16/32/48/56/64 拍句长重切，不再跑 16 倍数硬修。
+                        try:
+                            import structure_seg as _sseg
+                            _gm = _sec.grid_from_meta(
+                                {"grid": grid, "grid_manual": {}}) or None
+                            _base = _sec.auto_segments(_f2, dur=_d2, grid=_gm)
+                            _af0 = _sec.take_folded_anchor()
+                            if _af0 is not None and isinstance(grid, dict):
+                                grid["anchor"] = _af0
+                                try:
+                                    grid["phrase"] = int((int(grid.get("phrase") or 0) - 4) % 8)
+                                except (TypeError, ValueError):
+                                    grid["phrase"] = 0
+                                _gm = _sec.grid_from_meta(
+                                    {"grid": grid, "grid_manual": {}}) or _gm
+                            _se = _sseg.structure_edges_hybrid(_f2, _d2, _gm, _base)
+                            if _se and len(_se) >= 3:
+                                _sg2 = _sec.segments_from_edges(
+                                    _f2, _se, dur=_d2, grid=_gm, post=False)
+                                # 防碎：结构分段明显比旧能量分段更碎时回退旧结果
+                                _lim = max(len(_base or []) + 3,
+                                           int(len(_base or []) * 1.4))
+                                if _sg2 and len(_sg2) <= _lim:
+                                    _sg = _sg2
+                                    _sg_from_timbre = True
+                        except Exception:                    # noqa: BLE001
+                            _sg = None
+                    elif _seg_mode == "timbre":
+                        try:
+                            import timbre_seg as _tseg
+                            _te = _tseg.edges(sig, sr, grid, dur=dur)
+                            if _te and len(_te) >= 3:
+                                _sg = _sec.segments_from_edges(
+                                    _f2, _te, dur=_d2,
+                                    grid=_sec.grid_from_meta(
+                                        {"grid": grid, "grid_manual": {}}) or None)
+                                _sg_from_timbre = True
+                        except Exception:                    # noqa: BLE001
+                            _sg = None
+                    if _sg is None:
+                        _sg = _sec.auto_segments(
+                            _f2, dur=_d2,
+                            grid=_sec.grid_from_meta(
+                                {"grid": grid, "grid_manual": {}}) or None)
                     # ★ 折过锚点 ⇒ 写回网格，否则 8 拍线还是旧相位（用户 2026-11-07）
                     _af = _sec.take_folded_anchor()
                     if _af is not None and isinstance(grid, dict):
                         grid["anchor"] = _af
-                    # `raw` 同样过乐句判据（只是不吸附位置），与主程序一致
-                    _sgr = _sec.auto_segments(
-                        _f2, dur=_d2, grid=None,
-                        phrase_grid=_sec.grid_from_meta(
-                            {"grid": grid, "grid_manual": {}}) or None)
+                        # ★ 2026-11-12：折锚点 = 把八拍头提前 4 拍（等价于翻转
+                        #   半句相位）。只改 anchor 不改 phrase 会让 (anchor, phrase)
+                        #   这一对自相矛盾 —— 主程序 `effective_grid`/详情页按
+                        #   `anchor + phrase*beat_len` 反推基准拍时会整体偏 4 拍。
+                        #   phrase 的定义是「八拍头相对基准拍的拍偏移」，因此同步 -4。
+                        try:
+                            _ph = int(grid.get("phrase") or 0)
+                            grid["phrase"] = int((_ph - 4) % 8)
+                        except (TypeError, ValueError):
+                            grid["phrase"] = 0
+                    # `raw` 同样过乐句判据（只是不吸附位置），与主程序一致；
+                    # 音色模式没有「未吸附」的独立结果，raw 直接复用分段结果。
+                    if _sg_from_timbre:
+                        _sgr = _sg
+                    else:
+                        _sgr = _sec.auto_segments(
+                            _f2, dur=_d2, grid=None,
+                            phrase_grid=_sec.grid_from_meta(
+                                {"grid": grid, "grid_manual": {}}) or None)
                     if _sg:
                         secs, secs_raw = _sg, _sgr
                 del _f2
@@ -240,10 +368,11 @@ class Scanner:
             cover_bytes = None
         t6 = time.perf_counter()
 
-        for k, dt in (("t_decode", t1 - t0), ("t_fp", t2 - t1),
-                      ("t_meta", t3 - t2), ("t_grid", t4 - t3),
-                      ("t_wave", t5 - t4), ("t_cover", t6 - t5)):
-            self.stats[k] += dt
+        with self._stats_lock:
+            for k, dt in (("t_decode", t1 - t0), ("t_fp", t2 - t1),
+                          ("t_meta", t3 - t2), ("t_grid", t4 - t3),
+                          ("t_wave", t5 - t4), ("t_cover", t6 - t5)):
+                self.stats[k] += dt
 
         try:
             rel = os.path.relpath(path, self.root) if self.root else path
@@ -310,14 +439,40 @@ class Scanner:
         #   ⇒ 这里必须**倒着扫**，最终列表才等于资源管理器里的 A/B/C 顺序（否则是 C/B/A）。
         #   扫描顺序不影响分析结果（每首独立、写入按 song_id 幂等），只影响发号先后。
         todo.reverse()
+
+        # ★★★ 2026-11-14（用户「扫描速度太慢了」）：并行扫描。
+        #   单首 6~10 s 里 grid（BT 推理）占 75~85%，纯 CPU、每首独立；
+        #   `phrase_bt` 已改成每线程一条 ORT 会话，所以这里可以真并行。
+        #   worker 数：ERLIB_SCAN_WORKERS 优先；否则 min(4, 核数//8)（本机 32 核 ⇒ 4）。
+        #   1 = 完全退回原来的串行路径（排查用）。
+        workers = 1
+        try:
+            workers = int(os.environ.get("ERLIB_SCAN_WORKERS") or 0)
+        except (TypeError, ValueError):
+            workers = 0
+        if workers <= 0:
+            workers = min(4, max(1, (os.cpu_count() or 4) // 8))
+        workers = max(1, min(workers, max(1, total)))
+        if workers > 1 and total > 1:
+            return self._scan_parallel(todo, total, writer, workers)
+
         for i, p in enumerate(todo, 1):
             if self._stop:
                 break
+            # ★ 2026-11-13（用户「重新分析卡 0%」）：单首要 8~25 s，而进度只在**扫完**
+            #   才 +1，前 20 秒界面一直是 0% —— 看着就像卡死。这里先报一次
+            #   “正在扫哪首”（done 仍是 i-1，不虚报进度），界面立刻有反应。
+            if self.on_progress:
+                try:
+                    self.on_progress(i - 1, total, p)
+                except Exception:                                # noqa: BLE001
+                    pass
             try:
                 sid, meta, fps, cov, wf = self.scan_one(p)
-                writer.add_song(sid, meta, fps, cov, commit=False, waveform=wf)
+                _write_retry(lambda: writer.add_song(
+                    sid, meta, fps, cov, commit=False, waveform=wf))
                 if i % 6 == 0:
-                    writer.commit()
+                    _write_retry(writer.commit)
                 self.stats["ok"] += 1
             except Exception as e:                               # noqa: BLE001
                 self.stats["fail"] += 1
@@ -336,6 +491,74 @@ class Scanner:
                     self.on_progress(i, total, p)
                 except Exception:                                # noqa: BLE001
                     pass
+        if writer is not None:
+            writer.commit()
+        self.stats["elapsed"] = time.perf_counter() - t0
+        self.stats["total"] = total
+        return self.stats
+
+    # ---------------- 并行扫描（2026-11-14 提速） ----------------
+    def _scan_parallel(self, todo, total, writer, workers):
+        """并行跑 `todo`：worker 只算，写库/进度/统计都在本线程。
+
+        完成顺序不可控，但 `import_seq` 决定列表顺序 ⇒ 用「重排缓冲」：
+        结果按原始下标存着，从 0 开始连续就绪才落库，保证顺序与串行一致。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        t0 = time.perf_counter()
+        self.stats["workers"] = workers
+        if self.on_progress:
+            try:
+                self.on_progress(0, total, todo[0])
+            except Exception:                                    # noqa: BLE001
+                pass
+
+        def _fail(p, e):
+            self.stats["fail"] += 1
+            msg = "%s: %s" % (type(e).__name__, e)
+            errs = self.stats.setdefault("errors", [])
+            if len(errs) < 20:
+                errs.append((os.path.basename(p), msg))
+            if len(errs) == 1:
+                print("[erlib] 首条扫描失败：%s\n         → %s" % (p, msg))
+
+        buf = {}
+        nxt = 0
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="erlib-scan") as ex:
+            futs = {ex.submit(self.scan_one, p): (i, p)
+                    for i, p in enumerate(todo)}
+            for fut in as_completed(futs):
+                i, p = futs[fut]
+                if self._stop:
+                    for f in futs:
+                        f.cancel()
+                    break
+                try:
+                    buf[i] = (p, fut.result())
+                except Exception as e:                            # noqa: BLE001
+                    buf[i] = (p, e)
+                while nxt in buf:
+                    pp, res = buf.pop(nxt)
+                    nxt += 1
+                    if isinstance(res, Exception):
+                        _fail(pp, res)
+                    else:
+                        sid, meta, fps, cov, wf = res
+                        try:
+                            _write_retry(lambda: writer.add_song(
+                                sid, meta, fps, cov, commit=False, waveform=wf))
+                        except Exception as e:                    # noqa: BLE001
+                            _fail(pp, e)
+                        else:
+                            self.stats["ok"] += 1
+                            if self.stats["ok"] % 6 == 0:
+                                _write_retry(writer.commit)
+                    if self.on_progress:
+                        try:
+                            self.on_progress(nxt, total, pp)
+                        except Exception:                        # noqa: BLE001
+                            pass
         if writer is not None:
             writer.commit()
         self.stats["elapsed"] = time.perf_counter() - t0

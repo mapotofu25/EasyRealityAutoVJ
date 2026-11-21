@@ -671,9 +671,19 @@ def from_dict(d, meta_only=False):
                     opacity=(None if itd.get("opacity") is None
                              else _f(itd.get("opacity"), 1.0)),
                     trans_in=str(itd.get("trans_in") or "fade"),
-                    trans_in_beats=_f(itd.get("trans_in_beats"), 2.0),
+                    # ★ 2026-11-18：文件里缺 `trans_in_beats` 时，按 ERLIB/Cue 端
+                    #   的读法回落 0（硬切）；若老包只写了秒，则用秒换算。
+                    trans_in_beats=(
+                        _f(itd.get("trans_in_beats"))
+                        if "trans_in_beats" in itd else
+                        (sec_to_beats(itd.get("trans_in_sec"), bpm)
+                         if itd.get("trans_in_sec") is not None else 0.0)),
                     trans_out=str(itd.get("trans_out") or "fade"),
-                    trans_out_beats=_f(itd.get("trans_out_beats"), 2.0),
+                    trans_out_beats=(
+                        _f(itd.get("trans_out_beats"))
+                        if "trans_out_beats" in itd else
+                        (sec_to_beats(itd.get("trans_out_sec"), bpm)
+                         if itd.get("trans_out_sec") is not None else 0.0)),
                     snap=str(itd.get("snap") or "off"), note=str(itd.get("note") or "")))
             te.layers.append(ly)
         s.tracks.append(te)

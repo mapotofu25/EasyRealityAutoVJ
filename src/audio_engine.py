@@ -369,7 +369,7 @@ CHROMA_BPMVETO_TOT = 120
 # 真机实测：原速播放时自由扫会把 1.08~1.23 的次优峰刷到 0.64（只比 1.0 处低一点），
 # 采信它就会把前馈带跑（一次 4.27 拍/秒的位置窜动）。0.10 是能分开的量级。
 CHROMA_SLOPE_MARGIN_FULL = 0.10
-CHROMA_COOLDOWN = 0.0        # 每窗都做（实测 ~100ms；需要减负时调到 1.0）
+CHROMA_COOLDOWN = 2.0        # 每窗都做实测 ~100ms；锁定期间 2s 一次足够，给识别线程减负
 # ★★★ 2026-11-02：BPM 一致性校验否决识别时，**强制让实时 BPM 重估**的冷却秒数。
 #   太短（每窗都清）⇒ 票永远攒不到 20、锁不上，拍钟反而钉死在旧值；
 #   太长 ⇒ 现场换歌后要等很久才纠正。20s ≈ 一次"清票 + 重新锁上"的两倍余量。
@@ -626,11 +626,19 @@ def fp_lock_gate(sid, votes, tot, second_best, second_tot, hit_rate):
     if tot >= LOCK_TOT_STRICT and votes >= LOCK_VOTES_STRICT:
         return True
     # ② 变速兜底（DJ 混音/调速，逐值不变）
+    #   ★ 2026-11-11：曲库有同曲的不同版本时，`second_tot` 会被另一个版本抬高，
+    #   但 `second_best`（另一首的最佳单点）仍然很低（现场 A 组 5 票 vs 正确 67 票）。
+    #   此时不该因为"总票没领先 2 倍"就拒绝正确歌；允许用单点票领先作为替代证据。
+    _lead_ok = (tot >= LOCK_LEAD_WARP * max(1, second_tot)
+                or second_best <= max(5, votes // 2))
     if (hit_rate >= LOCK_HIT_WARP and tot >= LOCK_TOT_WARP
             and votes >= LOCK_VOTES_WARP
-            and tot >= LOCK_LEAD_WARP * max(1, second_tot)):
+            and _lead_ok):
         return True
     # ③ 重编码/低单点兜底（★ 新增）
+    #   ⚠ 这里**不加**单点替代领先：白噪样本实测 votes=5 / tot=75 / second_best=3，
+    #   一旦放宽就会被误认。白噪的单点票正好卡在 5，而 ③ 本来就是为
+    #   「重编码真歌 votes 6~9」准备的 —— 让 ③ 继续用「总票 ≥3× 第二名」守门。
     if (hit_rate >= LOCK_HIT_RECODE and tot >= LOCK_TOT_RECODE
             and votes >= LOCK_VOTES_RECODE
             and tot >= LOCK_LEAD_RECODE * max(1, second_tot)):
@@ -695,7 +703,11 @@ class RateEstimator:
     MIN_R = 0.6          # 合理下限（-40%，覆盖 DJ 大幅降速）
     MAX_R = 1.6          # 合理上限（+60%）
     MIN_DT = 0.2         # 挂钟增量下限（太小则噪声主导）
-    MAX_DT = 2.0         # 挂钟增量上限（太大则视为不连续）
+    # ★★ 2026-11-11（用户：码表演出和音乐差好几秒）：现场认歌线程在 5 路输出
+    #   满载时会掉到 ~12 秒才出一个 offset；旧 MAX_DT=2.0 把每一段都判成“断档”
+    #   ⇒ 速率估计永远停在 1.000 ⇒ 音乐实际 1.018× 时码表每秒慢 1.8%，
+    #   两三分钟就累积成 3 秒偏差。放宽到 60 秒，长基线回归仍能算出真实倍率。
+    MAX_DT = 60.0        # 挂钟增量上限（太大则视为不连续）
     MIN_DOFF = 0.05      # |Δoff| 下限（过小不可信）
     # ★ 2026-10-18（变速真机）：**离群闸门**替掉原来收窄的量程。
     #   原 `MIN_R/MAX_R = 0.8/1.25` 是拿"量程"当噪声过滤器 —— 副作用是 **±20% 变速本身
@@ -715,8 +727,8 @@ class RateEstimator:
     #   ⇒ 基线拉到 2s 噪声立刻降到 0.1，4s 降到 0.05。
     #   ⇒ 做法：只把"**合理步进**"的样本存进历史（野匹配一步 30~250s，直接判越界丢掉），
     #     再用"历史里最早那条 ↔ 最新那条"的**长基线**算速率。
-    WIN_SEC = 8.0        # 历史窗口（长基线最多这么长；8s 才能把 4s 阶梯抹平）
-    MIN_SPAN = 3.0       # 至少跨这么久才算一次速率（比它短就等）
+    WIN_SEC = 15.0       # 历史窗口（长基线；15s 足够 12 秒一窗的慢识别，也能较快跟真变速）
+    MIN_SPAN = 5.0       # 至少跨这么久才算一次速率（比它短就等）
     STEP_ALPHA = 0.6     # 长基线估计的跟随系数（估计本身已很平滑，可以跟得快）
 
     def __init__(self, tau=3.0):
@@ -770,6 +782,21 @@ class RateEstimator:
         #   保持两个都不动 ⇒ 下一次拿"上次可信 anchor"比，基线自动变长，反而更准。
         if not (self.MIN_R <= r_step <= self.MAX_R) or abs(doff) < self.MIN_DOFF:
             return self.rate
+        # ★★ 2026-11-11（用户：原速歌被识别成 1.20/1.05）：指纹在重复段落/长混音里
+        #   会偶发跳到歌里另一处（off 一次差 5~13 秒），斜率仍可能落在 0.6~1.6 内，
+        #   旧逻辑会把它当“变速”采纳。这里加一道**位置连续性**闸门：
+        #   与「上次锚点 + 当前倍率×dt」偏差 >3 秒 ⇒ 不参与倍率估计，直接重锚。
+        #   真 seek 也只重锚、倍率保持；真变速（1.2× 跑 10s 偏 2s）仍在 3 秒内。
+        try:
+            _pred = float(self._last_off) + dt * float(self.rate or 1.0)
+            if abs(float(off) - _pred) > 3.0:
+                self._last_off = off
+                self._last_t = wall_t
+                self._hist = [(wall_t, off)]
+                self._ready = False
+                return self.rate
+        except (TypeError, ValueError):
+            pass
         self._last_off = off
         self._last_t = wall_t
         self._hist.append((wall_t, off))
@@ -1061,6 +1088,10 @@ class _Analyzer:
         # ★ 2026-11-02：因「BPM 校验否决」而强制作废实时 BPM 的时刻/次数（冷却用）
         self._bpm_veto_t = 0.0
         self._bpm_veto_n = 0
+        # ★ 2026-11-11：BPM 否决的**连续窗口数**。现场实时 BPM 会偶发跳到
+        #   210.5/155（同一首 185 BPM 的歌），单窗否决就清 sid ⇒ 码表掉锁/重锚
+        #   ⇒ 画面跳来跳去。连续 3 窗都否决才真正丢掉，单窗坏 BPM 只记 bpm_hold。
+        self._bpm_veto_streak = 0
         self.prev_bass_spec = None         # kick 频段上一帧谱（低频通量用）
         self.bass_flux_hist = np.zeros(max(16, int(round(10.0 / self.block_sec))), dtype=np.float32)
         self.beat_interval = 0.5
@@ -1250,6 +1281,7 @@ class _Analyzer:
             self._bpm_votes.clear()
             self._bpm_lock = False
             self._bpm_far_sec = 0.0
+            from energy_log import log_capture_event
             log_capture_event(
                 "[BPM] 校验否决 ⇒ 实时 BPM 重估（第%d次）lbpm=%.1f rbpm=%.1f rel=%s "
                 "hit=%.2f tot=%d" % (
@@ -2052,6 +2084,21 @@ FP_WIN_LONG_SEC = float(os.environ.get("AUTOVJ_FP_WIN_LONG", "9.0") or 0)
 FP_WIN_LONG_COOLDOWN = 2.0
 
 
+#: 识别线程在 5 路输出满载时会被视频线程挤到 10 秒才跑一轮。
+#: Windows 下把这个线程提到 HIGHEST（只影响本线程，不动 GUI/引擎）——
+#: 认歌是“低频但强实时”的旁路，宁可让它插队，也不能让码表位置十几秒不更新。
+def _boost_current_thread():
+    try:
+        if os.name != "nt":
+            return
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentThread.restype = ctypes.c_void_p
+        k32.SetThreadPriority(k32.GetCurrentThread(), 1)   # THREAD_PRIORITY_ABOVE_NORMAL
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
 def _env_flag(name, default=False):
     """读布尔型环境变量（"0"/"off"/"false"/"" ⇒ False）。"""
     v = os.environ.get(name)
@@ -2566,25 +2613,30 @@ class AudioEngine:
             #     n_hash 正常(~300~500) 且 hit≈0    ⇒ 音频不是库里那首（声道/重采样/源不对）
             #     hit 很多但 votes 恒 0             ⇒ 匹配器/选取逻辑有问题
             hit, n_hash, seg_rms, seg_n = -1, -1, -1.0, -1
+            _n_uni = -1
             try:
                 if now - float(getattr(self, "_rec_hash_t", 0.0) or 0.0) >= 10.0:
                     self._rec_hash_t = now
-                    from fp import fingerprint_audio as _fa
                     with self._audio_buf_lock:
                         _seg = self._fp_buf.last(int(self._fp_sr * 4.5))
                     _seg = np.asarray(_seg, dtype=np.float32)
                     seg_n = int(_seg.size)
                     seg_rms = float(np.sqrt(np.mean(_seg ** 2))) if seg_n else 0.0
-                    _hs = _fa(_seg, self._fp_sr)
-                    n_hash = len(_hs)
-                    _n_uni = 0
-                    if n_hash and fp_db is not None:
-                        _uni = list({h for h, _o in _hs})[:400]
-                        _n_uni = len(_uni)
-                        _ph = ",".join("?" * len(_uni))
-                        hit = int(fp_db.conn.execute(
-                            "SELECT COUNT(DISTINCT hash) FROM fingerprints "
-                            "WHERE hash IN (%s)" % _ph, _uni).fetchone()[0])
+                    # ★★ 2026-11-11（用户：码表偏差 / 认歌慢）：这里以前每 10 秒
+                    #   对 400 个 hash 做一次 `COUNT(DISTINCT ...)`，现场 5 路输出
+                    #   满载 + 机械盘时会把识别循环拖到 10 秒一轮。
+                    #   命中率 `fp.match` 已经算好了（`last_hit_rate` + `last_hs`），
+                    #   这里直接换算，**不再发额外 SQL、不再重算指纹**。
+                    _hs = getattr(fp_db, "last_hs", None) if fp_db is not None else None
+                    if _hs:
+                        _uni_n = len({h for h, _o in _hs})
+                        n_hash = len(_hs)
+                        _n_uni = _uni_n
+                        try:
+                            hit = int(round(float(getattr(fp_db, "last_hit_rate", 0.0) or 0.0)
+                                            * _uni_n))
+                        except (TypeError, ValueError):
+                            hit = -1
             except Exception:                                    # noqa: BLE001
                 hit, n_hash, _n_uni = -1, -1, -1
             line = ("[%s] [R] db=%d eng=%d run=%d buf=%d(%.1fs) silent=%.1fs lvl=%.4f engy=%.3f bpm=%.1f "
@@ -2707,7 +2759,7 @@ class AudioEngine:
         except Exception:                                        # noqa: BLE001
             pass
 
-    def _match_with_win(self, fp_db, win_sec, hint, hint_w, hint_sid):
+    def _match_with_win(self, fp_db, win_sec, hint, hint_w, hint_sid, lock_sid=None):
         """用指定窗口长度（秒）重认一次。
 
         返回 `(sid, votes, off, tot, second, second_tot, hr, win_sec)`；窗口里
@@ -2727,7 +2779,8 @@ class AudioEngine:
             sig = _np.asarray(buf, dtype=_np.float32)
             sid, votes, off = fp_db.match(sig, self._fp_sr,
                                           hint_delta=hint, hint_w=hint_w,
-                                          hint_sid=hint_sid)
+                                          hint_sid=hint_sid,
+                                          lock_sid=lock_sid)
         except Exception:                                        # noqa: BLE001
             return None
         if int(sid) < 0:
@@ -2750,6 +2803,7 @@ class AudioEngine:
         import time as _t
         import numpy as _np
         from charge_engine import FpResult
+        _boost_current_thread()
         while not self._rec_stop.is_set():
             # ★ 2026-10-19 排查：每轮实际耗时 + 缓冲样本数（判断'循环慢'还是'采集停'）
             try:
@@ -2770,12 +2824,29 @@ class AudioEngine:
             if fp_db is None or eng is None or not self.state.running:
                 continue
             # ★ 每 10 秒刷新一次"有效曲目白名单"（曲库增删后无需重启）
+            #   ★★ 2026-11-11（用户：码表偏差/认歌慢）：旧实现在**识别线程里同步**
+            #   读配置 + 打开 imported_meta.db；现场满载时这一步能把整个认歌循环
+            #   拖到 10~12 秒一轮。改成后台线程刷新，识别线程永不因白名单阻塞。
             try:
                 _prov = getattr(self, "_allowed_provider", None)
                 _now2 = _t.time()
                 if _prov is not None and _now2 - float(getattr(self, "_allow_t", 0.0) or 0.0) >= 10.0:
                     self._allow_t = _now2
-                    fp_db.set_allowed(_prov())
+                    if not getattr(self, "_allow_busy", False):
+                        self._allow_busy = True
+
+                        def _refresh_allowed():
+                            try:
+                                _ids = _prov()
+                                if _ids is not None:
+                                    fp_db.set_allowed(_ids)
+                            except Exception:                # noqa: BLE001
+                                pass
+                            finally:
+                                self._allow_busy = False
+
+                        threading.Thread(target=_refresh_allowed, daemon=True,
+                                         name="fp-allowed").start()
             except Exception:                                    # noqa: BLE001
                 pass
             # 静音超时 → 回待机（清空识别）
@@ -2790,6 +2861,17 @@ class AudioEngine:
                     self.state.recognized_rate = 1.0
                     self.state.recognized_votes = 0
                 continue
+            # ★★ 2026-11-12（静音待机 CPU）：缓冲里可能还留着上一次的声音，
+            #   但当前采集电平已经是 0 —— 继续跑指纹/谱图只会反复匹配旧窗口，
+            #   既白烧 CPU（实测 ~0.18 核），又可能在静音间隙把码表带到旧位置。
+            #   10s 以上的静音已在上面重置；这里只挡 0.5~10s 的纯数字静音。
+            try:
+                with self.state.lock:
+                    _lvl_now = float(getattr(self.state, "level", 0.0) or 0.0)
+                if _lvl_now <= 1e-5 and silent >= 0.5:
+                    continue
+            except Exception:                                # noqa: BLE001
+                pass
             with self._audio_buf_lock:
                 if self._fp_buf.filled < 16000:
                     continue
@@ -2810,6 +2892,17 @@ class AudioEngine:
                     _pred = self.state.grid_pred_orig
                     _pred_w = self.state.grid_pred_w
                     _locked = self.state.recognized_song_id
+                # ★ 2026-11-12：本地跟踪用的锁定曲目 id。`recognized_song_id` 可能
+                #   因 BPM 否决被清零，但 `eng.current_song_id` 仍代表状态机锁定的歌。
+                try:
+                    _lock_sid = int(_locked)
+                except (TypeError, ValueError):
+                    _lock_sid = -1
+                if _lock_sid < 0:
+                    try:
+                        _lock_sid = int(getattr(eng, "current_song_id", -1))
+                    except (TypeError, ValueError):
+                        _lock_sid = -1
                 # ★★★ 2026-10-17：**还没锁定任何歌时绝不给 hint**。
                 #   现场实测（`hit=181/196`，查询哈希 92% 都在库里）：音频与库都没问题，
                 #   但 `votes` 长期偏小、电荷条永远不确认 ⇒ 认不出。根因就是这个 hint：
@@ -2880,7 +2973,8 @@ class AudioEngine:
                     _hint_w = FP_PREV_HINT_SEC * _FP_SR / _FP_HOP
                 sid, votes, off = fp_db.match(sig, self._fp_sr,
                                               hint_delta=_hint, hint_w=_hint_w,
-                                              hint_sid=(_prev_sid if _hint is not None else None))
+                                              hint_sid=(_prev_sid if _hint is not None else None),
+                                              lock_sid=(_lock_sid if _lock_sid >= 0 else None))
                 # ★ 本窗用的是哪个长度的窗口（决定下面「窗口起点→末端」补偿用几秒）。
                 #   默认短窗；下面长窗重试成功时会被改写。
                 self._win_used_sec = FP_WIN_SEC
@@ -2944,7 +3038,8 @@ class AudioEngine:
                             if _now_l - float(getattr(self, "_long_t", 0.0) or 0.0) >= FP_WIN_LONG_COOLDOWN:
                                 self._long_t = _now_l
                                 _r2 = self._match_with_win(fp_db, FP_WIN_LONG_SEC,
-                                                           _hint, _hint_w, _prev_sid)
+                                                           _hint, _hint_w, _prev_sid,
+                                                           lock_sid=(_lock_sid if _lock_sid >= 0 else None))
                                 if _r2 is not None:
                                     (_s2, _v2, _o2, _t2, _sec2, _sect2, _hr2, _w2) = _r2
                                     _tot2 = int(_t2)
@@ -3109,6 +3204,11 @@ class AudioEngine:
                 _sid_conf = -1     # ★ 2026-11-02：校验**前**的 sid（被否决后会清零，这里留底）
                 if sid >= 0:
                     _sid_conf = int(sid)
+                    _cur_sid = -1
+                    try:
+                        _cur_sid = int(getattr(eng, "current_song_id", -1))
+                    except Exception:                # noqa: BLE001
+                        _cur_sid = -1
                     _lbpm, _rbpm, _brel = 0.0, 0.0, None
                     _bprov = getattr(self, "_song_bpm_provider", None)
                     if _bprov is not None:
@@ -3133,10 +3233,13 @@ class AudioEngine:
                     if _bflag is None:
                         # 任一为 0（库里没 BPM / 实时还没测出来）⇒ 不校验，别误杀开局
                         self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1), None)
+                        self._bpm_veto_streak = 0       # 这一窗没有否决，别让旧 streak 累积
                     else:
                         self._bpm_gate = (round(_lbpm, 1), round(_rbpm, 1),
                                           round(_brel, 3) if _brel is not None else None)
                         self._bpm_ok_flag = 1 if _bpm_ok else 0
+                        if _bpm_ok:
+                            self._bpm_veto_streak = 0
                         if not _bpm_ok:
                             # ★★★ 2026-10-29：**否决之前先让 chroma 复核**。
                             #   实测「System Overloaded」：指纹命中率 96%、pick 正确，
@@ -3152,7 +3255,10 @@ class AudioEngine:
                             _strong = (_hit_now >= CHROMA_BPMVETO_HIT
                                        and int(_tot or 0) >= CHROMA_BPMVETO_TOT)
                             try:
-                                if CHROMA_BPMVETO_ON and _strong:
+                                if (CHROMA_BPMVETO_ON and _strong
+                                        and int(getattr(self, "_bpm_veto_streak", 0) or 0) >= 2):
+                                    # 只有连续第 3 窗（马上要丢歌）才花 100~400ms 做 chroma 复核；
+                                    # 单窗 BPM 抖动直接 hold，不跑重活。
                                     _cx2 = self._chroma_try(
                                         sig, int(sid), float(off) * 10.0,
                                         float(getattr(self.state, "recognized_rate",
@@ -3171,9 +3277,30 @@ class AudioEngine:
                                 # 2 = 否决被推翻；`!= 0` 的判据都按"通过"处理
                                 #    （界面上的"库内 BPM"照常发布）
                                 self._bpm_ok_flag = 2
+                                self._bpm_veto_streak = 0
                             else:
-                                self._last_gate = "bpm"
-                                sid, votes, off = -1, 0, 0.0
+                                # ★★★ 2026-11-12（用户：码表内容来回跳 / 偏差明显）：
+                                #   **已经锁定的曲目，BPM 不符不再丢歌**。
+                                #   实时 BPM 在 breakdown/大混响/半速段落会跳（现场实测
+                                #   142 的歌被估成 198.5/150.5），BPM 否决把 sid 清零后
+                                #   码表掉锁 → 下一窗重新认歌/重锚 ⇒ 画面跳。
+                                #   指纹已经锁定且位置连续时，BPM 只用于“初认护栏/显示”，
+                                #   不参与“已锁定歌还要不要继续跟”的判定。
+                                _is_cur = (_cur_sid >= 0 and int(_cur_sid) == int(sid))
+                                if _is_cur:
+                                    self._bpm_veto_streak = 0
+                                    self._last_gate = "bpm_hold"
+                                    self._bpm_ok_flag = 2
+                                else:
+                                    # 新歌/未锁定：保留原来的 3 窗否决护栏
+                                    self._bpm_veto_streak = int(
+                                        getattr(self, "_bpm_veto_streak", 0) or 0) + 1
+                                    if self._bpm_veto_streak < 3:
+                                        self._last_gate = "bpm_hold"
+                                        self._bpm_ok_flag = 2
+                                    else:
+                                        self._last_gate = "bpm"
+                                        sid, votes, off = -1, 0, 0.0
                                 # ★★★ 2026-11-02：**否决识别的同一时刻也要怀疑实时 BPM**，
                                 #   否则「BPM 错 → 校验否决 → 认不到歌 → 不解锁 BPM」自锁。
                                 #   只在指纹确实认得这首歌时做（低票误匹配没有重估的意义）。
@@ -3221,7 +3348,11 @@ class AudioEngine:
                 #     拟合不可信（倍率越界 / 票明显更低）时**原样不动**，绝不用坏数据。
                 self._fit_rate = None
                 if (int(sid) >= 0 and int(_locked) == int(sid)
-                        and int(votes or 0) < LOCK_VOTES_STRICT * 2):
+                        and int(votes or 0) < LOCK_VOTES_STRICT * 2
+                        and _now - float(getattr(self, "_last_fit_t", 0.0) or 0.0) >= 3.0):
+                    # ★ 2026-11-11：低票锁定时每窗都跑 `fit_rates`（又一次全 hash 查询 +
+                    #   直线拟合），最多 3 秒一次；它只是精修，不需要每个窗都做。
+                    self._last_fit_t = _now
                     try:
                         _fr = fp_db.fit_rates(getattr(fp_db, "last_hs", None), [int(sid)])
                         _one = (_fr or {}).get(int(sid))
@@ -3305,23 +3436,28 @@ class AudioEngine:
                     self.state.recognized_song_id = cur
                     if cur >= 0 and sid == cur and votes > 0:
                         # 估计输入播放速率 r（同一首歌连续识别时累计；Δoff/Δt 即 r）
-                        r = self._rate_est.update(cur, _off_norm, t_read)
-                        # ★ 2026-10-28：**频带校验给出的倍率优先**。
-                        #   票数口径在变速时 Δoff 抖动大，`_rate_est` 常给出 1.0 或乱值；
-                        #   频带校验是"按倍率找最佳对齐"，实测能稳定指到真倍率
-                        #   （×1.06 → 1.05、×0.94 → 0.94、×1.05 → 1.05）。
-                        #   只在两者同曲时采纳，且用带宽限制防呆。
+                        # ★ 2026-11-11：只有「匹配曲目 == 已确认曲目」且票数够时才喂倍率估计。
+                        #   未锁定时不估；匹配到别的歌（重复段落/误匹配）时也不污染当前倍率。
+                        if int(votes or 0) >= 8:
+                            r = self._rate_est.update(int(cur), _off_norm, t_read)
+                        else:
+                            try:
+                                r = float(getattr(self.state, "recognized_rate", 1.0) or 1.0)
+                            except (TypeError, ValueError):
+                                r = 1.0
+                        # ★★ 2026-10-28：频带校验倍率**只作为取证**，不再直接覆盖 r。
+                        #   ★ 2026-11-11（用户：原速歌被识别成 1.05）：频带/拟合都与
+                        #   指纹 offset 同源，重复段落里会拟合出 1.05/1.20 的假斜率；
+                        #   它们不能单独决定播放速度。r 的基础只保留 `_rate_est`
+                        #   —— 它带 3 秒位置连续性闸门，野跳样本不会污染。
                         _bl = getattr(self, "_band_last", None)
-                        if _bl and int(_bl[2]) == int(cur) and 0.80 <= float(_bl[1]) <= 1.25:
-                            r = float(_bl[1])
-                        # ★★ 2026-10-29：**斜率拟合给出的倍率最优先**。
-                        #   它是对整窗 (qoff,dboff) 点集直接解出来的斜率，不像
-                        #   `_rate_est` 靠相邻窗 off 的差分（Δoff 抖动大），也不像频带
-                        #   校验要额外算一遍谱相关。离线实测 1.08 → 1.082、1.20 → 1.196。
-                        #   ⚠ 拟合不出来（重复段落/无可靠斜线）时保持 None，退回上面两条。
+                        self._band_rate = (float(_bl[1]) if
+                                           (_bl and int(_bl[2]) == int(cur)
+                                            and 0.80 <= float(_bl[1]) <= 1.25) else None)
                         _fr2 = getattr(self, "_fit_rate", None)
-                        if _fr2 is not None and 0.86 <= float(_fr2) <= 1.16:
-                            r = float(_fr2)
+                        self._fit_rate_pub = (float(_fr2) if
+                                              (_fr2 is not None
+                                               and 0.86 <= float(_fr2) <= 1.16) else None)
                         # ★★★ 2026-10-29：**chroma 复核 —— 倍率的最高优先级来源**。
                         #   实测 `_rate_est` 在"票少 ⇒ 频繁掉锁"的变速工况下常年停在
                         #   1.000（它靠 Δoff/Δt，掉锁就攒不够基线）；而 chroma 的 slope
@@ -3407,22 +3543,20 @@ class AudioEngine:
                         #     而 chroma 的斜率受搜索范围约束、`_rate_est` 受票数摊平影响。
                         #     chroma 只有在「分数 ≥0.70 且与 BPM 差 >0.10」时才推翻它 ——
                         #     那说明 BPM 检测本身出错了（同曲实测 0.81~0.97、异曲 0.14~0.30）。
-                        _rr = bpm_ratio_rate(_lbpm, _rbpm, _bflag)
+                        # ★★★ 2026-11-11（用户：原速歌被识别成 1.20 / 1.05，码表跳）：
+                        #   **不再把「实时 BPM / 库内 BPM」当成独立倍率来源**。
+                        #   现场实时 BPM 会跳到 210.5（正确歌 185），比值 1.138 就被
+                        #   写进 `recognized_rate` ⇒ 素材/码表整体加速、位置超前再回跳。
+                        #   倍率只认指纹 offset 斜率（`_rate_est`）或 chroma 对齐；
+                        #   BPM 只在身份校验里用，不参与速度。
                         _cxr_now = self._chroma_rate
-                        if _rr is not None and _cxr_now is not None:
-                            # 两者都有结论：**一致才采纳 BPM**（它更精细），
-                            # 冲突时听 chroma —— 真机 Nimbus 原速播放时 BPM 检测偏了 13%
-                            # （143.6 → 162.4），单听 BPM 会把 r 带成 1.131，
-                            # 前馈把播放器加速、位置一路超前（实测 spd=1.41 期望 2.39、
-                            # dmax 0.52、判"位置窜动 1 次"）。而 chroma 那时报 1.000。
-                            if abs(float(_cxr_now) - float(_rr)) <= 0.06:
-                                r = float(_rr)
-                            else:
+                        if _cxr_now is not None and abs(float(_cxr_now) - 1.0) > 0.01:
+                            # ★★ 2026-11-11（用户：原速歌被识别成 1.20 / 1.05）：
+                            #   chroma **不能单独**把 1.0 改成别的值——重复段落的
+                            #   另一处也能让 chroma 拟合出 1.2。只在它支持指纹斜率
+                            #   （误差 ≤4%）时采纳；否则保持 `_rate_est` 的基础值。
+                            if abs(float(_cxr_now) - float(r)) <= 0.04:
                                 r = float(_cxr_now)
-                        elif _rr is not None:
-                            r = float(_rr)
-                        elif _cxr_now is not None:
-                            r = float(_cxr_now)
                         # ★★ 2026-10-29（真机抓到 r=1.300）：发布前**一律钳到 DJ 合理区间**。
                         #   根因是 `_rate_est` 在"刚锁定、历史点还只有 2~3 个"时，单点
                         #   0.15 秒的识别误差会被放大成 30% 的速率误差（dt=0.5s 时

@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QDialog, QDoubleSpinBox,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog,
                                QLabel, QMenu, QMessageBox, QPushButton,
@@ -78,6 +78,59 @@ def _lazy_waveform(path):
         return wf
     except Exception:                                            # noqa: BLE001
         return None
+
+
+class _ResegmentWorker(QThread):
+    """后台解码 + 重算能量段落，避免详情页在 UI 线程卡死。
+
+    只做纯计算：`soundfile` 读全曲 → 重采样 → 特征 → `sections.auto_segments`。
+    结果通过信号回主线程，由对话框负责落盘和刷新控件；worker 不碰 `cfg` / Qt 控件。
+    """
+
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, path, bpm, anchor, parent=None):
+        super().__init__(parent)
+        self._path = str(path)
+        self._bpm = float(bpm)
+        self._anchor = float(anchor)
+
+    def run(self):                                            # noqa: D102 - QThread 入口
+        try:
+            import numpy as np
+            import beatgrid as _bg
+            import soundfile as sf
+
+            if self.isInterruptionRequested():
+                return
+            data, sr = sf.read(self._path, dtype="float32", always_2d=True)
+            if self.isInterruptionRequested():
+                return
+            sig = np.mean(data, axis=1)
+            del data
+            m2, s2 = _bg.resample(sig, sr, _bg.SR_TARGET)
+            del sig
+            if self.isInterruptionRequested():
+                return
+            f = _bg.features(m2, s2)
+            dur = len(m2) / float(s2)
+            grid = {"anchor": self._anchor,
+                    "beat_len": round(60.0 / self._bpm, 6),
+                    "bpm": self._bpm}
+            got = S.auto_segments(f, dur=dur, grid=grid)
+            # ★ 与 ERLIB `erlib/detail.py::_resegment_by_bpm` 保持一致：
+            #   这里**不**把 `take_folded_anchor()` 写回局部 grid，否则同一首歌
+            #   在「按 BPM 重新分段」后 raw 的八拍相位会与 ERLIB 不同。
+            raw = S.auto_segments(f, dur=dur, grid=None, phrase_grid=grid)
+            del m2, f
+        except Exception as e:                                # noqa: BLE001
+            if not self.isInterruptionRequested():
+                self.failed.emit("%s: %s" % (type(e).__name__, e))
+            return
+        if not self.isInterruptionRequested():
+            self.done.emit({"bpm": self._bpm, "anchor": self._anchor,
+                            "got": got, "raw": raw})
 
 
 def info_text(cfg, path):
@@ -138,6 +191,8 @@ class MusicDetailDialog(QDialog):
         self._tick = None
         self._playing = False
         self._pending_play = False
+        self._resec_worker = None
+        self._resec_close_pending = False
         self._build()
         self._load()
 
@@ -255,6 +310,7 @@ class MusicDetailDialog(QDialog):
             self._meta = {}
         m = self._meta
         g = m.get("grid") if isinstance(m.get("grid"), dict) else {}
+        self._grid_auto = dict(g)
         manual = m.get("grid_manual") if isinstance(m.get("grid_manual"), dict) else None
         self._manual = manual
         try:
@@ -262,7 +318,9 @@ class MusicDetailDialog(QDialog):
             self._grid = _bg.effective_grid(g, manual, m)
         except Exception:                                        # noqa: BLE001
             self._grid = dict(g)
-        self._auto_bpm = float(self._grid.get("bpm") or 0.0)
+        # ★ 2026-11-18：这里必须是**自动网格的 BPM**（g），不是 effective_grid
+        #   的 BPM；否则手动分段会把“自动 BPM”标签显示成手动首段 BPM。
+        self._auto_bpm = float(g.get("bpm") or 0.0)
 
         title = m.get("title") or os.path.basename(self.path)
         artist = m.get("artist") or ""
@@ -303,6 +361,7 @@ class MusicDetailDialog(QDialog):
             bpm_m = 0.0
         # ★ 无勾选框了：手动值 > 0 就显示手动值，否则显示自动值。
         _spin_silent(self.spin_bpm, bpm_m if bpm_m > 0 else (self._auto_bpm or 120.0))
+        self._bpm_user_edited = False
         self._bpm_auto_shown = float(self._auto_bpm or 0.0)
 
         self.wave.set_waveform(self._wf)
@@ -333,15 +392,26 @@ class MusicDetailDialog(QDialog):
         except (TypeError, ValueError):
             bpm_now = 0.0
         auto = float(getattr(self, "_bpm_auto_shown", 0.0) or 0.0)
-        bpm_m = bpm_now if (bpm_now > 0 and (auto <= 0 or abs(bpm_now - auto) > 0.05)) else 0.0
+        _had_m = 0.0
+        try:
+            _had_m = float((self._manual or {}).get("bpm_manual") or 0.0)
+        except (TypeError, ValueError):
+            _had_m = 0.0
+        if not getattr(self, "_bpm_user_edited", False) and _had_m <= 0.0:
+            # 没改过 BPM、也没存过手动值 ⇒ 框里那个 120 只是占位，不能落盘
+            bpm_m = 0.0
+        else:
+            bpm_m = bpm_now if (bpm_now > 0 and (auto <= 0 or abs(bpm_now - auto) > 0.05)) else 0.0
         anchors = self.wave.anchors()
         segments = self.wave.segments()
         # ★★ 2026-10-28：自动分段「只显示、不落成手动」。
         #   波形控件只有一份 `_segments`，自动结果也画在那里；若原样写进 grid_manual，
         #   `effective_grid` 就会走 manual 分支（src="manual"），之后重扫也不更新。
-        #   判据：与自动结果等价 ⇒ 视为「用户没改过」⇒ 不写。
-        auto = (self._grid or {}).get("segments") or []
-        if auto and self._segments_equal(segments, auto):
+        #   ★ 2026-11-18：比较对象必须是**自动网格**（meta["grid"]），不能是
+        #   effective_grid —— 后者已经把 manual.segments 复制进来，手动分段永远
+        #   等于自己 ⇒ 一按保存就被清空。
+        auto_segs = (getattr(self, "_grid_auto", None) or {}).get("segments") or []
+        if auto_segs and self._segments_equal(segments, auto_segs):
             segments = []
         m = {"bpm_manual": round(float(bpm_m), 3),
              "anchors": [round(a, 4) for a in anchors],
@@ -361,6 +431,12 @@ class MusicDetailDialog(QDialog):
                     return False
                 bx, by = float(x.get("bpm") or 0.0), float(y.get("bpm") or 0.0)
                 if abs(bx - by) > max(0.05, tol * max(bx, by)):
+                    return False
+                # ★ 2026-11-18：anchor 也是用户可能改的（八拍线 ±1/±4 拍）；
+                #   只比 t0/bpm 会把“只挪相位”的手动状态误判成自动而清掉。
+                ax = float(x.get("anchor") or 0.0)
+                ay = float(y.get("anchor") or 0.0)
+                if abs(ax - ay) > max(0.005, tol * max(1.0, abs(ax), abs(ay))):
                     return False
             return True
         except (TypeError, ValueError, AttributeError):
@@ -438,6 +514,16 @@ class MusicDetailDialog(QDialog):
         segs.sort(key=lambda x: float(x.get("t0") or 0.0))
         if segs:
             segs[0]["t0"] = 0.0
+        # ★ 2026-11-18：切分/修改 BPM 造出的新段如果不带 anchor，会变成 0
+        #   ⇒ 8 拍线整体跳。默认继承当前生效网格的 anchor（后面可再手动调）。
+        _base_anchor = 0.0
+        try:
+            _base_anchor = float((self._grid or {}).get("anchor") or 0.0)
+        except (TypeError, ValueError):
+            _base_anchor = 0.0
+        for x in segs:
+            if x.get("anchor") is None:
+                x["anchor"] = round(_base_anchor, 4)
         for x in segs:
             try:
                 b = float(x.get("bpm") or 0.0)
@@ -448,6 +534,207 @@ class MusicDetailDialog(QDialog):
         self.wave.set_segments(segs)
         self._refresh_grid_preview()
         self._mark_dirty()
+
+    # ★★★ 2026-11-13（ERLIB 同步）：八拍线 ±1/±4 拍微调、尾巴 ±8 拍、
+    #   整段重排 8 拍、改段名 —— 与 ERLIB 详情页同一套操作。
+    def _nudge_grid(self, beats):
+        """整首八拍线平移 `beats` 拍（写手动 anchors；保存后一起跟随）。"""
+        try:
+            bl = float(self._beat_len_now() or 0.0)
+        except Exception:                                        # noqa: BLE001
+            bl = 0.0
+        if bl <= 0.0:
+            QMessageBox.information(self, "八拍线微调", "还没有可用的 BPM / 拍长。")
+            return False
+        d = float(beats) * bl
+        segs = self.wave.segments()
+        if segs:
+            for s in segs:
+                # ★ 2026-11-18：每段用**自己的**拍长（多 BPM 歌不能拿首段 BPM 一刀切）
+                try:
+                    _bl = float(s.get("beat_len") or 0.0)
+                except (TypeError, ValueError):
+                    _bl = 0.0
+                if _bl <= 0.0:
+                    try:
+                        _b = float(s.get("bpm") or 0.0)
+                    except (TypeError, ValueError):
+                        _b = 0.0
+                    _bl = (60.0 / _b) if _b > 0 else bl
+                try:
+                    s["anchor"] = round(float(s.get("anchor") or 0.0)
+                                        + float(beats) * _bl, 4)
+                except (TypeError, ValueError):
+                    pass
+            self.wave.set_segments(segs)
+        else:
+            a = float((self._grid or {}).get("anchor") or 0.0)
+            span = 8.0 * bl
+            _ans = [float(x) for x in (self.wave.anchors() or [])]
+            if _ans:
+                self.wave.set_anchors([round((x + d) % span, 4) for x in _ans])
+            else:
+                self.wave.set_anchors([round((a + d) % span, 4)])
+        self._refresh_grid_preview()
+        self._mark_dirty()
+        return True
+
+    def _save_sections_now(self, out, raw=None):
+        """把能量段落直接写回 cfg（`sections` / `sections_raw` / 手动标记）。
+
+        `raw` 只给“边界真的变了”的动作（尾巴平移/重排）用；改名这类动作必须
+        保留原有的未吸附边界，否则下次打开会被再吸附一次（越改越粗）。
+        """
+        try:
+            mm = self.cfg["music_meta"]
+            rec = mm.get(self.path)
+            if not isinstance(rec, dict):
+                rec = {}
+                mm[self.path] = rec
+            rec["sections"] = [dict(x) for x in out]
+            rec["sections_raw"] = [dict(x) for x in (raw if raw is not None else out)]
+            rec["sections_auto"] = False
+            self.cfg.save()
+        except Exception as e:                                    # noqa: BLE001
+            QMessageBox.warning(self, "能量段落", "保存失败：%s" % e)
+            return False
+        self._meta = rec
+        try:
+            self.wave.set_energy_sections([dict(x) for x in out])
+        except Exception:                                        # noqa: BLE001
+            pass
+        self._dirty = False
+        self._update_title()
+        return True
+
+    def _shift_tail(self, sec, beats):
+        """把 `sec` 之后的能量段落边界整体平移 `beats` 拍（写回 cfg）。"""
+        try:
+            bl = float(self._beat_len_now() or 0.0)
+        except Exception:                                        # noqa: BLE001
+            bl = 0.0
+        if bl <= 0.0:
+            QMessageBox.information(self, "尾巴平移", "还没有可用的 BPM / 拍长。")
+            return False
+        rows = [dict(x) for x in self._energy_rows()]
+        if len(rows) < 2:
+            QMessageBox.information(self, "尾巴平移",
+                                    "这首歌还没有能量段落，先「按 BPM 重新分段」。")
+            return False
+        d = float(beats) * bl
+        eps = 1e-6
+        out = [dict(x) for x in rows]
+        for x in out[:-1]:
+            try:
+                t = float(x.get("t1") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if t > sec + eps:
+                x["t1"] = t + d
+        for x in out[1:]:
+            try:
+                t = float(x.get("t0") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if t > sec + eps:
+                x["t0"] = t + d
+        out[0]["t0"] = 0.0
+        if len(out) >= 2:
+            try:
+                tail_len = float(out[-1]["t1"]) - float(out[-1]["t0"])
+            except (TypeError, ValueError):
+                tail_len = 0.0
+            if tail_len <= max(0.05, 1.0 * bl):
+                out[-2]["t1"] = out[-1]["t1"]
+                out.pop()
+        for i in range(1, len(out)):
+            a0 = float(out[i - 1]["t1"])
+            t0 = float(out[i]["t0"])
+            if t0 < a0 - 1e-3:
+                out[i]["t0"] = a0
+            if float(out[i]["t1"]) <= float(out[i]["t0"]):
+                out[i]["t1"] = float(out[i]["t0"]) + 1e-3
+        return self._save_sections_now(out)
+
+    def _rename_section(self, sec):
+        """改当前能量段的名字（段名会随 `sections` 落盘，演出端直接用）。"""
+        rows = [dict(x) for x in self._energy_rows()]
+        if not rows:
+            QMessageBox.information(self, "编辑本段名称", "这首歌还没有能量段落。")
+            return False
+        idx = 0
+        for i, x in enumerate(rows):
+            try:
+                if float(x.get("t0") or 0.0) <= sec:
+                    idx = i
+            except (TypeError, ValueError):
+                pass
+        old = str(rows[idx].get("name") or "")
+        name, ok = QInputDialog.getText(self, "编辑本段名称", "段名：", text=old)
+        if not ok:
+            return False
+        name = str(name or "").strip()
+        if not name:
+            return False
+        rows[idx]["name"] = name
+        if not self._save_sections_now(
+                rows, raw=(self._meta or {}).get("sections_raw")):
+            return False
+        return True
+
+    def _requantize_tail_8(self, sec):
+        """从 `sec` 起把能量段边界重排到最近的 8 拍线（段数不变）。"""
+        rows = [dict(x) for x in self._energy_rows()]
+        if len(rows) < 2:
+            QMessageBox.information(self, "整段重排", "这首歌还没有能量段落。")
+            return False
+        g = self._grid_for_snap() or {}
+        try:
+            a = float(g.get("anchor") or 0.0)
+            bl = float(g.get("beat_len") or 0.0)
+        except (TypeError, ValueError):
+            a, bl = 0.0, 0.0
+        if bl <= 0.0:
+            QMessageBox.information(self, "整段重排", "还没有可用的 BPM / 拍长。")
+            return False
+        step = 8.0 * bl
+        eps = 1e-6
+        try:
+            _dur = float(self._dur_now() or 0.0)
+        except (TypeError, ValueError):
+            _dur = 0.0
+        prev = 0.0
+        for i in range(1, len(rows)):
+            try:
+                t = float(rows[i].get("t0") or 0.0)
+            except (TypeError, ValueError):
+                t = prev
+            if t <= sec + eps:
+                prev = float(rows[i].get("t1") or t)
+                continue
+            try:
+                _next = (float(rows[i + 1].get("t0") or 0.0)
+                         if i + 1 < len(rows) else _dur)
+            except (TypeError, ValueError):
+                _next = _dur
+            k = round((t - a) / step)
+            nt = a + k * step
+            while nt <= prev + 0.5 * bl:
+                nt += step
+            # 不能越过下一段起点 / 曲尾；越界就保留原边界，避免 0 长度/重叠
+            if (_next > 0 and nt >= _next - 0.05) or (_dur > 0 and nt >= _dur):
+                nt = t
+            rows[i]["t0"] = round(nt, 3)
+            rows[i - 1]["t1"] = rows[i]["t0"]
+            prev = rows[i]["t0"]
+        try:
+            _last = float(rows[-1].get("t1") or 0.0)
+        except (TypeError, ValueError):
+            _last = 0.0
+        rows[-1]["t1"] = _dur if _dur > 0 else max(_last, rows[-1]["t0"] + 0.05)
+        if not self._save_sections_now(rows):
+            return False
+        return True
 
     def _build_seg_menu(self, sec):
         """构造右键菜单（**只构造不弹出** —— 便于单测；`_on_wave_context_menu` 负责 exec）。
@@ -468,6 +755,8 @@ class MusicDetailDialog(QDialog):
         acts = {}
         # 能量段落放在最前：它决定**演出时**什么时候换素材池，与 BPM 分段是不同的东西
         acts["esec"] = menu.addAction("编辑能量段落（演出到点直接切池）…")
+        acts["rename"] = menu.addAction("编辑本段名称…")
+        acts["rename"].setEnabled(bool(self._energy_rows()))
         menu.addSeparator()
         acts["cut"] = menu.addAction("在 %.2fs 处切分（输入该段 BPM）…" % sec)
         acts["edit"] = menu.addAction("修改本段 BPM（当前 %.1f）…" % cur_bpm)
@@ -476,6 +765,23 @@ class MusicDetailDialog(QDialog):
         menu.addSeparator()
         acts["half"] = menu.addAction("整段 ÷2 BPM（半速歧义）")
         acts["dbl"] = menu.addAction("整段 ×2 BPM（倍速歧义）")
+        menu.addSeparator()
+        # ★ 2026-11-13（ERLIB 同步）：八拍线手动微调（写 grid_manual.anchors）
+        acts["nudge_p1"] = menu.addAction("八拍线延后 1 拍（+1）")
+        acts["nudge_m1"] = menu.addAction("八拍线提前 1 拍（−1）")
+        acts["nudge_p4"] = menu.addAction("八拍线延后 4 拍（+4）")
+        acts["nudge_m4"] = menu.addAction("八拍线提前 4 拍（−4）")
+        acts["reset_phase"] = menu.addAction("八拍线恢复自动相位")
+        acts["reset_phase"].setEnabled(bool(self.wave.anchors())
+                                       or bool(self.wave.segments())
+                                       or bool((self._meta or {}).get("grid_flip")))
+        acts["tail_p8"] = menu.addAction("从 %.1fs 起整条尾巴后移 8 拍" % float(sec))
+        acts["tail_m8"] = menu.addAction("从 %.1fs 起整条尾巴前移 8 拍" % float(sec))
+        _n_esec = len(self._energy_rows())
+        acts["tail_p8"].setEnabled(_n_esec >= 2)
+        acts["tail_m8"].setEnabled(_n_esec >= 2)
+        acts["requant8"] = menu.addAction("从 %.1fs 起整段重排成 8 拍" % float(sec))
+        acts["requant8"].setEnabled(_n_esec >= 2)
         menu.addSeparator()
         acts["clear"] = menu.addAction("清除全部分段（回到自动网格）")
         # 首段不能删（网格必须从 0 开始）；单段也没有「删除本段」的意义
@@ -488,6 +794,8 @@ class MusicDetailDialog(QDialog):
         """执行右键菜单里的某一项（`key` 见 `_build_seg_menu` 的 acts）。"""
         if key == "esec":
             return self._edit_energy_sections(sec)
+        if key == "rename":
+            return self._rename_section(sec)
         if key == "cut":
             if sec < 1.0:
                 QMessageBox.information(self, "切分分段",
@@ -541,6 +849,37 @@ class MusicDetailDialog(QDialog):
                 self._refresh_grid_preview()
                 self._mark_dirty()
             return True
+        if key in ("nudge_p1", "nudge_m1", "nudge_p4", "nudge_m4"):
+            return self._nudge_grid({"nudge_p1": 1, "nudge_m1": -1,
+                                     "nudge_p4": 4, "nudge_m4": -4}[key])
+        if key == "reset_phase":
+            self.wave.set_anchors([])
+            # ★ 2026-11-18：手动分段的每段 anchor / grid_flip 也要一起清，
+            #   否则“恢复自动相位”看起来没反应。
+            _segs = [dict(x) for x in (self.wave.segments() or [])]
+            if _segs:
+                try:
+                    _a = float((self._grid_auto or {}).get("anchor") or 0.0)
+                except (TypeError, ValueError):
+                    _a = 0.0
+                for _s in _segs:
+                    _s["anchor"] = round(_a, 4)
+                self.wave.set_segments(_segs)
+            try:
+                _mm = self.cfg["music_meta"]
+                _rec = _mm.get(self.path)
+                if isinstance(_rec, dict) and _rec.get("grid_flip"):
+                    _rec.pop("grid_flip", None)
+                    self.cfg.save()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self._refresh_grid_preview()
+            self._mark_dirty()
+            return True
+        if key in ("tail_p8", "tail_m8"):
+            return self._shift_tail(sec, 8 if key == "tail_p8" else -8)
+        if key == "requant8":
+            return self._requantize_tail_8(sec)
         if key == "clear":
             self.wave.set_segments([])
             self._refresh_grid_preview()
@@ -569,6 +908,7 @@ class MusicDetailDialog(QDialog):
         _spin_silent(self.spin_bpm, val)
 
     def _on_bpm_edited(self, _v=None):
+        self._bpm_user_edited = True
         """BPM 一改就是手动：立刻重算网格预览（无勾选框）。"""
         self._refresh_grid_preview()
         self._mark_dirty()
@@ -761,6 +1101,27 @@ class MusicDetailDialog(QDialog):
             a = 0.0
         return {"anchor": a, "beat_len": bl}
 
+    def _resec_busy(self):
+        w = getattr(self, "_resec_worker", None)
+        try:
+            return w is not None and w.isRunning()
+        except Exception:                                        # noqa: BLE001
+            return False
+
+    def _set_resec_busy(self, busy):
+        """重算期间锁住会改数据/重复触发的控件；关闭键保持可用。"""
+        for name in ("btn_resec", "spin_bpm", "btn_save", "btn_revert"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.setEnabled(not busy)
+                except Exception:                                # noqa: BLE001
+                    pass
+        try:
+            self.btn_resec.setText("正在重新分段…" if busy else "按 BPM 重新分段")
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def _resegment_by_bpm(self, ask=False):
         """用**当前 BPM 框里的值**重算这一首的能量段落，并落盘。
 
@@ -774,10 +1135,12 @@ class MusicDetailDialog(QDialog):
         `beatgrid.features` → `sections.auto_segments(grid=生效网格)`，再算一份
         `sections_raw`（`grid=None, phrase_grid=生效网格`）。
 
-        写盘：`sections` / `sections_raw` / `sections_auto=True`，并把当前 BPM
-        记为 `grid_manual.bpm_manual`（用户就是在断言这个 BPM；不记的话下次
-        「扫描分析」又会按自动 BPM 重切，白改）。
+        ★ 2026-11-18：解码/特征/分段全部放到 `_ResegmentWorker`（QThread），
+           UI 线程只负责开始和收结果。大文件不再卡住详情页，也不会出现
+           `QApplication.processEvents()` 重入导致的“关到一半又弹窗”。
         """
+        if self._resec_busy():
+            return False
         try:
             bpm = float(self.spin_bpm.value() or 0.0)
         except (TypeError, ValueError):
@@ -796,49 +1159,63 @@ class MusicDetailDialog(QDialog):
                 QMessageBox.StandardButton.Yes)
             if ret != QMessageBox.StandardButton.Yes:
                 return False
-        from PySide6.QtWidgets import QApplication
-        import numpy as np
         try:
             anchor = float((self._grid or {}).get("anchor") or 0.0)
         except (TypeError, ValueError):
             anchor = 0.0
-        grid = {"anchor": anchor, "beat_len": round(60.0 / bpm, 6), "bpm": bpm}
 
         self._shutdown_audio()                 # 重算要独占读文件（试听可能正开着）
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            self.lbl_pos.setText("正在按 %.1f BPM 重新分段…" % bpm)
-            QApplication.processEvents()
-            import beatgrid as _bg
-            import soundfile as sf
-            data, sr = sf.read(self.path, dtype="float32", always_2d=True)
-            sig = np.mean(data, axis=1)
-            del data
-            m2, s2 = _bg.resample(sig, sr, _bg.SR_TARGET)
-            del sig
-            f = _bg.features(m2, s2)
-            dur = len(m2) / float(s2)
-            got = S.auto_segments(f, dur=dur, grid=grid)
-            # ★ 折过锚点 ⇒ 写回（详情页"重新分段"也要更新 8 拍线相位）
-            _af = S.take_folded_anchor()
-            if _af is not None and isinstance(grid, dict):
-                grid["anchor"] = _af
-            raw = S.auto_segments(f, dur=dur, grid=None, phrase_grid=grid)
-            del m2, f
-        except Exception as e:                                    # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "重新分段", "重算失败：%s" % e)
-            self.lbl_pos.setText("重新分段失败")
-            return False
-        finally:
-            try:
-                QApplication.restoreOverrideCursor()
-            except Exception:                                     # noqa: BLE001
-                pass
-        if not got:
-            QMessageBox.information(self, "重新分段", "这首算不出段落（特征不足）。")
-            return False
+        self._resec_close_pending = False
+        w = _ResegmentWorker(self.path, bpm, anchor, self)
+        self._resec_worker = w
+        w.done.connect(self._on_reseg_done)
+        w.failed.connect(self._on_reseg_failed)
+        w.finished.connect(self._on_reseg_finished)
+        self._set_resec_busy(True)
+        self.lbl_pos.setText("正在按 %.1f BPM 重新分段…" % bpm)
+        w.start(QThread.LowPriority)           # 低优先级：别和播放/预览抢 CPU
+        return True
 
+    def _on_reseg_done(self, payload):
+        if self._resec_close_pending:
+            return                              # 用户已关窗：丢弃迟到结果
+        try:
+            bpm = float((payload or {}).get("bpm") or 0.0)
+            got = list((payload or {}).get("got") or [])
+            raw = list((payload or {}).get("raw") or [])
+            anchor = float((payload or {}).get("anchor") or 0.0)
+        except Exception:                                        # noqa: BLE001
+            bpm, got, raw, anchor = 0.0, [], [], 0.0
+        if bpm <= 0 or not got:
+            self.lbl_pos.setText("重新分段失败：算不出段落")
+            QMessageBox.information(self, "重新分段", "这首算不出段落（特征不足）。")
+            return
+        self._apply_resegment(bpm, got, raw, anchor)
+
+    def _on_reseg_failed(self, msg):
+        if self._resec_close_pending:
+            return
+        self.lbl_pos.setText("重新分段失败")
+        QMessageBox.warning(self, "重新分段", "重算失败：%s" % msg)
+
+    def _on_reseg_finished(self):
+        w = getattr(self, "_resec_worker", None)
+        self._resec_worker = None
+        if w is not None:
+            try:
+                w.deleteLater()
+            except Exception:                                    # noqa: BLE001
+                pass
+        self._set_resec_busy(False)
+        if self._resec_close_pending:
+            self._resec_close_pending = False
+            QTimer.singleShot(0, self.close)
+
+    def _apply_resegment(self, bpm, got, raw, anchor=0.0):
+        """把 worker 结果落盘并刷新界面（只在 UI 线程调用）。"""
+        grid = {"anchor": float(anchor or 0.0),
+                "beat_len": round(60.0 / float(bpm), 6),
+                "bpm": float(bpm)}
         # ---- 落盘：sections + 手动 BPM（新 list ⇒ 引擎按引用失效自动重算）----
         try:
             mm = self.cfg["music_meta"]
@@ -857,6 +1234,10 @@ class MusicDetailDialog(QDialog):
                 gm.pop("bpm_manual", None)
             else:
                 gm["bpm_manual"] = float(bpm)
+            # ★ 2026-11-18：这个动作明确断言“整首就按这个 BPM” ⇒ 旧的
+            #   `grid_manual.segments`（多 BPM）必须清掉，否则 effective_grid
+            #   仍优先用手动分段，BPM 字段看着变了、播放网格没变。
+            gm.pop("segments", None)
             rec["grid_manual"] = gm
             rec["sections"] = [dict(x) for x in got]
             rec["sections_raw"] = [dict(x) for x in raw]
@@ -864,6 +1245,7 @@ class MusicDetailDialog(QDialog):
             self.cfg.save()
         except Exception as e:                                    # noqa: BLE001
             QMessageBox.warning(self, "重新分段", "写盘失败：%s" % e)
+            self.lbl_pos.setText("重新分段失败：写盘失败")
             return False
 
         # ---- 刷新界面（网格 + 色带 + 列表）----
@@ -895,7 +1277,9 @@ class MusicDetailDialog(QDialog):
         """
         try:
             meta = (self.cfg["music_meta"] or {}).get(self.path) or {}
-            raw = meta.get("sections") or []
+            # ★ 2026-11-18：优先用**未吸附**的 sections_raw；拿 sections 再切
+            #   “小节”是原地不动（8 拍是小节子集），用户会以为粒度没生效。
+            raw = meta.get("sections_raw") or meta.get("sections") or []
         except Exception:                                     # noqa: BLE001
             raw = []
         dlg = EnergySectionDialog(self, sections=raw, dur=self._dur_now(),
@@ -973,6 +1357,15 @@ class MusicDetailDialog(QDialog):
 
 
     def closeEvent(self, ev):
+        if self._resec_busy():
+            self._resec_close_pending = True
+            try:
+                self._resec_worker.requestInterruption()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self.lbl_pos.setText("正在取消重新分段…")
+            ev.ignore()
+            return
         if self._dirty:
             ret = QMessageBox.question(
                 self, "歌曲详情", "有未保存的修改，仍要关闭吗？",
@@ -986,5 +1379,13 @@ class MusicDetailDialog(QDialog):
 
     def done(self, r):                     # noqa: D401 - Qt 钩子
         """任何关闭路径（X / 关闭按钮 / ESC）都要停播 + 释放声卡流。"""
+        if self._resec_busy():
+            self._resec_close_pending = True
+            try:
+                self._resec_worker.requestInterruption()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self.lbl_pos.setText("正在取消重新分段…")
+            return
         self._shutdown_audio()
         super().done(r)

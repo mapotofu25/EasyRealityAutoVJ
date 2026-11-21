@@ -52,6 +52,8 @@ class SpoutOut:
         #   之间通过队列交接，任意时刻只属于一方，无需加长锁。
         self._free = []
         self._buf_max = 4
+        self._buf_cap = 0           # 池内最大缓冲字节数（分辨率变大时允许重新分配）
+        self.dropped = 0            # 池忙/太小丢弃的帧数（诊断）
 
     # ---------------------------------------------------------------- 生命周期
     def start(self):
@@ -130,19 +132,21 @@ class SpoutOut:
                 if len(b) > total:
                     buf = b
                     break
+            if buf is not None:
+                self._buf_cap = max(int(getattr(self, "_buf_cap", 0) or 0), len(buf))
         if buf is None:
             # ★★ 2026-11-10（性能：routes 偶发 271~278ms 尖峰）：
             #   池被发送线程抽干（Spout `sendImage` 偶发阻塞，项目里量到过 14s）⇒
             #   以前这里**每帧新分配 10.8MB**（3000×900×4），在渲染线程上造成尖峰。
-            #   现在：**只允许首次分配**，之后池空一律**丢这一帧**（队列本来只保留最新帧，
-            #   丢帧无害，下一帧还有）。
+            #   现在池空时丢这一帧；但**分辨率变大**（total > 池容量）必须允许重新分配，
+            #   否则 720p→1080p 后会永久丢帧。
             #   ⚠ 不能 `return False`：引擎把它当发送失败 ⇒ 触发 1s→30s 退避 + 关闭重建，
             #     会把"丢一帧"放大成"停发几秒"。这里返回 True 并在 `dropped` 里计数。
-            if getattr(self, "_had_alloc", False):
+            if total <= int(getattr(self, "_buf_cap", 0) or 0):
                 self.dropped = int(getattr(self, "dropped", 0)) + 1
                 self._size = (w, h)
                 return True
-            self._had_alloc = True
+            self._buf_cap = total
             buf = bytearray(total)
         # 拷贝：`bits` 是画布的活动视图，渲染线程下一帧就会覆写（同 NDI 的坑）
         if bpl and bpl != need:
@@ -185,7 +189,7 @@ class SpoutOut:
     def stats(self):
         with self._lock:
             return {"sent": self._sent, "longest_ms": self._longest_ms,
-                    "size": self._size}
+                    "size": self._size, "dropped": int(getattr(self, "dropped", 0) or 0)}
 
     # ---------------------------------------------------------------- 发送线程
     def _loop(self):

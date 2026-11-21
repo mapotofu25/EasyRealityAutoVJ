@@ -456,6 +456,8 @@ class NDIOutput:
             且只是顺序开销、不阻塞任何锁 ⇒ 帧节奏不受影响。
             ⚠ 绝不能再改回"存引用"，除非调用方传的是它自己的私有 buffer。
         """
+        if getattr(self, "_vstop", False):
+            return
         if not self._ensure(w, h):
             return
         try:

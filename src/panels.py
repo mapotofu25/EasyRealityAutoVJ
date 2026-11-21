@@ -8,6 +8,7 @@
 - AudioSourceDialog：音源详细设置（类型/设备/采样率/单声道/重扫/电平表）。
 - MiniLevel：工具条上的迷你电平指示灯。
 """
+import json
 import os
 
 from tags_def import (DYNAMIC_LOW, DYNAMIC_MID, DYNAMIC_HIGH, DYNAMIC_FLICKER,
@@ -32,6 +33,9 @@ from i18n import T, Tf, retranslate as i18n_retranslate
 import theme
 
 CLIP_MIME = "application/x-autovj-media"
+#: ★ 2026-11-18（用户：图层行左侧开关那块加拖动）：拖**整个图层**用的自定义 MIME。
+#:   与 `CLIP_MIME` 分开：图层拖动只改顺序/所属屏幕，绝不把图层当成素材塞进别的层。
+LAYER_MIME = "application/x-autovj-layer"
 HEADER_W = 456          # 图层头列宽（**默认值**；用户可拖分隔条改，见 ui.layer_header_w）
 HEADER_W_MIN = 220      # 左列最窄（再窄名称/码表下拉就挤没了）
 HEADER_W_MAX = 760      # 左列最宽（别把素材格挤到看不见）
@@ -755,19 +759,28 @@ class MusicLibraryPanel(QWidget):
         b_rescan = QPushButton(T("全量重扫"))
         b_rescan.setToolTip(T("忽略已有结果，重新分析全部"))
         b_clear = QPushButton(T("清除分析数据"))
-        b_clear.setToolTip(T("删除全部指纹、节拍网格与自动段落（保留手动标注与码表）"))
+        b_clear.setToolTip(T("删除全部指纹、节拍网格与自动段落（保留手动标注与码表）；"
+                             "同时清理已从曲库删除的歌残留的指纹"))
         # ★★ 2026-10-08（erlib 第二步）：导入 DJ 那边扫好的曲库分析包。
         #   包 = 封面 + 指纹 + 离线节拍网格（**不含音频**）。
         #   导入后：DJ 放歌时本机能认出是哪首，自动套用八拍网格。
         b_imp = QPushButton(T("导入曲库分析包"))
         b_imp.setToolTip(T("导入 erlib 导出的 .eravjlib（DJ 机扫好的封面/指纹/节拍网格）"))
+        # ★ 2026-11-16（用户要求）：导入曲库分析包右边加「删除已勾选」。
+        #   支持本机曲目 + 导入库曲目；码表派生行没有实体，提示去「码表」页处理。
+        self.btn_del_checked = QPushButton(T("删除已勾选"))
+        self.btn_del_checked.setToolTip(
+            T("删除当前勾选的曲目（本机曲库 + 导入库）；码表派生行请到「码表」页删除该表"))
+        self.btn_del_checked.setEnabled(False)
         b_dir.clicked.connect(self.main.import_music_dir)
         b_file.clicked.connect(self.main.import_music_files)
         self.btn_scan.clicked.connect(lambda: self.main.scan_music(force=False))
         b_rescan.clicked.connect(lambda: self.main.scan_music(force=True))
         b_clear.clicked.connect(self.main.show_clear_music_analysis)
         b_imp.clicked.connect(self.main.import_erlib_package)
-        for b in (b_dir, b_file, self.btn_scan, b_rescan, b_clear, b_imp):
+        self.btn_del_checked.clicked.connect(self._delete_checked)
+        for b in (b_dir, b_file, self.btn_scan, b_rescan, b_clear, b_imp,
+                  self.btn_del_checked):
             row.addWidget(b)
         row.addStretch(1)
         right.addLayout(row)
@@ -1294,6 +1307,15 @@ class MusicLibraryPanel(QWidget):
             self._act_snap = cue_act
             self._start_cover_backfill(need_cover)
             self._start_wave_backfill(need_wave)
+            # ★ 2026-11-16（用户「我已经全部删了怎么还有」）：删歌后底部概况标签
+            #   还停在「已导入 99 首」—— `_sync_p2_stat()` 原来只在启动时调一次。
+            #   每次重建列表都按当前 `music_library` 重算（几十~几百首，毫秒级）。
+            try:
+                _sync = getattr(self.main, "_sync_p2_stat", None)
+                if callable(_sync):
+                    _sync()
+            except Exception:                                  # noqa: BLE001
+                pass
         except Exception:                                          # noqa: BLE001
             pass
 
@@ -1774,6 +1796,12 @@ class MusicLibraryPanel(QWidget):
         if n > 0:
             lbl += Tf("   ｜ 已勾选 {} 首", n)
         self.lbl.setText(lbl)
+        try:
+            _en = n > 0
+            if self.btn_del_checked.isEnabled() != _en:
+                self.btn_del_checked.setEnabled(_en)
+        except Exception:                                        # noqa: BLE001
+            pass
 
     # ---------------- 来源筛选（用户要求②）----------------
     def _refresh_source_combo(self, imp_lib, cue_lib=None, cue_cov=None):
@@ -2497,7 +2525,7 @@ class MusicLibraryPanel(QWidget):
             # 导入包的歌：本机没有文件 ⇒ 只给「查看信息」与删除
             # （⚠ 必须是**右键的那一项本身**是导入歌，否则信息框会拿本机路径去解析 sid）
             info = menu.addAction(T("查看信息"))
-        rm_loc = rm_imp = None
+        rm_loc = rm_imp = open_cue = None
         if loc:
             if solo_loc:
                 menu.addSeparator()
@@ -2521,10 +2549,12 @@ class MusicLibraryPanel(QWidget):
                     T("从导入库移除") if len(imp) == 1
                     else Tf("从导入库移除（{} 首）", len(imp)))
         if cue:
-            # 明确告诉用户为什么这里没有"移除"（而不是让他以为菜单坏了）
+            # ★ 2026-11-16（用户「我已经全部删了怎么还有」）：码表派生行不能在这里
+            #   删（没有实体），但只给一句灰掉的说明用户找不到入口 ⇒ 直接给一个
+            #   可点击的跳转（到「码表」页删除这张表，派生行会一起消失）。
             menu.addSeparator()
-            _note = menu.addAction(T("码表曲目跟随码表：请到「码表」页删除该表"))
-            _note.setEnabled(False)
+            open_cue = menu.addAction(T("码表曲目跟随码表：打开「码表」页处理…"))
+            open_cue.setToolTip(T("在「码表」页删除这张表后，这些派生行会自动消失"))
         # ★★ 2026-10-31（用户「识别不到」的真正机理）：**清理与本机重复的导入副本**。
         #   为什么必须有这个入口：重复行已被 `_dedupe_imported` 隐去 ⇒ 用户**右键点不到**
         #   那几行，没法用「从导入库移除」自救；而库里那两套指纹还在，`match()` 分票
@@ -2543,6 +2573,9 @@ class MusicLibraryPanel(QWidget):
         i18n_retranslate(menu)      # 临时菜单：弹出前刷语言
         act = menu.exec(self.list.mapToGlobal(pos))
         if act is None:
+            return
+        if open_cue is not None and act == open_cue:
+            self.main.switch_page(3)
             return
         if clean_dup is not None and act == clean_dup:
             self._purge_imported_dups()
@@ -2593,6 +2626,78 @@ class MusicLibraryPanel(QWidget):
         except Exception as e:                                   # noqa: BLE001
             QMessageBox.warning(self, T("歌曲详情…"), Tf("打开歌曲详情失败：{}", e))
 
+    def _delete_checked(self):
+        """删除当前勾选的曲目（本机 + 导入库；一次确认、一次刷新）。
+
+        ★ 2026-11-16（用户要求）：工具栏「导入曲库分析包」右边新增「删除已勾选」。
+        码表派生行（`@cue:`）没有实体，不能在这里删 —— 明确提示去「码表」页。
+        """
+        keys = list(self._checked_keys())
+        if not keys:
+            QMessageBox.information(self, T("删除已勾选"), T("请先勾选要删除的曲目。"))
+            return
+        loc, imp, cue = [], [], []
+        for k in keys:
+            s = str(k or "")
+            if not s:
+                continue
+            if s.startswith("@imported:"):
+                imp.append(s)
+            elif s.startswith("@cue:"):
+                cue.append(s)
+            else:
+                loc.append(s)
+        if not loc and not imp:
+            QMessageBox.information(
+                self, T("删除已勾选"),
+                T("勾选的都是码表派生行，曲库里没有可删除的实体。\n"
+                  "请到「码表」页删除对应码表，这些行会自动消失。"))
+            return
+        # ★ 2026-11-17（用户：右键「从导入库移除」和工具栏「删除已勾选」
+        #   对同样 45 首导入曲目弹的确认框不一样）：
+        #   只勾选导入库曲目时，直接走右键同一条删除路径 ——
+        #   同一个确认框、同一套“曲风/封面/指纹一起删”的提示和同一段删除代码。
+        if not loc and imp and not cue:
+            self._remove_imported(imp)
+            return
+        # 同理：只勾本机曲目 ⇒ 和右键「从曲库移除」同一条路径/同一个确认框。
+        if loc and not imp and not cue:
+            self._remove_local(loc)
+            return
+        lines = [Tf("删除已勾选的 {} 首？", len(loc) + len(imp)), ""]
+        if loc:
+            lines.append(Tf("· 本机曲库：{} 首（会删除指纹/分析数据，音频文件不动）", len(loc)))
+        if imp:
+            lines.append(Tf("· 导入库：{} 首（会删除封面/指纹）", len(imp)))
+        if cue:
+            lines.append(Tf("· 另有 {} 首码表派生行不会删除（请到「码表」页处理）", len(cue)))
+        lines += ["", T("删除后无法在软件内撤销。")]
+        ret = QMessageBox.question(
+            self, T("删除已勾选"), "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if loc:
+                self.main.remove_music_many(loc)
+            if imp:
+                sids = []
+                for p in imp:
+                    try:
+                        sids.append(int(str(p).split(":", 1)[1]))
+                    except Exception:                            # noqa: BLE001
+                        pass
+                if sids:
+                    from config import app_base_dir
+                    import imported_lib as _IL
+                    _IL.remove_songs(app_base_dir(), sids)
+        except Exception as e:                                   # noqa: BLE001
+            print("[曲库] 删除已勾选失败：%s" % e)
+            QMessageBox.warning(self, T("删除已勾选"),
+                                Tf("删除失败：{}", e))
+        self.refresh()
+
     def _remove_local(self, paths):
         """从本机曲库移除（**二次确认**；批量 = 一次 save + 一次 refresh）。"""
         paths = [p for p in (paths or []) if p]
@@ -2604,8 +2709,8 @@ class MusicLibraryPanel(QWidget):
         ret = QMessageBox.question(
             self, T( T("从曲库移除")),
             Tf("从曲库移除这 {} 首？\n\n{}\n\n"
-               "只从曲库列表移除（连同曲风/网格等分析数据）；"
-               "音频文件本身不会被删除。", len(paths), names),
+               "会从曲库列表移除，并删除它们的指纹/节拍网格等分析数据"
+               "（之后不再识别这些歌）；音频文件本身不会被删除。", len(paths), names),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if ret != QMessageBox.StandardButton.Yes:
@@ -2868,6 +2973,8 @@ class LibraryGrid(MediaGrid):
         scan_one = menu.addAction("重扫此素材的动态/铺满度")
         scan_one.setEnabled(bool(sel))
         rescan_all = menu.addAction("全量重扫素材")
+        a_prev = menu.addAction("重建预览")
+        a_prev.setToolTip("清空预览缓存并重新生成所有视频的悬浮胶片预览")
         rescan_all.setToolTip(T("含已扫过的一起重扫（动态三档 / 频闪 / 铺满度 + 角色）"))
 
         menu.addSeparator()          # 分组：危险操作（红点标记）
@@ -2906,11 +3013,13 @@ class LibraryGrid(MediaGrid):
             for m in sel:
                 self.main.remove_from_all_layers(m)
         elif act == a_reveal:
-            self.main.reveal_in_explorer(sel[0] if sel else "")
+            self.main.reveal_in_explorer(getattr(sel[0], "path", sel[0]) if sel else "")
         elif act == scan_one:
             self.main.scan_tags(paths=[m.path for m in sel])
         elif act == rescan_all:
             self.main.scan_tags(force=True)
+        elif act == a_prev:
+            self.main._rebuild_previews()
         elif act == setdir:
             self.main.set_library_dir()
         elif act == rm_lib:
@@ -3006,6 +3115,15 @@ class ClipRow(QListWidget):
         self.setMovement(QListView.Static)
         self.setIconSize(QSize(self.cell_w - 8, self.cell_h - 10))
         self.setGridSize(QSize(self.cell_w, self.cell_h))
+        # ★ 2026-11-11（多屏操作卡顿，py-spy 抓到 QListView::doItemsLayout）：
+        #   同一行所有格子尺寸完全一致 ⇒ 开 uniformItemSizes + 批量布局，
+        #   重建/滚动时不再逐项 measure/排版。
+        try:
+            self.setUniformItemSizes(True)
+            self.setLayoutMode(QListView.Batched)
+            self.setBatchSize(40)
+        except Exception:                                          # noqa: BLE001
+            pass
         # ★ 2026-11-06（用户：「图层里面这个缩略图把它改成居中的，现在上面距离小下面距离大，
         #   看着不像」）：
         #   原来 `CELL_H + 14` = 72，而格子本身只有 58 高 ⇒ item 从**顶部**排起，
@@ -3398,6 +3516,96 @@ class _ColDivider(QWidget):
             e.accept()
 
 
+class _LayerDragHandle(QFrame):
+    """图层行**最左边**的拖动握把（用户 2026-11-18：「相关开关那块加拖动」）。
+
+    行为：
+      · 按住上下拖 → 调整图层顺序（与右键「上移/下移」同一份数据，只是多一种操作）；
+      · 拖到**另一个屏幕**的图层栈 → 把该图层移到那块屏（多屏多路）。
+    只改顺序 / 所属屏幕；图层的素材、混色、透明度、码表绑定等**一概不动**。
+    """
+
+    W = 14
+
+    def __init__(self, panel, idx, lay):
+        super().__init__(panel)
+        self._panel = panel
+        self._idx = int(idx)
+        self._lid = str(getattr(lay, "lid", "") or "")
+        self._press = None
+        self._row_h = 56
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(18)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setObjectName("layerGrip")
+        self.setToolTip("拖动调整图层上下顺序\n"
+                        "多屏多路：也可以拖到另一个屏幕的图层栈里")
+        self.setStyleSheet("background:transparent;border:none;"
+                           "#layerGrip:hover{background:rgba(255,255,255,28);"
+                           "border-radius:2px;}")
+        self.set_row_height(self._row_h)
+
+    def set_row_height(self, h):
+        """★ 2026-11-18（用户：和行高绑定）：高度撑满整行，宽度随行高 12~24px。
+
+        行高滑块改的是全局 `ui.layer_row_h`（38~140）；握把跟着一起变，
+        这样小行高时不会把名称/开关挤没，大行高时也更容易按住。
+        """
+        try:
+            hh = int(h)
+        except (TypeError, ValueError):
+            hh = 56
+        hh = max(18, min(140, hh))
+        self._row_h = hh
+        w = max(12, min(24, int(round(hh * 0.26))))
+        if w != self.width():
+            self.setFixedWidth(w)
+        self.update()
+
+    def paintEvent(self, _ev):                                   # noqa: N802
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing, False)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(theme.V("muted")))
+            cx = self.width() // 2
+            cy = self.height() // 2
+            for row in (-1, 0, 1):
+                for col in (-1, 1):
+                    p.drawRect(cx + col * 2 - 1, cy + row * 4 - 1, 2, 2)
+            p.end()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def mousePressEvent(self, e):                                # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._press = e.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):                                 # noqa: N802
+        if self._press is None:
+            return
+        try:
+            far = (e.position().toPoint() - self._press).manhattanLength()
+        except AttributeError:                                   # Qt5 兼容
+            far = (e.pos() - self._press).manhattanLength()
+        if far < QApplication.startDragDistance():
+            return
+        self._press = None
+        try:
+            self._panel.start_layer_drag(self._lid, self)
+        finally:
+            self.setCursor(Qt.OpenHandCursor)
+
+    def mouseReleaseEvent(self, e):                              # noqa: N802
+        self._press = None
+        self.setCursor(Qt.OpenHandCursor)
+        e.accept()
+
+
 class LayerStackPanel(QWidget):
     """图层栈：左图层头 + 右素材格，共用滚动"""
 
@@ -3447,6 +3655,7 @@ class LayerStackPanel(QWidget):
         super().__init__()
         self.main = main
         self.rows = []            # [(header_frame, ClipRow)]，**已按 `layer_ids` 过滤**
+        self._row_sig = {}        # idx -> 素材路径元组；自动切换时路径没变就不重建行
         self._sig_guard = False
         # ★★ 2026-11-09（用户第 10 条：「有几个独立屏幕，下面就有几个单独的图层配置」）：
         #   `layer_ids` 是**可选过滤**：只显示这些图层 id 的行；`None` = 全部（默认，
@@ -3873,6 +4082,76 @@ class LayerStackPanel(QWidget):
                 self._fill_row(i, lay)
         self.refresh_playing()
 
+    # ---- 普通素材行的缩略图后台补全（GUI 线程绝不解码） ----
+    def _ensure_row_thumbs(self, items):
+        """把缺缩略图的普通素材交给后台补，完成后重建一次这一栈。
+
+        ★ 2026-11-11：**演出中不补图**。自动图层换池会一次带进几十个新素材，
+          后台解码虽然不在 GUI 线程，但仍会和引擎/解码线程抢 GIL/磁盘；
+          现场表现就是操作一顿一顿。运行中先用已有缓存（没有就空图标），
+          停止后再统一补。
+        """
+        try:
+            if bool(getattr(self.main.engine, "running", False)):
+                return
+        except Exception:                                          # noqa: BLE001
+            pass
+        failed = getattr(self, "_row_thumb_failed", None)
+        if failed is None:
+            failed = self._row_thumb_failed = set()
+        need = []
+        for m in items or []:
+            try:
+                if m.resolve_thumb():
+                    continue
+                _k = os.path.normcase(str(getattr(m, "path", "")))
+                if _k in failed:
+                    continue
+                need.append(m)
+            except Exception:                                      # noqa: BLE001
+                continue
+        if not need:
+            return
+        w = getattr(self, "_row_thumb_worker", None)
+        if w is not None:
+            try:
+                if w.isRunning():
+                    self._row_thumb_pending = need
+                    return
+            except RuntimeError:                       # C++ 侧已销毁
+                w = None
+                self._row_thumb_worker = None
+        try:
+            w = ThumbBackfillWorker(need)
+            w.done.connect(self._on_row_thumbs_done)
+            self._row_thumb_worker = w          # 必须持引用
+            self._row_thumb_items = list(need)
+            self._row_thumb_pending = None
+            w.start()
+        except Exception:                                          # noqa: BLE001
+            self._row_thumb_worker = None
+
+    def _on_row_thumbs_done(self, *_a):
+        failed = getattr(self, "_row_thumb_failed", None)
+        if failed is None:
+            failed = self._row_thumb_failed = set()
+        for m in list(getattr(self, "_row_thumb_items", []) or []):
+            try:
+                if not m.resolve_thumb():
+                    failed.add(os.path.normcase(str(getattr(m, "path", ""))))
+            except Exception:                                      # noqa: BLE001
+                pass
+        pend = getattr(self, "_row_thumb_pending", None)
+        self._row_thumb_pending = None
+        # 一次性补画（此时缩略图已在磁盘缓存里，icon_cached 不会再解码）
+        try:
+            self.rebuild()
+        except Exception:                                          # noqa: BLE001
+            pass
+        if pend:
+            self._ensure_row_thumbs(pend)
+        self.refresh_playing()
+
     def apply_theme(self):
         """主题切换：重设所有图层头样式（ClipRow 的样式由各自注册的回调刷新）"""
         self.title.setStyleSheet("color:" + theme.V("muted") + ";font-weight:bold;")
@@ -3926,9 +4205,173 @@ class LayerStackPanel(QWidget):
                 best, best_d = pos, d
         return None if best is None else self._idx_of(best)
 
+    # ---- 图层拖动（2026-11-18）----
+    @staticmethod
+    def _ev_global_y(obj, ev):
+        """拖放事件的全局 y（Qt6 用 position()，Qt5 回退 pos()）。"""
+        try:
+            pos = ev.position().toPoint()
+        except AttributeError:
+            pos = ev.pos()
+        try:
+            return obj.mapToGlobal(pos).y()
+        except Exception:                                          # noqa: BLE001
+            return int(pos.y())
+
+    def _layer_drop_line(self):
+        ln = getattr(self, "_layer_drop_line_w", None)
+        if ln is None:
+            ln = QFrame(self.content)
+            ln.setFixedHeight(2)
+            ln.setStyleSheet("background:#4a6cf7;border:none;border-radius:1px;")
+            ln.hide()
+            self._layer_drop_line_w = ln
+        return ln
+
+    def _hide_layer_drop_line(self):
+        ln = getattr(self, "_layer_drop_line_w", None)
+        if ln is not None:
+            try:
+                ln.hide()
+            except Exception:                                      # noqa: BLE001
+                pass
+
+    def _drop_boundary(self, y_global):
+        """拖放 y → `(行位置, 是否插在该行之前)`（只看**当前显示**的行）。"""
+        n = len(self.rows)
+        if n == 0:
+            return (0, True)
+        for pos, (hdr, _g) in enumerate(self.rows):
+            try:
+                top = hdr.mapToGlobal(QPoint(0, 0)).y()
+                hgt = int(hdr.height())
+            except Exception:                                      # noqa: BLE001
+                continue
+            if y_global < top:
+                return (pos, True)
+            if top <= y_global <= top + hgt:
+                return (pos, y_global < top + hgt / 2.0)
+        return (n, True)
+
+    def _show_layer_drop_line(self, y_global):
+        try:
+            ln = self._layer_drop_line()
+            pos, before = self._drop_boundary(y_global)
+            if not self.rows:
+                yy = 2
+            elif pos >= len(self.rows):
+                hdr = self.rows[-1][0]
+                yy = hdr.mapTo(self.content, QPoint(0, 0)).y() + int(hdr.height()) + 1
+            else:
+                hdr = self.rows[pos][0]
+                yy = hdr.mapTo(self.content, QPoint(0, 0)).y()
+                if not before:
+                    yy += int(hdr.height()) + 1
+                else:
+                    yy -= 2
+            ln.setGeometry(2, yy, max(10, self.content.width() - 4), 2)
+            ln.raise_()
+            ln.show()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _lid_at(self, pos):
+        try:
+            return str(getattr(self.main.engine.layers[self._idx_of(pos)], "lid", "") or "")
+        except Exception:                                          # noqa: BLE001
+            return ""
+
+    def _drop_layer(self, md, y_global):
+        """把拖进来的图层插到当前栈的对应位置（必要时跨屏移动）。"""
+        try:
+            payload = json.loads(bytes(md.data(LAYER_MIME)).decode("utf-8"))
+        except Exception:                                          # noqa: BLE001
+            return False
+        if not isinstance(payload, dict):
+            return False
+        lid = str((payload or {}).get("lid") or "")
+        src = str((payload or {}).get("sid") or "") or None
+        if not lid:
+            return False
+        pos, before = self._drop_boundary(y_global)
+        if pos < len(self.rows):
+            anchor, side = self._lid_at(pos), ("before" if before else "after")
+        elif self.rows:
+            anchor, side = self._lid_at(len(self.rows) - 1), "after"
+        else:
+            anchor, side = None, "after"
+        dst = getattr(self, "screen_id", None)
+        fn = getattr(self.main, "move_layer_drag", None)
+        if not callable(fn):
+            return False
+        # ⚠ 拖放的 dropEvent 在 `QDrag.exec()` 的嵌套事件循环里；这里**立刻**
+        #   重建图层栈会把正在拖动的源控件删掉（崩溃）。推迟到本轮事件结束再改。
+        QTimer.singleShot(0, lambda: fn(lid, src, dst, anchor, side))
+        return True
+
+    def start_layer_drag(self, lid, widget=None):
+        """从左侧握把发起图层拖动。payload 只带 lid + 源屏幕 id。"""
+        try:
+            layers = self.main.engine.layers
+            lid = str(lid or "")
+            lay = None
+            for l in layers:
+                if str(getattr(l, "lid", "") or "") == lid:
+                    lay = l
+                    break
+            if lay is None or not lid:
+                return
+            md = QMimeData()
+            md.setData(LAYER_MIME, json.dumps(
+                {"lid": lid, "sid": str(getattr(self, "screen_id", "") or "")}
+            ).encode("utf-8"))
+            drag = QDrag(widget or self)
+            drag.setMimeData(md)
+            # 拖动影像：整行截图（缩到 70%），像"拿起一行"
+            try:
+                idx = layers.index(lay)
+                pos = self._pos_of(int(idx))
+                src_w = self.rows[pos][0] if pos is not None else None
+                if src_w is not None:
+                    pm = src_w.grab()
+                    drag.setPixmap(pm.scaledToWidth(
+                        max(120, int(pm.width() * 0.7)), Qt.SmoothTransformation))
+                    drag.setHotSpot(QPoint(12, max(1, pm.height() // 2)))
+            except Exception:                                      # noqa: BLE001
+                pass
+            drag.exec(Qt.MoveAction)
+        except Exception as e:                                     # noqa: BLE001
+            try:
+                self.main._log_ui_error("start_layer_drag", e)
+            except Exception:                                      # noqa: BLE001
+                pass
+
     def eventFilter(self, obj, ev):
         from PySide6.QtCore import QEvent
         t = ev.type()
+        # ★★ 2026-11-18：图层拖动（自定义 MIME）**先于**素材拖放处理。
+        if t in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop, QEvent.DragLeave):
+            try:
+                _md0 = ev.mimeData()
+            except Exception:                                      # noqa: BLE001
+                _md0 = None
+            if _md0 is not None and _md0.hasFormat(LAYER_MIME):
+                if t == QEvent.DragLeave:
+                    self._hide_layer_drop_line()
+                    return True
+                gy = self._ev_global_y(obj, ev)
+                if t == QEvent.Drop:
+                    self._hide_layer_drop_line()
+                    if self._drop_layer(_md0, gy):
+                        ev.acceptProposedAction()
+                        return True
+                    return False
+                self._show_layer_drop_line(gy)
+                ev.setDropAction(Qt.MoveAction)
+                ev.acceptProposedAction()
+                return True
+        if t == QEvent.DragLeave:
+            self._hide_layer_drop_line()
         # 整栈区域拖放（含空白处）：按落点找最近图层行
         if obj in (self, self.scroll, self.content) or obj is self.scroll.viewport():
             if t in (QEvent.DragEnter, QEvent.DragMove):
@@ -3974,6 +4417,7 @@ class LayerStackPanel(QWidget):
             if w:
                 w.deleteLater()
         self.rows = []
+        self._row_sig.clear()
         for i, lay in self._visible_layers():      # ★ 只建**该显示**的行（过滤见 `layer_ids`）
             row = QWidget()
             rl = QHBoxLayout(row)
@@ -3999,6 +4443,12 @@ class LayerStackPanel(QWidget):
             grid.reordered.connect(self.main.clips_reordered)
             grid.cross_moved.connect(self.main.clips_cross_moved)
             grid.menu_requested.connect(self.main.clip_menu)
+            # ★ 2026-11-18：图层拖动要能落在**素材格**上（按高度算插到该行前/后）
+            try:
+                grid.installEventFilter(self)
+                grid.viewport().installEventFilter(self)
+            except Exception:                                  # noqa: BLE001
+                pass
             rl.addWidget(grid, 1)
             self.vbox.insertWidget(self.vbox.count() - 1, row)
             self.rows.append((hdr, grid))
@@ -4090,6 +4540,12 @@ class LayerStackPanel(QWidget):
         #   修法：把右侧每个控件的高度**钉死**，让图层头最小高 = HEADER_MIN_H(50)。
         h.setContentsMargins(4, 2, 4, 2)
         h.setSpacing(6)
+        # ★ 2026-11-18（用户：在图层左边开关那块加拖动）：最左侧一个握把。
+        #   放在 `_tog` 之前，不改变原有开关的排布；整行右侧内容宽度由 HEADER_W 决定。
+        #   ⚠ 不能加 `AlignVCenter`：那样布局只按 sizeHint 给高度（0），握把会"消失"。
+        _grip = _LayerDragHandle(self, idx, lay)
+        f._grip = _grip
+        h.addWidget(_grip, 0)
         # ★★★ 2026-11-06（用户：「图层每一层上面不是有四个开关嘛，把那四个开关 UI 改成田字格，
         #   不要一行一个，改成两行」）：
         #   左侧 2×2：👁 / S（上排）、α / 🔒（下排）；右侧两行：名称（+ 码表下拉 / 角色）、
@@ -4321,6 +4777,14 @@ class LayerStackPanel(QWidget):
         except (TypeError, ValueError):
             return
         compact = h < HEADER_COMPACT_H
+        # ★ 2026-11-18（用户：和行高绑定）：握把宽度随行高连续变化（12~24px），
+        #   不能等到"紧凑/标准档切换"才更新（`_compact_hdr` 提前返回会漏掉它）。
+        try:
+            _grip = getattr(hdr, "_grip", None)
+            if _grip is not None:
+                _grip.set_row_height(h)
+        except Exception:                                          # noqa: BLE001
+            pass
         if getattr(hdr, "_compact_hdr", None) == compact:
             return                    # 同档：什么都不用做（拖动时这是绝对多数情况）
         hdr._compact_hdr = compact
@@ -4684,19 +5148,46 @@ class LayerStackPanel(QWidget):
                 self._ensure_cue_thumbs(need)
             return
         grid.set_cue_mode(False)
+        # ★ 2026-11-11（用户：「多屏下依然非常卡」）：
+        #   这里以前用 `m.icon()`，缓存未命中时会在 **GUI 线程**里
+        #   `ensure_thumbnail()`（解视频/缩放），自动图层换池时一次重建几十格
+        #   ⇒ 界面成片冻住几百毫秒~数秒。现在只取**已有**缩略图（`icon_cached`），
+        #   缺图统一交给后台 `ThumbBackfillWorker`，完成后一次性补画。
+        need = []
         for m in lay.clips:
-            icon = m.icon(iw, ih)   # 走缩略图缓存，避免重复读盘/缩放
+            icon = m.icon_cached(iw, ih)
+            if icon.isNull():
+                need.append(m)
             it = QListWidgetItem(icon, "")
             it.setData(Qt.UserRole, m)
             it.setToolTip(m.name)
             it.setSizeHint(QSize(cw, h))
             grid.addItem(it)
+        if need:
+            self._ensure_row_thumbs(need)
+        try:
+            self._row_sig[idx] = tuple(str(getattr(c, "path", "")) for c in (lay.clips or []))
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def sync_layer(self, idx):
-        """仅刷新指定行的素材格（不重建控件）"""
+        """仅刷新指定行的素材格（不重建控件）。
+
+        ★ 2026-11-11（现场：切换素材时 GUI 卡 175ms）：自动切换只是 `lay.cur`
+          变了，`lay.clips` 路径没变；旧实现每次都 `_fill_row` → `grid.clear()` +
+          重建 8 个 QListWidgetItem + 图标，Qt 样式/布局重算很贵。现在路径没变
+          直接跳过（播放高亮由 `refresh_playing` 单独更新）；只有自动池真的换了
+          素材（路径变化）才重建。
+        """
         if (0 <= idx < len(self.main.engine.layers)
                 and self._pos_of(idx) is not None):
-            self._fill_row(idx, self.main.engine.layers[idx])
+            lay = self.main.engine.layers[idx]
+            if not getattr(lay, "is_cuesheet", False):
+                sig = tuple(str(getattr(c, "path", "")) for c in (lay.clips or []))
+                if self._row_sig.get(idx) == sig:
+                    return
+                self._row_sig[idx] = sig
+            self._fill_row(idx, lay)
 
     def refresh_header(self, idx=None):
         """刷新图层头控件显示（可见/Solo/不透明度/混合模式/名称）"""
@@ -4745,24 +5236,20 @@ class LayerStackPanel(QWidget):
             f.setStyleSheet(self._header_style(lay, bool(getattr(f, "_compact_hdr", False))))
 
     # ---- 播放高亮：所有正在播放的素材（含过渡中的上一个）都高亮 ----
-    def refresh_playing(self):
-        """给"正在使用的素材"打金黄底。
-
-        ⚠⚠ **必须按素材路径比对，不能按对象身份比对**（2026-09-29 用户报"底色没了"）：
-          自动图层每次重算素材池都会 `lay.clips = list(picked)`（engine._refresh_auto_layers），
-          `sync_layer()` 又把行里的项整批重建 ⇒ 行里存的 MediaItem 和 `lay.clips` 里的
-          已经不是同一批对象，`m in playing` 永远为假 ⇒ **一个格子都不亮**。
-          换成路径比对后，对象怎么重建都能对上。
-
-        ⚠ 再加一层兜底：`cur == -1`（引擎停了 / 正在等切换点）时 `lay.clips[lay.cur]` 取不到，
-          但图层播放器还在解那个文件 —— 用播放器的路径高亮。用户要的是"正在使用的素材"
-          的底色，而不是"引擎此刻的索引"。
-        """
+    def refresh_playing(self, only_idx=None):
+        """给"正在使用的素材"打金黄底。`only_idx` 给定时只刷这些引擎索引的行。"""
         def _key(p):
             return os.path.normcase(str(p or ""))
 
+        _want = set()
+        try:
+            _want = set(int(x) for x in (only_idx or ()))
+        except (TypeError, ValueError):
+            _want = set()
         for pos, (_, grid) in enumerate(self.rows):
             i = self._idx_of(pos)          # ★ 行位置 → 引擎索引（过滤后两者不等）
+            if _want and i not in _want:
+                continue
             if i >= len(self.main.engine.layers):
                 continue
             lay = self.main.engine.layers[i]
@@ -4798,19 +5285,23 @@ class LayerStackPanel(QWidget):
                 it = grid.item(k)
                 m = it.data(Qt.UserRole)
                 pth = getattr(m, "path", None) or (m if isinstance(m, str) else "")
-                if _key(pth) and _key(pth) in playing:
+                _is_play = bool(_key(pth) and _key(pth) in playing)
+                # ★ 2026-11-11：只在状态变化时改 item。旧实现每秒对每个格子
+                #   setBackground/setForeground/setFont/setData 一遍，7 屏 × 11 行 ×
+                #   多素材时能把 GUI 主线程卡 150~200ms（现场 ui_stall.log 已抓到）。
+                _prev = it.data(PLAY_ROLE)
+                if _prev is not None and bool(_prev) == _is_play:
+                    continue
+                it.setData(PLAY_ROLE, _is_play)
+                if _is_play:
                     it.setBackground(QColor(255, 205, 0, 235))   # 正在播放：金黄打底
-                    it.setData(PLAY_ROLE, True)                  # ↑ delegate 再压一道金边
                     it.setForeground(QColor(25, 25, 25))
-                    f = it.font()
-                    f.setBold(True)
-                    it.setFont(f)
                 else:
                     it.setBackground(QColor(0, 0, 0, 0))
-                    it.setData(PLAY_ROLE, False)
                     it.setForeground(QColor(230, 230, 230))
-                    f = it.font()
-                    f.setBold(False)
+                f = it.font()
+                if f.bold() != _is_play:
+                    f.setBold(_is_play)
                     it.setFont(f)
 
 
@@ -4973,7 +5464,7 @@ class BeatGridOverlay(QWidget):
 
 
 class PreviewPanel(QWidget):
-    """输出预览 + HUD + 下一个素材预看"""
+    """输出预览 + HUD（不再显示「下一个素材」缩略图）"""
 
     def __init__(self, main):
         super().__init__()
@@ -5000,10 +5491,6 @@ class PreviewPanel(QWidget):
         self.chk_hud.setChecked(True)
         self.chk_hud.setToolTip("显示模式/倒计时/BPM/能量浮层")
         bar.addWidget(self.chk_hud)
-        self.chk_next = QCheckBox("下一个素材")
-        self.chk_next.setChecked(True)
-        self.chk_next.setToolTip("角落预看即将切入的素材")
-        bar.addWidget(self.chk_next)
         lay.addLayout(bar)
 
         self.view = QLabel()
@@ -5023,18 +5510,13 @@ class PreviewPanel(QWidget):
         # 「节拍网格线」浮层：贴在 HUD 下方（用户 2026-09-27 要求）
         self.beatbar = BeatGridOverlay(self.view)
 
-        self.next_box = QLabel(self.view)
-        self.next_box.setStyleSheet("background:rgba(0,0,0,150);color:#ffd54f;"
-                                    "padding:2px 4px;border-radius:3px;font-size:10px;")
-        self.next_box.setAlignment(Qt.AlignCenter)
-        self.next_box.hide()
-
-        self._next_path = None
-        # 每图层一个"下一个素材"缩略图（动态增减；无素材/隐藏的图层不显示）
-        self.layer_thumbs = []
         self.chk_hud.toggled.connect(self._sync_overlays)
-        self.chk_next.toggled.connect(self._sync_overlays)
         self.apply_preview_state()
+        # ★ 2026-11-12：启动时把预览帧率（30/15）同步给引擎，避免固定 60fps 白缩
+        try:
+            main.engine.set_gui_fps(self.pic_cfg().get("fps", 30))
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -5066,6 +5548,16 @@ class PreviewPanel(QWidget):
 
     def _place_overlays(self):
         w, h = self.view.width(), self.view.height()
+        # ★ 2026-11-11（用户图3）：多屏输出时 HUD 固定右上角。
+        #   不能只依赖 `toggle_multi_output()` 开头那次 `set_hud_align(True)`——
+        #   那次调用发生在布局/搬面板之前，view 宽度可能还是旧值，且后续 resize
+        #   若没触发就会停在左上。这里每次布局都按当前多屏状态兜一次。
+        try:
+            fn = getattr(self.main, "_multi_ui_active", None)
+            if callable(fn) and fn():
+                self.hud_align_right = True
+        except Exception:                                      # noqa: BLE001
+            pass
         self.hud.adjustSize()
         if self.hud_align_right:
             # ★ H1：右上角，右边缘留 8px（要求 ≤12px）；顶边默认 8，胶囊在时下移
@@ -5075,22 +5567,11 @@ class PreviewPanel(QWidget):
             hx, hy = 8, 8
         self.hud.move(hx, hy)
         self.beatbar.move(hx, hy + self.hud.height() + 4)
-        self._place_thumbs()
-
-    def _place_thumbs(self):
-        x, y = 8, self.view.height() - 54 - 8
-        for lbl in self.layer_thumbs:
-            if lbl.isVisible():
-                lbl.move(x, max(8, y))
-                x += 96 + 6
 
     def _sync_overlays(self, *_):
         on = self.preview_on()
         self.hud.setVisible(on and self.chk_hud.isChecked())
         self.beatbar.setVisible(on and self.chk_hud.isChecked() and self.beatbar.has_grid())
-        if not on or not self.chk_next.isChecked():
-            for lbl in self.layer_thumbs:
-                lbl.hide()
 
     def update_grid(self, idx, w):
         """预览「节拍网格线」浮层：idx=当前拍在栅格里的位置(0..w-1)，w=栅格宽度(8=八拍乐句/4=小节)。
@@ -5123,6 +5604,10 @@ class PreviewPanel(QWidget):
         ⚠ 只影响**主界面预览**：引擎照常合成，输出窗口、Spout、NDI 都照常发。
         """
         on = self.preview_on()
+        try:
+            self.main.engine.set_preview_res(self.pic_cfg().get("res", 1.0))
+        except Exception:                                      # noqa: BLE001
+            pass
         try:
             ow = getattr(self.main, "out_win", None)
             self.main.engine.set_frame_consumers(
@@ -5190,12 +5675,29 @@ class PreviewPanel(QWidget):
     def pic_cfg(self):
         p = self.main.cfg["ui"].setdefault("preview", {})
         p.setdefault("res", 1.0)         # 预览分辨率：1.0 / 0.5 / 0.25（性能）
-        p.setdefault("fit", "keep")      # keep / cover / stretch
-        p.setdefault("fps", 60)
+        p.setdefault("fit", "keep")      # 旧配置兼容；设置界面已移除“缩放模式”
+        p.setdefault("fps", 30)
         return p
 
     def open_pic_settings(self):
-        PreviewSettingsDialog(self.main, self).exec()
+        # ★ 2026-11-11：改为**非模态**。旧写法 `exec()` 会卡在嵌套事件循环里，
+        #   引擎继续跑时主界面无法操作，现场 ui_stall.log 的栈一直停在
+        #   `open_pic_settings`，表现为“软件在运行但操作非常卡”。
+        try:
+            dlg = getattr(self, "_pic_dlg", None)
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+                dlg.activateWindow()
+                return
+            dlg = PreviewSettingsDialog(self.main, self)
+            self._pic_dlg = dlg
+            dlg.setModal(False)
+            dlg.finished.connect(lambda _=0: setattr(self, "_pic_dlg", None))
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def set_frame(self, img, allow=True):
         import time as _t
@@ -5213,18 +5715,15 @@ class PreviewPanel(QWidget):
         except Exception:
             pass
         p = self.pic_cfg()
-        fps = max(1, int(p.get("fps", 60)))
-        # ★ 2026-11-08 二修：演出中且独立输出窗口在显示时，预览封顶 15fps。
-        #   输出窗口要的是 30fps 的稳定；预览只是监看，15fps 足够，能省下
-        #   约一半 GUI 线程时间（实测预览缩放 4~9ms/帧，直接抬高引擎 tick）。
-        try:
-            ow = getattr(self.main, "out_win", None)
-            if bool(getattr(self.main.engine, "running", False)) and ow is not None and ow.isVisible():
-                fps = min(fps, 15)
-        except Exception:
-            pass
+        fps = max(1, int(p.get("fps", 30)))
+        # ★ 2026-11-11（用户：「预览设置貌似不会生效」）：**不再偷偷封顶 15fps**。
+        #   以前演出中只要输出窗口可见，就把用户选的 30fps 压成 15fps ⇒ 用户改刷新率
+        #   看不到区别。现在严格按设置走；需要省性能请选 15fps。
         now = _t.perf_counter()
-        if fps < 60 and (now - getattr(self, "_last_t", 0.0)) < 1.0 / fps:
+        # ★ 2026-11-11（用户：预览看起来不到 30 帧）：frame_ready 会成对到达，
+        #   严格 1/30s 节流会丢掉每对里的第二帧。选 30 时按“来帧就画”，
+        #   只有选 15fps 才做时间节流。
+        if fps < 29 and (now - getattr(self, "_last_t", 0.0)) < 1.0 / fps:
             return                        # 按设定帧率节流（省 CPU）
         self._last_t = now
         self._rescale()
@@ -5235,57 +5734,6 @@ class PreviewPanel(QWidget):
         if text != self.hud.text():
             self.hud.setText(text)
             self.hud.adjustSize()
-
-    def update_next(self, media):
-        """兼容保留：旧的单一"下一个素材"小窗已由 update_layer_thumbs 取代"""
-        pass
-
-    def update_layer_thumbs(self, layers):
-        """输出预览底部显示每个图层的下一个素材缩略图。
-        多个图层显示多个；图层无素材或被关闭显示时不显示。
-
-        ⚠ 2026-10-10（审计 P1）：「下一个素材」改为读引擎的**无锁快照**
-          `engine.ui_snapshot()["next_clips"]`（键 = 图层在 engine.layers 里的索引），
-          不再调用 `engine.next_clip_for()` —— 后者会抢渲染锁，导致 GUI 卡渲染。
-        ⚠ 索引对齐：本方法的 `layers` 就是 `engine.layers`（唯一调用点
-          ui_main.py:5391），故 enumerate 的 i 即 engine.layers 下标，与快照键一致。
-        ⚠ Kv 层显示"当前素材"的分支不读快照（它本就不调 next_clip_for），保持不变。
-        """
-        infos = []
-        if self.chk_next.isChecked() and self.preview_on():
-            # 无锁只读快照：可能为空 {}（引擎未就绪）⇒ 一律当作"没有下一个素材"。
-            try:
-                _nxt_map = (self.main.engine.ui_snapshot() or {}).get("next_clips") or {}
-            except Exception:                                      # noqa: BLE001
-                _nxt_map = {}
-            for i, lay in enumerate(layers):
-                if not getattr(lay, "visible", False) or not lay.clips:
-                    continue
-                if getattr(lay, "is_kv", False):
-                    # Kv 待机层不自动切换：显示当前素材（而非"下一个"）
-                    cur = lay.clips[lay.cur] if 0 <= lay.cur < len(lay.clips) else lay.clips[0]
-                    infos.append((lay.name, cur))
-                    continue
-                nxt = _nxt_map.get(i)
-                if nxt:
-                    infos.append((lay.name, nxt))
-        while len(self.layer_thumbs) < len(infos):
-            lbl = QLabel(self.view)
-            lbl.setFixedSize(96, 54)
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet("background:#000;border:1px solid #2f6f9f;")
-            lbl.hide()
-            self.layer_thumbs.append(lbl)
-        for i, lbl in enumerate(self.layer_thumbs):
-            if i < len(infos):
-                lname, m = infos[i]
-                lbl.setPixmap(m.pixmap(94, 52))
-                lbl.setToolTip(Tf("[{}]  下一个：{}", lname, m.name))
-                if not lbl.isVisible():
-                    lbl.show()
-            elif lbl.isVisible():
-                lbl.hide()
-        self._place_thumbs()
 
 
 class AudioSourceDialog(I18nDialog):
@@ -5883,13 +6331,16 @@ class AudioSourceDialog(I18nDialog):
 
 
 class ImageAdjustDialog(I18nDialog):
-    """素材大小与位置调整（单独作用于当前素材，图片摆位）：缩放 / 水平 / 垂直"""
+    """素材大小与位置调整（作用于**当前图层里的这一个片段**，不共享到其它图层）"""
 
-    def __init__(self, main, media):
+    def __init__(self, main, layer, clip_idx):
         super().__init__(main)
         self.main = main
-        self.media = media
-        self.setWindowTitle(T("素材大小与位置 - ") + media.name)
+        self.layer = layer
+        self.clip_idx = int(clip_idx)
+        self.media = layer.clips[self.clip_idx]
+        self._xf = dict(layer.clip_xform(self.clip_idx))
+        self.setWindowTitle(T("素材大小与位置 - ") + self.media.name)
         self.setProperty("_i18nDynamic", True)   # 标题含文件名，动态
         self.setMinimumWidth(420)
         outer = QVBoxLayout(self)
@@ -5912,14 +6363,14 @@ class ImageAdjustDialog(I18nDialog):
             sl.valueChanged.connect(self._apply)
             return sl
 
-        self.sl_scale = row(0, "大小", 5, 400, round(media.img_scale * 100), " %")
-        self.sl_x = row(1, "水平位置", -100, 100, round(media.img_x), " %")
-        self.sl_y = row(2, "垂直位置", -100, 100, round(media.img_y), " %")
-        self.sl_rot = row(3, "旋转", 0, 360, round(getattr(media, "img_rot", 0.0)), " °")
+        self.sl_scale = row(0, "大小", 5, 400, round(float(self._xf.get("scale", 1.0)) * 100), " %")
+        self.sl_x = row(1, "水平位置", -100, 100, round(float(self._xf.get("x", 0.0))), " %")
+        self.sl_y = row(2, "垂直位置", -100, 100, round(float(self._xf.get("y", 0.0))), " %")
+        self.sl_rot = row(3, "旋转", 0, 360, round(float(self._xf.get("rot", 0.0))), " °")
         outer.addLayout(grid)
 
         hint = QLabel(T("100% = 完整显示（保持比例）；位置为相对画面中心的百分比。\n"
-                        "只作用于当前素材，其它素材不受影响。"))
+                        "只作用于当前图层里的这个片段；同一素材在别的图层不受影响。"))
         hint.setStyleSheet("color:#888;")
         hint.setWordWrap(True)
         outer.addWidget(hint)
@@ -5935,15 +6386,24 @@ class ImageAdjustDialog(I18nDialog):
         outer.addLayout(btns)
 
     def _apply(self, *_):
-        self.media.img_scale = self.sl_scale.value() / 100.0
-        self.media.img_x = float(self.sl_x.value())
-        self.media.img_y = float(self.sl_y.value())
-        self.media.img_rot = float(self.sl_rot.value())
-        adj = dict(self.main.cfg["clip_adj"].get(self.media.path, {}))
-        adj.update({"scale": self.media.img_scale, "x": self.media.img_x,
-                    "y": self.media.img_y, "rot": self.media.img_rot})
-        self.main.cfg["clip_adj"][self.media.path] = adj
-        self.main.cfg.save()
+        self._xf = {
+            "scale": self.sl_scale.value() / 100.0,
+            "x": float(self.sl_x.value()),
+            "y": float(self.sl_y.value()),
+            "rot": float(self.sl_rot.value()),
+        }
+        try:
+            self.layer.set_clip_xform(self.clip_idx, self._xf)
+        except Exception:                                      # noqa: BLE001
+            return
+        try:
+            self.main.save_layers()
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            self.main._layers_call("refresh_playing")
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def _reset(self):
         self.sl_scale.setValue(100)
@@ -5975,20 +6435,14 @@ class PreviewSettingsDialog(I18nDialog):
             self.res.setCurrentIndex(0)
         grid.addWidget(self.res, 1, 1)
 
-        grid.addWidget(QLabel("缩放模式"), 2, 0)
-        self.fit = QComboBox()
-        self.fit.addItems(["等比（完整显示）", "铺满（裁切填满）", "拉伸（变形填满）"])
-        self.fit.setCurrentIndex({"keep": 0, "cover": 1, "stretch": 2}.get(p.get("fit", "keep"), 0))
-        grid.addWidget(self.fit, 2, 1)
-
-        grid.addWidget(QLabel("预览刷新率"), 3, 0)
+        grid.addWidget(QLabel("预览刷新率"), 2, 0)
         self.fps = QComboBox()
-        self.fps.addItems(["60 fps（最流畅）", "30 fps（省性能）", "15 fps（最省）"])
+        self.fps.addItems(["30 fps（推荐）", "15 fps（最省）"])
         try:
-            self.fps.setCurrentIndex([60, 30, 15].index(int(p.get("fps", 60))))
+            self.fps.setCurrentIndex([30, 15].index(int(p.get("fps", 30))))
         except ValueError:
             self.fps.setCurrentIndex(0)
-        grid.addWidget(self.fps, 3, 1)
+        grid.addWidget(self.fps, 2, 1)
 
         # 预览总开关（⚠ 实测省的 CPU 很少，约 0.05 核 —— 别把它当省 CPU 的主要手段；
         #   真正吃 CPU 的是解码与后处理特效，见「更新内容」的说明）
@@ -6018,17 +6472,6 @@ class PreviewSettingsDialog(I18nDialog):
 
         outer.addLayout(grid)
 
-        hint = QLabel(T("【作用范围】「显示预览画面」「预览刷新率」同时作用于**主界面预览**和"
-                        "**输出页的屏幕卡片**；「预览分辨率」「缩放模式」只影响主界面预览"
-                        "（输出页卡片按卡片大小自适应）。\n"
-                        "「预览刷新率」是上限：引擎出图只有约 15 帧/秒，所以选 60/30 与 15 的差别不大；"
-                        "关掉「显示预览画面」会让输出页卡片停止刷新并显示「预览已关闭」。\n"
-                        "真正吃 CPU 的是解码（用「GPU 解码」解决）和后处理特效。\n"
-                        "预览设置只影响主界面预览窗口，不改变输出画面。"))
-        hint.setStyleSheet("color:#888;")
-        hint.setWordWrap(True)
-        outer.addWidget(hint)
-
         btns = QHBoxLayout()
         b_reset = QPushButton("重置")
         b_reset.clicked.connect(self._reset)
@@ -6041,30 +6484,43 @@ class PreviewSettingsDialog(I18nDialog):
 
         self.on.toggled.connect(self._apply)
         self.res.currentIndexChanged.connect(self._apply)
-        self.fit.currentIndexChanged.connect(self._apply)
         self.fps.currentIndexChanged.connect(self._apply)
-        for wid in (self.res, self.fit, self.fps):
+        for wid in (self.res, self.fps):
             wid.setEnabled(self.on.isChecked())
 
     def _apply(self, *_):
         p = self.panel.pic_cfg()
         p["on"] = bool(self.on.isChecked())
         p["res"] = [1.0, 0.5, 0.25][self.res.currentIndex()]
-        p["fit"] = ["keep", "cover", "stretch"][self.fit.currentIndex()]
-        p["fps"] = [60, 30, 15][self.fps.currentIndex()]
-        for wid in (self.res, self.fit, self.fps):
+        p["fps"] = [30, 15][self.fps.currentIndex()]
+        for wid in (self.res, self.fps):
             wid.setEnabled(self.on.isChecked())
         try:
             self.main.cfg.save()
         except Exception:
             pass
+        # ★ 2026-11-11：预览分辨率直接传给引擎（缩略图在引擎侧一次缩到最终尺寸）
+        try:
+            self.main.engine.set_preview_res(p["res"])
+        except Exception:                                      # noqa: BLE001
+            pass
+        # ★ 2026-11-12：GUI 发布帧率跟随预览设置（30/15），别让引擎固定 60fps 白缩
+        try:
+            self.main.engine.set_gui_fps(p["fps"])
+        except Exception:                                      # noqa: BLE001
+            pass
         self.panel._last_t = 0.0
         self.panel.apply_preview_state()
+        # 分辨率/刷新率变化后立刻重画当前帧，别等下一帧（否则看起来“设置没生效”）
+        try:
+            self.panel._rescale()
+            self.panel.update()
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def _reset(self):
         self.on.setChecked(True)
         self.res.setCurrentIndex(0)
-        self.fit.setCurrentIndex(0)
         self.fps.setCurrentIndex(0)
         self._apply()
 

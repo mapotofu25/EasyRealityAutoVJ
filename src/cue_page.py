@@ -32,8 +32,8 @@ from __future__ import annotations
 import os
 import time
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QEasingCurve, Qt, QTimer, QVariantAnimation
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QDialogButtonBox, QFileDialog, QHBoxLayout,
                                QHeaderView, QLabel, QMenu, QMessageBox,
@@ -584,9 +584,9 @@ class CueDetailPanel(I18nWidget):
             return
         warns = []
         try:
-            from version import APP_VERSION
+            from version import APP_VERSION_NUM
             w, _miss = cuesheet.capability_report(self.sheet,
-                                                 app_version=str(APP_VERSION))
+                                                 app_version=str(APP_VERSION_NUM))
             warns = list(w or [])
         except Exception:                                        # noqa: BLE001
             warns = []
@@ -717,14 +717,25 @@ class CueSheetPanel(QWidget):
                                      + _text_color() + ";")
         head.addWidget(self.lbl_title)
         head.addStretch(1)
-        self.btn_add = QPushButton(T("添加…"), self)
+        self.btn_add = QPushButton(T("导入码表包"), self)
         self.btn_add.setMinimumHeight(28)
         self.btn_add.setToolTip(T("导入 .ercue 码表包（可多选）"))
         self.btn_add.clicked.connect(self.on_add)
+        # 导入入口用蓝色呼吸底提示；2.2 秒一轮，不刺眼
+        self._breath = QVariantAnimation(self)
+        self._breath.setDuration(2200)
+        self._breath.setLoopCount(-1)
+        self._breath.setKeyValueAt(0.0, QColor("#1b3554"))
+        self._breath.setKeyValueAt(0.5, QColor("#2f7fd0"))
+        self._breath.setKeyValueAt(1.0, QColor("#1b3554"))
+        self._breath.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._breath.valueChanged.connect(self._on_breath)
+        self._on_breath(QColor("#1b3554"))
+        self._breath.start()
         head.addWidget(self.btn_add)
         self.btn_del = QPushButton(T("删除"), self)
         self.btn_del.setMinimumHeight(28)
-        self.btn_del.setToolTip(T("从列表移除（不删除磁盘文件）"))
+        self.btn_del.setToolTip(T("从列表移除，清理解压临时文件（保留 .ercue）"))
         self.btn_del.clicked.connect(self.on_remove)
         head.addWidget(self.btn_del)
         self.btn_locate = QPushButton(T("定位文件"), self)
@@ -750,7 +761,8 @@ class CueSheetPanel(QWidget):
         self.lbl_desc = QLabel(T(
             "这里管理演出端可用的码表文件：查看 / 添加 / 移除 / 定位。"
             "双击一行查看详情（只读）。\n"
-            "「删除」只把码表从列表里移除，不会删除磁盘上的 .ercue 文件。"
+            "「删除」会清理解压出来的 .media/.thumbs 临时目录，"
+            "但不会删除磁盘上的 .ercue 原文件。"
             "编排请在 EasyRealityCue 里做，演出端只负责执行。"))
         self.lbl_desc.setWordWrap(True)
         self.lbl_desc.setStyleSheet("color:" + _muted_color() + ";")
@@ -787,9 +799,58 @@ class CueSheetPanel(QWidget):
         root.addWidget(self.split, 1)
         self.tbl.itemSelectionChanged.connect(self._on_sel_changed)
 
+        # 无码表时的左侧空态提示（可点项目链接）
+        self.lbl_empty = QLabel(self.tbl.viewport())
+        self.lbl_empty.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_empty.setWordWrap(True)
+        self.lbl_empty.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.lbl_empty.setOpenExternalLinks(True)
+        self.lbl_empty.setStyleSheet(
+            "color:#9a9a9a;font-size:13px;background:transparent;")
+        self.lbl_empty.setText(
+            "<div style='text-align:center;'>"
+            "还没有码表。<br><br>"
+            "下载 <a href='https://github.com/mapotofu25/EasyRealityAutoVJ/releases'>"
+            "EasyRealityCue</a>，制作一张码表并导入吧。<br><br>"
+            "<a href='https://github.com/mapotofu25/EasyRealityAutoVJ'>"
+            "项目地址：github.com/mapotofu25/EasyRealityAutoVJ</a>"
+            "</div>")
+        self.lbl_empty.hide()
+
         self.lbl_stat = QLabel("")
         self.lbl_stat.setStyleSheet("color:" + _muted_color() + ";font-size:11px;")
         root.addWidget(self.lbl_stat)
+
+    def _on_breath(self, c):
+        try:
+            self.btn_add.setStyleSheet(
+                "QPushButton { color:#ffffff; font-weight:600;"
+                " border:1px solid #58a6ff; border-radius:6px;"
+                " padding:2px 10px; background-color:%s; }"
+                "QPushButton:hover { border-color:#a9d4ff; }"
+                % c.name())
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _show_empty(self, on):
+        try:
+            self.lbl_empty.setGeometry(self.tbl.viewport().rect())
+            self.lbl_empty.setVisible(bool(on))
+            if on:
+                self.lbl_empty.raise_()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        try:
+            self.lbl_empty.setGeometry(self.tbl.viewport().rect())
+            if not self.lbl_empty.isHidden():
+                self.lbl_empty.raise_()
+        except Exception:                                        # noqa: BLE001
+            pass
 
     # ---------------- 数据 ----------------
     def refresh(self):
@@ -826,7 +887,13 @@ class CueSheetPanel(QWidget):
                     it.setToolTip(path)
                 self.tbl.setItem(r, c, it)
         self._sync_stat(len(entries), missing)
-        if self.tbl.rowCount() and self.tbl.currentRow() < 0:
+        self._show_empty(not entries)
+        if not entries:
+            try:
+                self._detail.show_entry({})
+            except Exception:                                  # noqa: BLE001
+                pass
+        elif self.tbl.rowCount() and self.tbl.currentRow() < 0:
             self.tbl.selectRow(0)
 
     @staticmethod
@@ -1077,8 +1144,19 @@ class CueSheetPanel(QWidget):
         elif ok:
             self._flash(Tf("已导入 {} 张码表。右键一行可以「绑到图层…」。", len(ok)))
 
+    @staticmethod
+    def _remove_extracted(p):
+        """删除码表时清理它解压出来的临时目录；.ercue 原文件不碰。"""
+        import shutil
+        for d in (str(p) + ".media", str(p) + "." + cuesheet.THUMB_DIR):
+            try:
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:                                  # noqa: BLE001
+                pass
+
     def on_remove(self):
-        """删除：**只从列表移除**（二次确认，明确告知不删磁盘文件）。"""
+        """删除：从列表移除，清理解压临时文件；原始 .ercue 不删。"""
         paths = self._sel_paths()
         if not paths:
             QMessageBox.information(self, T( T("删除码表")), T("请先选中要移除的码表。"))
@@ -1089,8 +1167,8 @@ class CueSheetPanel(QWidget):
         box.setIcon(QMessageBox.Question)
         box.setText(Tf("从列表移除以下 {} 张码表？", len(paths))
                     + "\n\n" + "\n".join("· " + n for n in names))
-        box.setInformativeText(T("只会从列表里移除，不会删除磁盘上的 .ercue 文件。\n"
-                                 "（之后仍可用「添加…」重新导入）"))
+        box.setInformativeText(T("会清理解压出来的 .media/.thumbs 临时目录；\n"
+                                 "磁盘上的 .ercue 原文件不会删除。"))
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         box.button(QMessageBox.Yes).setText(T("移除"))
         box.button(QMessageBox.No).setText(T("取消"))
@@ -1126,12 +1204,15 @@ class CueSheetPanel(QWidget):
                 except Exception:                                # noqa: BLE001
                     lay.is_cuesheet = False
                     lay.cuesheet_id = ""
+        # 清理解压出来的 .media/.thumbs；.ercue 原文件保留
+        for p in paths:
+            self._remove_extracted(p)
         # ★ 把这张包灌进指纹库的指纹一起撤掉（后台）——
         #   否则放这首"本机没有文件"的歌时识别器会一直返回一个已经不存在的合成 id。
         self._fp_start(paths, "drop")
         self._after_layers_changed()
         self.refresh()
-        self._flash(Tf("已从列表移除 {} 张码表（磁盘文件仍在）。", len(paths)))
+        self._flash(Tf("已移除 {} 张码表；临时解压目录已清理，.ercue 原文件保留。", len(paths)))
 
     def on_locate(self):
         """定位文件：在资源管理器里选中（文件不在了就打开其所在目录）。"""
@@ -1179,6 +1260,10 @@ class CueSheetPanel(QWidget):
     def _on_sel_changed(self):
         paths = self._sel_paths()
         if not paths:
+            try:
+                self._detail.show_entry({})
+            except Exception:                                  # noqa: BLE001
+                pass
             return
         e = self._entry_for(paths[0]) or {"path": paths[0]}
         self._show_detail(e)
@@ -1212,15 +1297,12 @@ class CueSheetPanel(QWidget):
         if r not in {i.row() for i in self.tbl.selectedIndexes()}:
             self.tbl.selectRow(r)
         m = QMenu(self)
-        act_detail = m.addAction(T("查看详情…"))
         act_bind = m.addAction(T("绑到图层…"))
         m.addSeparator()
-        act_del = m.addAction(T("删除（仅从列表移除）"))
+        act_del = m.addAction(T("删除（清理临时文件，保留 .ercue）"))
         act_locate = m.addAction(T("定位文件"))
         chosen = m.exec(self.tbl.viewport().mapToGlobal(pos))
-        if chosen is act_detail:
-            self.on_detail()
-        elif chosen is act_bind:
+        if chosen is act_bind:
             self.on_bind()
         elif chosen is act_del:
             self.on_remove()
@@ -1322,7 +1404,8 @@ class CueSheetPanel(QWidget):
         self.lbl_desc.setText(T(
             "这里管理演出端可用的码表文件：查看 / 添加 / 移除 / 定位。"
             "双击一行查看详情（只读）。\n"
-            "「删除」只把码表从列表里移除，不会删除磁盘上的 .ercue 文件。"
+            "「删除」会清理解压出来的 .media/.thumbs 临时目录，"
+            "但不会删除磁盘上的 .ercue 原文件。"
             "编排请在 EasyRealityCue 里做，演出端只负责执行。"))
         self.tbl.setHorizontalHeaderLabels([T(c) for c in self.COLS])
         self.refresh()

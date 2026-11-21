@@ -544,6 +544,13 @@ def find_duplicates(pkg_tracks, local, dur_tol=DUR_TOL,
     重合率 ≥ `fp_min`（默认 `DUP_FP_MIN`）**且** 两个时长之比 ≥ `FP_DUR_RATIO`
     （防"电台版 vs 加长版"—— 后者是前者的超集，单看重合率会被误判成同一首）。
 
+    ## 历史残留指纹（不在 `local` 里的 sid）**不判重**
+    删除曲库条目后指纹可能还留在 `fingerprints.db` 里；它们已经不在
+    `local_tracks()`（曲库 / 导入库）中 ⇒ 不能算“本机已有”。
+    否则用户删光曲库后重新导入同一个包，弹窗仍会说“20 首已经有了”
+    （2026-11-16 用户报「我已经全部删了怎么还有」）。
+    这些 sid 也不参与现场识别（`FingerprintDB.set_allowed` 已过滤）。
+
     ## `fp_of` 为 None ⇒ 判据 ③ **整体关闭**（= 2026-11-01 之前的行为）
     `panels._dup_imported_items` 等旧调用方传两个参数就自动走这条路径，
     行为与改动前逐值一致；只有 `scan_package`（导入前提示）会传 `fp_of`。
@@ -597,9 +604,18 @@ def find_duplicates(pkg_tracks, local, dur_tol=DUR_TOL,
                         ov = float(ov)
                     except (TypeError, ValueError):
                         continue
+                    # ★ 2026-11-16（用户「我已经全部删了怎么还有」）：
+                    #   指纹库会残留**已从曲库删除**的 song_id。它们不在
+                    #   `local_tracks()`（曲库 / 导入库）里 ⇒ 用户明明把歌删光了，
+                    #   导入同一个包时仍被提示“20 首本机已经有了”。
+                    #   这种历史残留不参与识别（`FingerprintDB.set_allowed` 已过滤），
+                    #   也不该算“已有” ⇒ 直接跳过。真正的重复只认曲库/导入库里
+                    #   还有条目的 sid（判据①②仍完整保留）。
+                    lt = by_sid.get(lsid)
+                    if lt is None:
+                        continue
                     # 长度护栏：剪辑版/加长版（差 10% 以上）不算"同一首的母带差异"
                     # （理由见 FP_DUR_RATIO）
-                    lt = by_sid.get(lsid) or {}
                     dl = to_dur(lt.get("dur"))
                     if du_pkg > 0.0 and dl > 0.0:
                         lo, hi = (du_pkg, dl) if du_pkg <= dl else (dl, du_pkg)
@@ -613,11 +629,9 @@ def find_duplicates(pkg_tracks, local, dur_tol=DUR_TOL,
                     if ov >= need and ov > best_ov:
                         best_sid, best_ov = lsid, ov
                 if best_sid:
-                    # 本机库里有、但当前曲库已移除的 sid：`by_sid` 查不到 ⇒
-                    # 用占位条目（照样判重 —— 指纹还在库里，只是没在曲库列表里）。
-                    hit = by_sid.get(best_sid) or {
-                        "sid": best_sid, "name": "", "dur": 0.0, "path": "",
-                        "disp": "", "src": ""}
+                    # `best_sid` 一定在 `by_sid` 里（上面的 `lt is None` 已跳过
+                    # 历史残留指纹）⇒ 文案能写出“本机是哪首”。
+                    hit = by_sid[best_sid]
                     how, overlap = "fingerprint", best_ov
         if hit is not None:
             if sid:

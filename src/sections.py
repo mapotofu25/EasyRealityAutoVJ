@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """能量段落表：曲库里每首歌的「段落边界 + 目标能量 / 档位」。
 
 为什么需要它（用户 2026-10-28 明确要求）
@@ -36,8 +36,16 @@
 
 import math
 import os
+import threading
 
 import numpy as np
+
+# ★ 2026-11-18：扫描是多线程的（AutoVJ 最多 8 线程，ERLIB 4 线程）。
+#   原来 `_LAST_FOLD_ANCHOR` / `f_glob` 是进程级全局 ⇒ A 歌的折锚点/特征会被
+#   B 歌的线程取走，同一文件因线程调度不同算出不同段落。改成 thread-local，
+#   同线程内行为逐值不变。
+_FOLD_LOCAL = threading.local()
+_FEAT_LOCAL = threading.local()
 
 TIERS = ("low", "mid", "high")
 MIN_SEC = 1.0          # 短于 1 秒的段没有意义（也防除零/负长度）
@@ -84,6 +92,50 @@ DENSITY_W = 0.35           # 最多打 35% 的折
 
 
 PHRASE_BEATS = 8       # 一个「八拍」（乐句）多少拍 —— 与 waveform_mark 的八拍头同义
+
+# ★★★ 用户 2026-11-12 硬规则（连续两条指令合并）：
+#   「电子音乐的段落绝对不会出现 5 个八拍或者 9 个八拍等 4n+1 的情况」
+#   「也不会出现 4n-1 的情况」
+#   ⇒ 段落长度按**八拍计数只能是偶数**（4n+1 ∪ 4n-1 正好是所有奇数），
+#     也就是段长必须落在 **16 拍的整数倍**上：2/4/6/8… 个八拍都行，
+#     3/5/7/9… 个八拍一律不允许。
+#   为什么（音乐上）：电子音乐的乐句是 2 个八拍一组、往上按 4 个八拍（32 拍超乐句）
+#   叠加的，段落长度是 32 拍组的整数倍；出现奇数个八拍 ⇒ 边界有一侧多切/少切了
+#   一个八拍，99% 是切错而不是歌真的这样编（用户 2026-11-12 原话）。
+#   ⚠ 与旧的 `_odd_bars`（启发式，只管 24~128 拍区间、用来做"少切一刀算改善"的
+#     局部自证）不同：这是**硬约束**，由 `_is_odd_phrases` 判、由
+#     `_fix_odd_phrase_segments` 在 `_seg_impl` 末端硬修，见 `_n_odd_phrases`。
+#   ⚠ 首/尾段不计入强制面（前奏/尾奏长度由曲长决定，口径同 `_n_odd_bars`），
+#     但修内部边界顺手把它们变偶数是允许的。
+#   ★ 例外（用户 2026-11-12 追加）：「部分音乐可能在 drop 结束时有 24 拍高能量
+#     + 8 拍低能量的情况，这种情况除外」⇒ 相邻的 (3 个八拍 high, 1 个八拍低能)
+#     配对合计 32 拍，是编曲结构而非切错；由 `_drop_tail_exempt` 判，计数与修复
+#     都放行（顺序固定「先高后低」，反向不算 —— 那是 pre-drop 铺垫）。
+RULE_EVEN_PHRASES = True
+
+# ★★ 用户 2026-11-12 追加澄清（原话）：「有些歌在不同段落之间有八拍或十六拍的过渡
+#   这个你保留了吗」⇒ 16 拍的过渡本身是偶数（2 个八拍），天然合法；**8 拍（1 个
+#   八拍）的过渡段要单独放行**，否则会被偶数硬规则当成 4n±1 修掉/合并。
+#   判据见 `_break_transition_exempt`：内部段、恰好 1 个八拍、且不是 high 档
+#   （high 档的 1 个八拍更像被切碎的 drop，不放行）。`_insert_break_transition`
+#   用「独立低谷 + 后链 32 拍重铺」找到的正是这种段（2026-11-07 用户现场：
+#   「drop 9 前面的 8 拍是一个过渡」）。
+ALLOW_BREAK_TRANSITION = True
+
+# ★★ 2026-11-12（第二轮，用户痛点②「段落边界不准：drop/break 边界差几拍、切早或切晚」）：
+#   边界挑错"八拍线"的量化证据：真实库 27 首 / 491 条内部边界里，**18.7%** 在
+#   ±2 条八拍线（±16 拍）内存在明显更强的「多频带平台变化」（novelty 比值中位 3.3、
+#   75 分位 5.8）。⇒ 在 `_seg_impl` 最末端加一遍 novelty 重定位。
+#   ⚠ 只挪 **±2 条线（±16 拍）**：±1 条线会翻转两侧段长的奇偶性，直接违反
+#     `RULE_EVEN_PHRASES` 硬规则（±2 条 = 偶数个八拍单位，奇偶性不变）。
+#   ⚠ 只单向 +16 拍 / −16 拍各试一次，要求比值 ≥ `NOVELTY_GAIN_MIN` 且新位置
+#     绝对强度 ≥ `NOVELTY_FLOOR`（都按本曲 novelty 的 p95 归一化）；每首最多
+#     `NOVELTY_MAX_MOVES` 条，且改完「奇数个八拍段 / 碎段」不许增加。
+REFINE_NOVELTY = True
+NOVELTY_GAIN_MIN = 1.35      # 新位置 / 原位置的 novelty 比值门槛
+NOVELTY_FLOOR = 0.06         # 新位置绝对强度下限（p95 归一化后）
+NOVELTY_WIN_BEATS = 8.0      # novelty 两侧各看一个乐句（8 拍）
+NOVELTY_MAX_MOVES = 6        # 每首最多挪几条边界（防一改动全身）
 
 
 def phrase_snap(sec, anchor=0.0, beat_len=0.0, beats=PHRASE_BEATS):
@@ -1769,6 +1821,11 @@ def _cap_segment_beats(edges, cur, dt, ga, gbl, ok, max_beats=64):
             t = ga + nb * bar
             if t <= t0 + 1e-6 or t >= t1 - 1e-6:
                 continue
+            r = (t1 - t) / gbl
+            # ★ 2026-11-13：余数必须合规（8 拍的过门例外，或 16 的整数倍），
+            #   否则 80 = 56+24 会造出 3 个八拍的奇数段，违反 RULE_EVEN_PHRASES。
+            if r < 8.0 or (abs(r - 8.0) > 0.5 and abs(r - 16.0 * round(r / 16.0)) > 0.5):
+                continue
             v = _bar_step(cur, dt, t, win)
             if v > best_v:
                 best, best_v = t, v
@@ -3168,11 +3225,49 @@ def _seg_impl(f, dur=0.0, grid=None, win_sec=None, jump_thr=None,
         _cand = _pass(norm, cur, dt, ga, gbl, gok)
         if _n_odd_all(_cand, gbl) <= _n_odd_all(norm, gbl):
             norm = _cand
+    # ★★★ 用户 2026-11-12 硬规则（`RULE_EVEN_PHRASES`）：段落长度按八拍计数
+    #   只能是偶数 —— 4n+1（5/9 个八拍）与 4n-1（3/7 个八拍）都不允许出现。
+    #   前面所有 pass 都在优化"好看/对齐"，但谁都不保证最终表满足这条硬约束，
+    #   所以在最末端再硬修一遍：只挪内部边界 ±8 拍，且必须自证奇数段严格减少。
+    norm = _fix_odd_phrase_segments(norm, cur, dt, ga, gbl, gok)
+    # ★★ 2026-11-12（痛点②：边界切早/切晚）：在硬规则之后再按「多频带平台变化」
+    #   把边界挪到证据更强的八拍线上 —— 只挪 ±2 条线（±16 拍），不动奇偶性。
+    #   ⚠ 只在吸附过的分段表上跑（`grid` 给了才吸附）；`sections_raw` 保持原始边界。
+    norm = _refine_boundary_novelty(norm, f, cur, dt, ga, gbl,
+                                    bool(gok and isinstance(grid, dict)))
+    # ★ 2026-11-16：长段末尾 16 拍的局部音色/低频偏离（8/16 拍过渡）
+    if RULE_TAIL_TRANS:
+        try:
+            norm = _cut_phrase_tail_transition(norm, cur, dt, f, ga, gbl, gok)
+        except Exception:                                  # noqa: BLE001
+            pass
+    # ★★★ 2026-11-13：内部「不到 1 个八拍」的碎段必须消化掉 —— 实测
+    #   `Feel the Devotion` 在 61 拍处留下 3 拍的「过渡 2」（边界落在拍线上而不是
+    #   八拍线），段长既不是 8 也不是 16 的整数倍，会破坏「段落 = 八拍整数倍」的契约。
+    norm = _drop_tiny_segments(norm, ga, gbl, gok)
+    # ★★★ 2026-11-13（用户硬规则）：「一个段落最长不会超过 64 拍，超过就切出来」。
+    #   放在**最末端**：前面的 `_regularize_phrase_lengths` / `_shift_odd_chain` /
+    #   `_fix_odd_phrase_segments` 都可能把段又并长（实测 Trauma drop15、Clockwork drop7
+    #   都被并成 80 拍）。
+    norm = _final_cap_segments(norm, cur, dt, f, ga, gbl, gok)
+    # ★★★ 2026-11-13（用户：「我主要要的是 8 拍和段落边界要对」+「那你实现一下看看」）：
+    #   现有 novelty 只看「能量台阶」，遇到"响度没变但编曲换了"会漏；SSM（自相似矩阵）
+    #   看的是重复/对比结构，两者互补。只在 ±8 拍（1 个八拍）内重落位，段长仍是 8 的倍数。
+    if RULE_SSM_REFINE and gok:
+        try:
+            _nov, _nb = _ssm_novelty(f, ga, gbl, dur_eff)
+            if _nov is not None:
+                norm, _nmv = _ssm_relocate(norm, _nov, ga, gbl)
+                if _nmv:
+                    # 重落位可能让某段又超过 64 拍 ⇒ 再硬切一次（切点仍是段首+64）
+                    norm = _final_cap_segments(norm, cur, dt, f, ga, gbl, gok)
+        except Exception:                                      # noqa: BLE001
+            pass
     return norm
 
 
 
-_LAST_FOLD_ANCHOR = None
+_LAST_FOLD_ANCHOR = None      # 兼容旧引用；实际状态在 _FOLD_LOCAL.anchor
 
 
 def take_folded_anchor():
@@ -3182,9 +3277,8 @@ def take_folded_anchor():
     否则分段按折后的锚点算对了，但界面上画 8 拍线、引擎查表用的还是旧锚点，
     用户看到的就是"段落对了、8 拍线还差 4 拍"。
     """
-    global _LAST_FOLD_ANCHOR
-    v = _LAST_FOLD_ANCHOR
-    _LAST_FOLD_ANCHOR = None
+    v = getattr(_FOLD_LOCAL, "anchor", None)
+    _FOLD_LOCAL.anchor = None
     return v
 
 
@@ -3232,11 +3326,271 @@ def auto_segments(f, dur=0.0, grid=None, win_sec=None, jump_thr=None, **kw):
         global _LAST_FOLD_ANCHOR
         if (_head32(segs2, gbl) <= 1.0 and int(round(_h2 / 32.0)) in (2, 4)
                 and len(segs2) <= len(segs) + 4):
-            _LAST_FOLD_ANCHOR = round(ga - 4.0 * gbl, 6)
+            _FOLD_LOCAL.anchor = round(ga - 4.0 * gbl, 6)
             return segs2
     except Exception:                                          # noqa: BLE001
         pass
     return segs
+
+
+def _final_cap_segments(xs, cur, dt, f, ga, gbl, ok, max_beats=64):
+    """★★★ 2026-11-13 用户硬规则：「一个段落最长不会超过 64 拍，如果超过 64 拍，
+    那就把它切出来」—— 在**所有**后处理跑完之后再硬切一遍。
+
+    为什么要在最末端单独做（`_cap_segment_beats` 已经在 4.6 步做过一次）：
+    后面还有 `_regularize_phrase_lengths` / `_shift_odd_chain` / `_fix_drop_bars_segs`
+    / `_fix_odd_phrase_segments` 这些会合并/拉伸边界的 pass，实测 `Trauma Throne`
+    的 drop15（80 拍）与 `Clockwork Vespers` 的 drop7（80 拍）就是它们合并出来的。
+    切点规则与 4.6 一致：从段首往后 64 拍；在 56~64 拍之间挑「台阶最陡」的那条
+    八拍线。余数照切（72 → 64 + 8），保证两半都是 8 拍的整数倍。
+    """
+    if not ok or gbl <= 1e-6 or dt <= 1e-9 or cur is None or len(xs) < 2:
+        return xs
+    out = [dict(x) for x in xs]
+    guard = 0
+    i = 0
+    # 末段也要切：`A hail of sharp knives` 最后一 drop 是 87 拍（用户规则「任何段落
+    # 不超过 64 拍」不分首尾）；切出来的余数留在末尾当尾段（尾段允许不是整数乐句）。
+    while i < len(out) and guard < 64:
+        guard += 1
+        seg = out[i]
+        t0, t1 = float(seg["t0"]), float(seg["t1"])
+        L = (t1 - t0) / gbl
+        if L <= max_beats + 0.5:
+            i += 1
+            continue
+        # 段首不在八拍线上（前奏从曲首截断这种）⇒ 不切：切出来的余数不会是 8 的
+        # 整数倍，硬切只会再造一个碎段。前奏本身是「半句」性质，长度不参与乐句契约。
+        if abs(t0 - (ga + round((t0 - ga) / (8.0 * gbl)) * 8.0 * gbl)) > 0.35 * gbl:
+            i += 1
+            continue
+        # 切点：段首 + 64 拍；先在 [56, 64] 拍的两条八拍线里挑台阶最大的
+        best, best_v = None, -1.0
+        for k in (7, 8):
+            t = t0 + k * 8.0 * gbl
+            if t >= t1 - 2.0 * gbl:
+                continue
+            r = (t1 - t) / gbl
+            if r < 8.0 or (abs(r - 8.0) > 0.5 and abs(r - 16.0 * round(r / 16.0)) > 0.5):
+                continue                                     # 余数必须 8 或 16 的倍数
+            v = _bar_step(cur, dt, t, 8.0 * gbl)
+            if v > best_v:
+                best, best_v = t, v
+        if best is None or (t1 - best) / gbl < 8.0 - 0.5:
+            _plain = t0 + max_beats * gbl
+            _alt = t1 - 16.0 * gbl
+            # 常规切点会留下 <8 拍的碎尾 ⇒ 改成「最后 16 拍独立成段」，前面仍是 8 的倍数
+            if (_alt > t0 + 32.0 * gbl
+                    and abs((_alt - t0) / gbl - 8.0 * round((_alt - t0) / (8.0 * gbl))) <= 0.5):
+                best = _alt
+            else:
+                best = _plain
+        if best <= t0 + 1e-6 or best >= t1 - 1e-6:
+            i += 1
+            continue
+
+        def _e(a, b):
+            ia = max(0, min(len(cur) - 1, int(round(a / dt))))
+            ib = max(ia + 1, min(len(cur), int(round(b / dt))))
+            pen = 0.0
+            if f is not None:
+                try:
+                    pen = float(_density_penalty(f, [ia, ib], dt)[0])
+                except Exception:                              # noqa: BLE001
+                    pen = 0.0
+            return _clamp01(float(cur[ia:ib].mean())) ** ENERGY_GAMMA * (1.0 - pen)
+
+        e0 = _e(t0, best)
+        e1 = _e(best, t1)
+        out[i] = {"t0": t0, "t1": best, "energy": e0,
+                  "tier": tier_from_energy(e0), "name": seg.get("name", "")}
+        out.insert(i + 1, {"t0": best, "t1": t1, "energy": e1,
+                           "tier": tier_from_energy(e1), "name": ""})
+        i += 2
+    # 本曲相对档位：与本曲最响段只差 ~1.5 dB 且 ≥0.60 的也判 high（与 _seg_impl 同规则）
+    if out:
+        _mx = max(float(x["energy"]) for x in out)
+        if _mx > 0:
+            for x in out:
+                if x["tier"] != "high" and x["energy"] >= 0.60 and x["energy"] >= 0.84 * _mx:
+                    x["tier"] = "high"
+    return _renumber_names(out)
+
+
+def _drop_tiny_segments(xs, ga, gbl, ok=True, min_beats=8.0, tol=0.35):
+    """把内部「不到 1 个八拍」的碎段消化掉（2026-11-13）。
+
+    为什么需要：`_snap_weak_boundary` / `_insert_break_transition` 之类按**拍**落边界，
+    偶尔会在八拍线旁边留下 3~7 拍的碎段（实测 `Feel the Devotion` 有 3 拍「过渡 2」），
+    段长既不是 8 也不是 16 的整数倍。这里只做两件事：
+      1) 碎段有一端**正好在八拍线**上 ⇒ 把另一端吸过去，碎段消失（前后两段回到
+         原来的八拍整数倍）；
+      2) 两端都不在八拍线 ⇒ 并进能量更接近的邻段（后面 `_final_cap_segments` 再兜底）。
+    首段/末段不动（前奏/尾奏本来就允许不是整数乐句）。
+    """
+    if not ok or gbl <= 1e-6 or len(xs) < 3:
+        return xs
+    out = [dict(x) for x in xs]
+
+    def _near8(t):
+        return abs(t - (ga + round((t - ga) / (8.0 * gbl)) * 8.0 * gbl)) <= tol * gbl
+
+    def _legal_beats(cnt):
+        # 8 拍过门、16 的整数倍、或 ≤64 且是 32 的倍数，都算合法段长
+        return (abs(cnt - 8.0) <= 0.5 or abs(cnt - 16.0 * round(cnt / 16.0)) <= 0.5) \
+            and 8.0 - 0.5 <= cnt <= 64.5
+
+    changed = True
+    guard = 0
+    while changed and guard < 16:
+        changed = False
+        guard += 1
+        for i in range(1, len(out) - 1):
+            a, b = float(out[i]["t0"]), float(out[i]["t1"])
+            L = (b - a) / gbl
+            if L >= min_beats - tol:
+                continue
+            on_a = _near8(a)
+            on_b = _near8(b)
+            prev_len = (b - float(out[i - 1]["t0"])) / gbl
+            next_len = (float(out[i + 1]["t1"]) - a) / gbl
+            # ① 并进前一段：前一段本身不在八拍线上（前奏/尾奏这类天然不齐）
+            #    或并完仍是合法段长
+            if on_b and (not _near8(float(out[i - 1]["t0"])) or _legal_beats(prev_len)):
+                out[i - 1]["t1"] = b
+                del out[i]
+                changed = True
+                break
+            # ② 并进后一段
+            if on_a and _legal_beats(next_len):
+                out[i + 1]["t0"] = a
+                del out[i]
+                changed = True
+                break
+            # ③ 两端都不在线上 ⇒ 并进能量更接近的一侧
+            try:
+                de = abs(float(out[i]["energy"]) - float(out[i - 1]["energy"]))
+                dn = abs(float(out[i]["energy"]) - float(out[i + 1]["energy"]))
+            except (TypeError, ValueError):
+                de = dn = 0.0
+            if de <= dn:
+                out[i - 1]["t1"] = b
+            else:
+                out[i + 1]["t0"] = a
+            del out[i]
+            changed = True
+            break
+    return out
+
+
+# ★★★ 2026-11-13（用户：「我主要要的是 8 拍和段落边界要对」+「那你实现一下看看」）：
+#   SSM（自相似矩阵）+ 棋盘核 novelty —— 与"能量台阶"互补的**边界证据**。
+#   为什么：现有 novelty（`_novelty_curve`）只看能量/频带均值的变化，遇到
+#   "响度没变但编曲换了（换音色、换和弦、副歌回来了）"会给出接近 0 的分数；
+#   SSM 比较的是"这一段和那一段像不像"，重复结构（副歌/loop）在矩阵上是亮块，
+#   块边界就是段落变化。两步都只做"重落位"，不增删边界。
+#   ⚠ 只挪 ±8 拍（1 个八拍）：段长仍是 8 的倍数，满足 `RULE_EVEN_PHRASES`。
+RULE_SSM_REFINE = False   # ★ 2026-11-13 试过：在 7 首上 A/B，SSM 给出的 ±8/±16 搬动方向不一致（Cothurnus 对上了，Trauma/Clockwork 反而更乱）
+# ⇒ 默认关闭，保留实现供实验；打开后 _seg_impl 末尾会按 novelty 贪心重落位。
+SSM_GAIN_MIN = 2.0        # 新位置 novelty / 原位置 ≥ 这个比值才动
+SSM_FLOOR = 0.02          # 新位置绝对下限（未归一化的余弦差）
+SSM_MAX_MOVES = 6         # 每首最多挪几条（防一改动全身）
+SSM_KERNEL_BEATS = 8      # 棋盘核半宽（8 拍 = 1 个八拍）
+
+
+def _ssm_novelty(f, ga, gbl, dur):
+    """拍级 SSM → 棋盘核 novelty。
+
+    返回 `(nov, nb)`：`nov[c]` 是第 c 拍的"结构变化强度"（余弦差的棋盘和），
+    `nb` 是拍数。特征不全 / 曲子太短 ⇒ `(None, 0)`，调用方原样返回。
+    """
+    try:
+        eb = f.get("Eband")
+        fl = f.get("flux")
+        dt = float(f["dt"])
+        nf = int(f["nf"])
+    except Exception:                                          # noqa: BLE001
+        return None, 0
+    if eb is None or fl is None or dt <= 1e-9 or gbl <= 1e-6 or dur <= ga + 16.0 * gbl:
+        return None, 0
+    eb = np.asarray(eb, dtype=np.float64)
+    fl = np.asarray(fl, dtype=np.float64).reshape(-1)
+    if eb.ndim != 2 or eb.shape[1] < 8 or eb.shape[0] < 8:
+        return None, 0
+    nf = min(nf, eb.shape[0], fl.shape[0])
+    nb = int((dur - ga) / gbl) + 1
+    m = int(SSM_KERNEL_BEATS)
+    if nb < 2 * m + 4:
+        return None, 0
+    idx = np.rint((ga + np.arange(nb) * gbl) / dt).astype(np.int64)
+    idx = np.clip(idx, 0, nf - 1)
+    X = np.zeros((nb, 9), dtype=np.float64)
+    for k in range(nb):
+        a = int(idx[k])
+        b = int(idx[k + 1]) if k + 1 < nb else nf
+        b = min(max(b, a + 1), nf)
+        X[k, :8] = eb[a:b, :8].mean(axis=0)
+        X[k, 8] = float(fl[a:b].max())
+    sd = X.std(axis=0)
+    sd[sd < 1e-9] = 1.0
+    X = (X - X.mean(axis=0)) / sd
+    nrm = np.linalg.norm(X, axis=1, keepdims=True)
+    nrm[nrm < 1e-9] = 1.0
+    X = X / nrm
+    S = X @ X.T
+    np.fill_diagonal(S, 0.0)
+    # 2D 前缀和 ⇒ 四个象限和的 O(1) 查询（棋盘核：左上+右下 − 右上−左下）
+    I = np.zeros((nb + 1, nb + 1), dtype=np.float64)
+    I[1:, 1:] = S.cumsum(axis=0).cumsum(axis=1)
+
+    def qs(r0, r1, c0, c1):
+        return I[r1, c1] - I[r0, c1] - I[r1, c0] + I[r0, c0]
+
+    nov = np.zeros(nb, dtype=np.float64)
+    for c in range(m, nb - m):
+        nov[c] = (qs(c - m, c, c - m, c) + qs(c, c + m, c, c + m)
+                  - qs(c - m, c, c, c + m) - qs(c, c + m, c - m, c)) / float(m * m)
+    return nov, nb
+
+
+def _ssm_relocate(xs, nov, ga, gbl):
+    """把内部边界在 ±1 个八拍内挪到 SSM 证据更强的线上（段长仍是 8 的倍数）。"""
+    if nov is None or gbl <= 1e-6 or len(xs) < 4:
+        return xs, 0
+    out = [dict(x) for x in xs]
+    n = int(len(nov))
+    used = 0
+    for _ in range(SSM_MAX_MOVES):
+        bs = [int(round((float(x["t0"]) - ga) / gbl)) for x in out[:-1]]
+        bs.append(int(round((float(out[-1]["t1"]) - ga) / gbl)))
+        best = None
+        for k in range(1, len(out) - 1):
+            b = bs[k]
+            if b < 0 or b >= n:
+                continue
+            base = float(nov[b])
+            for d in (-16, 16):                              # ±2 条八拍线：段长奇偶性不变
+                q = b + d
+                if q < 8 or q >= n - 8:
+                    continue
+                L0, L1 = q - bs[k - 1], bs[k + 1] - q
+                if L0 < 8 or L1 < 8 or L0 > 64 or L1 > 64:
+                    continue
+                if L0 % 16 or L1 % 16:                       # 必须仍是偶数个八拍
+                    continue
+                v = float(nov[q])
+                if v < SSM_FLOOR or v < SSM_GAIN_MIN * max(base, 1e-6):
+                    continue
+                if best is None or (v - base) > best[0]:
+                    best = (v - base, k, q)
+        if best is None:
+            break
+        _, k, q = best
+        t = ga + q * gbl
+        out[k - 1]["t1"] = t
+        out[k]["t0"] = t
+        used += 1
+    return out, used
 
 
 def _renumber_names(xs):
@@ -3269,6 +3623,99 @@ def _odd_bars(L):
         return False
     q = L / 8.0
     return abs(q - round(q)) < 0.35 and int(round(q)) % 2 == 1
+
+
+def _is_odd_phrases(L, tol=0.35):
+    """L（拍）按八拍计数是不是**奇数个八拍**（3/5/7/9… 个 = 24/40/56/72… 拍）。
+
+    ★★★ 用户 2026-11-12 硬规则，见模块顶部 `RULE_EVEN_PHRASES`：
+      4n+1（5/9/13… 个八拍）与 4n-1（3/7/11… 个八拍）都不允许出现
+      ⇒ 合起来就是**所有奇数**都不允许 ⇒ 段长必须是 16 拍的整数倍。
+
+    与 `_odd_bars` 的区别（别混用）：
+      · `_odd_bars` 是旧代码的**启发式**（只抓 24~128 拍，用于后处理自证
+        "这条改写让怪乐句变少了就算改善"）；
+      · 本函数是用户的**硬约束**，不做区间截断（只保留取整容差），
+        由 `_fix_odd_phrase_segments` 在末端直接修。
+    容差 0.35 个八拍与 `_odd_bars` 同源：`t1-t0` 除以 `beat_len` 拿不到整数
+    （Dreamira 实测 23.9987 拍），写成严格相等会把"恰好 24 拍"整段漏判。
+    """
+    q = float(L) / float(PHRASE_BEATS)
+    return abs(q - round(q)) < tol and int(round(q)) % 2 == 1
+
+
+def _drop_tail_exempt(segs, i, gbl):
+    """第 `i` 段是否属于「drop 结束时 24 拍高能量 + 8 拍低能量」的例外形态。
+
+    ★★★ 用户 2026-11-12 追加（原话）：「部分音乐可能在 drop 结束时有 24 拍
+      高能量 + 8 拍低能量的情况  这种情况除外」。
+      形态 = 相邻的 (3 个八拍 high, 1 个八拍低能) 配对，合计 32 拍 = 一个标准
+      超乐句：drop 尾巴先顶满 3 个八拍，最后 1 个八拍掉能量收尾。这是编曲结构，
+      不是切错；硬按「偶数个八拍」挪边界反而会把真正的 drop 结束点切错。
+      ⇒ `_n_odd_phrases` 计数时跳过、`_fix_odd_phrase_segments` 不拿它开刀。
+
+    两个位置都算例外（`i` 是那个 3、或 `i` 是那个 1）。顺序固定为「先高后低」，
+    与用户描述一致；反向（8 拍低能在前）不算 —— 那通常是 pre-drop 的铺垫，
+    不构成 drop 结尾的 3+1。
+    """
+    if not gbl or float(gbl) <= 1e-9:
+        return False
+    n = len(segs)
+    if n < 3:
+        return False
+
+    def _u(k):
+        if not (0 <= k < n):
+            return None
+        L = (float(segs[k]["t1"]) - float(segs[k]["t0"])) / gbl
+        q = float(L) / float(PHRASE_BEATS)
+        if abs(q - round(q)) < 0.35:
+            return int(round(q))
+        return None
+
+    def _en(k):
+        try:
+            return float(segs[k].get("energy") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _tier(k):
+        return str(segs[k].get("tier") or "")
+
+    # (3 个八拍 high) 紧跟 (1 个八拍 低能) —— drop 尾巴的 32 拍超乐句被切成 3+1
+    if (_u(i) == 3 and _u(i + 1) == 1 and _tier(i) == "high"
+            and _en(i) > _en(i + 1) + 0.02):
+        return True
+    if (_u(i - 1) == 3 and _u(i) == 1 and _tier(i - 1) == "high"
+            and _en(i - 1) > _en(i) + 0.02):
+        return True
+    return False
+
+
+def _break_transition_exempt(segs, i, gbl):
+    """第 `i` 段是否是允许保留的「8 拍过渡」（用户 2026-11-12）。
+
+    ★ 原话：「有些歌在不同段落之间有八拍或十六拍的过渡  这个你保留了吗」。
+      16 拍 = 2 个八拍，满足偶数规则，不需要例外；**8 拍 = 1 个八拍** 是奇数，
+      会被 `_fix_odd_phrase_segments` 当成 4n±1 修掉 —— 但音乐上它常是段落之间
+      独立的过渡 / break（`_insert_break_transition` 就是专门切这种段的）。
+    判据（全部满足才放行）：
+      · 内部段（首尾不算，前奏/尾奏本来就不受强制）；
+      · 长度 ≈ 1 个八拍（±0.35，与 `_is_odd_phrases` 同容差）；
+      · tier 不是 "high" —— high 档的 8 拍更像被切碎的 drop 开头，不放过。
+    放行后：`_n_odd_phrases` / `_bad_idxs` 不再把它算成违规，修复 pass 也不会
+    去合并它。
+    """
+    if not ALLOW_BREAK_TRANSITION or not gbl or float(gbl) <= 1e-9:
+        return False
+    n = len(segs)
+    if n < 3 or i <= 0 or i >= n - 1:
+        return False
+    L = (float(segs[i]["t1"]) - float(segs[i]["t0"])) / float(gbl)
+    q = float(L) / float(PHRASE_BEATS)
+    if abs(q - 1.0) > 0.35:
+        return False
+    return str(segs[i].get("tier") or "") != "high"
 
 
 def _shift_boundaries(segs, idxs, delta_sec, cur, dt, lo, rng, drop=None):
@@ -3914,8 +4361,482 @@ def _insert_break_transition(segs, cur, dt, ga, gbl, ok):
     return _renumber_names(got)
 
 
+def _fix_odd_phrase_segments(segs, cur, dt, ga, gbl, ok, max_pass=6):
+    """末端硬修：把「奇数个八拍」的段修成偶数（用户 2026-11-12 硬规则）。
+
+    规则见模块顶部 `RULE_EVEN_PHRASES`：段长按八拍计数只能是偶数
+    （= 16 拍整数倍）⇒ 4n+1（5/9 个八拍）与 4n-1（3/7 个八拍）都不允许。
+
+    ★ 例外（用户 2026-11-12 追加）：「drop 结束时 24 拍高能 + 8 拍低能」的
+      相邻配对（3+1 个八拍 = 32 拍）由 `_drop_tail_exempt` 判为合法，
+      既不计入违反数、也不作为修复候选 —— 别把它挪成 2+2 或 4+0。
+
+    两种动作（都只动内部边界、首尾段绝不碰）：
+
+      ① 单边界挪一个八拍（±8 拍）：让相邻两段从 (奇,偶)/(奇,奇) 变 (偶,偶)。
+         奇数 ⇔ 奇偶性，±1 个八拍必然翻转两段的奇偶性。能修「相邻的两个奇数段」。
+      ② 两点之间的整段平移（run-shift）：把奇数段 a 与 b 之间的**所有**边界
+         同向挪一个八拍 ⇒ 中间各段长度不变、只有 a/b 两端的奇偶性翻转，
+         刚好一次修掉两个**不相邻**的奇数段。代价是这一串边界整体偏 8 拍，
+         所以额外要求这些边界新位置的平均台阶不比原来弱超过 0.12。
+      ③ 兜底（阶段 5，2026-11-12 真实库 `3 水晶の囚われ`）：1/3/7 个八拍的 fill 段，
+         四条相关边界能量几乎持平 ⇒ 带台阶门控的候选全军覆没、阶段 4 合并又改变不了
+         奇偶性（奇+偶=奇）；此时退化为**不查台阶**的推移，只保证「奇数段严格减少、
+         不造碎段、不压没前奏/尾奏」。硬规则优先于「切在强台阶上」。
+
+    判据（全部满足才动手）：
+      ① 至少一段是奇数个八拍（且不是 drop 尾例外）；
+      ② 修完两端都 ≥ 16 拍（不造 3 个八拍以下的碎段）且**都变偶数**；
+      ③ 台阶不能太弱：单边界允许 −0.12 归一化能量，run-shift 看平均台阶；
+         —— 用户报的就是「整体偏 1 拍/4 拍」，硬规则优先于听感，但也不能在
+         平地里凭空切一刀；
+      ④ **整首**「奇数个八拍段」严格减少（自证改善），且「8 拍奇数倍段」
+         与碎段数都不增加（不倒退现有后处理的行为）。
+    排序偏好：台阶强 > 两段都贴近 32 拍整（4 个八拍）> 位移小；
+    run-shift 则优先「要挪的边界最少」。
+
+    ⚠ 为什么放在所有 pass 之后：`_snap_weak_boundary` / `_relocate_weak_boundary` /
+      `_insert_break_transition` / `_regularize_phrase_lengths` 各自动刀都可能
+      重新制造奇数段（它们只管自己的局部自证），必须在末端统一收口。
+    """
+    if not RULE_EVEN_PHRASES or not ok or gbl <= 1e-6 or dt <= 1e-9 or cur is None:
+        return segs
+    if len(segs) < 3:
+        return segs
+    try:
+        lo, hi = np.percentile(cur, [5, 95])
+    except Exception:                                          # noqa: BLE001
+        return segs
+    rng = max(float(hi - lo), 1e-9)
+    bar = gbl * PHRASE_BEATS
+
+    def _step(t):
+        # 边界两侧各一个八拍的均值差绝对值（归一化）—— "这里是不是真台阶"。
+        a = _win_mean(cur, dt, t - bar, t)
+        b = _win_mean(cur, dt, t, t + bar)
+        return abs(b - a) / rng
+
+    def _bad_idxs(xs):
+        out = []
+        for i in range(1, len(xs) - 1):
+            L = (float(xs[i]["t1"]) - float(xs[i]["t0"])) / gbl
+            if (_is_odd_phrases(L)
+                    and not _drop_tail_exempt(xs, i, gbl)
+                    and not _break_transition_exempt(xs, i, gbl)):
+                out.append(i)
+        return out
+
+    def _better(xs, cand):
+        return (_n_odd_phrases(cand, gbl) < _n_odd_phrases(xs, gbl)
+                and _n_odd_all(cand, gbl) <= _n_odd_all(xs, gbl)
+                and _n_short_segs(cand, gbl) <= _n_short_segs(xs, gbl))
+
+    got = [dict(x) for x in segs]
+
+    # ---------- 阶段 1：挪一条边界 ±1 个八拍（修相邻的 (奇,奇) 对） ----------
+    for _ in range(max_pass):
+        n = len(got)
+        best = None
+        for i in range(1, n):
+            L1 = (float(got[i]["t0"]) - float(got[i - 1]["t0"])) / gbl
+            L2 = (float(got[i]["t1"]) - float(got[i]["t0"])) / gbl
+            odd1 = (_is_odd_phrases(L1)
+                    and not _drop_tail_exempt(got, i - 1, gbl)
+                    and not _break_transition_exempt(got, i - 1, gbl))
+            odd2 = (_is_odd_phrases(L2)
+                    and not _drop_tail_exempt(got, i, gbl)
+                    and not _break_transition_exempt(got, i, gbl))
+            if not (odd1 or odd2):
+                continue
+            t_old = float(got[i]["t0"])
+            s_old = _step(t_old)
+            t_lo = float(got[i - 1]["t0"]) + 15.5 * gbl
+            t_hi = float(got[i]["t1"]) - 15.5 * gbl
+            for d in (-1, 1):          # 一个八拍 = 奇偶性翻转一次
+                nL1 = L1 + d * PHRASE_BEATS
+                nL2 = L2 - d * PHRASE_BEATS
+                if nL1 < 15.5 or nL2 < 15.5:
+                    continue
+                if _is_odd_phrases(nL1) or _is_odd_phrases(nL2):
+                    continue
+                if _odd_bars(nL1) or _odd_bars(nL2):
+                    continue
+                t_new = t_old + d * bar
+                if not (t_lo <= t_new <= t_hi):
+                    continue
+                s_new = _step(t_new)
+                if s_new + 0.12 < s_old:   # 硬规则优先，但别切进平地里
+                    continue
+                quad = int(round(nL1 / PHRASE_BEATS)) % 4 == 0
+                quad += int(round(nL2 / PHRASE_BEATS)) % 4 == 0
+                key = (round(s_new, 4), quad, -abs(d))
+                if best is None or key > best[0]:
+                    best = (key, i, d * bar)
+        if best is None:
+            break
+        _, i, delta = best
+        cand = _renumber_names(_shift_boundaries(got, [i], delta, cur, dt, lo, rng))
+        if not _better(got, cand):
+            break
+        got = cand
+
+    # ---------- 阶段 2：两个奇数段之间的整段平移（run-shift） ----------
+    for _ in range(max_pass):
+        bad = _bad_idxs(got)
+        if len(bad) < 2:
+            break
+        best = None
+        for ai in range(len(bad) - 1):
+            for bi in range(ai + 1, len(bad)):
+                a, b = bad[ai], bad[bi]
+                idxs = list(range(a + 1, b + 1))
+                La = (float(got[a]["t1"]) - float(got[a]["t0"])) / gbl
+                Lb = (float(got[b]["t1"]) - float(got[b]["t0"])) / gbl
+                old_steps = [_step(float(got[k]["t0"])) for k in idxs]
+                old_mean = sum(old_steps) / float(len(old_steps))
+                for d in (-1, 1):
+                    nLa = La + d * PHRASE_BEATS
+                    nLb = Lb - d * PHRASE_BEATS
+                    if nLa < 15.5 or nLb < 15.5:
+                        continue
+                    new_steps = [_step(float(got[k]["t0"]) + d * bar)
+                                 for k in idxs]
+                    new_mean = sum(new_steps) / float(len(new_steps))
+                    if new_mean + 0.12 < old_mean:
+                        continue
+                    key = (-len(idxs), round(new_mean - old_mean, 4))
+                    if best is None or key > best[0]:
+                        best = (key, idxs, d * bar)
+        if best is None:
+            break
+        _, idxs, delta = best
+        cand = _renumber_names(_shift_boundaries(got, idxs, delta, cur, dt, lo, rng))
+        if not _better(got, cand):
+            break
+        got = cand
+
+    # ---------- 阶段 3：剩下的单个奇数段推到首/尾段（边缘段不在规则内） ----------
+    for _ in range(2):
+        bad = _bad_idxs(got)
+        if not bad:
+            break
+        a = bad[0]
+        n = len(got)
+        La = (float(got[a]["t1"]) - float(got[a]["t0"])) / gbl
+        best = None
+        for side in ("head", "tail"):
+            idxs = (list(range(1, a + 1)) if side == "head"
+                    else list(range(a + 1, n)))
+            if not idxs:
+                continue
+            old_steps = [_step(float(got[k]["t0"])) for k in idxs]
+            old_mean = sum(old_steps) / float(len(old_steps))
+            for d in (-1, 1):
+                # 见文件头注释的符号约定：head 让 seg a 变短，tail 让它变长
+                nLa = La + (-d if side == "head" else d) * PHRASE_BEATS
+                if nLa < 15.5:
+                    continue
+                if side == "head":
+                    e0 = (float(got[0]["t1"]) - float(got[0]["t0"])) / gbl
+                    if e0 + d * PHRASE_BEATS < 7.5:      # 前奏不能被压没
+                        continue
+                else:
+                    e1 = (float(got[-1]["t1"]) - float(got[-1]["t0"])) / gbl
+                    if e1 - d * PHRASE_BEATS < 7.5:       # 尾奏不能被压没
+                        continue
+                new_steps = [_step(float(got[k]["t0"]) + d * bar) for k in idxs]
+                new_mean = sum(new_steps) / float(len(new_steps))
+                if new_mean + 0.12 < old_mean:
+                    continue
+                key = (-len(idxs), round(new_mean - old_mean, 4))
+                if best is None or key > best[0]:
+                    best = (key, idxs, d * bar)
+        if best is None:
+            break
+        _, idxs, delta = best
+        cand = _renumber_names(_shift_boundaries(got, idxs, delta, cur, dt, lo, rng))
+        if (_n_odd_phrases(cand, gbl) >= _n_odd_phrases(got, gbl)
+                or _n_short_segs(cand, gbl) > _n_short_segs(got, gbl)):
+            break
+        got = cand
+
+    # ---------- 阶段 4：挪不动时把奇数段并进相邻段（删一条内部边界） ----------
+    #   2026-11-12（真实库 `Raver Stone`）：13.54~16.64 = 1 个八拍的段，左右两条边界
+    #   的能量台阶几乎一样强（0.271 / 0.273）⇒ 往哪边挪都会掉进平地、被台阶门控拒绝。
+    #   用户规则是硬约束：与其留一处违反，不如把这条 1 个八拍的碎段并进相邻段
+    #   （它本来就是 fill）。合并只删**较弱**的那条边界；被合并段若落在首/尾，
+    #   按 `_n_odd_phrases` 口径本来就不计入规则。
+    for _ in range(2):
+        bad = _bad_idxs(got)
+        if not bad:
+            break
+        n = len(got)
+        best = None
+        for i in bad:
+            for side in ("prev", "next"):
+                if side == "prev":
+                    if i - 1 < 0:
+                        continue
+                    t_del = float(got[i]["t0"])
+                    merged = (float(got[i]["t1"])
+                              - float(got[i - 1]["t0"])) / gbl
+                else:
+                    if i + 1 > n - 1:
+                        continue
+                    t_del = float(got[i]["t1"])
+                    merged = (float(got[i + 1]["t1"])
+                              - float(got[i]["t0"])) / gbl
+                if merged < 15.5:            # 别合并出一段 3 个八拍不到的碎段
+                    continue
+                s_del = _step(t_del)
+                if best is None or s_del < best[0]:
+                    best = (s_del, i, side)
+        if best is None:
+            break
+        _, i, side = best
+        drop = i if side == "prev" else i + 1
+        cand = _shift_boundaries(got, [], 0.0, cur, dt, lo, rng, drop=drop)
+        if not _better(got, cand):
+            break
+        got = cand
+
+    # ---------- 阶段 5：最后兜底 —— 不带台阶门控地推到首/尾（硬规则优先） ----------
+    #   2026-11-12 真实库 `3 水晶の囚われ.flac`：1/3/7 个八拍的 fill 段，四条相关
+    #   边界能量几乎持平（fill 边界本来就不是平台跳变）⇒ 阶段 1/2/3 的台阶门控全被拒，
+    #   阶段 4 合并又改变不了奇偶性。用户规则是硬约束，宁可把边界挪到弱一点的位置
+    #   也不许出现 4n±1。与阶段 3 同构，但**不查台阶**。
+    for _ in range(6):
+        bad = _bad_idxs(got)
+        if not bad:
+            break
+        n = len(got)
+        best = None
+        for a in bad:
+            La = (float(got[a]["t1"]) - float(got[a]["t0"])) / gbl
+            for side in ("head", "tail"):
+                idxs = (list(range(1, a + 1)) if side == "head"
+                        else list(range(a + 1, n)))
+                if not idxs:
+                    continue
+                for d in (-1, 1):
+                    nLa = La + (-d if side == "head" else d) * PHRASE_BEATS
+                    if nLa < 15.5:
+                        continue
+                    if side == "head":
+                        e0 = (float(got[0]["t1"]) - float(got[0]["t0"])) / gbl
+                        if e0 + d * PHRASE_BEATS < 7.5:   # 前奏不能被压没
+                            continue
+                    else:
+                        e1 = (float(got[-1]["t1"]) - float(got[-1]["t0"])) / gbl
+                        if e1 - d * PHRASE_BEATS < 7.5:   # 尾奏不能被压没
+                            continue
+                    new_steps = [_step(float(got[k]["t0"]) + d * bar) for k in idxs]
+                    new_mean = sum(new_steps) / float(len(new_steps))
+                    key = (-len(idxs), round(new_mean, 4))
+                    if best is None or key > best[0]:
+                        best = (key, idxs, d * bar)
+        if best is None:
+            break
+        _, idxs, delta = best
+        cand = _renumber_names(_shift_boundaries(got, idxs, delta, cur, dt, lo, rng))
+        if (_n_odd_phrases(cand, gbl) >= _n_odd_phrases(got, gbl)
+                or _n_short_segs(cand, gbl) > _n_short_segs(got, gbl)):
+            break
+        got = cand
+
+    return got
+
+
+def _novelty_curve(f, dt, gbl, win_beats=NOVELTY_WIN_BEATS):
+    """多频带「平台变化强度」曲线（按本曲 p95 归一化，0~1.5 左右）。
+
+    11 维 = `Elow`/`Emid`/`Ehigh` + `Eband` 8 个对数频段：
+      ① 逐维转 dB（`10*log10`），
+      ② 用**本曲**中位数 / 半分位距（p84−p16）z 化 —— 每首歌的母带/编曲习惯不同，
+         拿别的歌当基准会把整首判偏（同 `_density_penalty` 的教训），
+      ③ 该时刻「之后 `win_beats` 拍均值 − 之前 `win_beats` 拍均值」逐维求差，
+      ④ 跨维 RMS ⇒ 用一个数表示"这里的平台变化有多强"。
+
+    ⚠ 用「两侧各一个乐句」的窗而不是短窗：段落的本质是**平台跳变**（drop/break），
+      短窗会被 fill/滚奏/加花拉满，长窗才对应"换了一层编排"。
+    ⚠ 返回 None 表示特征不全（老特征字典 / 无 `Eband`）⇒ 调用方原样返回，行为不变。
+    """
+    if not isinstance(f, dict) or dt <= 1e-9 or gbl <= 1e-6:
+        return None
+    parts = []
+    for k in ("Elow", "Emid", "Ehigh"):
+        v = f.get(k)
+        if v is None:
+            return None
+        parts.append(np.asarray(v, dtype=np.float64))
+    eb = f.get("Eband")
+    if eb is None:
+        return None
+    eb = np.asarray(eb, dtype=np.float64)
+    if eb.ndim != 2 or eb.shape[1] < 3:
+        return None
+    nf = min([p.size for p in parts] + [eb.shape[0]])
+    if nf < 64:
+        return None
+    try:
+        V = np.column_stack([p[:nf] for p in parts] + [eb[:nf]])
+        V = 10.0 * np.log10(V + 1e-9)
+        med = np.median(V, axis=0)
+        spread = np.percentile(V, 84.0, axis=0) - np.percentile(V, 16.0, axis=0)
+        V = (V - med) / np.maximum(spread * 0.5, 1e-6)
+        cs = np.vstack([np.zeros((1, V.shape[1]), dtype=np.float64),
+                        np.cumsum(V, axis=0)])
+        w = max(2, int(round(win_beats * gbl / dt)))
+        idx = np.arange(nf)
+        a0 = np.clip(idx - w, 0, nf)
+        b1 = np.clip(idx + w, 0, nf)
+        na = np.maximum(1, idx - a0)[:, None]
+        nb = np.maximum(1, b1 - idx)[:, None]
+        d = (cs[b1] - cs[idx]) / nb - (cs[idx] - cs[a0]) / na
+        nov = np.sqrt((d * d).mean(axis=1))
+    except Exception:                                          # noqa: BLE001
+        return None
+    p95 = float(np.percentile(nov, 95.0))
+    if p95 > 1e-9:
+        nov = nov / p95
+    return nov
+
+
+def _refine_boundary_novelty(segs, f, cur, dt, ga, gbl, ok, max_pass=2):
+    """末端：把边界挪到多频带平台变化更强的八拍线上（只挪 ±2 条线 = ±16 拍）。
+
+    ★ 用户 2026-11-12 痛点②「段落边界不准（drop/break 边界差几拍、切早或切晚）」的
+      量化版本：真实库 27 首 / 491 条内部边界里 **18.7%** 在 ±2 条线内能找到明显
+      更强的平台变化（比值中位 3.3），说明现行候选层（dif 峰/线通道）挑错了线。
+
+    ★ 为什么只挪 ±2 条线（±16 拍）：
+      `RULE_EVEN_PHRASES` 要求每个内部段都是**偶数个八拍**；挪 ±1 条线会让两侧段长
+      各翻转一次奇偶性（偶数 ⇒ 奇数），直接违反硬规则。挪 ±2 条线 = 偶数个八拍单位，
+      两侧奇偶性不变，所以这条 pass 可以和硬规则共存、且不需要再修一遍。
+
+    判据（全部满足才动手，一条一验）：
+      ① 新的两条段长都仍是**偶数个八拍**、都 ≥ 2 个八拍（首/尾段不参与奇偶校验）；
+      ② 新位置 novelty ≥ 原位置 × `NOVELTY_GAIN_MIN`，且 ≥ `NOVELTY_FLOOR`；
+      ③ 改完「奇数个八拍段」与碎段数都不增加（`_n_odd_phrases` / `_n_short_segs`）；
+      ④ 每首最多挪 `NOVELTY_MAX_MOVES` 条；同一 pass 内相邻边界不重复挪。
+
+    ⚠ 只在**吸附过的**分段表上跑（`_seg_impl(grid=...)`）：`sections_raw` 是不吸附的
+      原始边界，不能把它强行拉到网格线上（调用方用 `snapped` 参数控制）。
+    """
+    if not REFINE_NOVELTY or not ok or gbl <= 1e-6 or dt <= 1e-9 or len(segs) < 3:
+        return segs
+    nov = _novelty_curve(f, dt, gbl)
+    if nov is None:
+        return segs
+    bar = PHRASE_BEATS * gbl          # 一条八拍线的间隔（秒）
+    step = 2.0 * bar                  # ±2 条线 = ±16 拍（偶数个八拍单位）
+
+    def nov_at(t):
+        i = int(round(t / dt))
+        return float(nov[max(0, min(nov.size - 1, i))])
+
+    def _units_ok(x, i, t_new):
+        """边界 i 挪到 t_new 后，受影响的段 i-1 / i 是否仍是偶数个八拍、且都 ≥2 个。"""
+        n = len(x)
+        L1 = (t_new - float(x[i - 1]["t0"])) / gbl / PHRASE_BEATS      # 段 i-1
+        L2 = (float(x[i]["t1"]) - t_new) / gbl / PHRASE_BEATS          # 段 i
+        for L, si in ((L1, i - 1), (L2, i)):
+            if si in (0, n - 1):                                       # 首/尾段不校验奇偶
+                if L < 1.0 - 1e-6:
+                    return False
+                continue
+            q = int(round(L))
+            if abs(L - q) > 0.04 or q < 2 or q % 2:
+                return False
+        return True
+
+    try:
+        lo, hi = np.percentile(cur, [5, 95])
+    except Exception:                                          # noqa: BLE001
+        return segs
+    rng = max(float(hi - lo), 1e-9)
+
+    got = [dict(x) for x in segs]
+    base_odd = _n_odd_phrases(got, gbl)
+    base_short = _n_short_segs(got, gbl)
+    moved = 0
+    for _ in range(max_pass):
+        n = len(got)
+        if n < 3:
+            break
+        cands = []
+        for i in range(1, n):
+            t0 = float(got[i]["t0"])
+            v0 = nov_at(t0)
+            for d in (-1.0, 1.0):
+                t1 = t0 + d * step
+                if t1 <= 1.0 or t1 >= float(got[-1]["t1"]) - 1.0:
+                    continue
+                if not _units_ok(got, i, t1):
+                    continue
+                v1 = nov_at(t1)
+                if v1 < NOVELTY_FLOOR:
+                    continue
+                gain = v1 / max(v0, 1e-6)
+                if gain < NOVELTY_GAIN_MIN:
+                    continue
+                cands.append((gain, v1, i, d * step, t1))
+        if not cands:
+            break
+        cands.sort(key=lambda z: (-z[0], -z[1]))
+        used = set()
+        applied = 0
+        for gain, v1, i, delta, t1 in cands:
+            if moved >= NOVELTY_MAX_MOVES:
+                break
+            if any(abs(i - j) <= 1 for j in used):
+                continue
+            # 用**当前**表复核（前面的挪动可能改了相邻段长）
+            if not _units_ok(got, i, t1):
+                continue
+            cand = _shift_boundaries(got, [i], delta, cur, dt, lo, rng)
+            for z in (i - 1, i):                      # tier 跟着新能量走
+                if 0 <= z < len(cand):
+                    cand[z]["tier"] = tier_from_energy(cand[z]["energy"])
+            if (_n_odd_phrases(cand, gbl) > base_odd
+                    or _n_short_segs(cand, gbl) > base_short):
+                continue
+            got = cand
+            used.add(i)
+            applied += 1
+            moved += 1
+        if not applied:
+            break
+    if moved == 0:
+        return segs
+    return _renumber_names(got)
+
+
+def _n_odd_phrases(segs, gbl):
+    """表里「奇数个八拍」的段数（首尾除外，口径与 `_n_odd_bars` 一致）。
+
+    ★ 2026-11-12：`_drop_tail_exempt` 认定的「24 拍高能 + 8 拍低能」drop 尾
+      配对（3+1 个八拍）是用户明说合法的编曲形态，**不计入违反数**。
+    ★ 2026-11-12 追加：`_break_transition_exempt` 认定的「8 拍过渡段」也放行
+      （用户：「有些歌在不同段落之间有八拍或十六拍的过渡」）。
+    """
+    if not gbl or float(gbl) <= 1e-9:
+        return 0
+    n = 0
+    for i in range(1, len(segs) - 1):
+        x = segs[i]
+        L = (float(x["t1"]) - float(x["t0"])) / gbl
+        if (_is_odd_phrases(L)
+                and not _drop_tail_exempt(segs, i, gbl)
+                and not _break_transition_exempt(segs, i, gbl)):
+            n += 1
+    return n
+
+
 def _n_odd_bars(segs, gbl):
     """表里「8 拍奇数倍段」的条数（首尾除外 —— 前奏/尾奏本来就跟着曲长走）。"""
+    if not gbl or float(gbl) <= 1e-9:      # ★ 无网格调用（grid=None）时无意义
+        return 0
     n = 0
     for x in segs[1:-1]:
         L = (float(x["t1"]) - float(x["t0"])) / gbl
@@ -3926,6 +4847,8 @@ def _n_odd_bars(segs, gbl):
 
 def _n_odd_all(segs, gbl):
     """表里「8 拍奇数倍段」的条数（**含首尾** —— 这一刀用它做全局自证）。"""
+    if not gbl or float(gbl) <= 1e-9:      # ★ 2026-11-12：gbl=0 时原来会 ZeroDivisionError
+        return 0
     n = 0
     for x in segs:
         L = (float(x["t1"]) - float(x["t0"])) / gbl
@@ -3936,6 +4859,8 @@ def _n_odd_all(segs, gbl):
 
 def _n_short_segs(segs, gbl):
     """表里长度 < 8 拍的段数（首尾除外）。"""
+    if not gbl or float(gbl) <= 1e-9:      # ★ 同上
+        return 0
     n = 0
     for x in segs[1:-1]:
         if (float(x["t1"]) - float(x["t0"])) / gbl < 7.75:
@@ -4022,3 +4947,1553 @@ def _rephase_chain(segs, start_t, ga, gbl, cur, dt, lo, rng, dur):
         prev = t1
     return built, j, round(float(new_end), 3)
 
+
+#: 中/高频存在感权重：0.55 = 只有低频的段落最多保留 55% 能量；
+#: 1.0 = 中高频都达到本曲中位以上，不扣。只影响段落 energy，不按歌名。
+SEG_PRESENCE_MIN = 0.55
+SEG_PRESENCE_REF = 1.50
+
+
+def _recompute_segment_energies(xs, f, cur, dt, gbl=0.0):
+    """按段自身边界重算 energy，并用中/高频存在感压低“只有低频”的假 drop."""
+    if not xs or cur is None or dt <= 1e-9:
+        return xs
+    try:
+        mlow = float(np.median(f["Elow"])) + 1e-9
+        mmid = float(np.median(f["Emid"])) + 1e-9
+        mhigh = float(np.median(f["Ehigh"])) + 1e-9
+    except Exception:                                          # noqa: BLE001
+        mlow = mmid = mhigh = 1.0
+    out = []
+    for s in xs:
+        try:
+            a = max(0, min(len(cur) - 1, int(round(float(s["t0"]) / dt))))
+            b = max(a + 1, min(len(cur), int(round(float(s["t1"]) / dt))))
+            mean = float(cur[a:b].mean())
+            pen = 0.0
+            try:
+                pen = float(_density_penalty(f, [a, b], dt)[0])
+            except Exception:                                  # noqa: BLE001
+                pen = 0.0
+            base = _clamp01(mean) ** ENERGY_GAMMA * (1.0 - pen)
+            lo_r = max(0.0, float(f["Elow"][a:b].mean()) / mlow)
+            mid_r = max(0.0, float(f["Emid"][a:b].mean()) / mmid)
+            hi_r = max(0.0, float(f["Ehigh"][a:b].mean()) / mhigh)
+            presence = (mid_r * hi_r) ** 0.5
+            fac = SEG_PRESENCE_MIN + (1.0 - SEG_PRESENCE_MIN) * min(
+                1.0, presence / SEG_PRESENCE_REF)
+            # 只压「已经是 high、但中高频存在感不足」的段（如只有低频的假 drop）；
+            # mid/low 段不套这个折扣，避免把正常的 build/transition 一起压低。
+            e = base * fac if (base >= 0.85 and presence < 1.0) else base
+            d = dict(s)
+            tier = s.get("tier") if s.get("tier_locked") else tier_from_energy(e)
+            # ?? drop???????/???????>=32 ???????? cur ?? low
+            if (not s.get("tier_locked") and gbl > 1e-9
+                    and (tier or "mid") in ("low", "mid")
+                    and (float(s["t1"]) - float(s["t0"])) / gbl >= 32.0
+                    and hi_r >= 1.50 and 0.60 <= mid_r <= 1.00 and lo_r >= 1.00
+                    and presence >= 1.00 and base < 0.30):
+                e = max(float(e), 0.72)
+                tier = "high"
+                if os.environ.get("ERLIB_HF_DROP_DEBUG") == "1":
+                    print("[hf-drop] %.3f-%.3f L=%.1f lo=%.2f mid=%.2f hi=%.2f pres=%.2f base=%.3f"
+                          % (float(s["t0"]), float(s["t1"]),
+                             (float(s["t1"]) - float(s["t0"])) / gbl,
+                             lo_r, mid_r, hi_r, presence, base))
+            d["energy"] = float(e)
+            d["tier"] = tier
+            out.append(d)
+        except Exception:                                      # noqa: BLE001
+            out.append(s)
+    return _renumber_names(out)
+
+
+#: 段落语法：主体只有 32/64 拍；40 拍 = 32+8 或 8+32；48 拍 = 32+16 或
+#: 16+32；72/80 拍 = 64+8 / 64+16。过渡在主体前还是后，由音频边界强度决定，
+#: 不按歌名、不按固定总长（用户 2026-11-18：48 不是整体，也可能是 40）。
+CHAIN_MAIN_BEATS = (64.0, 32.0)
+CHAIN_TRANS_BEATS = (8.0, 16.0)
+CHAIN_CUT_MIN = 0.12
+
+
+def _chain_block_change(feats, k):
+    """8 拍块边界 k 的多特征变化分（与结构 DP 同一口径）。"""
+    n = int(feats.get("n") or 0)
+    if k <= 0 or k >= n:
+        return 0.0
+
+    def d(key, log=True):
+        a = float(feats[key][k - 1]) + 1e-9
+        b = float(feats[key][k]) + 1e-9
+        return abs(np.log10(b / a)) if log else abs(b - a)
+
+    return max(d("Elow"), d("Ehigh"), d("flux"), d("cur", log=False) * 2.0)
+
+
+def _regularize_chain_phrases(segs, f, cur, dt, ga, bl):
+    """把两个 high 之间的 low/mid 链按「主体 + 过渡」重新分句。
+
+    只动内部（high → low/mid 链 → high）的链；主体/过渡长度来自段落语法，
+    具体落在哪一侧由 8 拍块特征的真实变化分决定。这样 40 拍会得到 32+8
+    或 8+32，48 拍会得到 32+16 或 16+32，不是固定规则。
+    """
+    if not segs or len(segs) < 3 or bl <= 1e-9 or dt <= 1e-9 or cur is None:
+        return segs
+    try:
+        import structure_seg as SS
+        feats = SS.block_features(f, len(cur) * dt, ga, bl)
+    except Exception:                                          # noqa: BLE001
+        return segs
+    nblk = int(feats.get("n") or 0)
+    if nblk < 3:
+        return segs
+    out = []
+    i = 0
+    nseg = len(segs)
+    while i < nseg:
+        s = segs[i]
+        if str(s.get("tier")) != "high" or i + 1 >= nseg:
+            out.append(dict(s))
+            i += 1
+            continue
+        j = i + 1
+        while j < nseg and str(segs[j].get("tier")) in ("low", "mid"):
+            j += 1
+        if j == i + 1 or j >= nseg or str(segs[j].get("tier")) != "high":
+            out.append(dict(s))
+            i += 1
+            continue
+        out.append(dict(s))
+        chain = segs[i + 1:j]
+        t0 = float(chain[0]["t0"])
+        t1 = float(chain[-1]["t1"])
+        fb0 = (t0 - ga) / (8.0 * bl)
+        fb1 = (t1 - ga) / (8.0 * bl)
+        b0, b1 = int(round(fb0)), int(round(fb1))
+        if (abs(fb0 - b0) > 0.12 or abs(fb1 - b1) > 0.12
+                or b0 < 0 or b1 > nblk or b1 - b0 < 1):
+            out.extend(dict(x) for x in chain)
+            i = j
+            continue
+        L = 8.0 * (b1 - b0)
+        pair = None
+        for main in CHAIN_MAIN_BEATS:
+            for trans in CHAIN_TRANS_BEATS:
+                if abs(main + trans - L) < 1e-6:
+                    pair = (main, trans)
+                    break
+            if pair:
+                break
+        if pair is None:
+            out.extend(dict(x) for x in chain)
+            i = j
+            continue
+        main, trans = pair
+        b_main = b0 + int(round(main / 8.0))
+        b_trans = b0 + int(round(trans / 8.0))
+        old_cuts = {b0, b1}
+        for x in chain:
+            old_cuts.add(int(round((float(x["t1"]) - ga) / (8.0 * bl))))
+        layout_main = {b0, b_main, b1}
+        layout_trans = {b0, b_trans, b1}
+        if old_cuts == layout_main or old_cuts == layout_trans:
+            out.extend(dict(x) for x in chain)
+            i = j
+            continue
+        s_main = _chain_block_change(feats, b_main)
+        s_trans = _chain_block_change(feats, b_trans)
+        if max(s_main, s_trans) < CHAIN_CUT_MIN:
+            out.extend(dict(x) for x in chain)
+            i = j
+            continue
+        cut = b_main if s_main >= s_trans else b_trans
+        pts = [t0, float(ga) + cut * 8.0 * bl, t1]
+        for a, b in zip(pts[:-1], pts[1:]):
+            e = _seg_energy_at(f, cur, dt, a, b)
+            out.append({"t0": round(a, 3), "t1": round(b, 3),
+                        "energy": float(e), "tier": tier_from_energy(e),
+                        "name": ""})
+        i = j
+    return out
+
+
+def _apply_prefix_strict(norm, f, cur, dt, ga, bl):
+    """只重切「开头 16 拍过渡之后、第一段 high 之前」且含非 32/64 段的前缀。
+
+    保护规则：
+      · 开头 16 拍过渡原样保留；
+      · 前缀里如果已经是 8/16/32/64，不再动；
+      · 第一段 high 用段落 tier 判定（不猜 drop 块）；
+      · 严格 32/64 前缀代价至少低 5% 才替换；
+      · 只替换 [protect_end, t_high] 区间，首尾段都不丢。
+    """
+    if not norm or len(norm) < 3 or bl <= 1e-9 or dt <= 1e-9 or cur is None:
+        return norm
+    hi = None
+    for i, s in enumerate(norm):
+        if str(s.get("tier")) == "high":
+            hi = i
+            break
+    if hi is None or hi == 0:
+        return norm
+    t_high = float(norm[hi]["t0"])
+    # 保留开头 16 拍过渡（连续段）
+    protect_end = float(norm[0]["t1"])
+    in_run = False
+    for s in norm[:hi]:
+        t0, t1 = float(s["t0"]), float(s["t1"])
+        L = (t1 - t0) / bl
+        is16 = abs(L - 16.0) < 0.6
+        if not in_run:
+            if is16:
+                in_run = True
+                protect_end = max(protect_end, t1)
+        else:
+            if is16:
+                protect_end = max(protect_end, t1)
+            else:
+                break
+    if t_high - protect_end < 16.0 * bl:
+        return norm
+    region = [s for s in norm
+              if float(s["t0"]) >= protect_end - 1e-6
+              and float(s["t1"]) <= t_high + 1e-6]
+    if not region:
+        return norm
+    # 只处理含非 8/16/32/64 段的前缀；已经合法的不动
+    bad = False
+    for s in region:
+        L = (float(s["t1"]) - float(s["t0"])) / bl
+        if not any(abs(L - v) < 0.6 for v in (8.0, 16.0, 32.0, 64.0)):
+            bad = True
+            break
+    if not bad:
+        return norm
+    try:
+        import structure_seg as SS
+        feats = SS.block_features(f, len(cur) * dt, ga, bl)
+        n = int(feats["n"])
+        fb0 = (protect_end - ga) / (8.0 * bl)
+        fb1 = (t_high - ga) / (8.0 * bl)
+        sb, b1 = int(round(fb0)), int(round(fb1))
+        if (abs(fb0 - sb) > 0.18 or abs(fb1 - b1) > 0.18
+                or b1 > n or b1 - sb < 16):
+            return norm
+        X = SS._feature_matrix(feats)
+        ss = SS.strict_32_64_edges(f, len(cur) * dt, ga, bl)
+        scuts = {sb, b1}
+        for e in ss:
+            b = (float(e) - ga) / (8.0 * bl)
+            if abs(b - round(b)) <= 0.18:
+                c = int(round(b))
+                if sb < c < b1:
+                    scuts.add(c)
+        scuts = sorted(scuts)
+        gcuts = {sb, b1}
+        for s in region[1:]:
+            b = (float(s["t0"]) - ga) / (8.0 * bl)
+            if abs(b - round(b)) > 0.18:
+                return norm
+            gcuts.add(int(round(b)))
+        gcuts = sorted(gcuts)
+        cg = SS._cut_cost(X, gcuts, 1.2)
+        cs = SS._cut_cost(X, scuts, 1.2)
+        if os.environ.get("ERLIB_PREFIX_DEBUG") == "1":
+            print("[prefix] b1=%d protect=%.3f sb=%d cg=%.2f cs=%.2f"
+                  % (b1, protect_end, sb, cg, cs))
+        if cs >= 0.90 * cg:
+            return norm
+        out = [dict(s) for s in norm if float(s["t1"]) <= protect_end + 1e-3]
+        prev = protect_end
+        for c in scuts[1:]:
+            t1 = float(ga) + c * 8.0 * bl
+            e = _seg_energy_at(f, cur, dt, prev, t1)
+            out.append({"t0": round(prev, 3), "t1": round(t1, 3),
+                        "energy": float(e), "tier": tier_from_energy(e),
+                        "name": ""})
+            prev = t1
+        out += [dict(s) for s in norm if float(s["t0"]) >= t_high - 1e-3]
+        return _renumber_names(out)
+    except Exception:                                          # noqa: BLE001
+        return norm
+
+
+def segments_from_edges(f, edges_sec, dur=0.0, grid=None, snap_beats=None,
+                        post=True):
+    """用**外部给的边界**（秒）生成段落表；能量/档位仍用本模块口径。
+
+    2026-11-16（用户：「分开来嘛 用音色分段 能量还是我们之前的算法」）：
+      · 边界由 `timbre_seg.edges()` 用音色变化给出；
+      · 段能量 `e_rep = clamp01(mean(cur))**ENERGY_GAMMA * (1 - 密度折扣)`、
+        档位阈值与「本曲相对」补丁全部照旧 —— 与 `_seg_impl` 完全同一套公式，
+        只是不再由能量台阶决定「在哪切」。
+    """
+    cur, dt = smooth_curve(f)
+    if cur is None:
+        return normalize([{"t0": 0.0, "t1": max(1.0, float(dur or 0.0)),
+                           "energy": 0.5, "tier": "low", "name": "全长"}],
+                         dur, grid, beats=snap_beats)
+    n = int(cur.size)
+    dur_eff = float(dur) if dur and dur > 0 else n * dt
+    ga, gbl, gok = _grid_ctx(grid)
+
+    strict_mode = getattr(edges_sec, "mode", "") == "strict"
+    es = [float(x) for x in (edges_sec or []) if x is not None]
+    es = sorted({round(x, 3) for x in es if 0.0 < x < dur_eff - 1e-3})
+    if len(es) < 2:
+        return normalize([{"t0": 0.0, "t1": dur_eff,
+                           "energy": float(np.mean(cur)), "tier": "low",
+                           "name": "全长"}], dur_eff, grid, beats=snap_beats)
+    edges = [0.0] + es + [dur_eff]
+
+    bis = [0]
+    for _e in edges[1:-1]:
+        _i = int(round(float(_e) / dt)) if dt > 1e-9 else 0
+        bis.append(max(bis[-1] + 1, min(n - 1, _i)))
+    bis.append(n)
+    if len(bis) < 2 or bis[-1] <= bis[0]:
+        return []
+
+    means = [float(cur[bis[k]:bis[k + 1]].mean()) for k in range(len(bis) - 1)]
+    _dens = _density_penalty(f, bis, dt)
+    e_rep = [_clamp01(float(e)) ** ENERGY_GAMMA * (1.0 - _dens[k])
+             for k, e in enumerate(means)]
+    tiers = [tier_from_energy(e) for e in e_rep]
+    _mx = max(e_rep) if e_rep else 0.0
+    if _mx > 0:
+        for _k, _e in enumerate(e_rep):
+            if tiers[_k] != "high" and _e >= 0.60 and _e >= 0.84 * _mx:
+                tiers[_k] = "high"
+    if tiers and "high" not in tiers:
+        tiers[int(np.argmax(e_rep))] = "high"
+
+    out = []
+    hi_n = mid_n = lo_n = 0
+    for k, e in enumerate(e_rep):
+        tier = tiers[k]
+        if tier == "high":
+            hi_n += 1
+            nm = "drop %d" % hi_n
+        elif tier == "mid":
+            mid_n += 1
+            nm = "中段 %d" % mid_n
+        else:
+            lo_n += 1
+            if k == 0:
+                nm = "前奏"
+            elif k == len(e_rep) - 1:
+                nm = "尾奏"
+            else:
+                nm = "过渡 %d" % lo_n
+        out.append({"t0": float(edges[k]), "t1": float(edges[k + 1]),
+                    "energy": float(e), "tier": tier, "name": nm})
+    out[0]["t0"] = 0.0
+    norm = normalize(out, dur_eff, grid, beats=snap_beats)
+    # ★ 2026-11-16 用户校准（水晶 / Extra Pain）：语义形状规则只改档位与边界，
+    #   不改能量口径；放在 post 硬修之前，post=False 也生效。
+    # ★ 2026-11-18：严格 32/64 候选只走能量/档位，不再让能量形状规则改边界，
+    #   否则刚切好的 64/32 网格又会被切回 48/16/56。
+    if not strict_mode:
+        try:
+            norm = _apply_shape_rules(norm, f, cur, ga, gbl, dt)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            norm = _apply_prefix_strict(norm, f, cur, dt, ga, gbl)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            norm = _split_kickless_half(norm, f, cur, dt, ga, gbl)
+        except Exception as _e:                                # noqa: BLE001
+            if os.environ.get("ERLIB_KICKLESS_DEBUG") == "1":
+                print("[kickless] EXC %s: %s" % (type(_e).__name__, _e))
+        try:
+            norm = _regularize_chain_phrases(norm, f, cur, dt, ga, gbl)
+        except Exception:                                      # noqa: BLE001
+            pass
+    try:
+        norm = _recompute_segment_energies(norm, f, cur, dt, gbl)
+    except Exception:                                      # noqa: BLE001
+        pass
+    # ★ 2026-11-18：形状规则偶尔会切出零长度段（t0==t1，例如 Hanged 87.78s），
+    #   显示上不可见但会占一条记录、也会被「退化段」校验抓到 —— 这里统一清掉。
+    try:
+        _keep = [x for x in norm if (float(x["t1"]) - float(x["t0"])) > 1e-3]
+        if len(_keep) != len(norm) and len(_keep) >= 2:
+            _keep[0]["t0"] = 0.0
+            norm = _renumber_names(_keep)
+    except Exception:                                      # noqa: BLE001
+        pass
+    if not post or strict_mode:
+        return norm
+    # 契约：碎段、奇数八拍、64 拍上限都沿用现有硬修（只动边界、不动能量口径）
+    try:
+        norm = _drop_tiny_segments(norm, ga, gbl, gok)
+    except Exception:                                          # noqa: BLE001
+        pass
+    try:
+        norm = _fix_odd_phrase_segments(norm, cur, dt, ga, gbl, gok)
+    except Exception:                                          # noqa: BLE001
+        pass
+    try:
+        norm = _final_cap_segments(norm, cur, dt, f, ga, gbl, gok)
+    except Exception:                                          # noqa: BLE001
+        pass
+    return norm
+
+# ★ 2026-11-16（用户 m05473）：三条「语义形状」规则。
+#   背景：能量口径判不出两类段落 ——
+#     1) 滤波/稀疏型 drop（低频还在、拍点还在，但谱能量低）→ 用「拍级低频起音自相关」认；
+#     2) build 末尾的「假 drop」（短促抬升后立刻回落）→ 单独切 16 拍；
+#     3) 「48 拍 drop + 48 拍中段，而中段开头仍很响」其实是 32 拍 drop + 64 拍 drop。
+RULE_DEEP_DROP = os.environ.get("ERLIB_RULE_DEEP_DROP", "1") != "0"
+RULE_FAKE_DROP = os.environ.get("ERLIB_RULE_FAKE_DROP", "1") != "0"
+DEEP_DROP_AC_MIN = float(os.environ.get("ERLIB_DEEP_AC", "0.65"))
+DEEP_DROP_LOW_MIN = float(os.environ.get("ERLIB_DEEP_LOW", "0.70"))
+FAKE_DROP_SPIKE = float(os.environ.get("ERLIB_FAKE_SPIKE", "0.85"))
+MERGE_HOT_MIN = float(os.environ.get("ERLIB_MERGE_HOT", "0.80"))
+
+
+def _seg_bounds_idx(t0, t1, ga, dt, n):
+    a = max(0, int(round((t0 - ga) / dt)))
+    b = max(a + 1, int(round((t1 - ga) / dt)))
+    return a, min(b, n)
+
+
+def _kick_ac(f, t0, t1, ga, bl, dt):
+    """拍级低频起音（Elow 正差分平滑后）在 1 拍滞后上的自相关。"""
+    low = f.get("Elow")
+    if low is None:
+        return 0.0
+    a, b = _seg_bounds_idx(t0, t1, ga, dt, int(low.size))
+    if b - a < 16:
+        return 0.0
+    seg = np.asarray(low[a:b], dtype=np.float64)
+    d = np.maximum(0.0, np.diff(seg, prepend=seg[0]))
+    d = np.convolve(d, np.ones(3) / 3.0, mode="same")
+    lag = max(1, int(round(bl / dt)))
+    if d.size <= lag * 2:
+        return 0.0
+    x = d - d.mean()
+    den = float((x * x).sum())
+    if den <= 1e-12:
+        return 0.0
+    return float((x[:-lag] * x[lag:]).sum() / den)
+
+
+def _low_mean(f, t0, t1, ga, dt):
+    low = f.get("Elow")
+    if low is None:
+        return 0.0
+    a, b = _seg_bounds_idx(t0, t1, ga, dt, int(low.size))
+    if b <= a:
+        return 0.0
+    return float(np.asarray(low[a:b], dtype=np.float64).mean())
+
+
+def _cur_mean(cur, t0, t1, dt):
+    a = max(0, int(round(t0 / dt)))
+    b = max(a + 1, int(round(t1 / dt)))
+    if b > cur.size:
+        b = cur.size
+    if b <= a:
+        return 0.0
+    return float(np.asarray(cur[a:b], dtype=np.float64).mean())
+
+
+def _deep_drop_fix(segs, f, ga, bl, dt):
+    if not RULE_DEEP_DROP or not segs:
+        return segs
+    highs = [s for s in segs if s.get("tier") == "high"]
+    if not highs or f.get("Elow") is None:
+        return segs
+    med = float(np.median([_low_mean(f, s["t0"], s["t1"], ga, dt) for s in highs]))
+    if med <= 1e-9:
+        return segs
+    for s in segs:
+        if s.get("tier") != "low" or s.get("name") in ("前奏", "尾奏"):
+            continue
+        if (s["t1"] - s["t0"]) / bl < 32.0 - 0.35:
+            continue
+        ac = _kick_ac(f, s["t0"], s["t1"], ga, bl, dt)
+        if ac >= DEEP_DROP_AC_MIN and _low_mean(f, s["t0"], s["t1"], ga, dt) >= DEEP_DROP_LOW_MIN * med:
+            s["tier"] = "high"
+            s["energy"] = max(float(s["energy"]), 0.72)
+    return segs
+
+
+def _fake_drop_split(segs, cur, dt, ga, bl):
+    if not RULE_FAKE_DROP or not segs:
+        return segs
+    out = []
+    for i, s in enumerate(segs):
+        nxt = segs[i + 1] if i + 1 < len(segs) else None
+        L = (s["t1"] - s["t0"]) / bl
+        if (s.get("tier") == "mid" and nxt is not None and nxt.get("tier") == "high"
+                and L >= 32.0 - 0.35 and L <= 64.0 + 0.35 and abs(L % 16.0) < 0.6):
+            cut = s["t1"] - 16.0 * bl
+            c1 = _cur_mean(cur, cut, cut + 8.0 * bl, dt)        # 16 拍里的前 8 拍（假 drop 的抬升）
+            c2 = _cur_mean(cur, cut + 8.0 * bl, s["t1"], dt)    # 后 8 拍（回落）
+            c_head = _cur_mean(cur, s["t0"], cut, dt)
+            if c1 >= FAKE_DROP_SPIKE and c2 <= c1 - 0.12 and c_head <= 0.78:
+                a = dict(s)
+                a["t1"] = cut
+                b = {"t0": cut, "t1": s["t1"],
+                     "energy": _clamp01((c1 + c2) / 2.0) ** ENERGY_GAMMA,
+                     "tier": "mid",
+                     "name": "过渡"}
+                out.append(a)
+                out.append(b)
+                continue
+        out.append(s)
+    return out
+
+
+def _merge_32_64(segs, cur, dt, ga, bl):
+    if not RULE_DEEP_DROP or not segs:
+        return segs
+    out = []
+    i = 0
+    while i < len(segs):
+        s = segs[i]
+        if i + 1 < len(segs):
+            n = segs[i + 1]
+            Ls = (s["t1"] - s["t0"]) / bl
+            Ln = (n["t1"] - n["t0"]) / bl
+            if (s.get("tier") == "high" and abs(Ls - 48.0) < 0.6
+                    and n.get("tier") == "mid" and abs(Ln - 48.0) < 0.6):
+                hot = _cur_mean(cur, n["t0"], n["t0"] + 16.0 * bl, dt)
+                if hot >= MERGE_HOT_MIN:
+                    cut = s["t0"] + 32.0 * bl
+                    a = dict(s)
+                    a["t1"] = cut
+                    a["energy"] = _clamp01(_cur_mean(cur, s["t0"], cut, dt)) ** ENERGY_GAMMA
+                    b = {"t0": cut, "t1": n["t1"],
+                         "energy": max(float(n["energy"]), 0.72),
+                         "tier": "high", "name": "drop"}
+                    out.append(a)
+                    out.append(b)
+                    i += 2
+                    continue
+        out.append(s)
+        i += 1
+    return out
+
+
+RULE_PRE_GAP = os.environ.get("ERLIB_RULE_PRE_GAP", "1") != "0"
+
+
+def _pre_gap_shift(segs, cur, dt, ga, bl):
+    """2026-11-16 Hanged Herself：连续过渡链的「头 8 拍」如果明显更安静，
+    把这 8 拍单独切成一个过渡，链内边界整体后移 8 拍（链尾那一段吃掉这 8 拍，后面的段不动）。
+
+    用户原话：「过渡4包括过渡5，得整体往后面挪八拍，然后前面空出来的8拍单独是一个过渡」。
+    """
+    if not RULE_PRE_GAP or len(segs) < 3:
+        return segs
+    out = []
+    i = 0
+    while i < len(segs):
+        s = segs[i]
+        if s.get("tier") == "low" and i + 1 < len(segs) and segs[i + 1].get("tier") == "low":
+            L = (s["t1"] - s["t0"]) / bl
+            c1 = _cur_mean(cur, s["t0"], s["t0"] + 8.0 * bl, dt)
+            c2 = _cur_mean(cur, s["t0"] + 8.0 * bl, s["t0"] + 16.0 * bl, dt)
+            if (abs(L - 64.0) < 0.6 and float(s.get("energy") or 0.0) < 0.10
+                    and c1 < 0.22 and c2 > 1e-6):
+                j = i
+                while j + 1 < len(segs) and segs[j + 1].get("tier") == "low":
+                    j += 1
+                # 链尾段吃掉这 8 拍，所以它得够长；32 拍是主体，不能被切成 24
+                # （2026-11-19 Endless & Limitless：24 拍不是真实结构，通用算法
+                # 自己切出 24 会让整首看起来不在 32/64 网格上）。
+                last_L = (segs[j]["t1"] - segs[j]["t0"]) / bl
+                if last_L >= 40.0:
+                    d = 8.0 * bl
+                    out.append({"t0": s["t0"], "t1": s["t0"] + d,
+                                "energy": _clamp01(c1) ** ENERGY_GAMMA,
+                                "tier": "low", "name": "过渡"})
+                    for k in range(i, j + 1):
+                        seg = dict(segs[k])
+                        seg["t0"] = seg["t0"] + d
+                        seg["t1"] = seg["t1"] + (0.0 if k == j else d)
+                        seg["energy"] = _clamp01(_cur_mean(cur, seg["t0"], seg["t1"], dt)) ** ENERGY_GAMMA
+                        out.append(seg)
+                    i = j + 1
+                    continue
+        out.append(s)
+        i += 1
+    return out
+
+def _drop_onset_fix(segs, cur, rms, dt, ga, bl):
+    """★ 2026-11-16（Hanged Herself 反馈）：drop 的判据应是「进来那一下的能量跳变」，
+    而不是整段平均 —— 64 拍的 drop 里有轻有重，按平均会掉成 mid。
+    规则：非 high、≥32 拍、进入前 8 拍 vs 上一段末 8 拍 RMS 比 ≥1.35、整段 cur 均值 ≥0.55 ⇒ high。
+    """
+    if not segs or rms is None or len(rms) < 2:
+        return segs
+    out = list(segs)
+    win = 8.0 * float(bl)
+    for i in range(1, len(out)):
+        s = out[i]
+        L = (float(s["t1"]) - float(s["t0"])) / float(bl)
+        pv = out[i - 1]
+        pL = (float(pv["t1"]) - float(pv["t0"])) / float(bl)
+        # 前一拍必须是**正常长度**的低能量过渡：开头那几段（前奏、进 drop 前只 2~8 拍的引子）
+        # 前面几乎是静音，比值必然很大，不能用来判 drop（水晶/Phreatic/Persistence 的前奏误判）。
+        if s.get("tier") == "high" or L < 32.0:
+            continue
+        if pL < 7.5 or pv.get("tier") != "low":
+            continue
+        if float(s["t0"]) < float(ga) + 8.0 * float(bl):
+            continue
+        t0 = float(s["t0"])
+        a0 = max(0, int(round((t0 - win) / dt)))
+        a1 = max(a0 + 1, int(round(t0 / dt)))
+        b1 = min(len(rms), max(a1 + 1, int(round((t0 + win) / dt))))
+        if b1 <= a1 or a1 >= len(rms):
+            continue
+        prev = float(np.mean(rms[a0:a1]))
+        head = float(np.mean(rms[a1:b1]))
+        # 还必须是「整段本来就响」的段落：平均 cur ≥0.62、进入时 RMS ≥1.05（相对全曲中位数），
+        # 否则近静音过渡后面接一段中响的 build 也会被误判成 drop（Hanged 41.33 处）。
+        if prev <= 1e-6 or head / prev < 1.35 or head < 1.05:
+            continue
+        i0 = max(0, int(round(t0 / dt)))
+        i1 = max(i0 + 1, int(round(float(s["t1"]) / dt)))
+        cm = float(np.mean(cur[i0:min(i1, len(cur))]))
+        if cm < 0.62:
+            continue
+        s = dict(s)
+        s["tier"] = "high"
+        s["energy"] = max(float(s.get("energy") or 0.0), 0.72)
+        out[i] = s
+    return out
+
+
+# 64 拍段按前后半音色差切 32+32（用户要求），ERLIB_RULE_TIMBRE_SPLIT=0 可关。
+RULE_TIMBRE_SPLIT = os.environ.get("ERLIB_RULE_TIMBRE_SPLIT", "1") != "0"
+_TIMBRE_SPLIT_DIST = float(os.environ.get("ERLIB_TIMBRE_SPLIT_DIST", "4.0"))
+
+
+# 连续 drop 按 64 拍重切，ERLIB_RULE_RECUT_DROPS=0 可关。
+RULE_RECUT_DROPS = os.environ.get("ERLIB_RULE_RECUT_DROPS", "1") != "0"
+RULE_PLATEAU_HIGH = os.environ.get("ERLIB_RULE_PLATEAU_HIGH", "1") != "0"
+
+
+# drop 尾巴延续判据（Enchanting Eyes 反馈），ERLIB_RULE_DROP_TAIL_HOLD=0 可关。
+RULE_DROP_TAIL_HOLD = os.environ.get("ERLIB_RULE_DROP_TAIL_HOLD", "1") != "0"
+
+
+# drop 进入点判据（Hanged 反馈），ERLIB_RULE_DROP_ONSET=0 可关。
+RULE_DROP_ONSET = os.environ.get("ERLIB_RULE_DROP_ONSET", "1") != "0"
+
+
+def _drop_tail_hold(segs, f, dt, ga, bl):
+    """★ 2026-11-16（Enchanting Eyes 反馈）：drop 进中段时，drop 的鼓组常常还延续 8 拍，
+    真正的新段落在下一根八拍线上才开始。判据：边界后的 8 拍里出现「2 拍以上的鼓点空洞」，
+    且第 +8 拍处鼓点重新回来 ⇒ 把边界后移 8 拍（drop 吃掉这 8 拍）。
+    """
+    el = f.get("Elow")
+    if el is None or len(segs) < 2 or not bl:
+        return segs
+    out = [dict(x) for x in segs]
+    for i in range(1, len(out)):
+        pv, cu = out[i - 1], out[i]
+        if pv.get("tier") != "high":
+            continue
+        b0 = int(round((float(cu["t0"]) - float(ga)) / float(bl)))
+        if b0 < 8:
+            continue
+        def beat_peak(k):
+            a = int(round((ga + k * bl) / dt))
+            b = int(round((ga + (k + 1) * bl) / dt))
+            if b <= a or a >= len(el):
+                return 0.0
+            return float(np.max(el[a:b]))
+        base = [beat_peak(k) for k in range(b0 - 8, b0)]      # drop 末 8 拍
+        ref = float(np.median([x for x in base if x > 0] or [0.0]))
+        if ref <= 1e-6:
+            continue
+        ahead = [beat_peak(k) for k in range(b0 + 1, b0 + 8)]
+        hole = sum(1 for x in ahead if x < 0.35 * ref)
+        restart = max(beat_peak(b0 + 8), beat_peak(b0 + 9))
+        if hole < 2 or restart < 0.55 * ref:
+            continue
+        # 只接受「后段还有足够长度」的情况：移动后下一段 ≥16 拍
+        if (float(cu["t1"]) - float(cu["t0"])) / float(bl) < 24.0:
+            continue
+        new_t = float(ga) + (b0 + 8) * float(bl)
+        if new_t <= float(cu["t0"]) + 1e-6:
+            continue
+        # 不能把 drop 撑过 64 拍（硬上限）
+        if (new_t - float(pv["t0"])) / float(bl) > 64.5:
+            continue
+        pv["t1"] = new_t
+        cu["t0"] = new_t
+    return out
+
+
+def _recut_drop_runs(segs, ga, bl):
+    """★ 2026-11-16（Witchcraft Butterfly 反馈）：连续 drop 应按 64 拍重切。
+    「很明显的 drop 连在一起」时，先给满 64 拍再切；现在的 56+32 是把切点提前了 8 拍。
+    只在「连续 high 组成的 run（中间的低能量空隙 ≤8 拍且 energy≥0.12）总长是 32 的倍数、
+    且 ≥128 拍、且 run 第一段是 48/56 拍」时生效，按 run 起点每 64 拍重切。
+    """
+    out = [dict(x) for x in segs]
+    if not bl:
+        return segs
+    n = len(out)
+    i = 0
+    while i < n:
+        if out[i].get("tier") != "high":
+            i += 1
+            continue
+        j = i
+        while j + 1 < n:
+            nxt = out[j + 1]
+            L = (float(nxt["t1"]) - float(nxt["t0"])) / float(bl)
+            if nxt.get("tier") == "high":
+                j += 1
+                continue
+            # 允许中间夹一个 ≤8 拍、energy≥0.12 的低能量空隙
+            if (j + 2 < n and L <= 8.5 and float(nxt.get("energy") or 0.0) >= 0.12
+                    and out[j + 2].get("tier") == "high"):
+                j += 2
+                continue
+            break
+        run = out[i:j + 1]
+        t0 = float(run[0]["t0"]); t1 = float(run[-1]["t1"])
+        total = (t1 - t0) / float(bl)
+        firstL = (float(run[0]["t1"]) - float(run[0]["t0"])) / float(bl)
+        ok_first = abs(firstL - 56.0) < 0.6 or abs(firstL - 48.0) < 0.6
+        # 空隙要紧跟在**至少两段** high 之后（56+32+8+64... 这种连续 drop 才重切；
+        # 「56 + 8 拍过渡 + 64」这种是正常结构，Dust/Core Mind 等原本就是对的，不能动）。
+        ok_gap_pos = True
+        for idx, x in enumerate(run):
+            if x.get("tier") != "high":
+                ok_gap_pos = idx >= 2
+                break
+        ok_first = ok_first and ok_gap_pos
+        if ok_first and total >= 128.0 and abs(total - 32.0 * round(total / 32.0)) < 0.6:
+            chunks = []
+            k = 0
+            while k * 64.0 + 32.0 <= total + 0.6:
+                a = t0 + k * 64.0 * bl
+                b = t0 + (k + 1) * 64.0 * bl if (k + 1) * 64.0 + 32.0 <= total + 0.6 else t1
+                chunks.append((a, b))
+                k += 1
+            if chunks and abs(chunks[-1][1] - t1) < 0.6 and len(chunks) >= 2:
+                e = float(run[0].get("energy") or 0.0)
+                tier = run[0].get("tier")
+                new = [{"t0": a, "t1": b, "energy": e, "tier": tier, "name": ""} for a, b in chunks]
+                out[i:j + 1] = new
+                n = len(out)
+                i += len(new)
+                continue
+        i += 1
+    return out
+
+
+def _timbre_half_dist(f, t0, t1, dt):
+    """两半段的音色（8 频带频谱形状）差异，dB 的 L2；用来判断 64 拍段中间是否该切一刀。"""
+    eb = f.get("Eband")
+    if eb is None or dt <= 0:
+        return None
+    mid = 0.5 * (float(t0) + float(t1))
+    outs = []
+    for a, b in ((t0, mid), (mid, t1)):
+        i0 = max(0, int(round(float(a) / dt)))
+        i1 = max(i0 + 5, int(round(float(b) / dt)))
+        if i1 > len(eb):
+            return None
+        block = eb[i0:i1]
+        if block.shape[0] < 5:
+            return None
+        outs.append(10.0 * np.log10(block.mean(axis=0) + 1.0))
+    p0, p1 = outs
+    # 只比「形状」：各自减掉整体电平，避免把响度差当成音色差
+    d = (p0 - p0.mean()) - (p1 - p1.mean())
+    return float(np.sqrt(np.mean(d ** 2)))
+
+
+def _split_timbre_halves(segs, f, cur, dt, ga, bl):
+    """★ 2026-11-16（用户要求，做加法）：64 拍的段如果前后两半音色明显不同，就从中间切成 32+32。
+
+    只加一条边界，不改任何已有的档位/能量/其它边界：两半沿用原段的 tier/energy/name，
+    名字由外层 `_renumber_names` 统一重编。
+    """
+    if not segs or not bl or _TIMBRE_SPLIT_DIST <= 0:
+        return segs
+    out = []
+    for s in segs:
+        L = (float(s["t1"]) - float(s["t0"])) / float(bl)
+        if abs(L - 64.0) > 0.8:
+            out.append(s)
+            continue
+        d = _timbre_half_dist(f, s["t0"], s["t1"], dt)
+        if d is None or d < _TIMBRE_SPLIT_DIST:
+            out.append(s)
+            continue
+        t0, t1 = float(s["t0"]), float(s["t1"])
+        mid = 0.5 * (t0 + t1)
+        for a, b in ((t0, mid), (mid, t1)):
+            out.append({"t0": a, "t1": b,
+                        "energy": float(s.get("energy") or 0.0),
+                        "tier": s.get("tier") or "mid",
+                        "name": s.get("name") or ""})
+    return out
+
+def _promote_plateau_high(segs, f, dt, ga, bl):
+    """★ 2026-11-16（Ya-Man-Ba）：整首歌只有 1 个 high 段时，如果后面还有一整片
+    同样响、只是「谱能量」偏低（0.6~0.7）的段落，把这一片也算 drop。
+
+    只在「正好 1 个 high」的极端情况下生效：这批歌里唯一的 high 是更响的那一段，
+    其余段落能量低 8%~30%，其实是同一档（母带/编排差异），用户的耳朵把它们都当 drop。
+    判据：mid、能量 >=0.55 且 >=0.70×唯一 high、长度 >=16 拍、RMS 与 high 相差 <=3.5 dB；
+    至少 3 段同时满足才动手（避免把偶然一段抬成 drop）。
+    """
+    if not segs or not bl:
+        return segs
+    hs = [x for x in segs if x.get("tier") == "high"]
+    if len(hs) != 1:
+        return segs
+    try:
+        rms, _ = rms_curve(f)
+    except Exception:                                          # noqa: BLE001
+        return segs
+    if rms is None or len(rms) < 8:
+        return segs
+
+    def _mean_rms(a, b):
+        i0 = max(0, int(round(float(a) / dt)))
+        i1 = max(i0 + 1, int(round(float(b) / dt)))
+        if i1 > len(rms):
+            return None
+        return float(np.mean(rms[i0:i1]))
+
+    ref = _mean_rms(hs[0]["t0"], hs[0]["t1"])
+    if not ref or ref <= 1e-9:
+        return segs
+    e1 = float(hs[0].get("energy") or 0.0)
+    if e1 <= 0.05:
+        return segs
+    cand = []
+    for s in segs:
+        if s.get("tier") != "mid":
+            continue
+        e = float(s.get("energy") or 0.0)
+        L = (float(s["t1"]) - float(s["t0"])) / float(bl)
+        if e < 0.55 or e < 0.70 * e1 or L < 16.0:
+            continue
+        rr = _mean_rms(s["t0"], s["t1"])
+        if rr is None:
+            continue
+        db = 20.0 * np.log10(max(rr, 1e-9) / ref)
+        if db < -3.5:
+            continue
+        cand.append(s)
+    if len(cand) < 3:
+        return segs
+    for s in cand:
+        s["tier"] = "high"
+        s["energy"] = max(float(s.get("energy") or 0.0), 0.72)
+    return segs
+
+
+def _fix_inverted_tier(segs, cur, dt, bl=0.0):
+    """high 段后面紧跟一个比它更响的 low 段（能量高 0.25 以上）⇒ 边界其实落早了，并成一段 high。"""
+    if not segs or len(segs) < 2:
+        return segs
+    out = []
+    for s in segs:
+        if (out and out[-1].get("tier") == "high" and s.get("tier") == "low"
+                and float(s.get("energy") or 0.0) - float(out[-1].get("energy") or 0.0) > 0.25):
+            if bl and (float(s["t1"]) - float(out[-1]["t0"])) / float(bl) > 64.5:
+                out.append(dict(s))
+                continue
+            out[-1]["t1"] = s["t1"]
+            out[-1]["energy"] = max(float(out[-1].get("energy") or 0.0), float(s.get("energy") or 0.0))
+            continue
+        out.append(dict(s))
+    return out
+
+
+
+# ★ 2026-11-17（用户 m07502，昏樹海）：三条「响度优先 / 结构重切」加法规则。
+#   背景：
+#     1) 104 拍 = 64 拍过渡（2×32）+ 32 拍 build + 8 拍过渡：能量曲线上只看到
+#        一个大平台，DP 会并成 56+48 两段，用户要求按 32/32/32/8 重切；
+#     2) 密度折扣会把「很响但频谱宽」的段落压到 mid（昏樹海 中段8 RMS 1.54，
+#        比 drop 还响，e 只有 0.69）⇒ 响度证据够强时直接判 high；
+#     3) 段尾混进 16 拍近静音（昏樹海 过渡5 末尾 16 拍是空白）⇒ 切掉并进后面的
+#        低能量段，避免整段能量被拉低。
+f_glob = None
+RULE_BUILD_104 = os.environ.get("ERLIB_RULE_BUILD_104", "1") != "0"
+RULE_TAIL_SILENCE = os.environ.get("ERLIB_RULE_TAIL_SILENCE", "1") != "0"
+RULE_LOUD_HIGH = os.environ.get("ERLIB_RULE_LOUD_HIGH", "1") != "0"
+RULE_LOUD_MID = os.environ.get("ERLIB_RULE_LOUD_MID", "1") != "0"
+RULE_DROP_SPLIT = os.environ.get("ERLIB_RULE_DROP_SPLIT", "1") != "0"
+RULE_INTRO32 = os.environ.get("ERLIB_RULE_INTRO32", "1") != "0"
+RULE_MID64 = os.environ.get("ERLIB_RULE_MID64", "1") != "0"
+RULE_TAIL16 = os.environ.get("ERLIB_RULE_TAIL16", "1") != "0"
+RULE_KICKLESS = os.environ.get("ERLIB_RULE_KICKLESS", "1") != "0"
+_DROP_SPLIT_D = float(os.environ.get("ERLIB_DROP_SPLIT_D", "1.1"))
+_DROP_SPLIT_DB = float(os.environ.get("ERLIB_DROP_SPLIT_DB", "0.9"))
+
+
+def _seg_energy_at(f, cur, dt, t0, t1):
+    """按现有口径（cur 均值 ^ ENERGY_GAMMA × (1-密度折扣)）算一段能量。"""
+    n = int(cur.size)
+    ia = max(0, min(n - 1, int(round(t0 / dt))))
+    ib = max(ia + 1, min(n, int(round(t1 / dt))))
+    pen = 0.0
+    if f is not None:
+        try:
+            pen = float(_density_penalty(f, [ia, ib], dt)[0])
+        except Exception:                                  # noqa: BLE001
+            pen = 0.0
+    return _clamp01(float(cur[ia:ib].mean())) ** ENERGY_GAMMA * (1.0 - pen)
+
+
+def _cur_beat_mean(cur, dt, ga, bl, b0, b1):
+    t0 = float(ga) + float(b0) * float(bl)
+    t1 = float(ga) + float(b1) * float(bl)
+    n = int(cur.size)
+    ia = max(0, min(n - 1, int(round(t0 / dt))))
+    ib = max(ia + 1, min(n, int(round(t1 / dt))))
+    return float(cur[ia:ib].mean())
+
+
+def _recut_build_104(segs, cur, dt, ga, bl):
+    """相邻两段合计 104 拍、且呈「凹口 + 爬升 + 跳升」时重切 32/32/32/8。"""
+    f_glob = getattr(_FEAT_LOCAL, "f", None)
+    if not segs or bl <= 1e-6:
+        return segs
+    out = []
+    i = 0
+    while i < len(segs):
+        s0 = segs[i]
+        if i + 2 < len(segs) and s0.get("tier") != "high" and segs[i + 1].get("tier") != "high":
+            L = (float(segs[i + 1]["t1"]) - float(s0["t0"])) / bl
+            L0 = (float(s0["t1"]) - float(s0["t0"])) / bl
+            L1 = (float(segs[i + 1]["t1"]) - float(segs[i + 1]["t0"])) / bl
+            if L0 < 48.0 or L1 < 40.0:
+                out.append(dict(s0)); i += 1; continue
+            if abs(L - 104.0) <= 1.2:
+                t0 = float(s0["t0"]); t1 = float(segs[i + 1]["t1"])
+                b0 = (t0 - ga) / bl; b1 = (t1 - ga) / bl
+                c_last8 = _cur_beat_mean(cur, dt, ga, bl, b1 - 8.0, b1)
+                c_prev32 = _cur_beat_mean(cur, dt, ga, bl, b1 - 40.0, b1 - 8.0)
+                c_first64 = _cur_beat_mean(cur, dt, ga, bl, b0, b0 + 64.0)
+                c_next8 = _cur_beat_mean(cur, dt, ga, bl, b1, b1 + 8.0)
+                if (c_prev32 > 1e-6 and c_last8 <= 0.90 * c_prev32
+                        and c_next8 >= 1.10 * c_prev32
+                        and c_prev32 >= 1.03 * c_first64):
+                    cuts = [t0 + 32.0 * bl, t0 + 64.0 * bl, t0 + 96.0 * bl]
+                    pts = [t0] + cuts + [t1]
+                    for k in range(4):
+                        a, b = pts[k], pts[k + 1]
+                        e = _seg_energy_at(f_glob, cur, dt, a, b)
+                        out.append({"t0": a, "t1": b, "energy": e,
+                                    "tier": tier_from_energy(e), "name": ""})
+                    i += 2
+                    continue
+        out.append(dict(s0))
+        i += 1
+    return out
+
+
+def _split_tail_silence(segs, cur, dt, ga, bl):
+    """段尾 ≥16 拍近静音（cur<0.12）而前面 ≥32 拍有声 ⇒ 把静音部分并进后面的低段。"""
+    if not segs or bl <= 1e-6:
+        return segs
+    out = []
+    for idx, s in enumerate(segs):
+        s = dict(s)
+        L = (float(s["t1"]) - float(s["t0"])) / bl
+        if L >= 40.0:
+            b0 = (float(s["t0"]) - ga) / bl; b1 = (float(s["t1"]) - ga) / bl
+            c_head = _cur_beat_mean(cur, dt, ga, bl, b0, b1 - 16.0)
+            c_tail = _cur_beat_mean(cur, dt, ga, bl, b1 - 16.0, b1)
+            if c_head >= 0.45 and c_tail <= 0.12:
+                cut_t = float(ga) + (b1 - 16.0) * bl
+                nxt = segs[idx + 1] if idx + 1 < len(segs) else None
+                if nxt is not None and nxt.get("tier") == "low":
+                    # 静音并进下一段（下一段已经是低能量段/尾奏），只改它的 t0
+                    nxt2 = dict(nxt); nxt2["t0"] = cut_t
+                    s["t1"] = cut_t
+                    out.append(s); out.append(nxt2)
+                    # 跳过下一段（已用）
+                    for rest in segs[idx + 2:]:
+                        out.append(dict(rest))
+                    return out
+                s["t1"] = cut_t
+                out.append(s)
+                out.append({"t0": cut_t, "t1": float(s["t1"]) if False else float(
+                    segs[idx]["t1"]), "energy": 0.02, "tier": "low", "name": ""})
+                continue
+        out.append(s)
+    return out
+
+
+def _promote_loud_high(segs, f, cur, dt, ga, bl):
+    """响度证据压过密度折扣：非 high 段 RMS ≥ 0.98×high 中位数且 cur≥0.85 ⇒ high。"""
+    try:
+        rms, _ = rms_curve(f)
+    except Exception:                                      # noqa: BLE001
+        return segs
+    hi = []
+    for s in segs:
+        if s.get("tier") == "high":
+            a, b = _seg_bounds_idx(s["t0"], s["t1"], ga, dt, int(rms.size))
+            if b - a >= 4:
+                hi.append(float(np.mean(rms[a:b])))
+    if len(hi) < 2:
+        return segs
+    med = float(np.median(hi))
+    if med <= 1e-6:
+        return segs
+    out = []
+    n = len(segs)
+    for idx, s in enumerate(segs):
+        s = dict(s)
+        L = (float(s["t1"]) - float(s["t0"])) / bl if bl > 1e-6 else 0.0
+        if s.get("tier") != "high" and 0 < idx < n - 1 and L >= 31.5:
+            a, b = _seg_bounds_idx(s["t0"], s["t1"], ga, dt, int(rms.size))
+            c0, c1 = _seg_bounds_idx(s["t0"], s["t1"], ga, dt, int(cur.size))
+            if (b - a >= 8 and c1 > c0
+                    and float(np.mean(rms[a:b])) >= 1.03 * med
+                    and float(np.mean(cur[c0:c1])) >= 0.85
+                    and float(s.get("energy") or 0.0) >= 0.55):
+                s["tier"] = "high"
+                s["energy"] = max(float(s.get("energy") or 0.0), 0.75)
+        out.append(s)
+    return out
+
+
+def _promote_loud_mid(segs, f, cur, dt, ga, bl):
+    """响但被打成 low 的段：RMS 接近 high 中位数、但频谱密度不够 high ⇒ 至少升到 mid。
+
+    2026-11-17 用户：昏樹海「过渡5 能量太低了，光看波形都没这么低」——该段 RMS 1.39
+    与 drop 中位 1.40 几乎相同，只因 cur 均值 0.80 < 0.85 过不了 loud_high 的门槛。
+    """
+    try:
+        rms, _ = rms_curve(f)
+    except Exception:                                      # noqa: BLE001
+        return segs
+    hi = []
+    for s in segs:
+        if s.get("tier") == "high":
+            a, b = _seg_bounds_idx(s["t0"], s["t1"], ga, dt, int(rms.size))
+            if b - a >= 4:
+                hi.append(float(np.mean(rms[a:b])))
+    if len(hi) < 2:
+        return segs
+    med = float(np.median(hi))
+    if med <= 1e-6:
+        return segs
+    out = []
+    n = len(segs)
+    for idx, s in enumerate(segs):
+        s = dict(s)
+        L = (float(s["t1"]) - float(s["t0"])) / bl if bl > 1e-6 else 0.0
+        if (s.get("tier") == "low" and 0 < idx < n - 1 and L >= 15.5
+                and float(s.get("energy") or 0.0) < 0.55):
+            a, b = _seg_bounds_idx(s["t0"], s["t1"], ga, dt, int(rms.size))
+            if b - a >= 8 and float(np.mean(rms[a:b])) >= 0.95 * med:
+                s["tier"] = "mid"
+                s["energy"] = 0.55
+        out.append(s)
+    return out
+
+
+def _split_drop_halves(segs, f, dt, ga, bl):
+    """64 拍 drop 的前后两半明显不同（音色 + 响度）⇒ 在中点切一刀。
+
+    2026-11-17 用户：Drunken 的 drop2/drop3「前后声音不一样，可以切一刀」。
+    判据：64±1 拍、tier=high、两半 8 频带形状差 d≥1.1、两半 RMS 差 ≥0.9 dB。
+    纯几何切分：两半沿用原 tier/energy，最后统一重编名字（不改其它段）。
+    """
+    try:
+        rms, _ = rms_curve(f)
+    except Exception:                                      # noqa: BLE001
+        return segs
+    out = []
+    for s in segs:
+        L = (float(s["t1"]) - float(s["t0"])) / bl if bl > 1e-6 else 0.0
+        if (s.get("tier") == "high" and abs(L - 64.0) <= 1.0):
+            try:
+                d = _timbre_half_dist(f, s["t0"], s["t1"], dt)
+                mid = 0.5 * (float(s["t0"]) + float(s["t1"]))
+                a, b = _seg_bounds_idx(s["t0"], mid, ga, dt, int(rms.size))
+                c0, c1 = _seg_bounds_idx(mid, s["t1"], ga, dt, int(rms.size))
+                r1 = float(np.mean(rms[a:b])) if b > a else 0.0
+                r2 = float(np.mean(rms[c0:c1])) if c1 > c0 else 0.0
+                db = abs(20.0 * np.log10(max(r2, 1e-6) / max(r1, 1e-6))) if r1 > 1e-6 and r2 > 1e-6 else 0.0
+            except Exception:                              # noqa: BLE001
+                d, db = 0.0, 0.0
+            if d >= _DROP_SPLIT_D and db >= _DROP_SPLIT_DB:
+                a_seg = dict(s); a_seg["t1"] = mid
+                b_seg = dict(s); b_seg["t0"] = mid
+                out.extend([a_seg, b_seg])
+                continue
+        out.append(s)
+    return out
+
+
+def _split_kickless_half(segs, f, cur, dt, ga, bl):
+    """8 ? high/mid ???? 4 ?? kick?? 4 ? kick ?? ? 4 ????
+    ??????????? high ?? 32 ?????? 4+4 ????
+
+    ???????? 4 ? Elow < ? 4 ? 50%?? 4 ? Emid > ? 4 ? 1.5 ??
+    ?? cur ?????? 8 ?????? 32 ????? high ????
+    """
+    if not segs or bl <= 1e-9 or dt <= 1e-9:
+        return segs
+    el = f.get("Elow")
+    em = f.get("Emid")
+    if el is None or em is None:
+        return segs
+    out = []
+    i = 0
+    n = len(segs)
+    while i < n:
+        s = segs[i]
+        L = (float(s["t1"]) - float(s["t0"])) / bl
+        if str(s.get("tier")) not in ("high", "mid") or abs(L - 8.0) > 0.6:
+            out.append(s)
+            i += 1
+            continue
+        t0, t1 = float(s["t0"]), float(s["t1"])
+        tm = t0 + 4.0 * bl
+        try:
+            n_el = int(el.size)
+            a0 = max(0, min(n_el - 1, int(round(t0 / dt))))
+            a1 = max(a0 + 1, min(n_el, int(round(tm / dt))))
+            b0 = a1
+            b1 = max(b0 + 1, min(n_el, int(round(t1 / dt))))
+            lo1 = float(np.mean(el[a0:a1]))
+            lo2 = float(np.mean(el[b0:b1]))
+            mi1 = float(np.mean(em[a0:a1]))
+            mi2 = float(np.mean(em[b0:b1]))
+            c1 = _cur_mean(cur, t0, tm, dt)
+            c2 = _cur_mean(cur, tm, t1, dt)
+        except Exception:                                      # noqa: BLE001
+            out.append(s)
+            i += 1
+            continue
+        if not (lo2 > 1e-6 and mi2 > 1e-6
+                and lo1 < 0.50 * lo2 and mi1 > 1.50 * mi2
+                and abs(c1 - c2) <= 0.15):
+            out.append(s)
+            i += 1
+            continue
+        # 4 ???
+        e_tr = _seg_energy_at(f, cur, dt, t0, tm)
+        out.append({"t0": round(t0, 3), "t1": round(tm, 3),
+                    "energy": float(e_tr), "tier": "mid",
+                    "name": "", "tier_locked": True})
+        # ???????????? high ?? 32 ??
+        j = i + 1
+        run_end = t1
+        while j < n and str(segs[j].get("tier")) == "high":
+            run_end = float(segs[j]["t1"])
+            j += 1
+        if run_end - tm < 32.0 * bl - 0.5 * bl:
+            # ???? 32?????? 4 ? high ???
+            e4 = _seg_energy_at(f, cur, dt, tm, t1)
+            out.append({"t0": round(tm, 3), "t1": round(t1, 3),
+                        "energy": float(e4), "tier": "high",
+                        "name": "", "tier_locked": True})
+            i += 1
+            continue
+        prev = tm
+        mark = tm + 32.0 * bl
+        while mark < run_end - 0.5 * bl:
+            e = _seg_energy_at(f, cur, dt, prev, mark)
+            out.append({"t0": round(prev, 3), "t1": round(mark, 3),
+                        "energy": float(e), "tier": "high",
+                        "name": "", "tier_locked": True})
+            prev = mark
+            mark += 32.0 * bl
+        ext_done = False
+        if ((run_end - prev) < 32.0 * bl - 0.5 * bl and j < n
+                and str(segs[j].get("tier")) in ("mid", "low")):
+            t_ext = prev + 32.0 * bl
+            t_cap = min(t_ext, float(segs[j]["t1"]))
+            if (t_cap - prev >= 32.0 * bl - 0.6 * bl
+                    and _cur_mean(cur, prev, t_cap, dt) >= 0.70):
+                e = _seg_energy_at(f, cur, dt, prev, t_cap)
+                out.append({"t0": round(prev, 3), "t1": round(t_cap, 3),
+                            "energy": float(e), "tier": "high",
+                            "name": "", "tier_locked": True})
+                t_mid_end = min(t_cap + 32.0 * bl, float(segs[j]["t1"]))
+                e2 = _seg_energy_at(f, cur, dt, t_cap, t_mid_end)
+                out.append({"t0": round(t_cap, 3), "t1": round(t_mid_end, 3),
+                            "energy": float(e2),
+                            "tier": segs[j].get("tier") or "mid",
+                            "name": "", "tier_locked": True})
+                # A?4 ???????????????????? -4 ?
+                shift = -4.0 * bl
+                for q in range(j + 1, n):
+                    s0 = float(segs[q]["t0"]) + shift
+                    s1 = float(segs[q]["t1"]) + (shift if q < n - 1 else 0.0)
+                    if s1 <= s0:
+                        continue
+                    e = _seg_energy_at(f, cur, dt, s0, s1)
+                    out.append({"t0": round(s0, 3), "t1": round(s1, 3),
+                                "energy": float(e),
+                                "tier": segs[q].get("tier") or "mid",
+                                "name": "", "tier_locked": True})
+                i = n
+                ext_done = True
+        if not ext_done:
+            if run_end - prev > 1e-3:
+                e = _seg_energy_at(f, cur, dt, prev, run_end)
+                out.append({"t0": round(prev, 3), "t1": round(run_end, 3),
+                            "energy": float(e), "tier": "high",
+                            "name": "", "tier_locked": True})
+            i = j
+        if os.environ.get("ERLIB_KICKLESS_DEBUG") == "1":
+            print("[kickless] %.3f-%.3f lo %.0f/%.0f emid %.0f/%.0f run_end=%.3f"
+                  % (t0, t1, lo1, lo2, mi1, mi2, run_end))
+    return out
+
+
+def _seg_feat(f, cur, t0, t1, ga, dt):
+    a, b = _seg_bounds_idx(t0, t1, ga, dt, int(cur.size))
+    if b <= a:
+        return 0.0
+    return float(cur[a:b].mean())
+
+
+def _split_intro32(segs, f, cur, dt, ga, bl):
+    """开场如果是「N 个 32 拍」且被切得很碎，就按 32 拍重切（用户 2026-11-18：五个三十二拍）。"""
+    if len(segs) < 3:
+        return segs
+    hi = None
+    for i, s in enumerate(segs):
+        if s.get("tier") == "high":
+            hi = i
+            break
+    if hi is None or hi < 2:
+        return segs
+    head = segs[:hi]
+    t_end = float(segs[hi]["t0"])
+    total = (t_end - float(ga)) / bl if bl > 1e-6 else 0.0
+    _r = total % 32.0
+    if total < 128.0 or min(_r, 32.0 - _r) > 1.0:
+        return segs
+    messy = any(abs((((float(s["t1"]) - float(s["t0"])) / bl) % 16.0)) > 0.75 for s in head)
+    if not messy:
+        return segs
+    out = []
+    if float(segs[0]["t0"]) < float(ga) - 1e-6:
+        first = dict(segs[0]); first["t1"] = float(ga); out.append(first)
+    t = float(ga)
+    while t < t_end - 1e-6:
+        t2 = min(t_end, t + 32.0 * bl)
+        e = _seg_energy_at(f, cur, dt, t, t2)
+        out.append({"t0": t, "t1": t2, "energy": float(e),
+                    "tier": tier_from_energy(e), "name": "过渡"})
+        t = t2
+    return out + [dict(s) for s in segs[hi:]]
+
+
+def _split_mid64_halves(segs, f, cur, dt, ga, bl):
+    """64 拍 mid 段若前后半段响度/音色明显不同，就在中点切开（用户：中段1 得切开）。"""
+    try:
+        rms, _ = rms_curve(f)
+    except Exception:                                       # noqa: BLE001
+        return segs
+    n = int(cur.size)
+    out = []
+    for s in segs:
+        L = (float(s["t1"]) - float(s["t0"])) / bl if bl > 1e-6 else 0.0
+        if s.get("tier") == "mid" and abs(L - 64.0) <= 1.0:
+            mid = 0.5 * (float(s["t0"]) + float(s["t1"]))
+            a, b = _seg_bounds_idx(s["t0"], mid, ga, dt, n)
+            c, d = _seg_bounds_idx(mid, s["t1"], ga, dt, n)
+            r1 = float(np.mean(rms[a:b])) if b > a else 0.0
+            r2 = float(np.mean(rms[c:d])) if d > c else 0.0
+            ratio = max(r1, r2) / max(1e-6, min(r1, r2))
+            try:
+                d_t = _timbre_half_dist(f, s["t0"], s["t1"], dt)
+            except Exception:                               # noqa: BLE001
+                d_t = 0.0
+            if ratio >= 1.25 and d_t >= 1.50:
+                x = dict(s); x["t1"] = mid
+                y = dict(s); y["t0"] = mid
+                out.extend([x, y])
+                continue
+        out.append(s)
+    return out
+
+
+def _split_tail16(segs, f, cur, dt, ga, bl):
+    """low 段（48/64 拍）尾部 16 拍明显更轻或是个 riser，就单独切出来（用户：过渡5/过渡4 后 16 拍）。"""
+    try:
+        rms, _ = rms_curve(f)
+    except Exception:                                       # noqa: BLE001
+        return segs
+    n = int(cur.size)
+    out = []
+    for s in segs:
+        L = (float(s["t1"]) - float(s["t0"])) / bl if bl > 1e-6 else 0.0
+        if s.get("tier") == "low" and 40.0 <= L <= 64.5:
+            _nb = int(round(L))
+            cut = float(s["t0"]) + float(_nb - 16) * bl
+            if _nb in (48, 64) and cut > float(s["t0"]) + 24.0 * bl:
+                a, b = _seg_bounds_idx(s["t0"], cut, ga, dt, n)
+                c, d = _seg_bounds_idx(cut, s["t1"], ga, dt, n)
+                ch = float(cur[a:b].mean()) if b > a else 0.0
+                ct = float(cur[c:d].mean()) if d > c else 0.0
+                rh = float(np.mean(rms[a:b])) if b > a else 0.0
+                rt = float(np.mean(rms[c:d])) if d > c else 0.0
+                quiet = ch > 0.10 and (ct <= 0.55 * ch or rt <= 0.60 * rh)
+                try:
+                    el = np.asarray(f.get("Elow"), dtype=np.float64)
+                    lo_h = float(np.median(el[a:b])) if b > a else 0.0
+                    lo_t = float(np.mean(el[c:d])) if d > c else 0.0
+                    loud_low = ch > 0.10 and ct >= 1.15 * ch and lo_h > 0 and lo_t >= 2.5 * lo_h
+                except Exception:                           # noqa: BLE001
+                    loud_low = False
+                try:
+                    eb = np.asarray(f.get("Eband"), dtype=np.float64)
+                    d_t = 0.0
+                    if eb.shape[0] > d and b > a:
+                        vh = np.log10(np.mean(eb[a:b], axis=0) + 1.0)
+                        vt = np.log10(np.mean(eb[c:d], axis=0) + 1.0)
+                        vh = vh - vh.mean(); vt = vt - vt.mean()
+                        d_t = float(np.sqrt(np.sum((vh - vt) ** 2)))
+                except Exception:                           # noqa: BLE001
+                    d_t = 0.0
+                riser = False
+                if d - c >= 8:
+                    h = (d - c) // 2
+                    f1 = float(np.mean(np.abs(np.diff(cur[c:c + h]))) + 1e-9) if h > 1 else 0.0
+                    f2 = float(np.mean(np.abs(np.diff(cur[c + h:d]))) + 1e-9) if h > 1 else 0.0
+                    riser = f2 >= 1.35 * f1 and ct <= 0.9 * ch
+                if quiet or riser or loud_low or d_t >= 1.50:
+                    x = dict(s); x["t1"] = cut
+                    y = dict(s); y["t0"] = cut; y["energy"] = float(_seg_energy_at(f, cur, dt, cut, s["t1"]))
+                    out.extend([x, y])
+                    continue
+        out.append(s)
+    return out
+
+
+def _demote_kickless_drop(segs, f, dt, ga, bl):
+    """只有低频、没有鼓/镲的 high 段，能量算高了，降成 mid（用户：水晶 drop3/drop4）。"""
+    try:
+        eb = np.asarray(f["Eband"], dtype=np.float64)
+    except Exception:                                       # noqa: BLE001
+        return segs
+    eh = np.asarray(f.get("Ehigh"), dtype=np.float64)
+    if eh.size < 4:
+        return segs
+    n = int(eh.size)
+    highs = [s for s in segs if s.get("tier") == "high"]
+    if len(highs) < 3:
+        return segs
+    med = float(np.median([
+        float(np.mean(eh[_seg_bounds_idx(s["t0"], s["t1"], ga, dt, n)[0]:
+                         _seg_bounds_idx(s["t0"], s["t1"], ga, dt, n)[1]]))
+        for s in highs if _seg_bounds_idx(s["t0"], s["t1"], ga, dt, n)[1] >
+                          _seg_bounds_idx(s["t0"], s["t1"], ga, dt, n)[0]]))
+    if med <= 0:
+        return segs
+    out = []
+    for s in segs:
+        if s.get("tier") == "high":
+            a, b = _seg_bounds_idx(s["t0"], s["t1"], ga, dt, n)
+            if b > a and float(np.mean(eh[a:b])) <= 0.62 * med:
+                y = dict(s); y["tier"] = "mid"; y["energy"] = min(float(s["energy"]), 0.55)
+                out.append(y)
+                continue
+        out.append(s)
+    return out
+
+
+def _swap_low_32_8(segs, ga, bl):
+    """相邻两个 low 段长度为 32 与 8 时，把 8 拍那段换到前面（用户：过渡3 是 8 拍、过渡4 是 32 拍）。"""
+    out = []
+    i = 0
+    while i < len(segs):
+        if i + 1 < len(segs):
+            a, b = segs[i], segs[i + 1]
+            la = (float(a["t1"]) - float(a["t0"])) / bl if bl > 1e-6 else 0.0
+            lb = (float(b["t1"]) - float(b["t0"])) / bl if bl > 1e-6 else 0.0
+            if (a.get("tier") == "low" and b.get("tier") == "low"
+                    and abs(la - 32.0) <= 0.9 and abs(lb - 8.0) <= 0.9):
+                t0 = float(a["t0"]); t2 = float(b["t1"])
+                cut = t0 + 8.0 * bl
+                x = dict(a); x["t0"] = t0; x["t1"] = cut
+                y = dict(a); y["t0"] = cut; y["t1"] = t2
+                out.extend([x, y])
+                i += 2
+                continue
+        out.append(segs[i]); i += 1
+    return out
+
+
+def _apply_shape_rules(segs, f, cur, ga, bl, dt):
+    _FEAT_LOCAL.f = f
+    if RULE_BUILD_104:
+        try:
+            segs = _recut_build_104(segs, cur, dt, ga, bl)
+        except Exception:                              # noqa: BLE001
+            pass
+    if RULE_TAIL_SILENCE:
+        try:
+            segs = _split_tail_silence(segs, cur, dt, ga, bl)
+        except Exception:                              # noqa: BLE001
+            pass
+    if RULE_LOUD_HIGH:
+        try:
+            segs = _promote_loud_high(segs, f, cur, dt, ga, bl)
+        except Exception:                              # noqa: BLE001
+            pass
+    if RULE_LOUD_MID:
+        try:
+            segs = _promote_loud_mid(segs, f, cur, dt, ga, bl)
+        except Exception:                              # noqa: BLE001
+            pass
+    segs = _deep_drop_fix(segs, f, ga, bl, dt)
+    segs = _fake_drop_split(segs, cur, dt, ga, bl)
+    # 先做「前置 8 拍空隙」（原始分段下判据才成立），再做会改边界的 merge/其它规则
+    segs = _pre_gap_shift(segs, cur, dt, ga, bl)
+    segs = _merge_32_64(segs, cur, dt, ga, bl)
+    if RULE_TIMBRE_SPLIT:
+        try:
+            segs = _split_timbre_halves(segs, f, cur, dt, ga, bl)
+        except Exception:                                      # noqa: BLE001
+            pass
+    if RULE_RECUT_DROPS:
+        try:
+            segs = _recut_drop_runs(segs, ga, bl)
+        except Exception:                                      # noqa: BLE001
+            pass
+    if RULE_DROP_TAIL_HOLD:
+        try:
+            segs = _drop_tail_hold(segs, f, dt, ga, bl)
+        except Exception:                                      # noqa: BLE001
+            pass
+    if RULE_DROP_ONSET:
+        try:
+            _rms, _ = rms_curve(f)
+        except Exception:                                      # noqa: BLE001
+            _rms = None
+        segs = _drop_onset_fix(segs, cur, _rms, dt, ga, bl)
+    try:
+        segs = _fix_inverted_tier(segs, cur, dt, bl)
+    except Exception:                                          # noqa: BLE001
+        pass
+    if RULE_PLATEAU_HIGH:
+        try:
+            segs = _promote_plateau_high(segs, f, dt, ga, bl)
+        except Exception:                                      # noqa: BLE001
+            pass
+    if RULE_INTRO32:
+        try:
+            segs = _split_intro32(segs, f, cur, dt, ga, bl)
+        except Exception:                                          # noqa: BLE001
+            pass
+    if RULE_MID64:
+        try:
+            segs = _split_mid64_halves(segs, f, cur, dt, ga, bl)
+        except Exception:                                          # noqa: BLE001
+            pass
+    if RULE_TAIL16:
+        try:
+            segs = _split_tail16(segs, f, cur, dt, ga, bl)
+        except Exception:                                          # noqa: BLE001
+            pass
+    try:
+        segs = _swap_low_32_8(segs, ga, bl)
+    except Exception:                                          # noqa: BLE001
+        pass
+    if RULE_KICKLESS:
+        try:
+            segs = _demote_kickless_drop(segs, f, dt, ga, bl)
+        except Exception:                                          # noqa: BLE001
+            pass
+    if RULE_DROP_SPLIT:
+        try:
+            segs = _split_drop_halves(segs, f, dt, ga, bl)
+        except Exception:                                          # noqa: BLE001
+            pass
+    try:
+        segs = _renumber_names(segs)
+    except Exception:                                          # noqa: BLE001
+        pass
+    return segs
+
+
+# ★ 2026-11-16（用户转来的方案）：长段末尾「局部偏离」检测，把 8/16 拍过渡切出来。
+#   与全局 novelty 不同：这里以**该段自己的稳态**为基线，只在该段最后 8/16 拍内
+#   看低频/高频/通量的累积偏离 —— 8 拍级别的局部变化在全局曲线上本来就出不了峰。
+#   先只切 **16 拍**（切完两侧段长仍是 16 的倍数，不需要挪后链）；8 拍过渡需要
+#   后链整体 +8 拍，走 `_insert_break_transition` 那条已有路径。
+RULE_TAIL_TRANS = os.environ.get("ERLIB_RULE_TAIL_TRANS", "") == "1"
+TAIL_TRANS_BEATS = 16.0
+TAIL_TRANS_MIN_SEG = 48.0       # 段至少 48 拍才切（切完还剩 ≥32）
+TAIL_TRANS_ZMIN = float(os.environ.get("ERLIB_TAIL_TRANS_ZMIN", "1.6"))
+
+
+def _tail_trans_score(f, t0, t1, cut, dt):
+    """段尾 [cut,t1) 相对 [t0,cut) 的稳态偏离（多特征 |z| 均值）。"""
+    i0 = max(0, int(round(t0 / dt)))
+    ic = max(i0 + 1, int(round(cut / dt)))
+    i1 = max(ic + 1, int(round(t1 / dt)))
+    keys = ("Elow", "Ehigh", "flux")
+    zs = []
+    for k in keys:
+        arr = f.get(k)
+        if arr is None or arr.size < i1:
+            continue
+        base = np.asarray(arr[i0:ic], dtype=np.float64)
+        tail = np.asarray(arr[ic:i1], dtype=np.float64)
+        if base.size < 8 or tail.size < 2:
+            continue
+        med = float(np.median(base))
+        mad = float(np.median(np.abs(base - med))) * 1.4826
+        sd = max(mad, float(np.std(base)) * 0.5, 1e-6)
+        zs.append(float(np.mean(np.abs(tail - med))) / sd)
+    return float(np.mean(zs)) if zs else 0.0
+
+
+def _cut_phrase_tail_transition(norm, cur, dt, f, ga, gbl, ok):
+    if not ok or gbl <= 1e-6 or len(norm) < 2:
+        return norm
+    out = []
+    for i, s in enumerate(norm):
+        out.append(s)
+        if i == 0 or i >= len(norm) - 1:
+            continue
+        t0, t1 = float(s["t0"]), float(s["t1"])
+        L = (t1 - t0) / gbl
+        if s.get("tier") == "low" or L < TAIL_TRANS_MIN_SEG - 0.6:
+            continue
+        if abs(L - 16.0 * round(L / 16.0)) > 0.6:
+            continue
+        cut = t1 - TAIL_TRANS_BEATS * gbl
+        if cut - t0 < 32.0 * gbl - 0.3:
+            continue
+        # 已有边界贴着（±1 拍）就别重复切
+        if any(abs(float(x["t0"]) - cut) < gbl * 1.02 for x in norm):
+            continue
+        sc = _tail_trans_score(f, t0, t1, cut, dt)
+        if sc < TAIL_TRANS_ZMIN:
+            continue
+        e_all = _clamp01(float(cur[int(round(t0 / dt)):int(round(t1 / dt))].mean()))
+        e_tail = _clamp01(float(cur[int(round(cut / dt)):int(round(t1 / dt))].mean()))
+        if e_all > 1e-6 and e_tail < 0.55 * e_all:
+            continue                      # 掉到 breakdown 了，交给别的 pass
+        tr = {"t0": cut, "t1": t1, "energy": e_tail, "tier": "mid", "name": ""}
+        out[-1] = dict(s, t1=cut, tier=s.get("tier"), name=s.get("name"))
+        out.append(tr)
+    if len(out) == len(norm):
+        return norm
+    return _renumber_names(out)

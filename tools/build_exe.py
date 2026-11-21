@@ -106,6 +106,16 @@ cmd = [
     "--hidden-import", "audio_playback",
     "--hidden-import", "sounddevice",
     "--hidden-import", "beatgrid",
+    # ★ 2026-11-18：扫描核心与两种新分段模式都是**惰性 import**（ui_main._one /
+    #   scan_core），PyInstaller 静态分析看不到 ⇒ 必须显式收集，否则 exe 里
+    #   段落计算被 `except Exception` 吞掉、静默没有段落。
+    "--hidden-import", "scan_core",
+    "--hidden-import", "sections",
+    "--hidden-import", "section_ui",
+    "--hidden-import", "structure_seg",
+    "--hidden-import", "timbre_seg",
+    # Beat This 兜底/音色分段都惰性 import 它；漏了 exe 里会静默退回更差的网格。
+    "--hidden-import", "phrase_bt",
     "--hidden-import", "lan_audio_send",
     "--hidden-import", "glctx",
     "--hidden-import", "SpoutGL",
@@ -247,7 +257,8 @@ if _EXE_BUILT:
         print("=" * 72)
         try:
             src = subprocess.run([sys.executable, "-u", smoke], cwd=ROOT,
-                                 capture_output=True, text=True, timeout=300)
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=300)
             out = (src.stdout or "") + (src.stderr or "")
             if "SMOKE_OK" in out and src.returncode == 0:
                 print("✅ UI 冒烟通过（SMOKE_OK）")

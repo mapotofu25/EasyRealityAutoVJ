@@ -63,6 +63,19 @@ HINT_WIN_MIN_RATIO = 0.50
 #     既覆盖 hint 误差（含 200BPM 的 2.67 拍仍在校验范围），又低于 3.5 拍错误下界。
 HINT_W_BEATS = 2.5
 
+# ★★★ 2026-11-12（用户：码表内容来回跳 / 认歌慢）：**已锁定曲目的本地跟踪**。
+#   对应 KVJ 的“锁定后只在 ±60ms/±1% 内局部跟踪”，而不是每个窗口重新全球认歌。
+#   `match(lock_sid=...)` 时：
+#     · 先只看当前锁定曲的票；只要它的最佳位置 ≥ 6 票、且 ≥ 全球最高票的 25%，
+#       就继续返回当前曲（位置仍按 hint 选，防重复段落）。
+#     · 低于这两条 ⇒ 退回全球众数，让 charge_engine 有机会真正换歌。
+#   这样相似曲/同专辑曲不会在单窗里把 sid 抢走，码表就不会反复重锚。
+#   ⚠ 2026-11-18 同步 ERLIB `fp.py` 时这段被漏掉（ERLIB 不跑实时认歌）——
+#     AVJ `audio_engine._recognize_loop` 传 `lock_sid=` 会 TypeError，
+#     **整个认歌循环直接死掉**（现场：歌一直"认不出来"）。
+TRACK_LOCK_MIN_VOTES = 6
+TRACK_LOCK_RATIO = 0.25
+
 
 def hint_window_frames(beat_len, w_beats=None):
     """把「hint 窗口半宽（拍）」换算成 delta 坐标的 hop 帧数。
@@ -80,16 +93,42 @@ def hint_window_frames(beat_len, w_beats=None):
     return wb * bl * SAMPLE_RATE / HOP_SIZE
 
 
+# 分块帧数：只影响**峰值内存**，不影响 FFT 数值（逐块 FFT 与整块 FFT 逐位相同）。
+# 背景（2026-11-12 用户"重新分析卡 0%"）：原实现一次性构造
+#   idx = arange(nframes)[:,None]*HOP + arange(4096)[None,:]   → int64 (nframes,4096)
+# 4 分钟歌 nframes≈4852 ⇒ 197 MB；再叠加 frames float32 82 MB / rfft complex 40 MB /
+# abs+spec 80 MB / sig 42 MB ⇒ 单首峰值 400~500 MB。本机 commit 余量只剩 0.27 GB 时
+# 每首都 MemoryError，界面看起来就"卡 0%"。分块后峰值 ≈ spec(40 MB)+块(4 MB)。
+_SPEC_CHUNK_FRAMES = 256
+
+# 峰值检测 numpy 回退路径的分块粒度（元素数，float32 ⇒ 1<<21 = 8 MB/块）。
+# 同样只影响峰值内存：每个输出点只在自己的 (2N+1) 窗口上求 max，分块不影响结果。
+_PEAK_CHUNK_ELEMS = 1 << 21
+
+
 def _spectrogram(sig):
     """mono float32(44.1k) → log-power 谱 (dB)，shape [freq_bins, frames]"""
     if len(sig) < FFT_WINDOW:
         return np.zeros((FFT_WINDOW // 2 + 1, 0), dtype=np.float32)
     win = np.hanning(FFT_WINDOW).astype(np.float32)
     nframes = 1 + (len(sig) - FFT_WINDOW) // HOP_SIZE
-    idx = np.arange(nframes)[:, None] * HOP_SIZE + np.arange(FFT_WINDOW)[None, :]
-    frames = sig[idx] * win                      # [nframes, FFT]
-    spec = np.abs(np.fft.rfft(frames, FFT_WINDOW, axis=1)).T   # [bins, frames]
-    return 10.0 * np.log10(spec ** 2 + 1e-10)
+    nbin = FFT_WINDOW // 2 + 1
+    # 滑窗视图不复制数据；每块再乘窗 → 只分配 chunk×FFT 的 float32
+    from numpy.lib.stride_tricks import sliding_window_view
+    frames_all = sliding_window_view(sig, FFT_WINDOW)[::HOP_SIZE]
+    spec = np.empty((nbin, nframes), dtype=np.float32)
+    chunk = _SPEC_CHUNK_FRAMES
+    for s in range(0, nframes, chunk):
+        e = min(nframes, s + chunk)
+        block = frames_all[s:e] * win            # [chunk, FFT] float32
+        spec[:, s:e] = np.abs(np.fft.rfft(block, FFT_WINDOW, axis=1)).T
+        del block
+    # 原地平方/加/取对数：省掉 2 份 (bins×frames) 的临时数组（4 min 歌每份 46 MB）
+    np.square(spec, out=spec)
+    spec += 1e-10
+    np.log10(spec, out=spec)
+    spec *= 10.0
+    return spec
 
 
 def _find_peaks(spec):
@@ -107,29 +146,55 @@ def _find_peaks(spec):
     W = 2 * N + 1
     if F <= 2 * N or T <= 2 * N:
         return []
+    from numpy.lib.stride_tricks import sliding_window_view
+    cand_pts = []                     # 候选 (f, t)，还没做「平顶并列」过滤
+    cp = cand_pts.append
     try:
         import cv2
         a = cv2.dilate(spec, np.ones((1, W), np.uint8),
                        borderType=cv2.BORDER_CONSTANT, borderValue=-np.inf)
         mx = cv2.dilate(a, np.ones((W, 1), np.uint8),
                         borderType=cv2.BORDER_CONSTANT, borderValue=-np.inf)
+        del a
+        inner = spec[N:F - N, N:T - N]
+        cand = np.where((inner == mx[N:F - N, N:T - N]) & (inner > AMP_MIN))
+        for r, c in zip(*cand):
+            cp((int(r) + N, int(c) + N))
+        del mx, inner, cand
     except Exception:                                          # noqa: BLE001
-        # 旧路径：numpy 可分离滑动最大
-        from numpy.lib.stride_tricks import sliding_window_view
-        pad_t = np.full((F, N), -np.inf, dtype=np.float32)
-        a = np.concatenate([pad_t, spec, pad_t], axis=1)
-        tMax = sliding_window_view(a, W, axis=1).max(axis=2)
-        pad_f = np.full((N, T), -np.inf, dtype=np.float32)
-        b = np.concatenate([pad_f, tMax, pad_f], axis=0)
-        mx = sliding_window_view(b, W, axis=0).max(axis=2)
+        # numpy 回退：可分离滑动最大 + 分块比较（峰值内存从 ~5×spec 降到 ~2×spec）。
+        # 每个输出点只在自己的窗口上求 max/比较 ⇒ 分块结果与整体实现逐位相同。
+        # 时间轴：按行分块（块内两侧 pad N 列再滑窗）
+        tMax = np.empty((F, T), dtype=np.float32)
+        row_chunk = max(1, min(F, _PEAK_CHUNK_ELEMS // max(1, T + 2 * N)))
+        for s in range(0, F, row_chunk):
+            e = min(F, s + row_chunk)
+            pad_t = np.full((e - s, N), -np.inf, dtype=np.float32)
+            blk = np.concatenate([pad_t, spec[s:e], pad_t], axis=1)
+            tMax[s:e] = sliding_window_view(blk, W, axis=1).max(axis=2)
+            del blk, pad_t
+        # 频率轴：按列分块，块内出最大后**立刻**比较出候选（不保留整张 mx）
+        col_chunk = max(1, min(T, _PEAK_CHUNK_ELEMS // max(1, F + 2 * N)))
+        for s in range(0, T, col_chunk):
+            e = min(T, s + col_chunk)
+            cs, ce = max(s, N), min(e, T - N)
+            if ce <= cs:
+                continue
+            pad_f = np.full((N, e - s), -np.inf, dtype=np.float32)
+            blk = np.concatenate([pad_f, tMax[:, s:e], pad_f], axis=0)
+            mxb = sliding_window_view(blk, W, axis=0).max(axis=2)
+            del blk, pad_f
+            inner = spec[N:F - N, cs:ce]
+            cand = np.where((inner == mxb[N:F - N, cs - s:ce - s]) & (inner > AMP_MIN))
+            for r, c in zip(*cand):
+                cp((int(r) + N, int(c) + cs))
+            del mxb, inner, cand
+        del tMax
 
-    # 候选：内部点，值 == 邻域最大 且 > 阈值
-    inner = spec[N:F - N, N:T - N]
-    cand = np.where((inner == mx[N:F - N, N:T - N]) & (inner > AMP_MIN))
+    # 候选：内部点，值 == 邻域最大 且 > 阈值；再排除平顶并列
     peaks = []
     ap = peaks.append
-    for r, c in zip(*cand):
-        f, t = int(r) + N, int(c) + N
+    for f, t in cand_pts:
         val = spec[f, t]
         # ⚠ 原来这里 `.copy()` 一个 41×41 邻域、把中心改成 -inf 再 any(>= val)；
         #   候选峰动辄上千个 ⇒ 每次识别白拷贝几 MB。改成"切片视图 + 计数"：
@@ -333,7 +398,18 @@ class FingerprintDB:
     """指纹库：add_song 建库，match 现场匹配（返回对齐票数，供音乐电池引擎消费）"""
     def __init__(self, path):
         # check_same_thread=False：指纹库在主线程创建、识别线程读取（扫描建库在后台线程写）
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
+        # ★★ 2026-11-11（用户：识别要十几秒）：指纹库 3.5M 行 / ~300MB，
+        #   SQLite 默认只有 2MB 页缓存（PRAGMA cache_size=-2000）且 mmap=0，
+        #   现场 5~10 路视频同时读盘时，一次 4.5s 窗的随机 hash 查询会被拖到几秒。
+        #   ⇒ 放大页缓存 + 映射整个库 + 临时表放内存（只读热路径，不改变数据）。
+        try:
+            self.conn.execute("PRAGMA cache_size=-65536")      # 64 MB
+            self.conn.execute("PRAGMA mmap_size=536870912")    # 512 MB（库 ~300MB）
+            self.conn.execute("PRAGMA temp_store=MEMORY")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:                                      # noqa: BLE001
+            pass
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA journal_mode=WAL")   # WAL：扫描写/识别读可并发
         self._pending = 0          # 批量模式下"已写未 commit"的歌曲数（见 commit_batch）
@@ -523,7 +599,7 @@ class FingerprintDB:
         return 0 if self.allowed is None else len(self.allowed)
 
     def match(self, sig, sr, hint_delta=None, hint_w=None, hint_sid=None,
-              rate=1.0, hs=None):
+              rate=1.0, hs=None, lock_sid=None):
         """返回 (song_id, aligned_votes, offset_sec) 或 (-1, 0, 0.0)
 
         hint_delta: 可选。预测的「对齐帧偏移」（单位 = HOP 帧，与内部 delta 同轴）。
@@ -541,7 +617,11 @@ class FingerprintDB:
           把票摊到一串相邻 delta 上。默认 1.0 ⇒ 与改动前逐值一致。
           实战里由引擎在「锁不上」时按档位重试（见 audio_engine.FP_RATE_CANDS）。
         hs: 可选。已算好的 `fingerprint_audio(sig, sr)` 结果，供同一段音频按多个 rate
-          重试时复用（否则每次都重算谱峰，7 个档位就慢 7 倍）。"""
+          重试时复用（否则每次都重算谱峰，7 个档位就慢 7 倍）。
+        lock_sid: 可选。当前已锁定的曲目 id。给了它 ⇒ **本地跟踪优先**：只要这首
+          在当前窗仍有 ≥`TRACK_LOCK_MIN_VOTES` 票、且 ≥全球最高票的
+          `TRACK_LOCK_RATIO`，就继续返回这首；否则退回全球众数。
+          对应 KVJ 的“锁定后局部跟踪”，避免相似曲单窗抢走 sid。"""
         if hs is None:
             hs = fingerprint_audio(sig, sr)
         # ★ 2026-10-29：留一份引用给 `fit_rates()` 复用（变速对齐要同一份 hash 再查一次
@@ -550,6 +630,8 @@ class FingerprintDB:
         if not hs:
             self.last_hit_rate = 0.0
             self.last_song_best = {}
+            self.last_global_song = -1
+            self.last_global_votes = 0
             return -1, 0, 0.0
         qoff_map = {}
         hashes = []
@@ -592,7 +674,31 @@ class FingerprintDB:
             if v_ > _best.get(s_, 0):
                 _best[s_] = v_
         self.last_song_best = _best
-        picked = self._pick(votes, hint_delta, hint_w, hint_sid)
+        # ★ 2026-11-12：全球最高票（诊断 + 本地跟踪的释放判据）
+        if not votes:
+            self.last_global_song, self.last_global_votes = -1, 0
+            return -1, 0, 0.0
+        _gbest = max(votes.items(), key=lambda kv: kv[1])
+        try:
+            self.last_global_song = int(_gbest[0][0])
+            self.last_global_votes = int(_gbest[1])
+        except (TypeError, ValueError, IndexError):
+            self.last_global_song, self.last_global_votes = -1, 0
+        picked = None
+        if lock_sid is not None:
+            try:
+                _ls = int(lock_sid)
+            except (TypeError, ValueError):
+                _ls = None
+            if _ls is not None:
+                _lv = {k: v for k, v in votes.items() if int(k[0]) == _ls}
+                if _lv:
+                    _lb = max(_lv.values())
+                    if (_lb >= TRACK_LOCK_MIN_VOTES
+                            and _lb >= TRACK_LOCK_RATIO * max(1, int(_gbest[1]))):
+                        picked = self._pick(_lv, hint_delta, hint_w, _ls)
+        if picked is None:
+            picked = self._pick(votes, hint_delta, hint_w, hint_sid)
         if picked is None:
             return -1, 0, 0.0
         (song_id, delta), cnt = picked

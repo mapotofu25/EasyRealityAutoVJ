@@ -191,8 +191,12 @@ def _ensure_screen(s, cfg, index, all_layer_ids, used_colors):
 
     if "include" not in s:
         s["include"] = True       # ★ C：老配置补默认值（参与输出）
-    if stype in ("main", "copy", "split"):
+    if stype in ("copy", "split"):
         s["layers"] = None
+    elif stype == "main":
+        # ★ 主屏保留显式 layers/layers_bound；只有老配置没这个键时才留 None（=全量）
+        if "layers" in s and not isinstance(s.get("layers"), list):
+            s["layers"] = None
     else:
         layers = s.get("layers")
         if layers is None or not isinstance(layers, list):
@@ -254,7 +258,8 @@ def _ensure_config(c, index, all_layer_ids):
             s["follow_main"] = True
         elif s["type"] == "main":
             s["source_id"] = ""
-            s["layers"] = None
+            # ⚠ 不再无条件 `s["layers"]=None`：主屏的显式归属要保留，
+            #   否则每次 ensure 都会把图层重新变成“全量”，独立屏新层会串回主屏。
             s["follow_main"] = True
     # 单路模式的整合画布/布局
     cs = c.get("combined_size")
@@ -392,13 +397,19 @@ def _crop_size(size, uv):
             max(1, int(round(h * (v1 - v0)))))
 
 
-def effective_size(cfg, screen):
+def effective_size(cfg, screen, _seen=None):
     """屏幕最终输出像素尺寸（复制/切分跟随源，切分=源裁切后的像素尺寸）。"""
     if not screen:
         return (1280, 720)
     t = screen.get("type")
+    sid = str(screen.get("id") or "")
+    _seen = set(_seen or ())
+    if sid:
+        if sid in _seen:
+            return (1280, 720)          # 环保护：脏配置/导入数据绝不无限递归
+        _seen.add(sid)
     if t == "copy":
-        return effective_size(cfg, main_screen(cfg))
+        return effective_size(cfg, main_screen(cfg), _seen)
     if t == "split":
         # ★★★ 2026-11-10（真机回归，必须记下来）：**UV 才是权威**，`width/height` 只能是
         #   派生值。一度改成"优先读 width/height"⇒ 老配置里被写脏的 `w=47 / h=720`
@@ -406,18 +417,24 @@ def effective_size(cfg, screen):
         #   ⇒ 尺寸永远由 `UV × 源屏` 反算；用户改分辨率走 `_on_screen_setup_changed()`
         #     反算 UV（写回 uv），所以"输入 585 → 显示 585"仍然成立，且两边绝不会打架。
         src = source_screen(cfg, screen)
-        sw, sh = effective_size(cfg, src)
+        sw, sh = effective_size(cfg, src, _seen)
         return _crop_size((sw, sh), screen.get("uv") or [0, 0, 1, 1])
     return (max(16, _as_int(screen.get("width"), 1280)),
             max(16, _as_int(screen.get("height"), 720)))
 
 
-def effective_color(cfg, screen):
+def effective_color(cfg, screen, _seen=None):
     if not screen:
         return SCREEN_PALETTE[0]
     if screen.get("type") in ("copy", "split"):
+        sid = str(screen.get("id") or "")
+        _seen = set(_seen or ())
+        if sid:
+            if sid in _seen:
+                return SCREEN_PALETTE[0]
+            _seen.add(sid)
         src = source_screen(cfg, screen)
-        return (src or {}).get("color") or SCREEN_PALETTE[0]
+        return effective_color(cfg, src, _seen) if src else SCREEN_PALETTE[0]
     return screen.get("color") or SCREEN_PALETTE[0]
 
 
@@ -762,7 +779,7 @@ def auto_layout(cfg, direction="h"):
     return tuple(cfg["combined_size"])
 
 
-def screen_rect(cfg, screen):
+def screen_rect(cfg, screen, _seen=None):
     """单路模式：该屏幕在整合画布上的像素矩形（**一律用自己的 layout + 实际尺寸**）。
 
     ★ 2026-11-10：切分屏以前返回"源屏 rect × UV 的裁切区" ⇒ 把 split 加进
@@ -774,39 +791,57 @@ def screen_rect(cfg, screen):
         return (0, 0, 0, 0)
     t = str(screen.get("type") or "main")
     if t == "copy":
+        sid = str(screen.get("id") or "")
+        _seen = set(_seen or ())
+        if sid:
+            if sid in _seen:
+                return (0, 0, 0, 0)
+            _seen.add(sid)
         src = source_screen(cfg, screen)
-        return screen_rect(cfg, src) if src else (0, 0, 0, 0)
+        return screen_rect(cfg, src, _seen) if src else (0, 0, 0, 0)
     w, h = effective_size(cfg, screen)
     x, y = _normalize_layout(screen.get("layout"))
     return (int(x), int(y), int(w), int(h))
 
 
-def screen_uv(cfg, screen):
+def screen_uv(cfg, screen, _seen=None):
     """单路模式：该屏幕在整合画布上的归一化 UV。"""
     cw, ch = combined_size(cfg)
     if screen and screen.get("type") == "copy":
+        sid = str(screen.get("id") or "")
+        _seen = set(_seen or ())
+        if sid:
+            if sid in _seen:
+                return [0.0, 0.0, 1.0, 1.0]
+            _seen.add(sid)
         src = source_screen(cfg, screen)
-        return screen_uv(cfg, src)
+        return screen_uv(cfg, src, _seen) if src else [0.0, 0.0, 1.0, 1.0]
     x, y, w, h = screen_rect(cfg, screen)
     return _normalize_uv([x / cw, y / ch, (x + w) / cw, (y + h) / ch])
 
 
 def screen_output_names(cfg):
-    cfg = getattr(cfg, "data", cfg)
-    if not isinstance(cfg, dict):
-        cfg = {}
     """给每个 screen 分配唯一发送端名，返回 {screen_id: name}。
 
     ★ T4 #9（用户第 9 条）：多路下**每屏一个输出，名字 = 这块屏的名字**，
       不要再出现固定的「主屏幕」字样。主屏若还叫默认名（"主屏幕"/空），
       用应用默认名（`EasyRealityAutoVJ`）——用户在「屏幕设置」里改过名才用新名字。
+    ★ 单路模式：名称锁定为**配置名**（用户约定），不再随主屏临时改名漂移。
     """
+    cfg = getattr(cfg, "data", cfg)
+    if not isinstance(cfg, dict):
+        cfg = {}
     used = set()
     out = {}
     for s in (cfg or {}).get("screens") or []:
         raw = str(s.get("name") or "").strip()
-        if str(s.get("type")) == "main" and raw in ("", "主屏幕", "主屏"):
-            raw = "EasyRealityAutoVJ"
+        if str(s.get("type")) == "main":
+            # ★ 2026-11-11（用户：多屏单路 Spout 输出失效）：单路输出就是**主屏**，
+            #   发送端名必须跟主屏名走（默认 EasyRealityAutoVJ），不能改按配置名。
+            #   旧逻辑用 cfg["name"]（例如“配置1 副本”）⇒ 一建副本 Spout/NDI 源就
+            #   改名，OBS 里原来那个源直接没信号，看起来就是“输出失效”。
+            if raw in ("", "主屏幕", "主屏"):
+                raw = "EasyRealityAutoVJ"
         nm = unique_sender_name(raw, used)
         used.add(nm)
         out[s["id"]] = nm

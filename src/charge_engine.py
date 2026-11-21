@@ -64,6 +64,13 @@ class ChargeBarEngine:
     #   要 8 秒才"发现换了歌"。改为 2 拍；并给"压倒性证据"一条快速通道（见 STRONG_VOTES）。
     BREAK_HITS = 2          # 别的歌连续 2 拍抢候选锁
     STRONG_VOTES = 60       # 单拍票数≥此值 ⇒ 这一拍算两拍（实测真歌 57~247，白噪≤4）
+    # ★★★ 2026-11-12（用户：听歌识曲十几秒才确定）：空槽首曲的“快速通道”。
+    #   真机首窗常见 43~55 票（不是每次都有 60+），旧逻辑必须等 2 拍；
+    #   而识别 tick 受匹配耗时影响可能 2~4 秒 ⇒ 首曲确认被拖到 8~12 秒。
+    #   `fp_lock_gate` 已经对初认做了严格门槛（warp: 总票≥120/命中≥0.8/领先2×），
+    #   这里把**仅首曲**的“压倒性”门槛降到 40，一窗满格就直接确认。
+    #   换歌仍用 STRONG_VOTES=60，避免相似曲单窗抢槽。
+    FIRST_TRACK_STRONG_VOTES = 40
     HOLD_SEC = 6.0          # 候选未充满时无进票的存活秒数
     # ★★ 换歌判据（2026-10-19 真机迭代）：**滑动窗口累计证据**。
     #   为什么不用'连续 N 拍'：切歌时票数会抖（实测 264→40→12），连续判据一断就重来，
@@ -235,7 +242,10 @@ class ChargeBarEngine:
                 # 别的歌：连续 BREAK_HITS 拍抢中 → 候选锁换人（旧条作废）
                 # ★ 压倒性证据（≥STRONG_VOTES）算两拍：现场切歌时正确歌常见 100+ 票，
                 #   不该再等第二个 tick；白噪/相似曲远达不到这个量级（实测 ≤4）。
-                self.break_count += (2 if r.aligned_votes >= self.STRONG_VOTES else 1)
+                self.break_count += (2 if (r.aligned_votes >= self.STRONG_VOTES
+                                           or (self.current_song_id < 0
+                                               and r.aligned_votes >= self.FIRST_TRACK_STRONG_VOTES))
+                                     else 1)
                 if self.break_count >= self.BREAK_HITS:
                     self.tentative_song_id = r.song_id
                     self.cand_bar = 0
@@ -277,8 +287,18 @@ class ChargeBarEngine:
                     self.cand_anchor = r.offset_sec
                     self.cand_anchor_t = now_sec
                     self.non_coh_streak = 0
-                chargeable = (advancing and
-                              r.aligned_votes >= self.CONFIRM_VOTES)
+                # ★ 2026-11-11（用户：听歌识曲失效，超过 5 秒认不出）：
+                #   现场 `[R]` 日志里正确歌 `raw=60~81 / ptot=331 / hit=95%`，
+                #   `fp_lock_gate` 已按 warp 放行；但这一窗常常来自 9s 长窗，
+                #   `offset` 一次跳 9~12s，`advancing` 判据过不了 ⇒ 永远不充电；
+                #   而长窗间隔 > HOLD_SEC(6s)，候选每次都被清掉 ⇒ 永不确认。
+                #   `STRONG_VOTES=60` 本来就是“压倒性证据”档（真歌 57~247，
+                #   误匹配 ≤61），强票窗口不应再被 delta 连续性一票否决。
+                _strong_match = (r.aligned_votes >= self.STRONG_VOTES
+                                 or (self.current_song_id < 0
+                                     and r.aligned_votes >= self.FIRST_TRACK_STRONG_VOTES))
+                chargeable = ((advancing or _strong_match)
+                              and r.aligned_votes >= self.CONFIRM_VOTES)
                 # ★★ 2026-10-19：**必须按'期望位置'判连续性**。
                 #   旧写法拿绝对偏移与锚点比，而窗口每拍前进 0.4~0.5s ⇒
                 #   必然超出 ±0.35s ⇒ 每拍都判'不连续' ⇒ 只能每 3 拍重锚时才充一次电
@@ -287,7 +307,12 @@ class ChargeBarEngine:
                 _pred = self.cand_anchor + max(0.0, now_sec - max(self.cand_anchor_t, 0.0)) \
                     if self.cand_anchor_t >= 0.0 else self.cand_anchor
                 coherent = abs(r.offset_sec - _pred) <= self.OFFSET_TOL_SEC
-                if coherent:
+                # 强票窗口允许直接重锚并充电（长窗 offset 本来就会跳一个窗长）
+                if _strong_match:
+                    self.cand_anchor = r.offset_sec
+                    self.cand_anchor_t = now_sec
+                    self.non_coh_streak = 0
+                if coherent or _strong_match:
                     self.non_coh_streak = 0
                     if chargeable:
                         self._charge_candidate(r.aligned_votes, now_sec)
@@ -308,7 +333,12 @@ class ChargeBarEngine:
         bar_full = (self.tentative_song_id >= 0 and self.cand_bar >= self.BAR_CAP)
         first_track_gate = True
         if bar_full and not self.slot_filled:
-            first_track_gate = (self.cand_hits >= self.FIRST_TRACK_HITS)
+            # ★ 2026-11-11（用户：以前 5 秒内能认出）：强票窗口（≥STRONG_VOTES）
+            #   一次就够。以前空槽必须等 2 次候选充电；现在正确歌常常只从 9s
+            #   长窗每 ~12s 来一次，等第二击就超过 5 秒（现场正是这样）。
+            first_track_gate = (self.cand_hits >= self.FIRST_TRACK_HITS
+                                or (self.current_song_id < 0
+                                    and r.aligned_votes >= self.FIRST_TRACK_STRONG_VOTES))
 
         # ★ 2026-10-19：旧歌电量满格时 slot_open=False，新歌要等它每秒漏 1 格（10 格≈4s）。
         #   但若新候选拿到过 ≥STRONG_VOTES 的压倒性票数（真歌 100+，白噪 ≤4），

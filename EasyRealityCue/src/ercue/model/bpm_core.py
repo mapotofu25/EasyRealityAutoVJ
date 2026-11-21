@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """★ BPM 自动识别核心（零 Qt，纯 numpy/stdlib）—— **逐字移植自 `AutoVJ/src/beatgrid.py`**。
 
 ⚠⚠ **与 `<工作区>\\AutoVJ\\src\\beatgrid.py` 逐字一致：改一端必须改另一端。**
@@ -56,7 +56,7 @@ F_MID = (200.0, 2000.0)    # 人声 / 主奏
 F_HIGH = (2000.0, 9000.0)  # hihat
 
 BPM_MIN, BPM_MAX = 60.0, 200.0
-BPM_PRIOR = (110.0, 190.0)  # DJ 音乐先验区间：半速歧义时优先取落在这里的候选
+BPM_PRIOR = (110.0, 210.0)  # 与 AutoVJ beatgrid.py 同步（2026-11-18）
 
 # VirtualDJ 库路径不硬编码，统一由 `vdj_db_path()` 自动探测（与 beatgrid 同名常量）。
 DEFAULT_VDJ = ""
@@ -89,9 +89,12 @@ def resample(mono, sr0, sr_target=SR_TARGET):
     n_out = int(len(mono) * sr_target / sr0)
     if n_out <= 1:
         return mono, sr0
-    idx = np.linspace(0.0, len(mono) - 1.0, n_out).astype(np.float32)
-    i0 = np.floor(idx).astype(np.int32)
-    i1 = np.minimum(i0 + 1, len(mono) - 1)
+    # ★ 2026-11-18：与 AutoVJ `beatgrid.resample` 逐字同步 —— float32 索引在
+    #   48kHz、>350s 时会把末端索引舍入越界（IndexError）；索引必须 float64 + clip。
+    _n = int(len(mono))
+    idx = np.linspace(0.0, float(_n - 1), n_out)          # float64
+    i0 = np.clip(np.floor(idx), 0, _n - 1).astype(np.int64)
+    i1 = np.minimum(i0 + 1, _n - 1)
     frac = (idx - i0).astype(np.float32)
     out = mono[i0] * (1.0 - frac) + mono[i1] * frac
     return np.ascontiguousarray(out, dtype=np.float32), sr_target
@@ -205,7 +208,7 @@ def scan_bpm(f, env, lo=BPM_MIN, hi=BPM_MAX, coarse=1.0, fine=0.05,
 
 
 def pick_bpm(peaks):
-    """从候选里挑「真实 BPM」：优先落在 DJ 先验区间 [110,190]，且分数足够接近最高分。
+    """从候选里挑「真实 BPM」：优先落在 DJ 先验区间 [110,210]，且分数足够接近最高分。
 
     为什么必须这么做：把 onset 按周期折叠时，**半速值（BPM/2）往往得分更高**
     （kick 每 2 拍响一次时，周期翻倍会让所有 kick 落进同一相位）。
@@ -593,7 +596,7 @@ def detect_bpm(mono, sr, maxsec=180.0, vdj=None, path="", dur=None):
 def selftest() -> bool:
     """零 Qt 自检：常量与 AutoVJ 一致 + 合成 click track 能识别出正确 BPM。"""
     assert (SR_TARGET, HOP, WIN, BPM_MIN, BPM_MAX, BPM_PRIOR) == \
-        (22050, 1024, 2048, 60.0, 200.0, (110.0, 190.0)), "常量被改动（必须与 AutoVJ 一致）"
+        (22050, 1024, 2048, 60.0, 200.0, (110.0, 210.0)), "常量被改动（必须与 AutoVJ 一致）"
     assert F_LOW == (30.0, 200.0) and F_MID == (200.0, 2000.0) and F_HIGH == (2000.0, 9000.0)
 
     # 合成 128 BPM 的 click track（44.1k / 60 秒）：每拍一个短促低频敲击

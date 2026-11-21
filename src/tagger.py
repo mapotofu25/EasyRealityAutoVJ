@@ -60,7 +60,7 @@ def auto_roles(kind="video", has_alpha=False, coverage=None, dynamic=False):
     if has_alpha:
         roles["fg"] = True
         return roles
-    if cov >= COVERAGE_FULL_THRESHOLD or (dynamic and cov >= COVERAGE_FULL_THRESHOLD_DYNAMIC):
+    if cov >= COVERAGE_FULL_THRESHOLD:
         roles["bg"] = True
     else:
         roles["fg"] = True
@@ -146,8 +146,92 @@ class Tagger:
         return round(v, 3)
 
     @staticmethod
-    def analyze_dynamic(path, kind):
-        """动态检测（不跑任何模型，轻量）：返回 `(motion, flicker, diff)`。
+    def motion_for_role(diff, flicker, role):
+        """角色优先的动态档：前景更敏感（p95），背景更严格（整帧）。"""
+        try:
+            d = float(diff)
+        except (TypeError, ValueError):
+            return ""
+        if d < 0:
+            return ""
+        if str(role) == "fg":
+            hi, mid = 16.0, 8.0
+        else:
+            hi, mid = 22.0, 12.0
+        if flicker or d >= hi:
+            return DYNAMIC_HIGH
+        if d >= mid:
+            return DYNAMIC_MID
+        return DYNAMIC_LOW
+
+    @staticmethod
+    def motion_from_metrics(metrics, role):
+        """按角色 + 整帧/局部/光流联合指标定档（2026-11-20.27）。
+
+        整帧帧差中位数会被大面积黑底稀释：黑底上的闪光、光束、颗粒素材
+        中位数只有 4~10，但视觉上一直在闪。这里同时看：
+          · `flow75`：160×90 粗尺度光流的 p75（**真实位移速度**，px/帧）
+          · `act_p90`：逐帧整帧帧差均值的 p90（偶发闪白/切镜）
+          · `flash`：高亮区(>200)占比相邻跳变 >2% 的比例（整幅闪白）
+          · `frac45` / `frac30`：4× 抽样下相邻帧变化 >45 / >30 的像素占比
+        ⚠ `frac45` 只用于升到「中」：缓慢匀速但细节高光的素材（ST冰屏）
+          `frac45` 可达 0.08，光流却只有 0.46 px/帧，视觉上是慢速。
+        """
+        m = metrics or {}
+        try:
+            d = float(m.get("diff", -1.0))
+        except (TypeError, ValueError):
+            d = -1.0
+        if d < 0:
+            return ""
+        fg = str(role) == "fg"
+        flick = bool(m.get("flicker", False))
+        try:
+            f45 = float(m.get("frac45", 0.0) or 0.0)
+            f30 = float(m.get("frac30", 0.0) or 0.0)
+            act90 = float(m.get("act_p90", -1.0))
+            flash = float(m.get("flash", 0.0) or 0.0)
+            flow75 = float(m.get("flow75", -1.0))
+        except (TypeError, ValueError):
+            f45 = f30 = flash = 0.0
+            act90 = flow75 = -1.0
+        hi, mid = (16.0, 8.0) if fg else (22.0, 12.0)
+        mid_f45, mid_f30 = (0.042, 0.038) if fg else (0.050, 0.045)
+        hi_act, mid_act = (24.0, 13.0) if fg else (30.0, 18.0)
+        if flick or d >= hi or act90 >= hi_act or flash >= 0.20 or flow75 >= 1.70:
+            return DYNAMIC_HIGH
+        if d >= mid or f45 >= mid_f45 or f30 >= mid_f30 or act90 >= mid_act:
+            return DYNAMIC_MID
+        return DYNAMIC_LOW
+
+    @staticmethod
+    def score_for_role(diff, flicker, role):
+        """角色优先的动态分：前景 0/8/16/30，背景 0/12/22/40。"""
+        try:
+            d = float(diff)
+        except (TypeError, ValueError):
+            return None
+        if d < 0:
+            return None
+        fg = str(role) == "fg"
+        lo, hi, top = (8.0, 16.0, 30.0) if fg else (12.0, 22.0, 40.0)
+        if d <= 0.0:
+            v = 0.0
+        elif d < lo:
+            v = 0.333 * (d / max(1e-6, lo))
+        elif d < hi:
+            v = 0.333 + 0.334 * ((d - lo) / max(1e-6, hi - lo))
+        else:
+            v = 0.667 + 0.333 * min(1.0, (d - hi) / max(1e-6, top - hi))
+        v = max(0.0, min(1.0, v))
+        if flicker:
+            v = max(v, 0.80 if fg else 0.75)
+        return round(v, 3)
+
+    @staticmethod
+    def analyze_dynamic(path, kind, with_coverage=False, with_metrics=False):
+        """动态检测（不跑任何模型，轻量）：返回 `(motion, flicker, diff)`；
+        `with_coverage=True` 时返回 `(motion, flicker, diff, coverage)`。
 
         motion ∈ {低动态, 中动态, 高动态}；图片天然低动态；打不开返回 `("", False, -1.0)`。
         供 `DynTagScanThread` 复用。
@@ -169,6 +253,9 @@ class Tagger:
 
         ⚠ 2026-10-30 砍掉亮度分档后，这里**不再返回 med**（全片灰度中位数）——
           `brights` 数组只为频闪检测保留。调用方是 3 元组解包。
+        coverage（可选）：顺序解码时每 10 帧取一帧算铺满度，最多 150 个采样；
+          剔除平均亮度 < 12 的黑帧；有效样本 ≥3 取 75 分位，<3 取最大值；
+          全部是黑帧时退回全样本。这样不会因为某一点刚好黑屏而误判“局部”。
         """
         import cv2
         if kind == "image":
@@ -179,29 +266,71 @@ class Tagger:
             #     现有标签（即一个也不加）；`dynamic_score(-1.0)` 返回 None（不打分）。
             #   ⚠ 调用方 `DynTagScanThread` 仍会单独算 coverage —— 那个只用于
             #     `auto_roles` 判断"前景/背景"，不进标签。
-            return "", False, -1.0
+            if with_metrics:
+                return "", False, -1.0, None, {}
+            return ("", False, -1.0, None) if with_coverage else ("", False, -1.0)
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            return "", False, -1.0
-        # 顺序读全片（不 seek），一次采集：全程相邻帧差 + 全程亮度
-        diffs = []    # 全程相邻帧差（灰度 abs diff 均值）
-        brights = []  # 全程每帧亮度（只给频闪检测用）
+            if with_metrics:
+                return "", False, -1.0, None, {}
+            return ("", False, -1.0, None) if with_coverage else ("", False, -1.0)
+        # 顺序读全片（不 seek），一次采集：
+        #   · 全帧相邻帧差均值（整体运动）
+        #   · 每帧亮度（整帧频闪）
+        #   · 4× 抽样下的局部强变化占比 / 高亮区占比 / 亮区 p99
+        #     → 火花、光束、颗粒、闪白这类"面积小但强度高"的变化，整帧均值会被黑底稀释
+        diffs = []
+        brights = []
+        frac30 = []
+        frac45 = []
+        bright_frac = []
+        p99s = []
+        flow_mags = []
         prev = None
+        prevs = None
+        prev_small = None
         read = 0
+        covers = []         # (coverage, 平均亮度)，只给可选的多帧铺满度用
         MAX_FRAMES = 1500   # 顺序读上限（约 50s@30fps）；VJ 循环素材远短于此
         while read < MAX_FRAMES:
             ok, f = cap.read()
             if not ok:
                 break
             g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            gs = g[::4, ::4]            # 4× 抽样：4K → 约 13 万像素，percentile 很便宜
+            # ★ 2026-11-20.27：160×90 粗尺度光流测「真实位移速度」。
+            #   像素差会被细碎高光/闪烁灌水（缓慢旋转的冰屏也能有 8% 像素跳变），
+            #   但位移幅度不会：缓慢匀速 0.4~0.6 px/帧，高速素材 1.5~2.5 px/帧。
+            small = cv2.resize(gs, (160, 90), interpolation=cv2.INTER_AREA)
             brights.append(float(g.mean()))
+            bright_frac.append(float((gs > 200).mean()))
+            p99s.append(float(np.percentile(gs, 99)))
             if prev is not None:
                 diffs.append(float(np.abs(g - prev).mean()))
+                ad = np.abs(gs - prevs)
+                frac30.append(float((ad > 30).mean()))
+                frac45.append(float((ad > 45).mean()))
+            if prev_small is not None:
+                try:
+                    _fl = cv2.calcOpticalFlowFarneback(prev_small, small, None,
+                                                       0.5, 2, 9, 2, 5, 1.1, 0)
+                    flow_mags.append(float(np.mean(np.hypot(_fl[..., 0], _fl[..., 1]))))
+                except Exception:                          # noqa: BLE001
+                    pass
             prev = g
+            prevs = gs
+            prev_small = small
             read += 1
+            if with_coverage and (read - 1) % 10 == 0:
+                try:
+                    covers.append((Tagger.coverage_score(f), float(g.mean())))
+                except Exception:                          # noqa: BLE001
+                    pass
         cap.release()
         if len(diffs) < 2:
-            return "", False, -1.0
+            if with_metrics:
+                return "", False, -1.0, None, {}
+            return ("", False, -1.0, None) if with_coverage else ("", False, -1.0)
 
         d = np.asarray(diffs, dtype=np.float64)
         diff = float(np.median(d))
@@ -229,4 +358,48 @@ class Tagger:
         #   老逻辑也是按高动态用的 ⇒ **档位必须跟上**，否则标签和分数对不上。
         if flicker:
             motion = DYNAMIC_HIGH
-        return motion, flicker, diff
+        # —— 局部变化 / 闪白脉冲指标（4× 抽样，抗黑底稀释）——
+        act90 = float(np.percentile(d, 90)) if d.size >= 8 else diff
+        f30 = float(np.median(frac30)) if frac30 else 0.0
+        f45 = float(np.median(frac45)) if frac45 else 0.0
+        flow75 = float(np.percentile(flow_mags, 75)) if len(flow_mags) >= 8 else -1.0
+        if len(bright_frac) >= 8:
+            _bf = np.asarray(bright_frac, dtype=np.float64)
+            flash = float((np.abs(np.diff(_bf)) > 0.02).mean())
+        else:
+            flash = 0.0
+        # ★ 2026-11-20.27：`frac45` 只升到中，不再单独升到高。
+        #   反例 ST冰屏素材(1)：缓慢匀速旋转的冰屏，8% 像素有强变化（细碎高光），
+        #   但粗尺度光流只有 0.46 px/帧 —— 视觉上是慢速，应判中动态。
+        #   ⇒ 高动态只认「真实位移速度」（flow75）+ 闪白 + 帧差 p90/中位数。
+        #   001(26) flow75=1.1 但 act90=31.7（闪白脉冲）→ 仍高；
+        #   红蓝(1) flow75=1.96 → 高；Balls visual flow75=2.2 → 高。
+        if flow75 >= 1.70 or act90 >= 30.0 or flash >= 0.20:
+            motion = DYNAMIC_HIGH
+        elif motion == DYNAMIC_LOW and (f30 >= 0.045 or f45 >= 0.050 or act90 >= 18.0):
+            motion = DYNAMIC_MID
+        if not with_coverage:
+            return motion, flicker, diff
+        cov = None
+        try:
+            vals = [c for c, b in covers if b >= 12.0]
+            if not vals:
+                vals = [c for c, _b in covers]
+            if len(vals) >= 3:
+                cov = float(np.percentile(vals, 75))
+            elif vals:
+                cov = float(max(vals))
+        except Exception:                                      # noqa: BLE001
+            cov = None
+        metrics = {
+            "diff": float(diff),
+            "flicker": bool(flicker),
+            "act_p90": float(act90),
+            "frac30": float(f30),
+            "frac45": float(f45),
+            "flash": float(flash),
+            "flow75": float(flow75),
+        }
+        if with_metrics:
+            return motion, flicker, diff, cov, metrics
+        return motion, flicker, diff, cov

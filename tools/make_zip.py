@@ -53,7 +53,10 @@ _QT_UNUSED_TOP = {
     "qt6svg.dll",                  # 仅 qsvgicon / qsvg 插件用
     "qt6virtualkeyboard.dll",      # 仅 qtvirtualkeyboardplugin 用
     "qt6network.dll",              # 仅 networkinformation / tls 插件用
-    "qt6opengl.dll",               # 项目用 glfw 建 GL 上下文，不碰 QOpenGLWidget
+    # ★ 2026-11-20.23：**不能再跳过 qt6opengl.dll** —— 输出窗口的 GPU 缩放用
+    #   `PySide6.QtOpenGLWidgets.QOpenGLWidget`，Qt6OpenGLWidgets.dll 的 PE
+    #   延迟加载依赖 Qt6OpenGL.dll。以前剔掉它 ⇒ 用户包里 import 失败 ⇒
+    #   QOpenGLWidget=None ⇒ 启动即 TypeError（112010/112022 实测崩）。
     "qtnetwork.pyd",               # 对应 Python 绑定
 }
 # 相对 PySide6/plugins/ 的 (插件类型目录, 文件名)

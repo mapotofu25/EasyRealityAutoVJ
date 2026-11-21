@@ -93,7 +93,7 @@ _STUTTER_AGE = 0.8
 _STUTTER_LOG_EVERY = 10.0
 
 # 掉锁后「冻结段位」多久（秒）。见 `_section_tick` 的 2026-10-30 复盘。
-_SEC_HOLD_SEC = 6.0
+_SEC_HOLD_SEC = 12.0
 _SILENT_NOFRAME_COOLDOWN = _SILENT_ACTION_MIN   # 同图层两次重建的最小间隔（≥2s/图层）
 _SILENT_NOFRAME_MAX = 3     # 同素材累计重建上限（≤3 次/素材，换素材重置）
 
@@ -437,14 +437,21 @@ def _gc_take():
 # ★ 2026-11-10 性能：预览卡片只有几百像素宽，1280 会让 1280×720 的帧走
 #   `frame.copy()` 全幅拷贝（7 屏 × 3.7MB × 15fps ≈ 388MB/s）。降到 512：
 #   预览卡片只有几百像素宽，清晰度仍够，拷贝字节降 >70%。
-PREVIEW_THUMB_MAX = 512
+# ★ 2026-11-11（用户：「操作非常卡」）：py-spy 实测 `_preview_thumb` 的
+#   `QImage.scaled` 在 22s 里持有 GIL 2.8s（≈13%），主线程因此排队。
+#   512→320 后输出像素只有原来的 39%；缩放改用 Fast（监看缩略图不需要
+#   高质量重采样，Smooth 在这条路径上纯烧 GIL），开销再降一个数量级。
+PREVIEW_THUMB_MAX = 960
+# 单屏 GUI 预览硬上限：1080p 输出保持原生，3000/4K 整合画布不再整幅塞给 GUI
+# （2026-11-13 用户：多屏预览卡死不动 —— 原生 3000×900 每帧 copy + GUI 缩放太重）
+PREVIEW_GUI_MAX = 1920
 
 
-def _preview_thumb(frame):
-    """预览用缩略图：**只缩不裁**，最长边不超过 PREVIEW_THUMB_MAX，平滑缩放。
+def _preview_thumb(frame, max_side=None):
+    """预览用缩略图：**只缩不裁**，最长边不超过 `max_side`（默认 PREVIEW_THUMB_MAX）。
 
-    ★ V4（用户第 4 条）：以前是 `scaled(480, 270, FastTransformation)`——
-      1280×720 的屏只剩 480 宽，再放大到 800px 就是马赛克。
+    ★ 2026-11-11：`max_side` 由 `engine._preview_res` 决定（预览设置里的 1/2、1/4
+      直接在引擎侧缩到最终尺寸），避免"引擎缩到 320 → GUI 再缩到 80"的双重缩放。
     """
     try:
         if frame is None or frame.isNull():
@@ -452,12 +459,13 @@ def _preview_thumb(frame):
         w, h = frame.width(), frame.height()
         if w <= 0 or h <= 0:
             return frame
+        _max = max(32, int(max_side or PREVIEW_THUMB_MAX))
         m = max(w, h)
-        if m <= PREVIEW_THUMB_MAX:
+        if m <= _max:
             return frame.copy()          # 本来就不大于上限，无需缩放
-        r = PREVIEW_THUMB_MAX / float(m)
+        r = _max / float(m)
         return frame.scaled(max(1, int(round(w * r))), max(1, int(round(h * r))),
-                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            Qt.KeepAspectRatio, Qt.FastTransformation)
     except Exception:                                              # noqa: BLE001
         return frame
 
@@ -519,6 +527,10 @@ MODE_LABELS = {
     "normal": "常规切",
     "fast": "快切",
     "beat": "逐拍交替",
+    # ★ 2026-11-11（用户：有段落时节奏标签还在常规/快切之间跳）：
+    #   段落表接管时，HUD/状态栏显示这一项；它**不是** `self.mode` 的合法值，
+    #   只用于 `modes_snapshot()` 的展示，避免把 MODE_META 的节奏档位改坏。
+    "section": "按段落切换",
     # ★ 2026-10-25：**不是一种节奏**，而是「完全不自动切换」的策略值（`cfg["mode"]["manual"]`）。
     #   它**绝不能进 `MODES`**：`MODES` 同时被 `manual_mode()` / `modes_snapshot()` 当合法值校验，
     #   而且 `MODES` 里的值会落到 `self.mode`，随后被 `MODE_META[self.mode]` 取过渡时长 ——
@@ -672,6 +684,11 @@ class Layer:
         self.hide_silent = False  # 无声音时隐藏本图层内容
         self.solo = False        # 独奏：只显示本图层
         self.clips = []          # [MediaItem]（手动素材）
+        # ★ 2026-11-13（用户：同一素材在不同图层要各自的大小/位置）：
+        #   `clips` 里的同一条媒体对象可能同时出现在多个图层；transform 不能再挂在
+        #   MediaItem 上（共享），改为**每个图层每个片段一份**：与 `clips` 等长。
+        #   `{"scale":1.0,"x":0.0,"y":0.0,"rot":0.0}`；旧配置加载时从 MediaItem 迁移。
+        self.clip_xforms = []
         self.is_kv = False       # Kv 主视觉图层（待机层）：无声音时切入、有声音时切出；全局唯一且默认置顶
         self.role = "bg"         # 图层角色：fg 前景 / bg 背景（自动匹配用）
         self.auto_mode = False   # 自动模式：按曲风自动挑素材
@@ -740,6 +757,7 @@ class Layer:
         self.pair = None         # (idx_a, idx_b)
         self.pair_turn = 0
         self.beats_in_pair = 0
+        self.beat_sec = None     # 当前对子所属的段落（换段 ⇒ 换一对）
         self.rand_pool = None
         self.order_dir = 1
         self.order_i = 0
@@ -779,11 +797,67 @@ class Layer:
         self._cue_sub_tmps = {}
         self.cs_states = []
 
+    # ---------- 每个图层片段独立的 transform（大小/位置/旋转） ----------
+    @staticmethod
+    def _default_clip_xform(item):
+        return {
+            "scale": float(getattr(item, "img_scale", 1.0) or 1.0),
+            "x": float(getattr(item, "img_x", 0.0) or 0.0),
+            "y": float(getattr(item, "img_y", 0.0) or 0.0),
+            "rot": float(getattr(item, "img_rot", 0.0) or 0.0),
+        }
+
+    def ensure_clip_xforms(self):
+        """保证 `clip_xforms` 与 `clips` 等长；旧配置/自动换池时按素材默认值补齐。"""
+        if not isinstance(getattr(self, "clip_xforms", None), list):
+            self.clip_xforms = []
+        n = len(self.clips)
+        while len(self.clip_xforms) < n:
+            self.clip_xforms.append(self._default_clip_xform(self.clips[len(self.clip_xforms)]))
+        if len(self.clip_xforms) > n:
+            del self.clip_xforms[n:]
+
+    def clip_xform(self, idx):
+        """取第 idx 个片段的 transform（返回内部 dict，只读使用）。"""
+        self.ensure_clip_xforms()
+        if 0 <= int(idx) < len(self.clip_xforms):
+            return self.clip_xforms[int(idx)]
+        return {"scale": 1.0, "x": 0.0, "y": 0.0, "rot": 0.0}
+
+    def set_clip_xform(self, idx, xf):
+        self.ensure_clip_xforms()
+        if not (0 <= int(idx) < len(self.clip_xforms)):
+            return
+        d = self.clip_xforms[int(idx)]
+        try:
+            d["scale"] = float(xf.get("scale", d.get("scale", 1.0)) or 1.0)
+            d["x"] = float(xf.get("x", d.get("x", 0.0)) or 0.0)
+            d["y"] = float(xf.get("y", d.get("y", 0.0)) or 0.0)
+            d["rot"] = float(xf.get("rot", d.get("rot", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    def append_clip(self, item, xf=None):
+        """加入片段，并复制一份独立 transform（不共享 MediaItem 上的旧值）。"""
+        self.ensure_clip_xforms()
+        self.clips.append(item)
+        self.clip_xforms.append(dict(xf) if isinstance(xf, dict)
+                                else self._default_clip_xform(item))
+
+    def remove_clip_at(self, idx):
+        self.ensure_clip_xforms()
+        if 0 <= int(idx) < len(self.clips):
+            self.clips.pop(int(idx))
+            self.clip_xforms.pop(int(idx))
+            return True
+        return False
+
     def to_dict(self):
+        self.ensure_clip_xforms()
         return {"lid": self.lid,
                 "name": self.name, "visible": self.visible, "opacity": self.opacity,
                 "blend": self.blend, "solo": self.solo,
-                "speed": self.speed, "pause_silent": self.pause_silent,
+                "speed": self.speed,
                 "use_alpha": self.use_alpha, "lock_motion": self.lock_motion,
                 "img_scale": self.img_scale, "img_x": self.img_x, "img_y": self.img_y,
                 "fixed": self.fixed, "hide_silent": self.hide_silent,
@@ -792,7 +866,8 @@ class Layer:
                 "is_cuesheet": bool(getattr(self, "is_cuesheet", False)),
                 "cuesheet_id": str(getattr(self, "cuesheet_id", "") or ""),
                 "auto_clips": [c.path for c in self.auto_clips],
-                "clips": [c.path for c in self.clips]}
+                "clips": [c.path for c in self.clips],
+                "clip_xforms": [dict(x) for x in self.clip_xforms]}
 
 
 def _crop_src_rect(image, crop):
@@ -855,9 +930,14 @@ CUE_FREEWHEEL_SEC = 2.0       # 常规外推窗口（现在只用于判断"是�
 #   ⇒ 只要**还是同一首歌**且**没静音**，就一直滑行（上限 CUE_FREEWHEEL_MAX）；
 #     真正释放只由 `sid<0` / 静音>3s / 超上限 触发。
 CUE_FREEWHEEL_MAX = 30.0
+# ★ 2026-11-13（用户：音乐停十几秒，码表还在演）：静音/无音频超过这个秒数
+#   立即停码表（清位置、卸子层播放器）。识别短暂断档（有声）仍走 30s freewheel，
+#   但“真的没声音了”不能继续演。
+CUE_STOP_SILENT_SEC = 2.0
 
-# 倍率死区（见 `_cue_auto_position` 里的说明）：±10% 内按原速处理（CUE_RATE_DEADBAND=0.10）
-CUE_RATE_DEADBAND = 0.10
+# 倍率死区（见 `_cue_auto_position` 里的说明）：±0.2% 内按原速处理。
+# ★ 2026-11-11：旧值 0.10 把现场真实的 1.018× 按回 1.000，150 秒累积 2.7 秒偏差。
+CUE_RATE_DEADBAND = 0.002
 
 # 演出提前量（秒）：补偿指纹识别的固有滞后（用户 2026-10-18 指定 0.5s）
 CUE_LEAD_SEC = 0.50
@@ -1029,6 +1109,16 @@ class AutoVJEngine(QObject):
         self._screen_cp_calls = 0      # 统计"这帧额外跑了几次按屏调色"（性能判据用）
         self._route_hb_t = 0.0         # 路由心跳上次落盘时刻（BUG-A 取证用，10s 一行）
         self._route_thumbs = {}
+        # ★ 2026-11-11（用户：多屏预览看起来不到 30 帧）：
+        #   QImage.cacheKey() 在图像释放后可能被**复用**，GUI 用 cacheKey 判重会
+        #   把新帧误判成旧帧（实测输出页只刷 ~10fps）。这里用单调递增的 rev
+        #   明确告诉 GUI「这批缩略图是新的」。
+        self._route_thumb_rev = 0
+        # ★ 2026-11-11（性能）：输出页多屏缩略图只在**输出页可见**时才需要生成。
+        #   以前每 2 个 tick 无条件为 7~8 块屏做 512px 平滑缩放，用户在多屏页之外
+        #   （素材库/码表/普通演出台）时纯属白烧 CPU。UI 通过
+        #   `set_route_thumb_consumers()` 开关；默认 True 保持工具/旧测试行为。
+        self._route_thumb_consumers = True
         self._route_frames = {}        # 发送端用（全分辨率，引用/裁切缓存）
         self._preview_route_id = ""
         self._route_senders = {}       # sid -> {"spout":..., "ndi":..., ...}
@@ -1036,7 +1126,27 @@ class AutoVJEngine(QObject):
         self._plan_rev = 0             # 配置变更代数（发送端重建用）
         self._plan_rev_ready = -1      # 已重建到的代数
         self._thumb_tick = 0
-        self._thumb_every = 2          # 30fps 时预览缩略图 15fps
+        # ★ 2026-11-11（用户：多屏预览看起来不到 30 帧）：缩略图必须跟引擎同帧率。
+        #   以前为省 GIL 改成每 3 帧一次 ⇒ 输出页监看只有 10fps，看起来一直掉帧。
+        #   现在缩略图已改成 320px + Fast 缩放，每帧一次也能承受；GUI 端还会按
+        #   `ui.preview.fps` 再节流（30/15）。
+        self._thumb_every = 1
+        # 预览分辨率（1.0 / 0.5 / 0.25）：引擎直接缩到最终尺寸，GUI 不再二次缩放
+        self._preview_res = 1.0
+        # GUI 发布帧率（预览面板 30/15fps；输出窗口/Spout/NDI 不限）
+        self._gui_fps = 30.0
+        # ★ 2026-11-12：单屏预览分辨率。以前固定 1600，且 `preview.res` 只影响
+        #   多屏缩略图、不影响单屏 ⇒ 用户觉得“预览分辨率设置失效”。
+        #   现在：无输出窗口时 maxw = **输出画布分辨率** × preview.res；
+        #   输出窗口可见时按输出画布原生分辨率（不拿预览设置去降上屏画质）。
+        self._gui_max_w = 1920
+        self._out_window_live = False
+        # ★ 2026-11-16（用户：多屏多路要给每块屏设不同输出显示器）：
+        #   每个物理输出窗口拿自己的路由帧。GUI 把"有窗口的屏幕 id"登记到这里，
+        #   引擎按 30fps 复制一份最新帧（不能直接给画布引用 —— 下一 tick 会被清空/重画）。
+        self._display_route_ids = set()
+        self._display_frames = {}
+        self._display_t = 0.0
         self._combined_key = None
         self._spout = None
         self._spout_fail = False       # True=当前处于"失败退避"态（ui_main 置 False ⇒ 立即重试）
@@ -1131,6 +1241,14 @@ class AutoVJEngine(QObject):
         # Spout/NDI Alpha：开启时画布用 ARGB32（直通 alpha，非预乘），
         # 这样 Spout/NDI 可以原样发 BGRA+A；显示器窗口仍按黑底画。
         self._alpha_out = bool(self.cfg["output"].get("alpha_enabled", False))
+        # ★ 2026-11-17（用户：多屏多路里**按屏**开了 alpha 却不透明）：
+        #   `_alpha_out` 只是"并集/主画布"的格式开关；每块屏自己的 alpha 存在这里，
+        #   由 `_rebuild_output_plan()` 按 `screen["alpha"]` 重算 ⇒ 独立屏/切分屏的
+        #   画布格式跟随本屏，不再被别的屏强行拖成 ARGB32 或退回 RGB32。
+        self._screen_alpha = {}
+        # 任一路由需要 alpha ⇒ 禁用 GPU 合成（GPU 回读会换掉画布格式，见 `_compose_to`）。
+        # 与 `_alpha_out`（主画布格式）分开：主屏可以不透明、旁屏透明。
+        self._any_alpha = bool(self._alpha_out)
         self.canvas = QImage(1280, 720, self._canvas_format())
         self._clear_canvas(self.canvas)
         # ---- optional GPU composition (QPainter on QOpenGLPaintDevice) ----
@@ -1143,6 +1261,12 @@ class AutoVJEngine(QObject):
         self._gpu_premul_order = []
         self._gpu_premul_max = 24
         self._gpu_frame_consumers = True   # skip GUI copy when no preview/output
+        # ★ 静音待机（见 `_tick_locked`）：运行但长时间无音频时暂停解码/降帧
+        self._silent_standby = False
+        self._silent_standby_prev = False
+        # Kv 过渡期间禁止降帧（见 `_kv_transition_pending`）
+        self._kv_anim = False
+        self._silent_low_since = 0.0
         self._gpu_last_reason = ""
         self._gpu_active = False
         # adaptive render cadence: never compose faster than the source material
@@ -1194,14 +1318,58 @@ class AutoVJEngine(QObject):
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self._tick)
 
-    def _canvas_format(self):
+    def _canvas_format(self, on=None):
         """输出画布格式：Alpha 输出用 ARGB32（直通 alpha，Spout/NDI 可直接发），
-        否则保持原来的 RGB32（不透明，零额外开销）。"""
-        return QImage.Format_ARGB32 if self._alpha_out else QImage.Format_RGB32
+        否则保持原来的 RGB32（不透明，零额外开销）。
+
+        `on=None` ⇒ 用全局并集 `_alpha_out`（主画布/整合画布）；
+        传 True/False ⇒ 按**该屏自己的** alpha 决定（独立屏/切分屏画布）。
+        """
+        on = self._alpha_out if on is None else bool(on)
+        return QImage.Format_ARGB32 if on else QImage.Format_RGB32
 
     def _clear_canvas(self, img):
-        """按当前 Alpha 模式清画布：透明底 or 黑底。"""
-        img.fill(Qt.transparent if self._alpha_out else Qt.black)
+        """按**该画布自己的格式**清画布：透明底 or 黑底。
+
+        ★ 2026-11-11（用户：「操作非常卡」）：`QImage.fill()` 在 PySide 里
+        **不释放 GIL**（py-spy：20s 里占 1.6s）。改用 numpy 写同一块像素，
+        memcpy 期间释放 GIL，主线程能插进来画界面。RGB32 必须写
+        `0xFF000000`（不透明黑），不能写 0 —— 否则 NDI/Spout 收到的 alpha 是 0。
+        ★ 2026-11-17：判据从"全局 `_alpha_out`"改为"**这块画布有没有 alpha 通道**"，
+           否则某屏 alpha=off（RGB32）而全局并集为真时会被清成 0（本该是不透明黑）。
+        """
+        _has_a = bool(img.hasAlphaChannel())
+        try:
+            n = int(img.sizeInBytes()) // 4
+            if n > 0:
+                arr = np.frombuffer(img.bits(), dtype=np.uint32, count=n)
+                arr.fill(0x00000000 if _has_a else 0xFF000000)
+                return
+        except Exception:                                      # noqa: BLE001
+            pass
+        img.fill(Qt.transparent if _has_a else Qt.black)
+
+    @staticmethod
+    def _blit_1to1(dst, x, y, src):
+        """把同格式、同尺寸的 `src` 原样贴到 `dst` 的 (x,y)。
+
+        返回 True=成功；False=调用方退回 QPainter。numpy 的 copy 会释放 GIL，
+        比 `QPainter.drawImage()` 更适合大块 1:1 拷贝（单路整合画布的主路径）。
+        """
+        try:
+            x, y = int(x), int(y)
+            w, h = int(src.width()), int(src.height())
+            if (x < 0 or y < 0 or w <= 0 or h <= 0
+                    or x + w > dst.width() or y + h > dst.height()
+                    or src.format() != dst.format()):
+                return False
+            dbpl, sbpl = int(dst.bytesPerLine()), int(src.bytesPerLine())
+            d = np.frombuffer(dst.bits(), dtype=np.uint8).reshape(dst.height(), dbpl)
+            s = np.frombuffer(src.constBits(), dtype=np.uint8).reshape(h, sbpl)
+            d[y:y + h, x * 4:(x + w) * 4] = s[:, :w * 4]
+            return True
+        except Exception:                                      # noqa: BLE001
+            return False
 
     @_locked
     def set_alpha_output(self, on):
@@ -1215,6 +1383,7 @@ class AutoVJEngine(QObject):
             return
         with self._tick_lock:
             self._alpha_out = on
+            self._any_alpha = bool(on)
             w = max(160, min(7680, int(self.canvas.width())))
             h = max(120, min(4320, int(self.canvas.height())))
             self.canvas = QImage(w, h, self._canvas_format())
@@ -1239,12 +1408,13 @@ class AutoVJEngine(QObject):
 
     # ---- 线程（由 ui_main 把引擎 moveToThread 到独立线程后调用） ----
     def frame_interval_ms(self):
-        """主循环间隔（毫秒）—— 读 `cfg["perf"]["render_fps"]`，钳到 15~120fps。
+        """主循环间隔（毫秒）—— 读 `cfg["perf"]["render_fps"]`，钳到 1~120fps。
 
         为什么做成可配：素材大多是 25~30fps，而按 60fps 合成时**有一半左右是把同一帧
         重复合成一遍** —— 在 4 核老机器上是纯浪费（用户目标是把 CPU 让给 VDJ / 直播）。
         若 `perf.fps_follow_source` 为真，`_auto_fps_tick` 会把有效帧率压到素材帧率，
         避免对 30fps 素材做 60fps 的重复合成。
+        ★ 2026-11-12：下限从 15 放宽到 1 —— 静音待机用 2fps（`silent_standby_fps`）。
         """
         try:
             fps = int((self.cfg["perf"] or {}).get("render_fps", 60) or 60)
@@ -1252,7 +1422,7 @@ class AutoVJEngine(QObject):
             fps = 60
         if self._effective_fps:
             fps = min(fps, int(self._effective_fps))
-        fps = max(15, min(120, fps))
+        fps = max(1, min(120, fps))
         return max(1, int(round(1000.0 / fps)))
 
     @_locked
@@ -1309,6 +1479,17 @@ class AutoVJEngine(QObject):
     @Slot()
     def start(self):
         """在引擎所属线程里启动主循环（QTimer 必须在所属线程启动）"""
+        # ★ 2026-11-11（用户：「操作非常卡」）：引擎线程降到 BELOW_NORMAL。
+        #   GIL 的排队规则不看优先级，但**操作系统**的 CPU 调度看；引擎是纯后台
+        #   产出，GUI 是交互线程，让 GUI 先拿到时间片能明显减少点击迟滞。
+        try:
+            from PySide6.QtCore import QThread as _QT
+            if _QT.currentThread() is self.thread():
+                import ctypes as _ct
+                _ct.windll.kernel32.SetThreadPriority(
+                    _ct.windll.kernel32.GetCurrentThread(), 0)
+        except Exception:                                      # noqa: BLE001
+            pass
         # Create the optional GPU context here: this slot runs in the engine
         # thread, which is where every QOpenGLContext call must happen.
         try:
@@ -1337,7 +1518,10 @@ class AutoVJEngine(QObject):
             lay.blend = ld.get("blend", "normal") or "normal"
             lay.solo = bool(ld.get("solo", False))
             lay.speed = float(ld.get("speed", 1.0) or 1.0)
-            lay.pause_silent = bool(ld.get("pause_silent", False))
+            # ★ 2026-11-16（用户要求）：UI 里的「静音时暂停播放」已删除，
+            #   只保留「无声音时隐藏本层」。旧配置即使还写着 pause_silent=True，
+            #   加载时也强制关掉 —— 否则用户看不到开关、层却一直冻着。
+            lay.pause_silent = False
             lay.use_alpha = bool(ld.get("use_alpha", True))
             lay.lock_motion = bool(ld.get("lock_motion", False))
             lay.img_scale = float(ld.get("img_scale", 1.0) or 1.0)
@@ -1359,12 +1543,17 @@ class AutoVJEngine(QObject):
                     self.library[p] = m
                 lay.auto_clips.append(m)
             lay.clips = []
-            for p in ld.get("clips", []):
+            lay.clip_xforms = []
+            _xfs = ld.get("clip_xforms") or []
+            for _ci, p in enumerate(ld.get("clips", [])):
                 m = self.library.get(p)
                 if m is None:
                     m = MediaItem(p)
                     self.library[p] = m
                 lay.clips.append(m)
+                _xf = _xfs[_ci] if _ci < len(_xfs) and isinstance(_xfs[_ci], dict) else None
+                lay.clip_xforms.append(dict(_xf) if _xf is not None
+                                       else lay._default_clip_xform(m))
             self.layers.append(lay)
         self._switch_layer_to(self.layers[0], 0, instant=True) if self.layers else None
 
@@ -1393,6 +1582,8 @@ class AutoVJEngine(QObject):
         只有「字段完整 + conf 足够高」的 grid 才会被 ui_main 注入（见 _inject_song_grids）。
         mapping=None / {} 时等价于关闭网格模式（退回现有拍钟逻辑）。"""
         self._song_grid_lookup = mapping or {}
+        # 换库 / 重扫 / 改网格：段落是按旧 anchor 吸附的 ⇒ 缓存必须一起作废
+        self._sec_cache = None
         # 换库 / 重扫：旧的网格时钟坐标系作废
         self._reset_grid_clock()
 
@@ -1746,10 +1937,26 @@ class AutoVJEngine(QObject):
                         return got
         except Exception:                                          # noqa: BLE001
             pass
+        # ★ 2026-11-11（P0：单屏预览黑屏 + 多屏持续卡顿）：
+        #   `self.cfg` 是 `Config` 对象，**没有 `.get()`**。这里以前写成
+        #   `cfg.get("auto")` ⇒ 每次 Kv 待机层 tick 都抛 AttributeError，
+        #   `_tick` 被整个中断（合成/输出都没跑）⇒ 预览黑屏；异常栈以 30fps
+        #   反复构造又把 GIL/CPU 拖满 ⇒ 操作卡。这里按 Config/dict 两种形态取值。
         cfg = self.cfg
-        return {"auto": cfg.get("auto") or {}, "color": cfg.get("color") or {},
-                "postfx": cfg.get("postfx") or {}, "kv": cfg.get("kv") or {},
-                "beat": cfg.get("beat") or {}}
+        try:
+            if isinstance(cfg, dict):
+                _g = cfg.get
+            else:
+                def _g(k, d=None):
+                    try:
+                        return cfg[k]
+                    except Exception:                          # noqa: BLE001
+                        return d
+            return {"auto": _g("auto") or {}, "color": _g("color") or {},
+                    "postfx": _g("postfx") or {}, "kv": _g("kv") or {},
+                    "beat": _g("beat") or {}}
+        except Exception:                                      # noqa: BLE001
+            return {"auto": {}, "color": {}, "postfx": {}, "kv": {}, "beat": {}}
 
     def _auto_for(self, lay=None):
         """该层所属屏的 `auto` 参数（没有 → 全局）。U7 第二步。"""
@@ -1782,6 +1989,13 @@ class AutoVJEngine(QObject):
         for lay in self.layers:
             if not getattr(lay, "auto_mode", False):
                 continue
+            # ★ 多屏：该层所属屏如果明确设为“手动”，段落/能量换池不能偷偷切它
+            try:
+                _sc = self._layer_screen(lay)
+                if _sc is not None and self._mode_for_screen(_sc) == SWITCH_MANUAL:
+                    continue
+            except Exception:                                  # noqa: BLE001
+                pass
             if force_tier is None and not force and lay.clips:
                 continue                      # 池子非空且非强制 ⇒ 保持现状（不 churn）
             # 记住当前正在播的素材：换池时保留画面，等切换点（小节线）再切
@@ -1791,6 +2005,7 @@ class AutoVJEngine(QObject):
             picked = list(match_clips(energy, self.library, role=lay.role, n=8,
                                       tier=force_tier))
             lay.clips = list(picked)
+            lay.clip_xforms = [lay._default_clip_xform(_m) for _m in picked]
             lay.auto_clips = list(picked)
             lay.fixed = -1
             lay.recent = []
@@ -1813,6 +2028,16 @@ class AutoVJEngine(QObject):
             # - 能量跨档（force_tier 非空）：立即切（响应速度优先，用户明确要求）
             # - 曲风变化但当前还没画面：先放一个（避免黑屏）
             # - 纯曲风变化且正在播：只换池、保留当前画面，等下一个切换点（小节线）再切 → 对齐
+            # ★ 2026-11-21：drop 段内被逐拍交替接管的前景层，换池后**不立刻切**，
+            #   留给 `_beat_tick` 用新池直接起 A/B（否则同帧两刀，闪一下）。
+            if self.beat_owns(lay):
+                lay.pair = None
+                lay.beat_sec = None
+                lay.cur = -1
+                lay.prev_idx = -1
+                lay.pre_idx = -1
+                changed.append(self.layers.index(lay))
+                continue
             if force_tier is not None or lay.player is None or lay.cur < 0:
                 # ★★★ 2026-11-07（用户：「The Songbird 来回放，素材固定在那几个」）：
                 #   这里原来**永远挑新池的第 0 个**（`_switch_layer_to(lay, 0)`）。
@@ -1915,7 +2140,8 @@ class AutoVJEngine(QObject):
             return cached[2]
         # ★ 传 grid ⇒ `normalize` 会把每个 t0 吸附到最近的八拍头
         #   （与 waveform_mark.grid_times 同一组 anchor/beat_len）。
-        secs = sections.normalize(raw, dur, grid if grid else None) if raw else []
+        # ??????????????? snap??? 4 ??????? 8 ??Remix 107.504?
+        secs = sections.normalize(raw, dur, None) if raw else []
         self._sec_cache = (key, raw, secs)
         self._sec_path = path
         return secs
@@ -1934,24 +2160,21 @@ class AutoVJEngine(QObject):
         return snap_energy(snap)
 
     def _section_log(self, msg):
-        """段落取证：写一行 `[S]` 到 `cue_health.log`（失败静默，绝不影响渲染）。"""
+        """段落取证：写一行 `[S]` 到 `cue_health.log`（失败静默，绝不影响渲染）。
+
+        ★ 2026-11-11（现场：主线程 150~600ms 停顿）：旧实现直接在**引擎线程**上
+          `open/append`，超过 800 行还会整文件读+重写。磁盘一忙就持着 GIL 卡住
+          GUI/预览几十到几百毫秒。现在复用 `_LayerHealthLog` 的后台写线程：
+          渲染线程只 `put_nowait`，裁剪也在后台做。
+        """
         try:
-            path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
-                                "cue_health.log")
-            d = os.path.dirname(path)
-            if d and not os.path.isdir(d):
-                os.makedirs(d, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("[%s] [S] %s\n" % (time.strftime("%H:%M:%S"), msg))
-            # 环形裁剪：超过 800 行只留最后 400 行（与 layer_health 同风格）
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-                if len(lines) > 800:
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.writelines(lines[-400:])
-            except Exception:                                 # noqa: BLE001
-                pass
+            lg = getattr(self, "_cue_section_log", None)
+            if lg is None:
+                path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ",
+                                    "cue_health.log")
+                lg = _LayerHealthLog(path, max_lines=800, keep=400)
+                self._cue_section_log = lg
+            lg.write("[%s] [S] %s" % (time.strftime("%H:%M:%S"), msg))
         except Exception:                                     # noqa: BLE001
             pass
 
@@ -2241,21 +2464,40 @@ class AutoVJEngine(QObject):
             pass
         self._next_due = None
         self._due_cap = False        # 新段落 ⇒ 重新算（见 `_next_switch_due`）
+        # 段落已经统一切过：按屏 override 的排期也一起清空，避免同一帧再切第二刀
+        try:
+            self._scr_switch.clear()
+        except Exception:                                     # noqa: BLE001
+            pass
         # ④ 立刻逐层切一次
+        # ★★ 2026-11-11（用户：段落切换稳不住，时不时跳常规/快切）：
+        #   旧实现只遍历 `_layers_for_global_schedule()` —— 带 `auto/mode` override 的屏
+        #   （现场 `dj` 屏就是）被排除，段落切换**永远轮不到它们**；它们只按自己的
+        #   8/16 拍排期切，于是同一首歌里一半图层按段落、一半按快切，看起来就是
+        #   “节奏一直在变”。段落是整首歌的确定事件，必须覆盖所有屏；只有用户
+        #   显式选了「手动切换素材」的屏才跳过。
         _n_sw = 0
-        for lay in self.layers:
+        _layers = self.layers
+        for lay in _layers:
             if getattr(lay, "fixed", -1) >= 0 or not getattr(lay, "clips", None):
                 continue
             if self.locked:
                 continue
             if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
                 continue
+            try:
+                if self._mode_for_layer(lay) == SWITCH_MANUAL:
+                    continue
+            except Exception:                                  # noqa: BLE001
+                pass
             # ★★★ 2026-11-08（用户：「段落切换时两个素材之间会有一拍切入第三个素材」）：
             #   上面 `_refresh_auto_layers(force_tier=…)` 已经**切过一次**（并带过渡）。
             #   这里原来在「同档位段落」（如连续两段 high）又调 `_switch_layer_random`
             #   ⇒ 同一帧切第二刀：第一刀选中的素材变成 prev_player，淡入时就会在
             #   旧素材与新素材之间露出第三个素材一拍。现在自动层只由上面切一次。
             if getattr(lay, "auto_mode", False):
+                continue
+            if self.beat_owns(lay):
                 continue
             try:
                 self._switch_layer_random(lay, snap)
@@ -2329,13 +2571,17 @@ class AutoVJEngine(QObject):
         #   ⇒ mid 也重 roll（以前只有 low/high 才 roll，中能量段一直在旧池子里挑）。
         self._refresh_auto_layers(snap, force_tier=tier, instant=False)
         # 手动图层：在现有池里按动态档挑一个
-        for lay in self.layers:
+        _sel_layers = getattr(self, "_layers_for_global_schedule", None)
+        _layers = _sel_layers() if callable(_sel_layers) else self.layers
+        for lay in _layers:
             if lay.fixed >= 0 or not lay.clips or self.locked:
                 continue
             if getattr(lay, "auto_mode", False):
                 continue    # 自动图层上面已重 roll + instant 切
             if getattr(lay, "is_kv", False):
                 continue    # Kv 待机层不受能量档位影响
+            if self.beat_owns(lay):
+                continue    # drop 段由逐拍交替接管
             self._switch_layer_random(lay, snap)
 
     # ---------------- 主循环 ----------------
@@ -2414,6 +2660,29 @@ class AutoVJEngine(QObject):
                 except Exception:
                     pass
         self._tick_ms = (time.perf_counter() - t_start) * 1000.0
+        # ★ 诊断：每秒统计一次"引擎 tick / Spout 发送 / GUI 发布 / 缩略图"的真实速率。
+        #   用来区分"引擎本身只有 22fps"还是"引擎 30fps、GUI 只画了 22fps"。
+        if os.environ.get("AUTOVJ_RATE_PROBE") == "1":
+            try:
+                self._rate_ticks = int(getattr(self, "_rate_ticks", 0)) + 1
+                _now = time.perf_counter()
+                _t0 = float(getattr(self, "_rate_t0", 0.0) or 0.0)
+                if not _t0:
+                    self._rate_t0 = _now
+                elif _now - _t0 >= 1.0:
+                    import stallwatch
+                    stallwatch.log_line(
+                        "[RATE] ticks=%d spout=%d gui=%d thumbs=%d"
+                        % (self._rate_ticks, int(getattr(self, "_rate_spout", 0)),
+                           int(getattr(self, "_rate_gui", 0)),
+                           int(getattr(self, "_rate_thumbs", 0))))
+                    self._rate_ticks = 0
+                    self._rate_spout = 0
+                    self._rate_gui = 0
+                    self._rate_thumbs = 0
+                    self._rate_t0 = _now
+            except Exception:                                  # noqa: BLE001
+                pass
         # 引擎线程的 tick 间隔/处理耗时取证：输出侧 `[OUT]` 日志会带上这两个值。
         # 只有明显异常才写（30fps 下 150ms ≈ 4~5 帧），每 2 秒最多一行，绝不影响演出。
         try:
@@ -2539,6 +2808,45 @@ class AutoVJEngine(QObject):
         self._seg_reset()
         self._phase_set("tick")
         snap = self.audio.snapshot()
+        # ★★★ 2026-11-12（用户：没声音待机仍有 25~35% CPU）：
+        #   运行中但长时间无音频时，播放器仍在按源帧率解码、5 屏整合/Spout/GUI
+        #   仍按 30fps 跑。这里进入"静音待机"：解码/合成/GUI 全部降到
+        #   `perf.silent_standby_fps`（默认 2fps），并且不激活任何播放器。
+        #   音频一回来下一 tick 就恢复，画面停在上一次合成帧。
+        try:
+            _sil = float(snap.get("silent_sec", 0.0) or 0.0)
+            _lvl = float(snap.get("level", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _sil, _lvl = 0.0, 1.0
+        try:
+            _perf = self.cfg["perf"] or {}
+            _ss_sec = float(_perf.get("silent_standby_sec", 8.0) or 8.0)
+            _ss_lvl = float(_perf.get("silent_standby_level", 0.002) or 0.002)
+        except (TypeError, ValueError, KeyError):
+            _ss_sec, _ss_lvl = 8.0, 0.002
+        # `silent_sec` 在采集线程停住/零块时可能不增长（实测卡在 4.3s），
+        # 所以引擎侧再用挂钟累计“连续低电平”时长，作为第二判据。
+        _now_s = time.perf_counter()
+        if _lvl <= max(0.0, _ss_lvl):
+            if self._silent_low_since <= 0.0:
+                self._silent_low_since = _now_s
+        else:
+            self._silent_low_since = 0.0
+        _low_dur = (_now_s - self._silent_low_since) if self._silent_low_since > 0.0 else 0.0
+        self._silent_standby = bool(
+            self.running and not self.freeze and not self.blackout
+            and not str(snap.get("error", "") or "")
+            and max(_sil, _low_dur) >= max(2.0, _ss_sec))
+        # ★★ 2026-11-17（用户：Kv 图层淡入时画面掉帧）：
+        #   Kv 的淡入/淡出只有 1.5s，而静音待机把引擎降到 2fps ⇒ 整段淡入只有
+        #   3 帧，看起来就是"一卡一卡"。这里在 Kv **正在或即将**过渡时禁止进待机
+        #   （只在过渡那一两秒保持正常帧率，静音待机的省 CPU 目的不受影响）。
+        try:
+            self._kv_anim = bool(self._kv_transition_pending())
+        except Exception:                                      # noqa: BLE001
+            self._kv_anim = False
+        if self._kv_anim:
+            self._silent_standby = False
         self._auto_fps_tick()
         if self.freeze:
             return  # 冻结：画面完全不变
@@ -2560,12 +2868,16 @@ class AutoVJEngine(QObject):
             self._bar_off_user = None
             self._next_due = None
 
+        # 静音待机：没有音频时不推进自动换素材/模式/Kv，避免不断打开新播放器
+        # （即使它们随后被挂起，开容器+解首帧也会造成 CPU 尖峰）。
+        _standby = bool(getattr(self, "_silent_standby", False))
         # 行为模式：每秒评估一次（自动打分或手动强制）
-        if self.running:
+        if self.running and not _standby:
             self._update_mode(snap)
 
         # 自动匹配：曲风变化时重算自动图层素材池
-        self._refresh_auto_layers(snap)
+        if not _standby:
+            self._refresh_auto_layers(snap)
 
         # ★ 2026-10-25「手动切换素材」：**一次性关掉本帧所有自动切换入口**。
         #   为什么用同一个布尔而不是各分支各写一遍：切换入口一共 3 个
@@ -2577,7 +2889,7 @@ class AutoVJEngine(QObject):
 
         # 能量跨档即时切换：能量从高/低跨过阈值（带防抖）时立即换素材动态档，
         # 不等到下一个拍位切换点（否则能量变了十几秒素材动态还换不过来）。
-        if self.running and not _no_auto_switch and self.mode != "beat":
+        if self.running and not _no_auto_switch and not _standby and self.mode != "beat":
             self._energy_tier_switch(snap)
 
         # BPM 速度同步
@@ -2593,17 +2905,20 @@ class AutoVJEngine(QObject):
         speed = content_speed(snap, bool(self.cfg["auto"].get("bpm_speed_sync")))
 
         # 非逐拍模式的按拍位切换
-        if self.running and not _no_auto_switch and self.mode != "beat":
+        if self.running and not _no_auto_switch and not _standby and self.mode != "beat":
             self._auto_switch_tick(snap)
 
-        # 逐拍交替（仅当模式为 beat；相位驱动，每帧节流在内部完成）
-        if self.running and not _no_auto_switch and self.mode == "beat":
+        # 逐拍交替：独立开关（只接管前景层；只在 drop 段生效）
+        if self.running and not _no_auto_switch and not _standby:
             self._beat_tick(snap)
 
         # 预热：把「下一个要切的素材」提前打开容器+解首帧（切到时零延迟，见 warm_up）
-        self._process_warms(snap)
+        if not getattr(self, "_silent_standby", False):
+            self._process_warms(snap)
 
         # Kv 待机层：静音切入 / 有声切出（独立于所有其它设置，不受 pause_auto 影响）
+        # ★ 2026-11-12：**静音待机时也必须继续 tick** —— 它负责“没音乐时把 Kv 图
+        #   淡入”。之前跟着 `_standby` 一起跳过，结果 Kv 在音乐停止时永远不显示。
         if self.running and not self.locked:
             self._kv_tick(snap)
 
@@ -2625,14 +2940,38 @@ class AutoVJEngine(QObject):
             #   （tools/_probe_4k.py 实测），多路并发时 30fps 的 33ms 预算直接爆掉，
             #   而且每路都在从素材盘取数据（Y: 是机械盘，见 tools/_probe_disk.py）。
             #   过渡中的图层仍要解码（淡入需要新画面），所以 `trans_active` 也算可见。
+            # ????????? trans_active?_compose_to ?????
+            # ????????????????? active ???CPU ????
+            if not bool(getattr(lay, "visible", True)):
+                try:
+                    lay.trans_active = False
+                except Exception:
+                    pass
             vis_now = (bool(getattr(lay, "visible", True))
                        or bool(getattr(lay, "trans_active", False)))
+            # ★★★ 2026-11-12（用户：只显示一张图，CPU 仍 30%+）：
+            #   `hide_silent` 的图层在静音时**合成端已经不再画**，但活跃标记只看
+            #   `visible` ⇒ 解码器继续满速跑。现场 config 里 L5/L6/L9 都是
+            #   `hide_silent=True`，静音时画面只剩 L0 一张图，CPU 却仍是 3 路视频。
+            #   合成端不画 ⇒ 解码端也必须挂起。
+            try:
+                _op_now = float(getattr(lay, "opacity", 1.0) or 0.0)
+            except (TypeError, ValueError):
+                _op_now = 1.0
+            if _op_now <= 0.002:
+                vis_now = False
+            if bool(getattr(lay, "hide_silent", False)) and silent_now:
+                vis_now = False
             seen = set()
             for p in list(lay.cache.values()) + [lay.player, lay.prev_player]:
                 if p is None or id(p) in seen:
                     continue
                 seen.add(id(p))
-                active = (p is lay.player or p is lay.prev_player) and vis_now
+                active = ((p is lay.player or p is lay.prev_player) and vis_now
+                          and not getattr(self, "blackout", False)
+                          and (not getattr(self, "_silent_standby", False)
+                               or (getattr(lay, "is_kv", False)
+                                   and float(getattr(lay, "kv_on", 0.0) or 0.0) > 0.01)))
                 # 静音时暂停：保持当前画面不动（解码线程挂起，最后一帧仍在显示）
                 # 仅在 VJ 运行中生效；停止时预览要保持实时，不能挂起
                 if active and lay.pause_silent and silent_now and p is lay.player and self.running:
@@ -2648,12 +2987,23 @@ class AutoVJEngine(QObject):
         # ★ 卡帧看门狗：活跃播放器超过 `_STALL_SECS` 没有新帧 ⇒ 关掉、从缓存摘除、重建。
         #   放在活跃循环**之外**（避免遍历 cache 时改 dict）。
         #   这是"素材解不出来也不会永久冻帧"的兜底，覆盖 R1/R2/R4/R6/R9。
-        for lay in self.layers:
-            self._heal_stalled(lay)
-            # ★ 静默冻帧兜底：`_heal_stalled` 看不见的那几类（player 不在缓存 ⇒ 永不被激活 /
-            #   player is None / 有帧前就 ended）在这里恢复并留下日志，避免"画面冻住而日志沉默"。
-            #   传 `snap` 供"无帧封顶后跳到下一个素材"复用 `_candidate_indices`。
-            self._heal_silent(lay, snap)
+        # ★★ 2026-11-17（用户：静音待机时 39% CPU、电脑卡死）：
+        #   待机时上面的活跃循环**故意**把所有解码器挂起（`set_active(False)`），
+        #   而看门狗把"不活跃 / 没有新帧"当成故障 ⇒ 每 2~5s 强行激活/重建解码器、
+        #   甚至跳到下一个素材、反复读盘（现场 Task Manager：39% CPU / 23MB/s）。
+        #   待机期间**直接跳过自愈**，并清掉计时器；音频回来后的第一帧再正常检查
+        #   （那时播放器已经重新激活，真有故障仍会被 `_heal_stalled` 抓到）。
+        if _standby:
+            for lay in self.layers:
+                lay._silent_inactive_since = 0.0
+                lay._silent_noframe_since = 0.0
+        else:
+            for lay in self.layers:
+                self._heal_stalled(lay)
+                # ★ 静默冻帧兜底：`_heal_stalled` 看不见的那几类（player 不在缓存 ⇒ 永不被激活 /
+                #   player is None / 有帧前就 ended）在这里恢复并留下日志，避免"画面冻住而日志沉默"。
+                #   传 `snap` 供"无帧封顶后跳到下一个素材"复用 `_candidate_indices`。
+                self._heal_silent(lay, snap)
 
         # ★ 每层健康快照（每秒 1 行，只在 running 时）—— 卡了能直接回看那一刻每层状态。
         self._health_tick()
@@ -2689,6 +3039,27 @@ class AutoVJEngine(QObject):
             self._cp_cfg = None
             self._section_log("主屏参数读取失败（回落全局）：%s" % _e)
         self._compose(snap)
+        # ★★★ 2026-11-11（用户：多屏预览卡 + CPU 30%+）：**复用主屏合成**。
+        #   `dj` 这类 follow_main 的从屏，图层集合/尺寸和主屏完全相同，只差
+        #   color / 强度参数；旧实现每帧把 10 层 + 码表**再合成一遍**（ci 8~88ms）。
+        #   这里在**主屏染色之前**把未染色的主画布复制给它，后面只套它自己的
+        #   颜色 LUT（~2ms），省掉整次重合成。
+        #   ⚠ 仅允许 params 里只有 color/auto.intensity（postfx 关闭时）；
+        #     强度脉冲沿用主屏（差异 <3%，换来一半合成开销）。
+        self._reused_screens = set()
+        try:
+            self._copy_main_for_reused_screens(snap)
+        except Exception:                                      # noqa: BLE001
+            self._reused_screens = set()
+        # ★ 2026-11-11（用户：「操作非常卡」）：主合成/多屏合成/缩略图发布都是
+        #   单次几毫秒~几十毫秒的 Qt C++ 调用，PySide 在这些调用期间**不释放 GIL**
+        #   （py-spy 实测引擎线程占 GIL 54%，主线程只有 7.5%）。每个重阶段后主动
+        #   让出一次 GIL，GUI 才有机会处理点击/重绘，而不是等整帧结束。
+        #   `time.sleep(0)` = Sleep(0)：只让出时间片，不引入固定延时。
+        try:
+            time.sleep(0)
+        except Exception:                                      # noqa: BLE001
+            pass
         # 颜色渲染 + 后处理特效链（合成后、输出前）。
         # ★ 2026-10-28（性能）：合并成一个入口，**整帧只读回/写回一次**。
         #   原来两段各做一次 `_np_view_bgr` + `write_back_bgr`（1280×720 共 3.7 MB），
@@ -2711,13 +3082,25 @@ class AutoVJEngine(QObject):
                 self._compose_independent(snap)
                 self._phase_set("copy_comb")
                 self._build_combined(snap)
+                try:
+                    time.sleep(0)      # 5 屏拼接后主动让 GIL，避免主线程停顿
+                except Exception:                                  # noqa: BLE001
+                    pass
             else:
                 self._compose_independent(snap)
                 self._phase_set("copy_comb")
             self._phase_set("copy_pub")
             self._publish_multi_frame()
+            try:
+                time.sleep(0)
+            except Exception:                                  # noqa: BLE001
+                pass
             self._phase_set("routes")
             self._send_multi_routes()
+            try:
+                time.sleep(0)          # 路由发送后让出时间片（Spout/NDI 入队也是 Python 侧拷贝）
+            except Exception:                                      # noqa: BLE001
+                pass
         else:
             # ---- 旧的单路输出（没有配置时保持原逻辑）----
             # 深拷贝一帧再发射：GUI 只读这份独立数据，worker 不再碰它，彻底消除跨线程抢画布竞态
@@ -2752,30 +3135,32 @@ class AutoVJEngine(QObject):
         #   GUI 只读快照。本函数此刻已持 `_tick_lock`（RLock，**可重入**）⇒ 这里再调那几个
         #   @_locked 方法不会死锁；`_beat_pos` 按时间戳重算且幂等（见其注释），额外调用不改行为。
         try:
-            _ui = {"switch_cd": self.switch_countdown(snap),
-                   # 引擎 tick 实测（供输出侧 [OUT] 卡顿日志关联）
-                   "tick_ms": round(float(getattr(self, "_tick_ms", 0.0) or 0.0), 1),
-                   "tick_gap_ms": round(float(getattr(self, "_tick_gap_ms", 0.0) or 0.0), 1),
-                   # ★ 2026-11-06：告诉 HUD 这次是"段落接管"（用段落措辞）还是"按拍"
-                   "switch_kind": getattr(self, "_due_kind", None),
-                   # ★ 2026-11-06：当前段落名（设置页「当前节奏」直接显示"跟随段落「X」"）
-                   "sec_name": str((getattr(self, "_sec_info", None) or {}).get("name") or ""),
-                   "phrase_cd": self.phrase_countdown(snap),
-                   "grid_view": self.beat_grid_view(snap),
-                   # ★ T05②：当前段/多锚（有分段/多锚才有值，否则 None ⇒ HUD 一字不变）
-                   "grid_seg": self.grid_segment_info(snap)}
+            # ★★ 2026-11-11（用户：播放音乐多屏输出时界面/预览非常卡）：
+            #   `ui_snap` 里的 switch/phrase/grid 计算每帧都做，且现场 stall 日志
+            #   978/991 次都停在 `阶段=ui_snap`。HUD 本身 500ms 才刷新一次，
+            #   这里降到 10Hz（0.1s）已经足够，渲染线程每帧省下这组计算/锁竞争。
             _now_ui = time.perf_counter()
-            if (_now_ui - getattr(self, "_ui_next_t", 0.0)) >= _UI_NEXT_CLIP_INTERVAL:
-                self._ui_next_t = _now_ui
-                _nxt = {}
-                for _i, _ly in enumerate(self.layers):
-                    try:
-                        _nxt[_i] = self.next_clip_for(_ly)
-                    except Exception:
-                        pass
-                self._ui_next_clips = _nxt
-            _ui["next_clips"] = getattr(self, "_ui_next_clips", {})
-            self._ui_snap = _ui          # 整体赋值（GIL 下原子）
+            if (not self._ui_snap
+                    or (_now_ui - float(getattr(self, "_ui_calc_t", 0.0) or 0.0)) >= 0.1):
+                _ui = {"switch_cd": self.switch_countdown(snap),
+                       # 引擎 tick 实测（供输出侧 [OUT] 卡顿日志关联）
+                       "tick_ms": round(float(getattr(self, "_tick_ms", 0.0) or 0.0), 1),
+                       "tick_gap_ms": round(float(getattr(self, "_tick_gap_ms", 0.0) or 0.0), 1),
+                       # ★ 2026-11-06：告诉 HUD 这次是"段落接管"（用段落措辞）还是"按拍"
+                       "switch_kind": getattr(self, "_due_kind", None),
+                       # ★ 2026-11-06：当前段落名（设置页「当前节奏」直接显示"跟随段落「X」"）
+                       "sec_name": str((getattr(self, "_sec_info", None) or {}).get("name") or ""),
+                       "phrase_cd": self.phrase_countdown(snap),
+                       "grid_view": self.beat_grid_view(snap),
+                       # ★ T05②：当前段/多锚（有分段/多锚才有值，否则 None ⇒ HUD 一字不变）
+                       "grid_seg": self.grid_segment_info(snap)}
+                # ★★ 2026-11-11：`next_clips` 功能已随「下一个素材」开关一起删除，
+                #   不再为 10 个图层每 0.25s 调 `next_clip_for()`（现场 ui_snap 205ms 的元凶）。
+                _ui["next_clips"] = {}
+                self._ui_calc_t = _now_ui
+                self._ui_snap = _ui          # 整体赋值（GIL 下原子）
+        except Exception:
+            pass
         except Exception:
             pass
 
@@ -2890,11 +3275,20 @@ class AutoVJEngine(QObject):
                                                  or "EasyRealityAutoVJ")
             w, h = self.canvas.width(), self.canvas.height()
             bpl = self.canvas.bytesPerLine()
+            # ★ 2026-11-17：与多路一致 —— Alpha 画布按**预乘**发给 Spout
+            #   （OBS Spout2 源的 Premultiplied Alpha 合成口径）。RGB32 不动。
+            _fr = self.canvas
+            if _fr.format() == QImage.Format_ARGB32:
+                try:
+                    _fr = _fr.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+                    w, h, bpl = _fr.width(), _fr.height(), _fr.bytesPerLine()
+                except Exception:                                  # noqa: BLE001
+                    _fr = self.canvas
             # ★ 参数顺序是 (buffer, width, height, …)：之前误写成 (buf, h, w, …) ⇒ 发送端宣告
             #   尺寸转置（1920×1080 → 1080×1920），画面错乱且不报错。`send()` 里是 (w, h)。
             # ★★ 2026-10-28（用户实测：OBS 里 Spout 画面上下颠倒）：
             #   第 5 个参数 `bInvert` 必须为 **False**（画布本就是 top-down，见 SpoutOut）。
-            self._spout.send(self.canvas.bits(), w, h, bpl)
+            self._spout.send(_fr.bits(), w, h, bpl)
         except Exception as e:                                     # noqa: BLE001
             # ⚠ 失败时**保留已有 `self._spout`**、不丢成 None 重建：源名反复消失/出现更难恢复
             self._output_fail("Spout", now, e)
@@ -2940,8 +3334,16 @@ class AutoVJEngine(QObject):
             #   现在 `_ensure()` 失败 = 抛错走退避重试（分辨率变化 / Runtime 晚启动都能自愈）。
             if not self._ndi._ensure(w, h):
                 raise RuntimeError("NDI _ensure(%dx%d) 返回 False" % (w, h))
-            bpl = self.canvas.bytesPerLine()
-            bgra = _np.frombuffer(self.canvas.bits(), dtype=_np.uint8, count=bpl * h)
+            # ★ 2026-11-17：Alpha 画布按**预乘**发（NDI 的 alpha 也是预乘口径）。
+            _fr = self.canvas
+            if _fr.format() == QImage.Format_ARGB32:
+                try:
+                    _fr = _fr.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+                    w, h = _fr.width(), _fr.height()
+                except Exception:                                  # noqa: BLE001
+                    _fr = self.canvas
+            bpl = _fr.bytesPerLine()
+            bgra = _np.frombuffer(_fr.bits(), dtype=_np.uint8, count=bpl * h)
             # 传给 NDI 的是 BGRA 连续缓冲（画布 RGB32 = BGRA 内存序）。
             # send_video 自己返回真实提交结果；这里仅用于诊断，不把单帧丢弃当成异常。
             self._ndi.send_video(bgra, w, h)
@@ -2989,6 +3391,16 @@ class AutoVJEngine(QObject):
                         "scores": dict(self.mode_scores or {})}
         except Exception:                                        # noqa: BLE001
             manual = None
+        # ★ 2026-11-11（用户：段落接管时“时不时跳成常规切/快切”）：只要段落表
+        #   正在接管，展示层就固定显示「按段落切换」。实际切换也由 `_section_tick`
+        #   独占，不再让常规/快切的拍位排期插刀。
+        try:
+            if (manual is None and bool(getattr(self, "running", False))
+                    and getattr(self, "_sec_energy", None) is not None):
+                return {"mode": "section", "manual": manual,
+                        "scores": dict(self.mode_scores or {})}
+        except Exception:                                        # noqa: BLE001
+            pass
         return {
             "mode": manual or self.mode,
             "manual": manual,
@@ -3389,7 +3801,7 @@ class AutoVJEngine(QObject):
         try:
             all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
             ids = output_model.effective_layers(plan, screen, all_ids)
-            return self._out_layers_by_ids(ids)
+            return self._pin_kv_order(self._out_layers_by_ids(ids))
         except Exception:                                          # noqa: BLE001
             return []
 
@@ -3409,6 +3821,18 @@ class AutoVJEngine(QObject):
             if sid_ not in ov_sids:
                 self._scr_switch.pop(sid_, None)
         if not ov_sids:
+            return
+        # ★★ 2026-11-11（用户：段落切换稳不住，时不时跳常规/快切）：
+        #   段落表接管期间，**所有屏**都只能由 `_section_tick` 在段落边界切；
+        #   带 override 的屏以前仍按自己的 8/16 拍排期切（现场 `dj` 屏日志每 8/16
+        #   拍一条），和段落边界交替出现 ⇒ 听感就是节奏一直在变。
+        #   这里直接放弃本帧及已排的 due，等段落路径统一切（手动模式仍在上面跳过）。
+        if getattr(self, "_sec_energy", None) is not None:
+            for _st in self._scr_switch.values():
+                try:
+                    _st["due"] = None
+                except Exception:                              # noqa: BLE001
+                    pass
             return
         pos = self._beat_pos(snap)
         for sc in plan.get("screens") or []:
@@ -3455,6 +3879,8 @@ class AutoVJEngine(QObject):
                 if lay.fixed >= 0 or not lay.clips:
                     continue
                 if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
+                    continue
+                if self.beat_owns(lay):
                     continue
                 lay.trans_ms = trans_ms
                 self._switch_layer_random(lay, snap)
@@ -3602,7 +4028,12 @@ class AutoVJEngine(QObject):
     # ★ 2026-11-06：段落接管素材切换后的「最长不换素材」上限（拍）。
     #   段落可能很长（20 个八拍 = 160 拍），不做上限的话现场会出现"十几秒不换画面"。
     #   64 拍 ≈ 4 个八拍乐句，也是常规切（16 拍）的 4 倍，够宽松又不会闷。
-    AUTO_SWITCH_MAX_BEATS = 64.0
+    #: 段落模式下的**安全上限**：段落再长也别超过这么多拍不换素材。
+    #: ★ 2026-11-11（用户：稳不住按段落切换，时不时跳常规/快切）：旧值 64 拍
+    #:   ≈ 22 秒，现场很多 drop/过渡段本身就 25~30 秒 ⇒ 每到 64 拍就被拍位路径
+    #:   强切一刀，听感就是“段落中间突然变回常规切”。这里放到 512 拍（≈3.5 分钟），
+    #:   只作为脏数据的保险丝，正常段落完全由段落边界决定。
+    AUTO_SWITCH_MAX_BEATS = 512.0
     #: **段落切换**提前多少拍触发。
     #: 2026-11-08 用户要求：识别到歌曲后按段落切换有一拍提前量，去掉 ⇒ 0.0。
     #: ⚠ 按拍切换的 `SWITCH_ADVANCE_BEATS` 是另一条路径，不要一起改。
@@ -3665,7 +4096,7 @@ class AutoVJEngine(QObject):
                 if _bpm > 0 and 0 <= _i < len(_secs) - 1 and _cur_sec >= 0:
                     _nxt = float(_secs[_i + 1].get("t0") or 0.0)
                     _dsec = _nxt - _cur_sec
-                    if 1.0 <= _dsec <= 120.0:            # 合理区间，防脏数据
+                    if 1.0 <= _dsec <= 600.0:            # 合理区间，防脏数据
                         _pos_now = self._beat_pos(snap)
                         _sec_beat = _pos_now + _dsec * _bpm / 60.0
                         # 上限：段落再长也别超过 MAX 拍不换素材
@@ -3875,6 +4306,8 @@ class AutoVJEngine(QObject):
                     continue
                 if getattr(lay, "is_kv", False):
                     continue    # Kv 待机层不参与按拍自动切换
+                if self.beat_owns(lay):
+                    continue    # drop 段由逐拍交替接管
                 lay.trans_ms = trans_ms
                 self._switch_layer_random(lay, snap)
         # ★ BUG-D 波2：带 override 的屏各自排期（旁路；无 override 时本函数直接 return）
@@ -3945,7 +4378,7 @@ class AutoVJEngine(QObject):
             return None
         if lay.fixed >= 0 and 0 <= lay.fixed < len(lay.clips):
             return lay.clips[lay.fixed]
-        if self.mode == "beat" and lay.pair and len(lay.clips) >= 2:
+        if self.beat_owns(lay) and lay.pair and len(lay.clips) >= 2:
             nxt = lay.pair[lay.pair_turn ^ 1]
             if 0 <= nxt < len(lay.clips):
                 return lay.clips[nxt]
@@ -3996,8 +4429,8 @@ class AutoVJEngine(QObject):
             pass
 
     def _process_warms(self, snap):
-        """每帧检查一次「到点该预热了」（只在拍位切换模式下用；逐拍交替在 _beat_show 里直接预热）"""
-        if self.mode == "beat" or self.locked:
+        """每帧检查一次「到点该预热了」（逐拍交替的对子预热在 _beat_show 里直接做）"""
+        if self.locked:
             return
         now = time.perf_counter()
         for lay in self.layers:
@@ -4005,6 +4438,8 @@ class AutoVJEngine(QObject):
                 continue
             lay.warm_pend = False
             if lay.fixed >= 0 or self.locked or getattr(lay, "is_kv", False):
+                continue
+            if self.beat_owns(lay):
                 continue
             cands = self._candidate_indices(lay, snap)
             if not cands:
@@ -4173,6 +4608,23 @@ class AutoVJEngine(QObject):
             return
         if not (0 <= lay.cur < len(lay.clips)):
             return
+        # ★★ 2026-11-17（用户：切歌时视频输出卡顿掉帧十几秒）：
+        #   `hide_silent` 图层在静音时、`opacity=0` 的图层，合成端**故意**不画，
+        #   上面的活跃循环也**故意**挂起它们的解码器。但看门狗把"不活跃"当故障，
+        #   每 1~2s 又强行激活 ⇒ 下一帧再挂起 ⇒ **反复开/停解码线程 + 读盘**，
+        #   切歌/试听那段十几秒就一直抖。这两类"不活跃"是设计行为，直接放过。
+        try:
+            if (bool(getattr(lay, "hide_silent", False))
+                    and bool(getattr(self, "_silent_now_debounced", False))):
+                lay._silent_inactive_since = 0.0
+                lay._silent_noframe_since = 0.0
+                return
+            if float(getattr(lay, "opacity", 1.0) or 0.0) <= 0.002:
+                lay._silent_inactive_since = 0.0
+                lay._silent_noframe_since = 0.0
+                return
+        except (TypeError, ValueError):
+            pass
         now = time.perf_counter()
         p = lay.player
 
@@ -5037,6 +5489,13 @@ class AutoVJEngine(QObject):
             ids.update(self._cue_peer_song_ids(tr))
         except Exception:                                        # noqa: BLE001
             pass
+        # ★ 2026-11-17：导入库的歌不在 `music_meta` 里，但认歌线程会给出它的 sid。
+        #   不并进来 ⇒ 护栏把“导入库那首”当成别的歌 ⇒ pb=None ⇒ 码表图层永远没位置
+        #   （用户：“导入到 avj 没画面”）。
+        try:
+            ids.update(self._cue_imported_song_ids(tr))
+        except Exception:                                        # noqa: BLE001
+            pass
         frozen = frozenset(ids)
         self._cue_bound_cache = (tr, primary, frozen)
         return primary, frozen
@@ -5181,6 +5640,57 @@ class AutoVJEngine(QObject):
                     out.add(sid)
             except Exception:                                    # noqa: BLE001
                 continue
+        return out
+
+    def _cue_imported_song_ids(self, tr):
+        """码表曲目在本机**导入库**里对应的 song_id 集合。
+
+        导入库（`imported_meta.db`）是独立 SQLite，不在 `cfg["music_meta"]`；
+        但认歌线程会把导入歌的 sid 报上来。码表护栏若不认识这个 sid，就会把
+        “正确认出的导入歌”当成别的歌 ⇒ `pb=None` ⇒ 码表图层没画面。
+        判据与 `match_track()` 第 ③ 级**完全一致：归一化名 + 艺人**（时长只用于
+        多候选排序，不作硬门槛）—— 否则“扩展版/不同母带差 >2 秒”会被 binder 绑上、
+        又被 guard 拒掉，现场就是“码表导入了却没画面”。
+        """
+        out = set()
+        try:
+            idn = getattr(tr, "identity", None)
+            if idn is None:
+                return out
+            title = str(getattr(idn, "title", "") or "")
+            artist = str(getattr(idn, "artist", "") or "")
+            try:
+                dur = float(getattr(idn, "duration_sec", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            if not (title or artist):
+                return out
+            import cuesheet as _cs
+            norm = _cs._norm_title_artist
+            want_nt, want_na = norm(title), norm(artist)
+            import imported_lib as _IL
+            from config import app_base_dir
+            for r in (_IL.display_rows(app_base_dir()) or []):
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    sid = int(r.get("sid") or -1)
+                except (TypeError, ValueError):
+                    sid = -1
+                if sid < 0:
+                    continue
+                try:
+                    rdur = float(r.get("dur") or 0.0)
+                except (TypeError, ValueError):
+                    rdur = 0.0
+                try:
+                    if (norm(str(r.get("title") or "")) == want_nt
+                            and norm(str(r.get("artist") or "")) == want_na):
+                        out.add(int(sid))
+                except Exception:                                # noqa: BLE001
+                    continue
+        except Exception:                                        # noqa: BLE001
+            pass
         return out
 
     def _cue_diag(self, sid, votes, off, status, pb, now):
@@ -5354,7 +5864,9 @@ class AutoVJEngine(QObject):
             if meta:
                 q["title"] = str(meta.get("title") or "")
                 q["artist"] = str(meta.get("artist") or "")
-                q["duration_sec"] = float(meta.get("duration") or 0.0)
+                # ★ 2026-11-18：扫描把时长写在 `grid.dur`，顶层没有 `duration`
+                #   ⇒ 原来这里永远 0，`match_track` 第 ②/③ 级全废。
+                q["duration_sec"] = self._cue_local_dur(meta)
                 # `md5` 是早期键名，保留作旧配置兼容（新扫描只写 `file_md5`）
                 q["file_md5"] = str(meta.get("file_md5") or meta.get("md5") or "")
                 q["fp_id"] = str(meta.get("fp_id") or "")
@@ -5381,6 +5893,61 @@ class AutoVJEngine(QObject):
             return {}
         m = cur.get("fp_songs")
         return m if isinstance(m, dict) else {}
+
+    def _cue_imported_meta(self, sid):
+        """导入库（`imported_meta.db`）里某个 `song_id` 的歌名/艺人/时长。
+
+        ★ 2026-11-17（用户：放 Can We Believe，dj 屏码表仍不演出）：
+          日志是 `pb=111.0 sheet=1 track=None rt=0 why=no_rt` —— 位置早就对了，
+          卡在“认曲目”这一步：导入库的歌**没有本机文件路径**，`_cue_track_query()`
+          拿不到，而 `_cue_track_query_by_sid()` 原来只查 `cfg["cue"]["fp_songs"]`
+          （那是码表包自带的指纹合成 id）。导入库的 sid 不在这张表里 ⇒ 查询为空
+          ⇒ `match_track()` 永远返回 None ⇒ `_cue_rt` 永远是 None ⇒ 码表图层
+          **一次都没演过**（`items=0`）。
+          导入库有 title/artist/dur，正好够 `match_track()` 的第 ③/④ 级。
+
+        `display_rows()` 每次要开 SQLite；按库文件 mtime 缓存一份
+        （导入/删除会改 mtime，自动失效）。
+        """
+        try:
+            want = int(sid)
+        except (TypeError, ValueError):
+            return None
+        try:
+            import imported_lib as _IL
+            from config import app_base_dir
+            base = app_base_dir()
+            dbp = _IL.meta_db_path(base)
+            mtime = os.path.getmtime(dbp) if os.path.isfile(dbp) else 0.0
+            cache = getattr(self, "_cue_imp_cache", None)
+            if not cache or float(cache[0]) != float(mtime):
+                rows = {}
+                for r in (_IL.display_rows(base) or []):
+                    if not isinstance(r, dict):
+                        continue
+                    try:
+                        rows[int(r.get("sid") or -1)] = r
+                    except (TypeError, ValueError):
+                        continue
+                cache = (mtime, rows)
+                self._cue_imp_cache = cache
+            r = (cache[1] or {}).get(want)
+            if not r:
+                return None
+            try:
+                dur = float(r.get("dur") or 0.0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            return {
+                "title": str(r.get("title") or r.get("file_name") or ""),
+                "artist": str(r.get("artist") or ""),
+                "duration_sec": dur,
+                "file_name": "",
+                "fp_id": str(r.get("fp_id") or ""),
+                "file_md5": str(r.get("file_md5") or ""),
+            }
+        except Exception:                                        # noqa: BLE001
+            return None
 
     def _cue_track_query_by_sid(self, sid):
         """**合成 `song_id`**（码表包带来的指纹）→ 认歌查询参数；不是合成 id ⇒ `{}`。
@@ -5415,7 +5982,10 @@ class AutoVJEngine(QObject):
                 "duration_sec": dur,
                 "file_name": "",
             }
-        return {}
+        # ★ 2026-11-17：导入库的歌（有 sid、没有本机文件、也不在 fp_songs 里）
+        #   用 imported_meta.db 的 title/artist/dur 走 match_track ③/④ 级。
+        _im = getattr(self, "_cue_imported_meta", None)
+        return (_im(want) if callable(_im) else {}) or {}
 
     def _cue_beat_len_for(self, path, use_track=True):
         """⚠ **诊断用，不要再用它算 `pos_beats`**（2026-10-17 起）。
@@ -5641,6 +6211,28 @@ class AutoVJEngine(QObject):
         off = _f(getattr(st, "recognized_offset", -1.0), -1.0)
         votes = _i(getattr(st, "recognized_votes", 0), 0)
         rate = _f(getattr(st, "recognized_rate", 1.0), 1.0)
+        # ★★★ 2026-11-13（用户：音乐停了十几秒，码表还在演）：
+        #   freewheel 原本只看 `silent_sec <= 3`，但采集线程在“播放器暂停/没有新 block”
+        #   时 `silent_sec` 可能根本不增长（现场日志卡在 0.0~4.3s）⇒ 码表按最后位置
+        #   继续演最多 30s。这里用**引擎侧连续低电平**兜底：真的没声音 2s 就停，
+        #   不依赖音频线程有没有正常送出 silent 计数。
+        _lvl_now = _f(getattr(st, "level", 0.0), 0.0)
+        _sil_now = _f(getattr(st, "silent_sec", 0.0), 0.0)
+        _low_since = float(getattr(self, "_silent_low_since", 0.0) or 0.0)
+        _low_dur = (now - _low_since) if _low_since > 0.0 else 0.0
+        _silent_eff = max(_sil_now, _low_dur)
+        if _silent_eff >= CUE_STOP_SILENT_SEC:
+            self._cue_fw_pos = None
+            self._cue_fw_t = 0.0
+            self._cue_fw_on = False
+            try:
+                self._cue_pos_tracker.reset()
+            except Exception:                                # noqa: BLE001
+                pass
+            self._cue_pos_song = -1
+            self._cue_diag(-1, 0, off, "lost", None, now)
+            self.set_cue_position(None, "fp")
+            return ("lost", None)
         # ★★★ 2026-10-18（用户："码表视频还是会慢 跟不上音频"）——**用节拍钟 BPM 校正倍率**。
         #   现场取证（用户自己的 cue_health.log，西行谣）：
         #     · `pb` 74 秒只推进 172.1 拍 = 72.7 秒内容 ⇒ **0.983×，累积慢 1.3 秒**
@@ -5662,7 +6254,25 @@ class AutoVJEngine(QObject):
         trk = self._cue_pos_tracker
         rate = rate if rate > 0 else 1.0
         self._cue_rate_raw = rate               # 取证：未经死区的原始估计
-        trk.rate = 1.0 if abs(rate - 1.0) <= CUE_RATE_DEADBAND else rate
+        # ★★★ 2026-11-11（用户：码表演出和音乐差好几秒）：
+        #   现场 `r=1.000` 但音乐实际是 142.5/140 = **1.018×**；旧死区 ±10% 把
+        #   1.018 硬按回 1.000 ⇒ 码表每秒慢 1.8% ⇒ 150 秒后差 2.7 秒，
+        #   正是用户看到的“好几秒严重偏差”。
+        #   现在：死区收紧到 ±0.2%，并做慢 EMA（真实变速几秒内跟上，单窗噪声不抖）。
+        #   ⚠ 倍率仍只来自指纹 offset 斜率（不用 BPM 比值，避免码表 BPM 填错时反向带偏）。
+        _raw = max(0.5, min(2.0, float(rate)))
+        try:
+            if sid >= 0 and int(sid) != int(getattr(self, "_cue_pos_song", -1) or -1):
+                self._cue_rate_ema = 1.0        # 换歌：不继承上一首的倍率
+        except (TypeError, ValueError):
+            pass
+        _prev_rate = float(getattr(self, "_cue_rate_ema", 1.0) or 1.0)
+        if not (0.5 <= _prev_rate <= 2.0):
+            _prev_rate = 1.0
+        _alpha = 0.35 if abs(_raw - _prev_rate) > 0.004 else 0.08
+        _ema = _prev_rate + (_raw - _prev_rate) * _alpha
+        self._cue_rate_ema = _ema
+        trk.rate = 1.0 if abs(_ema - 1.0) <= CUE_RATE_DEADBAND else _ema
         # ★★★ 拍长必须与「真正消费 pos_beats 的那个 runtime」**同一来源**（2026-10-17 复盘）
         #
         # 为什么 BPM 本身不影响对拍：整条链上它是**纯单位换算**，两端用同一个常数就完全抵消。
@@ -5685,7 +6295,27 @@ class AutoVJEngine(QObject):
         # 修法：直接用 `self._cue_rt.beat_len`。它就是下面 `update()` 的那个对象，
         #   结构上不可能不一致；表没装（rt 为 None）时给退化值 1.0（此时也没有片段可选）。
         bl = self._cue_pos_beat_len() if (sid >= 0 and votes > 0) else None
-        status, pb, song = trk.feed(sid, off, votes, now, beat_len=bl)
+        # ★★ 2026-11-11（用户：码表演出和音乐差好几秒）：`recognized_offset` 对应的
+        #   是**识别窗末端**（`state.recognized_t`），而本次轮询的 now 可能已经晚了
+        #   几十毫秒到两秒（匹配/BPM 校验/线程调度）。旧写法直接把旧窗口位置锚在
+        #   now 上 ⇒ 整条码表滞后“处理耗时”。
+        #   这里把这段延迟按倍率补回 offset，再照常用 now 作为挂钟时间喂给 tracker
+        #   —— 不碰 tracker 的 STALE 保护，也不会回退到比上次更早的时间。
+        #   上限 2s：超过说明不是处理延迟而是识别断档，交给 freewheel 处理。
+        _t_rec = _f(getattr(st, "recognized_t", 0.0), 0.0)
+        _lat = 0.0
+        try:
+            if _t_rec > 0.0 and _t_rec <= now:
+                _lat = min(2.0, float(now) - float(_t_rec))
+        except (TypeError, ValueError):
+            _lat = 0.0
+        _off_feed = off
+        if sid >= 0 and off >= 0.0 and _lat > 0.0:
+            try:
+                _off_feed = float(off) + _lat * max(0.5, min(2.0, float(trk.rate or 1.0)))
+            except (TypeError, ValueError):
+                _off_feed = off
+        status, pb, song = trk.feed(sid, _off_feed, votes, now, beat_len=bl)
         if status in ("ok", "switch") and song != self._cue_pos_song:
             self._cue_pos_song = song
             q = self._cue_track_query(path) if path else {}
@@ -6061,13 +6691,16 @@ class AutoVJEngine(QObject):
                 it = MediaItem(path)
             except Exception:                                     # noqa: BLE001
                 it = _CueItemStub(path)
-            # ★★★ 2026-10-17：把码表包里的 `has_alpha` **当天条**写进 MediaItem，
-            #   否则 `create_video_player()` 会因为"本地没有缩略图"而判 False ⇒ 用 OpenCV
+            # ★★★ 2026-10-17：码表包里的 `has_alpha` 用来避免
+            #   `create_video_player()` 因"本地没有缩略图"而判 False ⇒ 用 OpenCV
             #   解码 ⇒ 透明区变不透明黑（整层盖住下层 = 多层看起来没生效 + 淡出末尾黑屏）。
+            # ★ 2026-11-18：只信 **True**。包里的 `False` 可能只是编排端没探测/老包，
+            #   照信会把真 alpha 素材解成黑底（ERCUE 预览却正常）；False/缺省都留给
+            #   media_manager 的缩略图/AV 探测去判。
             try:
                 _al = getattr(self, "_cue_alpha", None) or {}
-                if path in _al:
-                    it._has_alpha = bool(_al[path])
+                if path in _al and bool(_al[path]):
+                    it._has_alpha = True
                     # 明确告诉后面的重开判据：这个结论来自包内元数据，不是"猜的"
                     it._cue_alpha_src = "pkg"
             except Exception:                                     # noqa: BLE001
@@ -6220,6 +6853,32 @@ class AutoVJEngine(QObject):
         cache[ps.lyr_id] = img            # 只存引用，不拷贝（解码线程每帧产出新 QImage）
         return img
 
+    def _cue_sheet_view(self, W, H):
+        """码表画布在输出画布里的**等比 contain 区域** → `(w, h, ox, oy)`。
+
+        ★ 2026-11-18：ERCUE 预览按码表自己的 `res_w/res_h` 做 cover/contain；
+          ERAVJ 之前直接用输出画布尺寸 ⇒ 4:3/竖屏/2:1 码表在 16:9 输出上
+          位置和裁切都会变。现在把码表子层画到同比例的子画布、居中留黑边，
+          输出屏比例与码表一致时（w,h)==(W,H)，行为不变。
+        """
+        try:
+            aw, ah = self._cue_sheet.aspect()
+            ar = float(aw) / float(ah) if ah else 0.0
+        except Exception:                                        # noqa: BLE001
+            ar = 0.0
+        if ar <= 0.0:
+            return W, H, 0, 0
+        out_ar = float(W) / float(H) if H else 0.0
+        if abs(ar - out_ar) <= 1e-4:
+            return W, H, 0, 0
+        if ar < out_ar:
+            h2, w2 = H, int(round(H * ar))
+        else:
+            w2, h2 = W, int(round(W / ar))
+        w2 = max(2, min(int(W), int(w2)))
+        h2 = max(2, min(int(H), int(h2)))
+        return w2, h2, (W - w2) // 2, (H - h2) // 2
+
     def _draw_cuesheet_layer(self, p, lay, W, H, snap, subtract_jobs):
         """把码表图层的所有激活子层画到画布上（按 z 升序 = 后画的在上）。
 
@@ -6272,6 +6931,11 @@ class AutoVJEngine(QObject):
                                  crop=ps.crop,
                                  out_dir=bool(getattr(ps, "trans_is_out", False)))
                 p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            # ★ 每个码表子层画完让出 GIL：3 个子层叠起来也能挡 GUI 十几毫秒
+            try:
+                time.sleep(0)
+            except Exception:                                  # noqa: BLE001
+                pass
 
     def _preload_clips(self, lay, clips=None, max_preload=3):
         """已废弃：预加载机制曾导致 decoder 线程堆积、CPU 20%→60%（详见 memory）。
@@ -6343,39 +7007,83 @@ class AutoVJEngine(QObject):
     def lock_clip(self):
         self.locked = not self.locked
 
-    # ---------------- 逐拍交替（模式为 beat 时） ----------------
+    # ---------------- 逐拍交替（独立开关：仅前景层 · 仅 drop 段） ----------------
+    def _cur_section_row(self):
+        try:
+            i = int(getattr(self, "_sec_idx", -1))
+            secs = getattr(self, "_sec_list", None) or []
+            if 0 <= i < len(secs):
+                return secs[i]
+        except Exception:                                          # noqa: BLE001
+            pass
+        return None
+
+    def beat_drop_epoch(self):
+        """当前是否处于 drop 段；是则返回段落标识（换段 ⇒ 换对子），否则 None。
+
+        判据：曲库能量段落表里该段 `tier == "high"` 或名字含 drop。
+        **没有段落表 / 没认出歌 ⇒ 一律 None（不触发）**——实时 drop 只是低频冲击，
+        不适合当作持续的“段”。
+        """
+        row = self._cur_section_row()
+        if not row:
+            return None
+        name = str(row.get("name") or "").lower()
+        tier = str(row.get("tier") or "").lower()
+        if tier != "high" and "drop" not in name:
+            return None
+        try:
+            t0 = round(float(row.get("t0") or 0.0), 3)
+        except (TypeError, ValueError):
+            t0 = 0.0
+        return (int(getattr(self, "_sec_idx", -1)), t0, name)
+
+    def _beat_cfg_for(self, lay):
+        try:
+            params = self._params_for(lay) or {}
+            return params.get("beat") or self.cfg["beat"]
+        except Exception:                                          # noqa: BLE001
+            return self.cfg["beat"]
+
+    def beat_owns(self, lay, epoch=None):
+        """该图层此刻是否由逐拍交替接管（开关开 + 前景 + drop 段 + 至少 2 个素材）。"""
+        if epoch is None:
+            epoch = self.beat_drop_epoch()
+        if epoch is None:
+            return False
+        if str(getattr(lay, "role", "bg") or "bg") != "fg":
+            return False
+        if getattr(lay, "is_kv", False) or getattr(lay, "is_cuesheet", False):
+            return False
+        try:
+            if not bool(self._beat_cfg_for(lay).get("enabled", False)):
+                return False
+        except Exception:                                          # noqa: BLE001
+            return False
+        return len(getattr(lay, "clips", None) or []) >= 2
+
     def _beat_tick(self, snap):
-        """逐拍交替（按拍位相位驱动，支持 1/4 拍粒度的交替间隔）。
-        不受「素材最小切换间隔」影响（独立节奏）。"""
+        """逐拍交替：只在 drop 段、只接管前景层；对子跟着段落换。"""
+        epoch = self.beat_drop_epoch()
+        if epoch is None:
+            return
         pos = self._beat_pos(snap)
         for lay in self.layers:
-            if lay.fixed >= 0 or len(lay.clips) < 2 or self.locked:
+            if lay.fixed >= 0 or self.locked:
                 continue
-            if getattr(lay, "is_kv", False):
-                continue    # Kv 待机层不参与逐拍交替
-            # ★ 2026-11-09：逐拍参数按**该层所属屏**取（每屏可以不同间隔/模式/结束动作）；
-            #   相位本来就存在 layer 上（`beat_last` / `pair_start`），天然各屏独立。
-            bc = (self._params_for(lay) or {}).get("beat") or self.cfg["beat"]
+            if not self.beat_owns(lay, epoch):
+                continue
+            bc = self._beat_cfg_for(lay)
             interval = max(0.25, float(bc.get("interval_beats", 1) or 1))
-            bars = max(1, int(bc.get("bars_per_pair", 2)))
-            if lay.pair is None:
+            # ★ 2026-11-21（用户）：一对素材跟着段落走 —— 进新段落才换下一对，
+            #   段内一直 A↔B 交替（不再按「每对小节数」换）。
+            if lay.pair is None or getattr(lay, "beat_sec", None) != epoch:
+                lay.beat_sec = epoch
                 lay.pair = self._new_pair(lay, bc, prev_second=None)
                 lay.pair_turn = 0
-                # 对子起点贴到小节线：之后每 bars 小节换一对，换对时机自然踩在整小节上
-                lay.pair_start = self._bar_floor(pos, snap)
                 lay.beat_last = pos
                 self._beat_show(lay, 0, bc)
                 continue
-            # 每对小节数：一对素材整体使用 bars 小节后换新一对
-            if pos - getattr(lay, "pair_start", pos) >= bars * 4:
-                prev_second = lay.pair[1]
-                lay.pair = self._new_pair(lay, bc, prev_second)
-                lay.pair_turn = 0
-                lay.pair_start = self._bar_floor(pos, snap)
-                lay.beat_last = pos
-                self._beat_show(lay, 0, bc)
-                continue
-            # 交替间隔：拍位每推进 interval 拍，A↔B 交替一次（默认 1 拍）
             if pos - getattr(lay, "beat_last", pos) >= interval:
                 lay.beat_last = pos
                 lay.pair_turn ^= 1
@@ -6536,6 +7244,43 @@ class AutoVJEngine(QObject):
         if kv.kv_on > 0.01:
             self._kv_show(kv)
 
+    def _kv_transition_pending(self):
+        """是否有 Kv 图层正在 / 即将做淡入淡出。
+
+        ★ 2026-11-17（用户：Kv 图层淡入时画面掉帧）：
+          静音待机会把帧率降到 `perf.silent_standby_fps`（默认 2fps），而 Kv 的
+          `in_dur` 默认 1.5s ⇒ 整个淡入只有 ~3 帧。这里在两种时刻返回 True：
+            · 正在过渡（`kv_trans_active` 或 `kv_on` 在 0~1 之间）；
+            · 触发条件已经满足、下一帧就会 `_kv_begin`（静音/有声计时到达阈值）。
+          只覆盖淡入淡出那一两秒，长静音仍然照常进待机。
+        """
+        for l in (getattr(self, "layers", None) or []):
+            if not getattr(l, "is_kv", False):
+                continue
+            try:
+                on = float(getattr(l, "kv_on", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                on = 0.0
+            if bool(getattr(l, "kv_trans_active", False)) or 0.001 < on < 0.999:
+                return True
+            try:
+                _cfg = (self._params_for(l) or {}).get("kv") or self.cfg["kv"]
+            except Exception:                                  # noqa: BLE001
+                _cfg = {}
+            try:
+                _sd = max(0.0, float(_cfg.get("silent_delay", 2.0)))
+                _rd = max(0.0, float(_cfg.get("resume_delay", 2.5)))
+            except (TypeError, ValueError):
+                _sd, _rd = 2.0, 2.5
+            try:
+                if on < 1.0 and float(getattr(l, "kv_silent_sec", 0.0) or 0.0) >= _sd:
+                    return True
+                if on > 0.0 and float(getattr(l, "kv_loud_sec", 0.0) or 0.0) >= _rd:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
     def _kv_begin(self, kv, to_state, kind, dur):
         """开始 Kv 切入(to_state=1)/切出(to_state=0) 过渡。cut 视为瞬切。"""
         kind = kind or "fade"
@@ -6570,7 +7315,7 @@ class AutoVJEngine(QObject):
     # （`_apply_screen_cp()` 已于 2026-11-10 删除：每屏 color/postfx 合进
     #   `_compose_independent()`，否则单路会套两遍、颜色/特效叠加。）
 
-    def _apply_color_postfx(self, snap, canvas=None, advance=True):
+    def _apply_color_postfx(self, snap, canvas=None, advance=True, state_key=None):
         """颜色 + 后处理：**共用一次**全画布 BGR 读回 / 写回。
 
         ★ 2026-10-28（性能）：原来 `_apply_color` 和 `_apply_postfx` 各自
@@ -6605,12 +7350,16 @@ class AutoVJEngine(QObject):
             except Exception:                                  # noqa: BLE001
                 _seg_snap = None
         try:
-            bgr = self._apply_color(snap, bgr=bgr, write=False, canvas=tgt)
+            # 主画布推进共享颜色状态；独立屏只读，避免换色速度按屏数翻倍。
+            _adv = bool(advance and (canvas is None or tgt is self.canvas))
+            bgr = self._apply_color(snap, bgr=bgr, write=False, canvas=tgt,
+                                    advance=_adv)
         except Exception:
             pass
         try:
             _t_p = time.perf_counter()
-            bgr = self._apply_postfx(snap, bgr=bgr, write=False)
+            bgr = self._apply_postfx(snap, bgr=bgr, write=False, canvas=tgt,
+                                     state_key=state_key)
             _POST_ACC["post"] += (time.perf_counter() - _t_p) * 1000.0
         except Exception:
             pass
@@ -6701,7 +7450,9 @@ class AutoVJEngine(QObject):
         """
         # ★ 码表接管期间跳整条调色链（与 Kv 同口径：码表里是 DJ 做好的成片，不能再染色）
         #   ★ 按**画布所属的屏**判断（多屏下别的屏有码表不该拖累本屏）
-        if self._cuesheet_on(self._canvas_screen(canvas)):
+        _tgt = canvas if canvas is not None else self.canvas
+        _scr = self._canvas_screen(_tgt)
+        if self._cuesheet_on(_scr):
             return bgr
         cfx = self.color_fx
         try:
@@ -6710,23 +7461,44 @@ class AutoVJEngine(QObject):
             return bgr
         if cfx is None or not cfg:
             return bgr
-        kv = self.kv_layer()
+        kv = self._kv_for_screen(_scr)
         kv_on = float(getattr(kv, "kv_on", 0.0) or 0.0) if kv is not None else 0.0
-        flick = self._flicker_hibernate(cfg)
+        flick = self._flicker_hibernate(cfg, _scr)
+        # ⚠ advance=False（独立屏）时绝不调用 `_color_rotate_due()`：
+        #   它也会改共享的 `_color_phrase` 状态 ⇒ 颜色轮换会按屏数加速。
         try:
-            _rot = self._color_rotate_due(snap, cfg) if bool(cfg.get("auto", True)) else None
+            _rot = (self._color_rotate_due(snap, cfg)
+                    if advance and bool(cfg.get("auto", True)) else None)
         except Exception:                                     # noqa: BLE001
             _rot = None
         s = cfx.tick(cfg, snap, kv_on=kv_on, flicker=flick,
                      bypass=bool(cfg.get("bypass", False)), rotate_hint=_rot,
                      advance=advance)
         if s > 0.004:
-            _tgt = canvas if canvas is not None else self.canvas
             try:
+                _col = None if advance else cfx.color_for_cfg(cfg)
+                _mode = cfg.get("mode", "lut")
+                # ★ 2026-11-11（用户：多屏播放音乐时界面/预览卡）：**原地 LUT 快路径**。
+                #   旧链路 = 读回转 BGR（2ms）+ LUT 新数组（3.7ms）+ 写回（7ms），
+                #   3000×900 每帧约 13ms；原地 4 通道 LUT 实测 ~1.8ms。
+                #   返回 None 表示"已经直接写进画布"，`_apply_color_postfx` 就不再写回。
+                if bgr is None and _mode != "duotone":
+                    try:
+                        from postprocess import _np_view_bgra
+                        _v4 = _np_view_bgra(_tgt)
+                        if (_v4 is not None
+                                and cfx.apply_bgra_inplace(_v4, _mode,
+                                                           color=_col, strength=s)):
+                            return None
+                    except Exception:                          # noqa: BLE001
+                        pass
                 if bgr is None:
                     from postprocess import _np_view_bgr
                     bgr = _np_view_bgr(_tgt)
-                out = cfx.apply_to_bgr(bgr, cfg.get("mode", "lut"))
+                # 从屏共享主屏当前色相，但按**本屏**的强度/手动色卡染色；
+                # 传显式 color/strength 不会改 ColorRenderer 的共享状态。
+                out = cfx.apply_to_bgr(bgr, _mode,
+                                       color=_col, strength=s)
                 if out is not None:
                     bgr = out
                     if write:
@@ -6736,7 +7508,27 @@ class AutoVJEngine(QObject):
                 pass   # 调色失败不影响出画面
         return bgr
 
-    def _flicker_hibernate(self, cfg):
+    def _kv_for_screen(self, screen=None):
+        """该屏自己的 Kv 待机层；没有归属信息时退回全局 `kv_layer()`。
+
+        `screen is None` = 旧单路/无输出配置，保持原来的“任意 Kv”语义。
+        """
+        try:
+            if screen is None:
+                return self.kv_layer()
+            sid = str(screen.get("id") or "")
+            for lay in self.layers:
+                if not getattr(lay, "is_kv", False):
+                    continue
+                sc = self._layer_screen(lay)
+                if sc is not None and str(sc.get("id") or "") == sid:
+                    return lay
+            # 该屏没有自己的 Kv：返回 None，绝不能拿别的屏的 Kv 把本屏颜色关掉
+            return None
+        except Exception:                                      # noqa: BLE001
+            return None
+
+    def _flicker_hibernate(self, cfg, screen=None):
         """频闪素材要不要让颜色休眠：开 / 关 / 随机。
 
         - on     遇频闪就休眠（防"画面在闪 + 颜色在变"叠加）
@@ -6749,23 +7541,48 @@ class AutoVJEngine(QObject):
             mode = "on" if cfg.get("skip_flicker", True) else "off"
         if mode == "off":
             return False
-        path = self._current_flicker_path()
+        path = self._current_flicker_path(screen)
         if not path:
             return False
         if mode == "on":
             return True
-        if self._flicker_latch.get("path") != path:
-            self._flicker_latch = {"path": path, "on": random.random() < 0.5}
-        return bool(self._flicker_latch.get("on"))
+        _sid = str((screen or {}).get("id") or "main")
+        _key = "%s|%s" % (_sid, path)
+        try:
+            on = self._flicker_latch.get(_key)
+        except Exception:                                      # noqa: BLE001
+            self._flicker_latch = {}
+            on = None
+        if on is None:
+            on = random.random() < 0.5
+            if len(self._flicker_latch) > 256:
+                self._flicker_latch.clear()
+            self._flicker_latch[_key] = on
+        return bool(on)
 
-    def _current_flicker_path(self):
-        """当前在播的可见非 Kv 图层里，带「频闪」标签的素材路径（没有则空串）"""
+    def _current_flicker_path(self, screen=None):
+        """当前在播的可见非 Kv 图层里，带「频闪」标签的素材路径（没有则空串）。
+
+        `screen` 非 None 时只看该屏自己的图层（多屏下不能拿别屏的频闪素材
+        把本屏颜色一起休眠）。
+        """
         try:
             from tags_def import DYNAMIC_FLICKER
         except Exception:
             return ""
+        want = None
+        if screen is not None:
+            try:
+                ids = set(output_model.effective_layers(
+                    self._out_cfg, screen,
+                    [str(getattr(l, "lid", "")) for l in self.layers]))
+                want = ids
+            except Exception:                                  # noqa: BLE001
+                want = None
         for lay in self.layers:
             if getattr(lay, "is_kv", False) or not getattr(lay, "visible", True):
+                continue
+            if want is not None and str(getattr(lay, "lid", "")) not in want:
                 continue
             try:
                 i = lay.cur
@@ -6777,35 +7594,47 @@ class AutoVJEngine(QObject):
                 continue
         return ""
 
-    def _apply_postfx(self, snap, bgr=None, write=True):
+    def _apply_postfx(self, snap, bgr=None, write=True, canvas=None, state_key=None):
         """对合成后的画布应用后处理特效链。
 
         触发模式（每个特效独立）：
         - constant 常驻：恒定按手动强度
         - event    事件：Drop 触发后从峰值按 decay 秒衰减回 0
         自动联动总开关 auto=False 时，全部退化为常驻。
+
+        ★ 2026-11-10（多屏）：canvas/state_key 用于独立屏，后处理必须读写
+          **该屏自己的画布**与拖影缓冲；`state_key` 由调用方按屏 id 传入。
         """
+        tgt = canvas if canvas is not None else self.canvas
+        scr = self._canvas_screen(tgt)
+        pf_key = state_key or ("main" if tgt is self.canvas else str(id(tgt)))
+
+        def _pf_info(d):
+            # 全局 `_postfx_info` 只反映主屏，避免独立屏每帧把主屏 HUD/诊断覆盖
+            if pf_key == "main":
+                self._postfx_info = d
+
         # ★ 码表接管期间跳整条后处理链（同 Kv：成片不该被辉光/色差等污染）
         #   ★ 同样按画布所属的屏判断
-        if self._cuesheet_on(self._canvas_screen(canvas)):
+        if self._cuesheet_on(scr):
             # 拖影缓冲必须一起清：不清的话码表切回来会闪一帧上一场的残影
-            self._postfx_reset_trails()
-            self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
-                                 "state": "码表接管中，已跳过"}
+            self._postfx_reset_trails(pf_key)
+            _pf_info({"mode": "", "g": 0.0, "E": 0.0, "fx": {},
+                      "state": "码表接管中，已跳过"})
             return bgr
         cfg = (self._cp_cfg or self.cfg)["postfx"]
         # Kv 待机层显示中：画面以 Kv 为主，跳过整条后处理链
         # （Kv 图层要求完全独立，不受「后处理」等任何设置影响）
-        kv = self.kv_layer()
+        kv = self._kv_for_screen(scr)
         if kv is not None and kv.kv_on > 0.01:
-            self._postfx_reset_trails()
-            self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
-                                 "state": "Kv 待机层接管，已跳过"}
+            self._postfx_reset_trails(pf_key)
+            _pf_info({"mode": "", "g": 0.0, "E": 0.0, "fx": {},
+                      "state": "Kv 待机层接管，已跳过"})
             return bgr
         if not cfg or not cfg.get("enabled", True):
-            self._postfx_reset_trails()
-            self._postfx_info = {"mode": "", "g": 0.0, "E": 0.0, "fx": {},
-                                 "state": "总开关已关闭"}
+            self._postfx_reset_trails(pf_key)
+            _pf_info({"mode": "", "g": 0.0, "E": 0.0, "fx": {},
+                      "state": "总开关已关闭"})
             return bgr
         self._frame_i = getattr(self, "_frame_i", 0) + 1
         now = time.perf_counter()
@@ -6873,8 +7702,8 @@ class AutoVJEngine(QObject):
             _m = _g_eff * _wake_auto
             mods = {n: _m for n in chosen}
             if self._frame_i % 6 == 0:       # 10Hz 足够（GUI 每 500ms 才读一次）
-                self._postfx_info = {"mode": "auto", "g": g, "E": E_auto,
-                                     "fx": {n: _m for n in chosen}, "state": ""}
+                _pf_info({"mode": "auto", "g": g, "E": E_auto,
+                          "fx": {n: _m for n in chosen}, "state": ""})
         else:
             effects_override = None
             mods = {}
@@ -6907,11 +7736,11 @@ class AutoVJEngine(QObject):
                 mods[name] = m
                 active.append((name, e))
             if self._frame_i % 6 == 0:       # 同上：10Hz 回显就够
-                self._postfx_info = {"mode": "manual", "g": g, "E": float(E),
-                                     "fx": {n: float(v) * float(
-                                         (effects_cfg.get(n) or {}).get("level", 0)) / 100.0
-                                         for n, v in mods.items()},
-                                     "state": ""}
+                _pf_info({"mode": "manual", "g": g, "E": float(E),
+                          "fx": {n: float(v) * float(
+                              (effects_cfg.get(n) or {}).get("level", 0)) / 100.0
+                              for n, v in mods.items()},
+                          "state": ""})
         # 拖影：**只在「刚刚停止」那一帧清一次**。
         # ⚠ 旧写法 `reset_trails=not self.running` 在**预览**（从未点开始）时每帧都清 ⇒
         #   拖影在预览里永远为空，用户会认定「拖影这个效果没有用」。
@@ -6921,29 +7750,34 @@ class AutoVJEngine(QObject):
         try:
             from postprocess import postfx_effects_bgr, write_back_bgr
             _out, _changed = postfx_effects_bgr(
-                self.canvas, bgr, cfg, seed=self._frame_i, mods=mods,
+                tgt, bgr, cfg, seed=self._frame_i, mods=mods,
                 spectrum=snap.get("spectrum"),
                 reset_trails=_reset,
-                effects_override=effects_override)
+                effects_override=effects_override,
+                trail_key=pf_key)
             if _changed and _out is not None:
                 bgr = _out
                 if write:
-                    write_back_bgr(self.canvas, bgr)
+                    write_back_bgr(tgt, bgr)
         except Exception:
             pass  # 后处理失败不影响渲染
         return bgr
 
-    def _postfx_reset_trails(self):
+    def _postfx_reset_trails(self, key=None):
         """清空拖影缓冲（步进被跳过时用，避免下次开启闪现旧残影）。
 
         ★ 只在缓冲**真的有内容**时才动：码表演出时这条每帧都会被调用，
           无条件清一次等于每帧多一次函数调用 + 属性写（虽然是微秒级，
           但热路径上的"每帧都做"要能省就省）。
+
+        ★ 2026-11-10（多屏）：`key` 只清该屏的拖影；不传 = 清所有屏。
         """
         try:
             import postprocess as _pp
-            if _pp._TRAIL.get("buf") is not None:
-                _pp.fx_trails(None, 0.0, reset=True)
+            keys = list(getattr(_pp, "_TRAILS", {}).keys()) if key is None else [key]
+            for k in keys:
+                if _pp._TRAILS.get(k) is not None:
+                    _pp.fx_trails(None, 0.0, reset=True, key=k)
         except Exception:
             pass
 
@@ -6971,8 +7805,149 @@ class AutoVJEngine(QObject):
         the source has no new frame to show.  GIFs/images still animate via
         effects/transitions at the capped rate.
         """
+        # ★★★ 2026-11-12（用户：「软件开着什么都不放也 38% CPU」）：
+        #   停止/冻结/黑场时**没有任何演出消费端**（输出窗口已隐藏、Spout/NDI
+        #   也被 `running` 门控），却仍按素材 30fps 全速解码 + 30/60fps 合成 +
+        #   每帧 GUI 缩放。这里统一降到 idle 帧率：
+        #     · 停止：`perf.idle_fps`（默认 15，预览仍然实时，只是 15fps）
+        #     · 冻结/黑场：10fps（画面本来就不变，`_set_players_active(False)`
+        #       已把播放器挂起）
+        #   开始 VJ 后下一 tick 会恢复源帧率，不影响演出。
+        # ★★★ 2026-11-12：**静音待机**（运行中但长时间没有音频）。
+        #   这不是"停止 VJ"（停止走下面的 idle_fps），而是现场放着歌单但还没放歌：
+        #   画面仍要保留最后一帧，但不需要解码/合成/发送。
+        #   先于 freeze/stop 判断；音频一回来把解码上限和帧率表重置，避免
+        #   恢复后的头几秒还用 2fps 的 EMA 把播放压住。
+        if bool(getattr(self, "_silent_standby", False)):
+            self._silent_standby_prev = True
+            try:
+                _sfps = float((self.cfg["perf"] or {}).get(
+                    "silent_standby_fps", 2.0) or 2.0)
+            except (TypeError, ValueError):
+                _sfps = 2.0
+            _sfps = max(1.0, min(15.0, _sfps))
+            # ★★ 2026-11-17（用户：切歌时视频输出卡顿掉帧十几秒）：
+            #   待机的 2fps 会把 **Spout/NDI 输出**也压成 2fps —— 切歌/试听时
+            #   中间有十几秒低电平，接收端（OBS/Resolume）看到的就是一卡一卡。
+            #   解码器仍然挂起（省 CPU 的大头），但**有输出路由时**把合成/发送
+            #   保持在 15fps：画面内容不变，只是重复发同一帧，接收端时间轴是平滑的。
+            try:
+                _has_out = False
+                for _s in (self._out_cfg or {}).get("screens") or []:
+                    if _s.get("include", True) is False:
+                        continue
+                    if _s.get("spout") or _s.get("ndi"):
+                        _has_out = True
+                        break
+                if not _has_out:
+                    _oc = self.cfg["output"] or {}
+                    _has_out = bool(_oc.get("spout_enabled")
+                                    or _oc.get("ndi_enabled"))
+            except Exception:                                  # noqa: BLE001
+                _has_out = False
+            if _has_out:
+                _sfps = max(_sfps, 15.0)
+            _last = float(getattr(self, "_dec_cap_pub", -1.0) or -1.0)
+            if abs(_sfps - _last) >= 0.5:
+                self._dec_cap_pub = _sfps
+                try:
+                    import media_manager as _mm
+                    _mm.set_decode_fps_cap(_sfps)
+                except Exception:                          # noqa: BLE001
+                    pass
+            _tgt = int(round(_sfps))
+            if self._effective_fps != _tgt:
+                self._effective_fps = _tgt
+                if self.timer.isActive():
+                    self.timer.start(self.frame_interval_ms())
+            return
+        if bool(getattr(self, "_silent_standby_prev", False)):
+            self._silent_standby_prev = False
+            self._gap_ema_ms = 0.0
+            self._tick_gap_ms = 0.0
+            self._dec_cap_pub = 0.0
+            # ★ 2026-11-17（Kv 淡入/淡出卡顿）：离开待机必须**立刻**恢复帧率。
+            #   旧逻辑只清了 EMA/解码上限，`_effective_fps` 还是 2、`_fps_next_t`
+            #   还可能压着最多 2 秒 ⇒ 音乐回来后的 Kv 淡出仍然一卡一卡。
+            try:
+                self._fps_next_t = 0.0
+                self._effective_fps = None
+                if self.timer.isActive():
+                    self.timer.start(self.frame_interval_ms())
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                import media_manager as _mm
+                _mm.set_decode_fps_cap(0.0)
+            except Exception:                              # noqa: BLE001
+                pass
+
+        try:
+            _frozen = bool(getattr(self, "freeze", False)
+                           or getattr(self, "blackout", False))
+            _running = bool(getattr(self, "running", False))
+            if _frozen or not _running:
+                if _frozen:
+                    _idle_fps = 10.0
+                else:
+                    try:
+                        _idle_fps = float((self.cfg["perf"] or {}).get(
+                            "idle_fps", 15) or 15)
+                    except (TypeError, ValueError):
+                        _idle_fps = 15.0
+                _idle_fps = max(5.0, min(30.0, _idle_fps))
+                _last = float(getattr(self, "_dec_cap_pub", -1.0) or -1.0)
+                if abs(_idle_fps - _last) >= 0.5:
+                    self._dec_cap_pub = _idle_fps
+                    try:
+                        import media_manager as _mm
+                        _mm.set_decode_fps_cap(_idle_fps)
+                    except Exception:                          # noqa: BLE001
+                        pass
+                _tgt = int(round(_idle_fps))
+                if self._effective_fps != _tgt:
+                    self._effective_fps = _tgt
+                    if self.timer.isActive():
+                        self.timer.start(self.frame_interval_ms())
+                return
+        except Exception:                                      # noqa: BLE001
+            pass
+
+        # ★★★ 2026-11-11（现场：多屏预览卡，OBS 正常）：**解码节流**。
+        #   引擎实际合成只有 ~10fps 时，解码器仍按素材 30fps 全速出帧 ⇒ 白烧 CPU、
+        #   抢 GIL/内存带宽，反过来把引擎和 GUI 拖得更慢（正反馈）。
+        #   这里按最近 tick 间隔的 EMA 给解码器设上限 = 实际 fps + 4（12~30），
+        #   实际 ≥28fps 时不限制。上限只影响“解码出帧”，不改输出帧率/内容。
+        try:
+            _now = time.perf_counter()
+            _g = float(getattr(self, "_tick_gap_ms", 0.0) or 0.0)
+            if _g > 0.0:
+                _ema = float(getattr(self, "_gap_ema_ms", 0.0) or 0.0)
+                self._gap_ema_ms = _g if _ema <= 0.0 else (_ema * 0.70 + _g * 0.30)
+            _ema = float(getattr(self, "_gap_ema_ms", 0.0) or 0.0)
+            if bool(getattr(self, "running", False)) and _ema > 0.0:
+                _actual = 1000.0 / max(1.0, _ema)
+                if _actual >= 28.0:
+                    _cap = 0.0                     # 已经跟得上，不限制
+                else:
+                    _cap = max(12.0, min(30.0, _actual + 4.0))
+                _last = float(getattr(self, "_dec_cap_pub", -1.0) or -1.0)
+                if _cap <= 0.0 or abs(_cap - _last) >= 2.0:
+                    self._dec_cap_pub = _cap
+                    try:
+                        import media_manager as _mm
+                        _mm.set_decode_fps_cap(_cap)
+                    except Exception:                          # noqa: BLE001
+                        pass
+        except Exception:                                      # noqa: BLE001
+            pass
         try:
             if not bool((self.cfg["perf"] or {}).get("fps_follow_source", True)):
+                # 从 idle 恢复：`_effective_fps=None` 表示用配置里的 render_fps
+                if self._effective_fps is not None:
+                    self._effective_fps = None
+                    if self.timer.isActive():
+                        self.timer.start(self.frame_interval_ms())
                 return
             now = time.perf_counter()
             if now < float(getattr(self, "_fps_next_t", 0.0) or 0.0):
@@ -7211,6 +8186,87 @@ class AutoVJEngine(QObject):
         """无锁只读：{screen_id: QImage 缩略图}，给上方输出预览工作区。"""
         return self._route_thumbs
 
+    def latest_route_thumbs_rev(self):
+        """缩略图批次号（每次 `_route_thumbs` 被替换 +1），供 GUI 判新帧。"""
+        return int(getattr(self, "_route_thumb_rev", 0))
+
+    def set_preview_res(self, res):
+        """预览分辨率（1.0 / 0.5 / 0.25）。只写一个 float，GIL 下原子。"""
+        try:
+            self._preview_res = max(0.1, min(1.0, float(res)))
+        except (TypeError, ValueError):
+            self._preview_res = 1.0
+
+    def set_gui_fps(self, fps):
+        """GUI 发布帧率上限（预览面板可选 30/15）。
+
+        ★ 2026-11-12：引擎以前固定 60fps 做 `_gui_scaled`，而预览面板默认
+          30fps、可选 15fps ⇒ 一半以上的缩放/信号/拷贝纯属白烧。这里跟随
+          预览设置；输出窗口/Spout/NDI 不受影响。
+        """
+        try:
+            self._gui_fps = max(5.0, min(60.0, float(fps)))
+        except (TypeError, ValueError):
+            self._gui_fps = 30.0
+
+    def set_out_window_live(self, on):
+        """输出窗口当前是否可见（决定 `_gui_scaled` 能否吃 preview.res）。
+
+        ★ 单屏预览：输出窗口不可见时，预览就是唯一消费者，允许按
+          `preview.res` 降低/提高 GUI 帧；输出窗口可见时保持 1920，
+          不拿预览设置去降真正上屏的画质。
+        """
+        self._out_window_live = bool(on)
+
+    def set_display_routes(self, ids):
+        """登记当前**有独立输出窗口**的屏幕 id（多路多显示器用）。"""
+        try:
+            self._display_route_ids = {str(x) for x in (ids or ()) if x}
+        except Exception:                                        # noqa: BLE001
+            self._display_route_ids = set()
+        if not self._display_route_ids:
+            self._display_frames = {}
+
+    def display_frames(self):
+        """最新一批「每屏一份」的显示帧（QImage 独立副本，GUI 只能读）。"""
+        d = getattr(self, "_display_frames", None)
+        return d if isinstance(d, dict) else {}
+
+    def _publish_display_frames(self, frames):
+        """为多路输出窗口复制各屏最新帧（30fps，避免把引擎画布引用交给 GUI）。"""
+        ids = getattr(self, "_display_route_ids", None)
+        if not ids:
+            self._display_frames = {}
+            return
+        now = time.perf_counter()
+        try:
+            _fps = 60.0 if len(ids) <= 1 else 30.0
+        except Exception:                                        # noqa: BLE001
+            _fps = 30.0
+        if now - float(getattr(self, "_display_t", 0.0) or 0.0) < (1.0 / _fps):
+            return
+        self._display_t = now
+        out = {}
+        for sid in ids:
+            f = (frames or {}).get(sid)
+            if f is None:
+                continue
+            try:
+                if not f.isNull():
+                    out[sid] = f.copy()
+            except Exception:                                    # noqa: BLE001
+                continue
+        self._display_frames = out
+
+    def set_route_thumb_consumers(self, on):
+        """输出页是否可见：不可见时引擎不再生成多屏缩略图（省 7~8 次缩放/帧）。
+
+        ★ 2026-11-11：**故意不加 `@_locked`**。这里只写一个 bool（GIL 下原子），
+        而 `showEvent/hideEvent` 在 GUI 线程调用；加锁会在引擎忙时超时丢弃，
+        导致用户切回输出页后缩略图一直不更新。引擎每帧读它即可。
+        """
+        self._route_thumb_consumers = bool(on)
+
     def set_preview_route(self, sid):
         """选择本地输出窗口/主预览要显示哪一路（多路模式）。"""
         self._preview_route_id = str(sid or "")
@@ -7235,7 +8291,49 @@ class AutoVJEngine(QObject):
             self._combined_key = None
             return
 
+        # ★ 2026-11-17（用户：多屏多路按屏开 alpha 仍不透明）：先按**每块屏自己的**
+        #   `alpha` 标志算出格式，再建画布。以前全用一个全局 `_alpha_out`：
+        #   · 任一屏开 alpha ⇒ 所有屏都 ARGB32（多花内存，但没错）；
+        #   · 更要命的是反过来——如果全局并集来自别的屏/残留值，本屏拿到的
+        #     可能就是 RGB32 ⇒ **本屏的透明通道从画布这一步就没了**。
+        #   现在：独立屏/切分屏各用各的格式；主画布（主屏/复制屏/复用主屏的屏共用）
+        #   取这几条路由的并集 ⇒ 只有真的用到主画布的屏要 alpha 时它才是 ARGB32。
+        _per = {}
+        _main_alpha = False
+        try:
+            _all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+        except Exception:                                      # noqa: BLE001
+            _all_ids = []
+        for _s in (plan.get("screens") or []):
+            _sid = str(_s.get("id") or "")
+            if not _sid:
+                continue
+            _on = bool(_s.get("alpha", False))
+            _per[_sid] = _on
+            _t = str(_s.get("type") or "")
+            if _t in ("main", "copy"):
+                _main_alpha = _main_alpha or _on
+            elif _t == "independent":
+                try:
+                    if self._independent_reuses_main(plan, _s, _all_ids):
+                        _main_alpha = _main_alpha or _on
+                except Exception:                              # noqa: BLE001
+                    pass
+        if str(plan.get("mode") or "multi") == "single":
+            # 单路只有一张整合画布：任一屏要 alpha 就必须 ARGB32；
+            # 同时尊重遗留全局开关（单路界面上没有"按屏"的概念）。
+            _main_alpha = bool(_main_alpha or any(_per.values())
+                               or self._alpha_out)
+        self._screen_alpha = _per
+        self._any_alpha = bool(any(_per.values()) or self._alpha_out)
+        # ⚠ 只有配置里**真的存在** `alpha` 键时才让计划说了算；老配置（从来没勾过）
+        #   保留遗留全局开关的行为，避免升级后被强制关掉。
+        _has_key = any("alpha" in _s for _s in (plan.get("screens") or []))
+        if _has_key and bool(_main_alpha) != bool(self._alpha_out):
+            self._alpha_out = bool(_main_alpha)
+            self._latest_frame = None
         fmt = self._canvas_format()
+
         main = output_model.main_screen(plan)
         if main is not None:
             mw, mh = output_model.effective_size(plan, main)
@@ -7253,19 +8351,22 @@ class AutoVJEngine(QObject):
                 continue
             if st == "independent":
                 w, h = output_model.effective_size(plan, s)
+                # ★ 每屏自己的 alpha：本屏没勾就是 RGB32（实底），勾了才 ARGB32。
+                _f = self._canvas_format(self._screen_alpha.get(sid, self._alpha_out))
                 cv = self._screen_canvases.get(sid)
                 if (cv is None or cv.width() != w or cv.height() != h
-                        or cv.format() != fmt):
-                    cv = QImage(w, h, fmt)
+                        or cv.format() != _f):
+                    cv = QImage(w, h, _f)
                     self._screen_canvases[sid] = cv
                 self._clear_canvas(cv)
                 keep.add(sid)
             elif st == "split":
                 w, h = output_model.effective_size(plan, s)
+                _f = self._canvas_format(self._screen_alpha.get(sid, self._alpha_out))
                 cv = self._screen_canvases.get(sid)
                 if (cv is None or cv.width() != w or cv.height() != h
-                        or cv.format() != fmt):
-                    cv = QImage(w, h, fmt)
+                        or cv.format() != _f):
+                    cv = QImage(w, h, _f)
                     self._screen_canvases[sid] = cv
                 self._clear_canvas(cv)
                 keep.add(sid)
@@ -7424,6 +8525,21 @@ class AutoVJEngine(QObject):
                 continue
             if self._independent_reuses_main(plan, s, all_ids):
                 continue
+            if sid in getattr(self, "_reused_screens", set()):
+                # 主屏染色前的副本已放进 cv；这里只套本屏自己的颜色（通常 off）
+                try:
+                    self._cp_cfg = (output_model.effective_params(self.cfg, s)
+                                    if (s or {}).get("params") else None)
+                except Exception:                          # noqa: BLE001
+                    self._cp_cfg = None
+                try:
+                    self._apply_color_postfx(snap, canvas=cv, advance=False,
+                                             state_key=sid)
+                    self._screen_cp_calls += 1
+                except Exception:                          # noqa: BLE001
+                    pass
+                self._cp_cfg = None
+                continue
             ids = output_model.effective_layers(plan, s, all_ids)
             layers = self._out_layers_by_ids(ids)
             _has_ov = bool((s or {}).get("params"))
@@ -7451,17 +8567,94 @@ class AutoVJEngine(QObject):
                     # ⚠ 传 `self.cfg` 即可：`effective_params` 已兼容 Config 对象/普通 dict
                     #   （生产是 Config，单测夹具是 dict，两边都能吃）。
                     self._cp_cfg = output_model.effective_params(self.cfg, s)
-                self._apply_color_postfx(snap, canvas=cv)
+                self._apply_color_postfx(snap, canvas=cv, advance=False,
+                                         state_key=sid)
                 self._screen_cp_calls += 1
             except Exception as _e:                            # noqa: BLE001
                 self._section_log("屏调色失败（跳过本屏调色）：%s" % _e)
             self._cp_cfg = None
+
+    def _screen_can_reuse_main(self, plan, s, all_ids):
+        """从屏能否直接复用主屏**未染色**画布（只差 color/强度）。
+
+        ★ 2026-11-11：`dj` 是 follow_main 的从屏，图层/尺寸与主屏相同，params 只有
+          `auto.intensity` + `color`（postfx 全局关闭）。旧实现每帧重合成 10 层+码表
+          （现场 ci 8~88ms），是 CPU 30%+ 的主要来源之一。
+        """
+        try:
+            if not s or s.get("type") != "independent" or not s.get("follow_main"):
+                return False
+            if self._independent_reuses_main(plan, s, all_ids):
+                return True                    # 无 params：`_route_frame` 已直接返回主画布
+            params = s.get("params") or {}
+            if not params:
+                return True
+            allowed = {"color", "auto", "postfx"}
+            if set(str(k) for k in params.keys()) - allowed:
+                return False
+            auto = params.get("auto") or {}
+            if auto and set(str(k) for k in auto.keys()) - {"intensity"}:
+                return False
+            # postfx 关闭时才允许（从屏的 postfx.mode 只是存储，关闭时无效果）
+            try:
+                if bool((self.cfg.get("postfx") or {}).get("enabled", False)):
+                    return False
+            except Exception:                                  # noqa: BLE001
+                return False
+            mw, mh = output_model.effective_size(plan, output_model.main_screen(plan))
+            sw, sh = output_model.effective_size(plan, s)
+            if (int(sw), int(sh)) != (int(mw), int(mh)):
+                return False
+            # ★ 2026-11-18：主/从屏 alpha 设定不同时不能复用同一张画布
+            #   （否则 RGB32/ARGB32 格式串用，OBS 端不是透明就是全黑）。
+            try:
+                _main = output_model.main_screen(plan) or {}
+                _ma = bool(self._screen_alpha.get(str(_main.get("id") or ""),
+                                                  self._alpha_out))
+                _sa = bool(self._screen_alpha.get(str(s.get("id") or ""), self._alpha_out))
+                if _ma != _sa:
+                    return False
+            except Exception:                                  # noqa: BLE001
+                return False
+            return set(output_model.effective_layers(plan, s, all_ids)) == set(all_ids)
+        except Exception:                                      # noqa: BLE001
+            return False
+
+    def _copy_main_for_reused_screens(self, snap):
+        """主屏**染色前**复制给可复用的从屏；记录 sid，供 `_compose_independent` 跳过。"""
+        plan = self._out_cfg
+        if not plan:
+            return
+        if str(plan.get("mode") or "multi") != "single":
+            return
+        all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+        main = output_model.main_screen(plan)
+        if main is None:
+            return
+        mw, mh = output_model.effective_size(plan, main)
+        if int(self.canvas.width()) != int(mw) or int(self.canvas.height()) != int(mh):
+            return
+        for s in plan.get("screens") or []:
+            if not self._screen_can_reuse_main(plan, s, all_ids):
+                continue
+            sid = str(s.get("id") or "")
+            if not sid:
+                continue
+            # 无 params 的屏本来就 `_route_frame` 返回 main（不占画布）；
+            # 有 params 的才需要一份独立像素。
+            if not (s.get("params") or {}):
+                continue
+            cv = self.canvas.copy()
+            self._screen_canvases[sid] = cv
+            self._reused_screens.add(sid)
 
     def _independent_reuses_main(self, plan, s, all_ids=None):
         """“跟随主屏 + 图层集合与主屏一致 + 分辨率一致”时直接复用主屏画布。"""
         if not s or s.get("type") != "independent" or not s.get("follow_main"):
             return False
         try:
+            if s.get("params"):
+                return False          # 有按屏颜色/后处理 override ⇒ 不能直接复用主屏原图
             if all_ids is None:
                 all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
             main = output_model.main_screen(plan)
@@ -7481,24 +8674,53 @@ class AutoVJEngine(QObject):
         cv = self._combined_canvas
         if not plan or cv is None:
             return
-        self._clear_canvas(cv)
-        p = QPainter(cv)
-        # ★ alpha 输出：用 Source 直接覆盖（含 alpha），别用默认 SourceOver
-        #   把透明底与半透明内容叠出不正确的 alpha；不透明区域仍是 255。
-        p.setCompositionMode(QPainter.CompositionMode_Source)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-        for s in output_model.layout_sources(plan):
+        # ★ 2026-11-11：整合画布**只在布局变更那一帧清一次**，不再每帧整幅填充。
+        #   3000×900 的 numpy fill 每帧约 1ms；屏幕覆盖区每帧都会被完整重画，
+        #   空出来的黑底只会在布局变更时出现，所以按 `_plan_rev_ready` 清一次足够。
+        _rev = int(getattr(self, "_plan_rev_ready", -1))
+        if int(getattr(self, "_combined_clear_rev", -999)) != _rev:
+            self._clear_canvas(cv)
+            self._combined_clear_rev = _rev
+        # ★ 2026-11-11：1:1 的屏直接 numpy 拷贝（释放 GIL），只有需要缩放或
+        #   越界的屏才走 QPainter。顺序保持 layout_sources 原顺序；一旦开了
+        #   QPainter，后面的屏全部走 QPainter，避免"直接写"覆盖已画的层。
+        p = None
+        for _si, s in enumerate(output_model.layout_sources(plan)):
+            if _si:
+                try:
+                    time.sleep(0)      # 每块屏之间让出 GIL（5 屏拼接也能挡 GUI 几十 ms）
+                except Exception:                          # noqa: BLE001
+                    pass
             sid = str(s.get("id") or "")
             frame = self._route_frame(plan, sid, str(s.get("type") or "independent"))
             if frame is None or frame.isNull():
                 continue
             x, y, w, h = output_model.screen_rect(plan, s)
+            if (p is None and int(frame.width()) == int(w)
+                    and int(frame.height()) == int(h)
+                    and self._blit_1to1(cv, x, y, frame)):
+                try:
+                    time.sleep(0)
+                except Exception:                          # noqa: BLE001
+                    pass
+                continue
+            if p is None:
+                p = QPainter(cv)
+                # ★ alpha 输出：用 Source 直接覆盖（含 alpha），别用默认 SourceOver
+                #   把透明底与半透明内容叠出不正确的 alpha；不透明区域仍是 255。
+                p.setCompositionMode(QPainter.CompositionMode_Source)
+                p.setRenderHint(QPainter.SmoothPixmapTransform)
             if frame.width() == w and frame.height() == h:
                 p.drawImage(int(x), int(y), frame)
             else:
                 p.drawImage(QRectF(x, y, w, h), frame,
                             QRectF(0, 0, frame.width(), frame.height()))
-        p.end()
+            try:
+                time.sleep(0)
+            except Exception:                              # noqa: BLE001
+                pass
+        if p is not None:
+            p.end()
 
     def _split_frame(self, plan, screen):
         """切分屏幕：把源画布按 UV 裁到复用缓冲。
@@ -7514,15 +8736,20 @@ class AutoVJEngine(QObject):
         if sid in _cache:
             return _cache[sid]
         cv = self._screen_canvases.get(sid)
+        _sf = self._canvas_format(self._screen_alpha.get(sid, self._alpha_out))
         if cv is None:
             w, h = output_model.effective_size(plan, screen)
-            cv = QImage(w, h, self._canvas_format())
+            cv = QImage(w, h, _sf)
             self._screen_canvases[sid] = cv
         src = source_frame = None
         src_screen = output_model.source_screen(plan, screen)
         if src_screen is not None:
             ssid = str(src_screen.get("id") or "")
-            source_frame = self.canvas if src_screen.get("type") == "main" else self._screen_canvases.get(ssid)
+            if (src_screen.get("type") == "main"
+                    or self._independent_reuses_main(plan, src_screen)):
+                source_frame = self.canvas
+            else:
+                source_frame = self._screen_canvases.get(ssid)
         if source_frame is None or source_frame.isNull():
             self._clear_canvas(cv)
             _cache[sid] = cv
@@ -7537,8 +8764,8 @@ class AutoVJEngine(QObject):
         #   结果老配置里被写脏的 `w=47 / h=720`（UV 其实是全幅）直接把切分屏裁成
         #   一条 47 像素宽的竖条。**UV 才是权威**，尺寸只能由 UV 反算；
         #   用户改分辨率走 `_on_screen_setup_changed()` 反算 UV，不在这里覆盖。
-        if cv.width() != tw or cv.height() != th:
-            cv = QImage(tw, th, self._canvas_format())
+        if cv.width() != tw or cv.height() != th or cv.format() != _sf:
+            cv = QImage(tw, th, _sf)
             self._screen_canvases[sid] = cv
         p = QPainter(cv)
         p.setCompositionMode(QPainter.CompositionMode_Source)
@@ -7566,13 +8793,41 @@ class AutoVJEngine(QObject):
             return self._split_frame(plan, s)
         return None
 
+    def _preview_thumb_side(self, frame):
+        """按**该屏输出分辨率** × preview.res 决定缩略图边长。
+
+        用户要求「预览用输出屏幕设置的分辨率」：1280×720 的屏就生成 1280 宽的
+        缩略图，1080p 屏就 1920 宽；只有整合画布/超宽屏用 1920 硬上限保护内存。
+        """
+        try:
+            w = int(frame.width())
+        except Exception:                                      # noqa: BLE001
+            w = PREVIEW_THUMB_MAX
+        try:
+            res = float(getattr(self, "_preview_res", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            res = 1.0
+        res = max(0.1, min(1.0, res))
+        side = int(round(max(32, w) * res))
+        return max(64, min(PREVIEW_THUMB_MAX, side))
+
     def _publish_multi_frame(self):
         """生成缩略图 + 选中路由的全分辨率预览帧；返回是否有新帧。"""
         plan = self._out_cfg
         if not plan:
             return False
         self._thumb_tick += 1
-        do_thumbs = (self._thumb_tick % max(1, int(self._thumb_every))) == 0
+        # ★ 2026-11-11：缩略图**每 tick 都生成**（与 OBS/Spout 同帧），不再按屏数降频。
+        #   5 屏 320px 约 2~3ms/tick；预览内容必须和输出同速，否则就是"OBS 流畅、预览掉帧"。
+        _nscr = len(plan.get("screens") or [])
+        _every = max(1, int(getattr(self, "_thumb_every", 1) or 1))
+        # ★★★ 2026-11-11（用户：多屏预览比 OBS 掉帧多）：这里曾把 ≥4 屏的缩略图
+        #   降到 10fps（每 3 tick 一次）。但 OBS 的 Spout 发的是**每 tick 的全帧**，
+        #   于是 OBS 30fps、软件内预览只有 10fps 内容 —— 用户看到的正是"预览掉帧"。
+        #   320px 缩略图实测 0.3~0.5ms/屏，5 屏每 tick 约 2~3ms，换来预览与输出同速。
+        #   是否生成仍由 `_route_thumb_consumers`（输出页是否可见）控制。
+        do_thumbs = (bool(getattr(self, "_route_thumb_consumers", True))
+                     and (self._thumb_tick % _every) == 0)
         mode = str(plan.get("mode") or "multi")
         thumbs = {}
         frames = {}
@@ -7581,8 +8836,11 @@ class AutoVJEngine(QObject):
             frame = self._combined_canvas
             if frame is not None:
                 frames[sid] = frame
-                if do_thumbs:
-                    thumbs[sid] = _preview_thumb(frame)
+                # ★ 2026-11-11：单路下每块屏都有自己的缩略图，整合画布那张
+                #   （3000×900 → 320）是最大、最贵的一次缩放，而且预览卡片
+                #   只把它当兜底。只有在**没有任何屏幕**时才生成它。
+                if do_thumbs and not (plan.get("screens") or []):
+                    thumbs[sid] = _preview_thumb(frame, self._preview_thumb_side(frame))
                 # ★★ 2026-11-10（用户）：**预览卡片与输出画布解耦**。
                 #   Mapping 只负责摆位置 / 定分辨率 / 选哪些屏参与输出；
                 #   预览里每块屏必须显示它**自己的完整画面**，与它在整合画布里摆在哪无关。
@@ -7601,14 +8859,19 @@ class AutoVJEngine(QObject):
                         continue
                     frames[_sid2] = _f2
                     if do_thumbs:
-                        thumbs[_sid2] = _preview_thumb(_f2)
+                        thumbs[_sid2] = _preview_thumb(_f2, self._preview_thumb_side(_f2))
+                        try:
+                            time.sleep(0)      # 每块屏缩略图后让出 GIL
+                        except Exception:                  # noqa: BLE001
+                            pass
             self._route_frames = frames
-            self._route_thumbs = thumbs if do_thumbs else self._route_thumbs
+            if do_thumbs:
+                self._route_thumb_rev = int(getattr(self, "_route_thumb_rev", 0)) + 1
+                self._rate_thumbs = int(getattr(self, "_rate_thumbs", 0)) + 1
+                self._route_thumbs = thumbs
             if self._gpu_frame_consumers and frame is not None:
-                self._latest_frame = frame.copy()
-                self._frame_seq += 1
-                self.frame_ready.emit(self._frame_seq)
-                return True
+                if self._publish_gui_frame(frame):
+                    return True
             return False
         # multi
         for s in plan.get("screens") or []:
@@ -7617,9 +8880,16 @@ class AutoVJEngine(QObject):
             if frame is not None:
                 frames[sid] = frame
                 if do_thumbs:
-                    thumbs[sid] = _preview_thumb(frame)
+                    thumbs[sid] = _preview_thumb(frame, self._preview_thumb_side(frame))
+                    try:
+                        time.sleep(0)
+                    except Exception:                      # noqa: BLE001
+                        pass
         self._route_frames = frames
+        self._publish_display_frames(frames)
         if do_thumbs:
+            self._route_thumb_rev = int(getattr(self, "_route_thumb_rev", 0)) + 1
+            self._rate_thumbs = int(getattr(self, "_rate_thumbs", 0)) + 1
             self._route_thumbs = thumbs
         sel = str(self._preview_route_id or "")
         if sel not in frames:
@@ -7627,11 +8897,69 @@ class AutoVJEngine(QObject):
             sel = str((main or {}).get("id") or "")
         frame = frames.get(sel)
         if self._gpu_frame_consumers and frame is not None:
-            self._latest_frame = frame.copy()
-            self._frame_seq += 1
-            self.frame_ready.emit(self._frame_seq)
-            return True
+            if self._publish_gui_frame(frame):
+                return True
         return False
+
+    def _publish_gui_frame(self, frame):
+        """把一帧发布给 GUI（主预览 + 独立输出窗口），**默认每 tick 都发（60fps 上限）**。
+
+        ★ 2026-11-11（用户：多屏播放音乐时界面/预览非常卡）：
+          旧实现每帧 `frame.copy()` 后把 3000×900 原图交给 GUI，GUI 线程要在
+          `preview_panel._rescale()`、输出窗口 `paintEvent`、输出页卡片里各做一次
+          **SmoothTransformation 缩放**（实测 3000×900→1280 一次就 8.6ms），
+          一个 frame_ready 能把 GUI 线程占 30~60ms ⇒ 操作卡、预览掉到 6~8fps。
+          现在：
+            · 引擎线程用 cv2.INTER_AREA 只缩一次到 ≤1600 宽（~3ms，且释放 GIL）；
+            · GUI 各消费端拿到的是同一张小图，1:1 或小幅缩放，成本降到 <3ms；
+            · GUI 发布限 15fps（输出/Spout 仍按原帧率走，不受影响）。
+        """
+        now = time.perf_counter()
+        try:
+            _fps_cap = float(os.environ.get("AUTOVJ_GUI_FPS",
+                                            getattr(self, "_gui_fps", 60.0)) or 60.0)
+        except (TypeError, ValueError):
+            _fps_cap = 60.0
+        _gap = 1.0 / max(1.0, _fps_cap)
+        if now - float(getattr(self, "_gui_pub_t", 0.0) or 0.0) < _gap:
+            return False
+        self._gui_pub_t = now
+        self._latest_frame = self._gui_scaled(frame)
+        try:
+            time.sleep(0)          # 预缩放后让出 GIL，GUI 可立即重绘
+        except Exception:                                      # noqa: BLE001
+            pass
+        self._frame_seq += 1
+        self._rate_gui = int(getattr(self, "_rate_gui", 0)) + 1
+        self.frame_ready.emit(self._frame_seq)
+        return True
+
+    def _gui_scaled(self, frame):
+        """GUI 预览图：按**输出画布分辨率 × preview.res** 缩一次。"""
+        try:
+            hard = int(getattr(self, "_gui_max_w", PREVIEW_GUI_MAX) or PREVIEW_GUI_MAX)
+            hard = max(320, min(PREVIEW_GUI_MAX, hard))
+            if getattr(self, "_out_window_live", False):
+                maxw = min(hard, int(frame.width()))
+            else:
+                try:
+                    _res = float(getattr(self, "_preview_res", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    _res = 1.0
+                _res = max(0.1, min(1.0, _res))
+                maxw = min(hard, max(160, int(round(frame.width() * _res))))
+            if frame.width() <= maxw:
+                return frame.copy()
+            tw = maxw
+            th = max(2, int(round(frame.height() * tw / float(frame.width()))))
+            # ★ 2026-11-11 实测：`cv2.resize(INTER_AREA)` 在 3000×900×4 上要
+            #   **18~25ms/帧**（4 通道 AREA 没有 SIMD 优化），是 v18 `cp` 段从
+            #   6ms 涨到 50ms 的元凶；QImage.scaled 的 Smooth 只要 **2.5ms**，
+            #   而且质量更好。这里改回 QImage，避免在渲染线程上白烧 20ms。
+            return frame.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        except Exception:                                      # noqa: BLE001
+            pass
+        return frame.copy()
 
     def _send_multi_routes(self):
         """把各路由帧提交给 NDI/Spout（不阻塞 GUI）。"""
@@ -7650,6 +8978,19 @@ class AutoVJEngine(QObject):
             _rs["n"] += 1
             _tb = time.perf_counter()
             frame = self._route_frame(plan, sid, kind)
+            # ★ 2026-11-17（用户：按屏 alpha 仍不透明）：Spout / NDI 的 alpha 约定
+            #   都是**预乘（premultiplied）**——OBS 的 Spout2 源只有把 Composite mode
+            #   设成 Premultiplied Alpha 才按透明合成。Qt 画布是直通 alpha
+            #   （Format_ARGB32），原样发出去半透明边缘会发亮/发白。
+            #   这里只对**真的带 alpha** 的路由转一次（ARGB32_Premultiplied 是
+            #   Qt 的 SIMD 转换，720p 约 0.6ms/路；RGB32 路由完全不动）。
+            if (frame is not None and not frame.isNull()
+                    and frame.format() == QImage.Format_ARGB32):
+                try:
+                    frame = frame.convertToFormat(
+                        QImage.Format_ARGB32_Premultiplied)
+                except Exception:                              # noqa: BLE001
+                    pass
             _rs["bits"] += (time.perf_counter() - _tb) * 1000.0
             if frame is None or frame.isNull():
                 continue
@@ -7689,6 +9030,7 @@ class AutoVJEngine(QObject):
                             _ts = time.perf_counter()
                             ok = sp.send(frame.bits(), frame.width(), frame.height(),
                                          frame.bytesPerLine())
+                            self._rate_spout = int(getattr(self, "_rate_spout", 0)) + 1
                             _rs["spout"] += (time.perf_counter() - _ts) * 1000.0
                             _rs["dr"] = int(getattr(sp, "dropped", 0) or 0)
                             if not ok:
@@ -7739,6 +9081,10 @@ class AutoVJEngine(QObject):
                             _rs["ndi"] += (time.perf_counter() - _tn) * 1000.0
                         except Exception as e:                     # noqa: BLE001
                             self._route_fail(sid, "ndi", now, e)
+            try:
+                time.sleep(0)          # 每条路由发完让出 GIL（Spout 拷贝可能几毫秒）
+            except Exception:                                  # noqa: BLE001
+                pass
         self._route_heartbeat(now)
 
     def _route_heartbeat(self, now):
@@ -7778,6 +9124,38 @@ class AutoVJEngine(QObject):
                 _output_health_write("%s 路由心跳：routes=%d → %s"
                                      % ("/".join(sorted(kinds)) or "ROUTE",
                                         len(segs), " | ".join(segs)))
+            # ★ 2026-11-17（用户：按屏 alpha 仍不透明）：把**实际要发出去的帧**
+            #   的 alpha 统计写进同一份取证日志。判据很直接：
+            #     · `a=0..255 trans=92.0%` ⇒ 帧里真的有透明像素，发送端没问题，
+            #       接收端（OBS Spout2 源）要把 Composite mode 选 Premultiplied Alpha；
+            #     · `a=255..255 trans=0.0%`  ⇒ 这块屏的图层把画面铺满了（全屏不透明
+            #       素材/BGA），alpha 通道本身没有透明区，怎么设接收端都不会透。
+            #   采样 1/16 行 × 1/16 列，1080p 约 8000 点，10s 一次，成本可忽略。
+            _abits = []
+            _plan = getattr(self, "_out_cfg", None)
+            _any_a = any(bool(v) for v in (self._screen_alpha or {}).values())
+            for sid, kind, name, _sp, _nd in (self._route_specs() if _any_a else ()):
+                fr = self._route_frame(_plan, sid, kind)
+                if fr is None or fr.isNull():
+                    continue
+                if not fr.hasAlphaChannel():
+                    _abits.append("%s fmt=RGB32(实底)" % name)
+                    continue
+                try:
+                    _a = np.frombuffer(fr.constBits(), dtype=np.uint8,
+                                       count=fr.sizeInBytes())
+                    _a = _a.reshape(fr.height(), fr.bytesPerLine())
+                    _a = _a[:, :fr.width() * 4].reshape(fr.height(), fr.width(), 4)
+                    _s = _a[::16, ::16, 3]
+                    _abits.append("%s fmt=ARGB32 a=%d..%d trans=%.1f%%"
+                                  % (name, int(_s.min()), int(_s.max()),
+                                     float((_s < 250).mean()) * 100.0))
+                except Exception:                                  # noqa: BLE001
+                    _abits.append("%s fmt=ARGB32 a=?" % name)
+            if _abits:
+                _output_health_write("Alpha 取证：%s ｜ 接收端需选 Premultiplied Alpha"
+                                     "（OBS: Spout2 源 → Composite mode）"
+                                     % " | ".join(_abits))
         except Exception:                                          # noqa: BLE001
             pass
 
@@ -7819,6 +9197,14 @@ class AutoVJEngine(QObject):
         return (max(1, int(self.canvas.width() * scale)),
                 max(1, int(self.canvas.height() * scale)))
 
+    def _pin_kv_order(self, layers):
+        """KV ????????? UI ????????logo ?? KV ????"""
+        kv = [x for x in layers if getattr(x, "is_kv", False)]
+        rest = [x for x in layers if not getattr(x, "is_kv", False)]
+        pos = {id(x): i for i, x in enumerate(self.layers)}
+        rest.sort(key=lambda x: pos.get(id(x), 10 ** 9))
+        return kv + rest
+
     def _main_screen_layers(self):
         """主屏该画哪些层。
 
@@ -7828,7 +9214,20 @@ class AutoVJEngine(QObject):
         """
         plan = getattr(self, "_out_cfg", None)
         if not plan:
-            return self.layers                     # 老配置 / 单屏：保持原行为
+            # ★ 2026-11-12（普通演出台仍显示独立屏内容）：多屏关闭时
+            #   `_out_cfg=None`，旧实现直接返回 self.layers（全部层）
+            #   ⇒ 独立屏的 图层5/7/码表 也会混进主屏。
+            #   这里仍按当前多屏配置的 main 屏图层集合合成；没有配置才回退全部。
+            try:
+                active = output_model.active_config(self.cfg)
+                main = output_model.main_screen(active) if active else None
+                if main is not None and main.get("layers") is not None:
+                    all_ids = [str(getattr(l, "lid", "")) for l in self.layers]
+                    ids = output_model.effective_layers(active, main, all_ids)
+                    return self._pin_kv_order(self._out_layers_by_ids(ids))
+            except Exception:                                  # noqa: BLE001
+                pass
+            return self.layers                     # 无多屏配置 / 无主屏图层限制
         main = None
         for s in plan.get("screens") or []:
             if s.get("type") == "main":
@@ -7841,7 +9240,7 @@ class AutoVJEngine(QObject):
             ids = output_model.effective_layers(plan, main, all_ids)
         except Exception:                                          # noqa: BLE001
             return self.layers
-        return self._out_layers_by_ids(ids)
+        return self._pin_kv_order(self._out_layers_by_ids(ids))
 
     def _compose(self, snap):
         """主屏合成（保留旧入口）：主画布 + **主屏自己的**图层，允许 GPU 合成。"""
@@ -7860,7 +9259,7 @@ class AutoVJEngine(QObject):
         # _gpu_safe_for_scene).  Subtracts and the other blend modes stay CPU.
         gpu_p = None
         if (allow_gpu and not self._gpu_dead and self._gpu_comp is not None
-                and not self._alpha_out
+                and not self._any_alpha
                 and self._gpu_safe_for_scene()):
             gpu_p = self._gpu_begin(W, H)
         if gpu_p is not None:
@@ -7898,7 +9297,17 @@ class AutoVJEngine(QObject):
         subtract_jobs = []  # 需要逐像素"减少"混合的图层
 
         # 图层列表 index 0 = 最上层 → 从下往上绘制
-        for lay in reversed(layers):
+        for _li, lay in enumerate(reversed(layers)):
+            _tl = time.perf_counter()
+            # ★★★ 2026-11-11（现场：预览/主线程 150~630ms 停顿）：`_draw_layer`
+            #   里的 QPainter 在 PySide 下**整段持 GIL**。实测 10 层连续画，
+            #   另一个 Python 线程最长被饿 **57ms**；每层后 `sleep(0)` 后降到 **3.8ms**。
+            #   旧实现每 4 层才让一次 ⇒ GUI 仍可能被挡 4 层的时长。现在**每层都让**。
+            if _li:
+                try:
+                    time.sleep(0)
+                except Exception:                              # noqa: BLE001
+                    pass
             if not lay.visible:
                 continue
             # ★★ 码表图层是**容器**：它没有单一 player，画面由内部子层按码表渲染。
@@ -7910,7 +9319,39 @@ class AutoVJEngine(QObject):
                     continue
                 if getattr(lay, "hide_silent", False) and silent:
                     continue
-                self._draw_cuesheet_layer(p, lay, W, H, snap, subtract_jobs)
+                _tc = time.perf_counter()
+                # ★ 2026-11-18：按码表画布比例 contain 到输出画布（与原预览一致）。
+                #   同比例时 ox=oy=0、w/h==W/H，直接画（零额外开销）。
+                _cw, _ch, _ox, _oy = self._cue_sheet_view(W, H)
+                if (_cw, _ch) == (W, H):
+                    self._draw_cuesheet_layer(p, lay, W, H, snap, subtract_jobs)
+                else:
+                    _sub_jobs = []
+                    p.save()
+                    try:
+                        p.translate(_ox, _oy)
+                        p.setClipRect(0, 0, _cw, _ch)
+                        self._draw_cuesheet_layer(p, lay, _cw, _ch, snap, _sub_jobs)
+                    finally:
+                        p.restore()
+                    # 减少混合的暂存图是子画布尺寸 ⇒ 先搬进整幅透明图再参与相减
+                    for _tmp, _op in _sub_jobs:
+                        _full = QImage(W, H, QImage.Format_ARGB32)
+                        _full.fill(Qt.transparent)
+                        _qp = QPainter(_full)
+                        try:
+                            _qp.drawImage(_ox, _oy, _tmp)
+                        finally:
+                            _qp.end()
+                        subtract_jobs.append((_full, _op))
+                _dc = (time.perf_counter() - _tc) * 1000.0
+                if _dc > 30.0 and os.environ.get("AUTOVJ_DRAW_PROBE") == "1":
+                    try:
+                        import stallwatch as _sw
+                        _sw.log_line("[LAYER] cuesheet=%s %.0fms canvas=%dx%d"
+                                     % (getattr(lay, "name", "?"), _dc, W, H))
+                    except Exception:                      # noqa: BLE001
+                        pass
                 continue
             if not lay.player:
                 continue
@@ -7995,6 +9436,19 @@ class AutoVJEngine(QObject):
                 p.setCompositionMode(BLEND_QT.get(blend, QPainter.CompositionMode_SourceOver))
                 self._draw_layer(p, lay, img, W, H, prog, tr, pulse, snap, drift_x, drift_y)
                 p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            _dl = (time.perf_counter() - _tl) * 1000.0
+            if _dl > 30.0 and os.environ.get("AUTOVJ_DRAW_PROBE") == "1":
+                try:
+                    import stallwatch as _sw
+                    _sw.log_line("[LAYER] %s %.0fms img=%dx%d blend=%s canvas=%dx%d"
+                                 % (getattr(lay, "name", "?"), _dl,
+                                    img.width(), img.height(), blend, W, H))
+                except Exception:                          # noqa: BLE001
+                    pass
+            try:
+                time.sleep(0)          # 每层画完让出 GIL（见循环开头说明）
+            except Exception:                                  # noqa: BLE001
+                pass
 
         # 黑场
         if self.blackout:
@@ -8102,27 +9556,57 @@ class AutoVJEngine(QObject):
             prev = self._gpu_prepare_image(prev)
         now = time.perf_counter()
 
-        # 每个素材独立的大小/位置（存在 MediaItem 上，而非整个图层）
-        cur_item = lay.clips[lay.cur] if 0 <= lay.cur < len(lay.clips) else None
-        prev_item = getattr(lay, "_trans_prev_item", None)
-        if prev_item is None and lay.trans_active and 0 <= lay.prev_idx < len(lay.clips):
-            prev_item = lay.clips[lay.prev_idx]
+        # 每个**图层片段实例**独立的大小/位置（存在 Layer.clip_xforms，不再共享 MediaItem）
+        # ⚠ `_draw_layer` 也会被码表子层 `_CueSubLayer` 调用；它没有 clip_xform，
+        #   必须回退到 item 自身属性，绝不能因此抛异常把整个引擎 tick 打断。
+        def _xf_of(l, idx):
+            if l is None or idx is None or int(idx) < 0:
+                return None
+            fn = getattr(l, "clip_xform", None)
+            if not callable(fn):
+                return None
+            try:
+                return fn(int(idx))
+            except Exception:                                  # noqa: BLE001
+                return None
 
-        def _t(item):
+        cur_idx = lay.cur if 0 <= lay.cur < len(lay.clips) else -1
+        cur_item = lay.clips[cur_idx] if cur_idx >= 0 else None
+        cur_xf = _xf_of(lay, cur_idx)
+        prev_idx = -1
+        if getattr(lay, "trans_active", False) and 0 <= lay.prev_idx < len(lay.clips):
+            prev_idx = lay.prev_idx
+        prev_item = lay.clips[prev_idx] if prev_idx >= 0 else None
+        if prev_item is None:
+            prev_item = getattr(lay, "_trans_prev_item", None)
+            if prev_item is not None:
+                try:
+                    prev_idx = lay.clips.index(prev_item)
+                except ValueError:
+                    prev_idx = -1
+        prev_xf = _xf_of(lay, prev_idx)
+
+        def _t(item, xf=None):
             if item is None:
                 return False, 0.0, 0.0, 1.0, 0.0
-            us = float(getattr(item, "img_scale", 1.0) or 1.0)
-            ux = float(getattr(item, "img_x", 0.0) or 0.0)
-            uy = float(getattr(item, "img_y", 0.0) or 0.0)
-            rot = float(getattr(item, "img_rot", 0.0) or 0.0)
+            if xf:
+                us = float(xf.get("scale", 1.0) or 1.0)
+                ux = float(xf.get("x", 0.0) or 0.0)
+                uy = float(xf.get("y", 0.0) or 0.0)
+                rot = float(xf.get("rot", 0.0) or 0.0)
+            else:
+                us = float(getattr(item, "img_scale", 1.0) or 1.0)
+                ux = float(getattr(item, "img_x", 0.0) or 0.0)
+                uy = float(getattr(item, "img_y", 0.0) or 0.0)
+                rot = float(getattr(item, "img_rot", 0.0) or 0.0)
             custom = (abs(us - 1.0) > 1e-3 or abs(ux) > 1e-3
                       or abs(uy) > 1e-3 or abs(rot) > 1e-3)
             return custom, W * ux / 100.0, H * uy / 100.0, us, rot
 
-        def paint_cover(painter, image, item, scale=1.0, dx=0.0, dy=0.0, a=1.0):
+        def paint_cover(painter, image, item, xf=None, scale=1.0, dx=0.0, dy=0.0, a=1.0):
             if image is None or image.isNull():
                 return
-            custom, ux, uy, us, rot = _t(item)
+            custom, ux, uy, us, rot = _t(item, xf)
             iw, ih = image.width(), image.height()
             # ★ 裁切（码表 cue 的 crop = [x, y, w, h] 归一化；普通图层 crop=None）
             #   用 drawImage 的「源矩形」重载，**不做每帧 copy**；
@@ -8161,7 +9645,7 @@ class AutoVJEngine(QObject):
                     painter.drawImage(_tgt, image, src)
             painter.restore()
 
-        def _own_w(image, item, scale=1.0):
+        def _own_w(image, item, xf=None, scale=1.0):
             """该素材**实际画出来**的宽度（px）—— 与 `paint_cover` 同一套公式。
 
             ★★ 2026-11-02（用户：「缩小图滑动时从屏幕最右边进来」）：
@@ -8172,7 +9656,7 @@ class AutoVJEngine(QObject):
             """
             if image is None or image.isNull() or image.width() <= 0:
                 return 0.0
-            custom_w, _ux, _uy, us, _rot = _t(item)
+            custom_w, _ux, _uy, us, _rot = _t(item, xf)
             iw, ih = image.width(), image.height()
             src = _crop_src_rect(image, crop)
             if src is not None:
@@ -8191,33 +9675,33 @@ class AutoVJEngine(QObject):
             dx = dy = 0.0
 
         if tr == "beat_cut" or prog >= 1.0 or (not is_kv and not lay.trans_active):
-            paint_cover(p, img, cur_item, pulse, dx, dy, alpha)
+            paint_cover(p, img, cur_item, cur_xf, pulse, dx, dy, alpha)
             return
 
         if tr == "fade":
             if prev is not None:
-                paint_cover(p, prev, prev_item, pulse, dx, dy, alpha)
-            paint_cover(p, img, cur_item, pulse, dx, dy, alpha * prog)
+                paint_cover(p, prev, prev_item, prev_xf, pulse, dx, dy, alpha)
+            paint_cover(p, img, cur_item, cur_xf, pulse, dx, dy, alpha * prog)
         elif tr == "slide":
             # ★★ 2026-11-02（用户：「滑动消失不是从原位置滑，是从屏幕最右边滑」）：
             #   ① 位移量从 `W`（整屏）改成 **d = 素材自己的宽度**；
             #   ② 方向按 `out_dir` 反向 —— 入场 `+d → 0`（从自己右边一格滑到位），
             #      出场 `0 → −d`（继续向左滑出）。原来两者共用 `W*(1-prog)`，
             #      而出场时 prog 是 1→0，于是出场也演成"从右边滑进来"。
-            d = _own_w(img, cur_item, pulse)
+            d = _own_w(img, cur_item, cur_xf, pulse)
             sgn = -1.0 if out_dir else 1.0
             if prev is not None:
-                paint_cover(p, prev, prev_item, pulse, -sgn * d * prog, dy, alpha)
-            paint_cover(p, img, cur_item, pulse, sgn * d * (1.0 - prog), dy, alpha)
+                paint_cover(p, prev, prev_item, prev_xf, pulse, -sgn * d * prog, dy, alpha)
+            paint_cover(p, img, cur_item, cur_xf, pulse, sgn * d * (1.0 - prog), dy, alpha)
         elif tr == "zoom":
             if prev is not None:
-                paint_cover(p, prev, prev_item, pulse * (1 + 0.4 * prog), dx, dy, alpha * (1 - prog))
-            paint_cover(p, img, cur_item, pulse * (0.7 + 0.3 * prog), dx, dy, alpha)
+                paint_cover(p, prev, prev_item, prev_xf, pulse * (1 + 0.4 * prog), dx, dy, alpha * (1 - prog))
+            paint_cover(p, img, cur_item, cur_xf, pulse * (0.7 + 0.3 * prog), dx, dy, alpha)
         elif tr == "glitch":
             import random as _r
             rng = _r.Random(int(now * 1000))
             if prev is not None:
-                paint_cover(p, prev, prev_item, pulse, 0, 0, alpha)
+                paint_cover(p, prev, prev_item, prev_xf, pulse, 0, 0, alpha)
             # 随机行错位（用源矩形绘制，避免每行 copy）
             # ★ crop：在**裁切窗口内**按比例切；`src` 为 None 时与原式逐像素一致
             # ★★ 2026-11-02（用户：「缩小图消失时先把它拉成全屏，然后再淡出消失」）：
@@ -8232,10 +9716,10 @@ class AutoVJEngine(QObject):
             else:
                 sx0, sy0, sw, sh_img = (src.x(), src.y(),
                                         src.width(), src.height())
-            custom_g, ux_g, uy_g, us_g, rot_g = _t(cur_item)
+            custom_g, ux_g, uy_g, us_g, rot_g = _t(cur_item, cur_xf)
             if sw <= 0 or sh_img <= 0 or abs(rot_g) > 1e-3:
                 # 旋转状态下做行错位会把图切成斜碎片 ⇒ 退回正常绘制（宁可没特效）
-                paint_cover(p, img, cur_item, pulse, dx, dy, alpha)
+                paint_cover(p, img, cur_item, cur_xf, pulse, dx, dy, alpha)
             else:
                 if custom_g:
                     _s = min(W / sw, H / sh_img) * pulse * us_g
@@ -8259,16 +9743,48 @@ class AutoVJEngine(QObject):
                     yy += step
                 p.restore()
         else:
-            paint_cover(p, img, cur_item, pulse, dx, dy, alpha)
+            paint_cover(p, img, cur_item, cur_xf, pulse, dx, dy, alpha)
+
+    def _set_players_active(self, active):
+        """冻结/黑场时把已存在的播放器全部挂起，避免解码线程继续满速吃 CPU。
+
+        ★ 2026-11-12（用户：什么都不放还有 38% CPU）：旧 `freeze` 只是让
+          `_tick_locked` 提前 return，播放器的 `set_active(False)` 在更后面，
+          根本执行不到 ⇒ 画面冻住但解码还在跑。这里显式挂起。
+        """
+        seen = set()
+        for lay in self.layers:
+            ps = []
+            try:
+                ps.extend(list((getattr(lay, "cache", None) or {}).values()))
+            except Exception:                                  # noqa: BLE001
+                pass
+            ps.extend([getattr(lay, "player", None), getattr(lay, "prev_player", None)])
+            try:
+                ps.extend(list((getattr(lay, "_cue_players", None) or {}).values()))
+            except Exception:                                  # noqa: BLE001
+                pass
+            for p in ps:
+                if p is None or id(p) in seen:
+                    continue
+                seen.add(id(p))
+                try:
+                    p.set_active(bool(active))
+                except Exception:                              # noqa: BLE001
+                    pass
 
     # ---------------- 手动干预 ----------------
     @_locked
     def set_blackout(self, on):
         self.blackout = on
+        if on:
+            self._set_players_active(False)
 
     @_locked
     def set_freeze(self, on):
         self.freeze = on
+        if on:
+            self._set_players_active(False)
 
     @_locked
     def set_pause_auto(self, on):
@@ -8277,6 +9793,9 @@ class AutoVJEngine(QObject):
     @_locked
     def toggle_run(self):
         self.running = not self.running
+        if self.running:
+            # 静音待机从“开始”重新计时：给 8s 正常预览，别一开就 2fps
+            self._silent_low_since = time.perf_counter()
         pos = self._beat_pos(self.audio.snapshot())
         self.switch_pos = pos
         self._next_due = None

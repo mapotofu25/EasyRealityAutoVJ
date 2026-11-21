@@ -13,11 +13,12 @@
 import copy
 import json
 import os
+import threading
 import time
 
 from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter,
-                           QPen, QPixmap, QLinearGradient)
+                           QPen, QPixmap, QLinearGradient, QPalette)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QFormLayout, QLabel, QPushButton, QComboBox,
                                QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit,
@@ -108,6 +109,8 @@ class _CheckerTile:
 
     _pm = None
     _key = ""
+    _img = None
+    _img_key = ""
     #: (亮格, 暗格)
     PALETTE = {"dark": ("#2b2b2b", "#232323"),
                "light": ("#f3f3f3", "#d7d7d7")}
@@ -129,6 +132,25 @@ class _CheckerTile:
             cls._pm = pm
             cls._key = key
         return cls._pm
+
+    @classmethod
+    def image(cls):
+        """QImage 版棋盘格：**跨线程渲染**只能用 QImage（QPixmap 必须 GUI 线程）。"""
+        try:
+            key = "dark" if str(theme.current()) == "dark" else "light"
+        except Exception:                                          # noqa: BLE001
+            key = "light"
+        if cls._img is None or cls._img_key != key:
+            a, b = cls.PALETTE.get(key, cls.PALETTE["light"])
+            im = QImage(32, 32, QImage.Format_ARGB32)
+            im.fill(QColor(a))
+            p = QPainter(im)
+            p.fillRect(0, 0, 16, 16, QColor(b))
+            p.fillRect(16, 16, 16, 16, QColor(b))
+            p.end()
+            cls._img = im
+            cls._img_key = key
+        return cls._img
 
 
 # ---------------------------------------------------------------- 预览工作区
@@ -166,6 +188,7 @@ class OutputPreview(QWidget):
     action = Signal(str, str)       # (action, screen_id)
     geometry_changed = Signal()     # 拖动/缩放结束（保存配置）
     view_changed = Signal()         # 缩放/平移（保存 UI 状态）
+    render_ready = Signal()         # ★ 后台渲染完成（跨线程 → GUI update）
 
     def __init__(self, studio, parent=None):
         super().__init__(parent)
@@ -190,6 +213,26 @@ class OutputPreview(QWidget):
         # ★ 预览设置接线（2026-11-10）：`ui.preview.on/fps` 也作用到输出页卡片
         self._preview_off = False
         self._last_thumb_key = None
+        # ★★★ 2026-11-11（现场：多屏输出预览卡，OBS 正常）：
+        #   预览的 5 块屏卡片是**几十个 PySide/Qt 调用**，在 GUI 线程上实测
+        #   20~120ms/帧（纯绘制 2.4ms，其余是 GIL 等待）。它反过来把引擎/解码
+        #   线程也拖慢，形成正反馈。这里把整张预览**画到 QImage 后台缓冲**，
+        #   GUI 的 paintEvent 只做一次 drawImage（~0.5ms）；渲染线程独立跑 20fps，
+        #   GUI 永不等 PySide 的绘制循环。QImage 绘制可跨线程，QPixmap 不行
+        #   （棋盘格已改为 QImage 版本）。
+        self._back = None
+        self._back_lock = threading.Lock()
+        self._render_stop = True
+        self._render_active = False
+        self._render_thread = None
+        # ★★★ 2026-11-11（OBS 对照）：预览卡片改为**每屏一个 QLabel + QPixmap**。
+        #   OBS 的预览是原生 GPU display，Qt 不参与逐帧绘制；Python 侧每帧画 5 张卡
+        #   即使放到后台线程也会长期持 GIL（实测 6~30ms/帧），反过来拖慢引擎。
+        #   现在图片缩放/贴图交给 Qt C++（QLabel.setPixmap），Python 只在缩略图
+        #   更新时 setPixmap 一次；父控件只画棋盘格/边框/文字，不再逐帧 QPainter 画图。
+        self._card_labels = {}
+        self._render_thread = None
+        self.render_ready.connect(self.update, Qt.QueuedConnection)
 
     # ---------- 数据 ----------
     def set_context(self, mode, screens, cfg, selected_id=""):
@@ -205,20 +248,27 @@ class OutputPreview(QWidget):
         self.cfg = cfg
         self.selected_id = str(selected_id or "")
         self._ensure_multi_rects()
+        self._sync_card_labels()
         self.update()
 
     def set_thumbs(self, thumbs):
         """喂缩略图。★ 内容（图对象 + 尺寸）没变就不 update()，
-        避免"引擎每帧产新 dict ⇒ 每帧重画 7 张图"的空转。"""
+        避免"引擎每帧产新 dict ⇒ 每帧重画 7 张图"的空转。
+
+        ★ 2026-11-11：同时带上引擎的 `_thumb_rev`。只用 QImage.cacheKey() 判重
+          会因内存地址复用把新帧误判成旧帧（现场输出页只有 ~10fps）。
+        """
         thumbs = dict(thumbs or {})
-        key = tuple(sorted((str(k), (v.cacheKey() if v is not None else 0),
-                            v.width() if v is not None else 0,
-                            v.height() if v is not None else 0)
-                           for k, v in thumbs.items()))
+        _rev = getattr(self, "_thumb_rev", None)
+        key = (_rev, tuple(sorted((str(k), (v.cacheKey() if v is not None else 0),
+                                   v.width() if v is not None else 0,
+                                   v.height() if v is not None else 0)
+                                  for k, v in thumbs.items())))
         if key == self._last_thumb_key and thumbs.keys() == self.thumbs.keys():
             return
         self._last_thumb_key = key
         self.thumbs = thumbs
+        # ★ 2026-11-12：不再维护 QLabel；父控件直接画缩略图，内容变了才重绘。
         self.update()
 
     def set_preview_off(self, off):
@@ -230,6 +280,8 @@ class OutputPreview(QWidget):
         if off:
             self.thumbs = {}
             self._last_thumb_key = None
+        for lbl in getattr(self, "_card_labels", {}).values():
+            lbl.setVisible(not off)
         self.update()
 
     def set_selected(self, sid):
@@ -657,6 +709,9 @@ class OutputPreview(QWidget):
         fn = getattr(self.studio, "layout_screen_badge", None)
         if callable(fn):
             fn()
+        fn2 = getattr(self.studio, "layout_output_hud", None)
+        if callable(fn2):
+            fn2()
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_0:
@@ -720,26 +775,58 @@ class OutputPreview(QWidget):
         m.exec(gp)
 
     # ---------- 绘制 ----------
-    def paintEvent(self, _ev):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), QColor("#151515"))
-        p.fillRect(self.rect(), QBrush(_CheckerTile.pixmap()))
-        if getattr(self, "_preview_off", False):
-            # ★ 用户关掉「显示预览画面」：给明确占位，别停在最后一帧（否则像"设置没生效"）
-            p.setPen(QColor(200, 200, 200, 220))
-            p.setFont(QFont("Microsoft YaHei", 13, QFont.Bold))
-            p.drawText(self.rect(), Qt.AlignCenter,
-                       "预览已关闭")
-            p.setFont(QFont("Microsoft YaHei", 9))
-            p.setPen(QColor(160, 160, 160, 220))
-            p.drawText(self.rect().adjusted(0, 26, 0, 0), Qt.AlignCenter,
-                       "「设置 ▸ 预览画面设置」里勾选「显示预览画面」可恢复")
-            p.end()
+    def _probe_paint(self, t0, mode):
+        if os.environ.get("AUTOVJ_DRAW_PROBE") != "1":
             return
+        try:
+            import stallwatch as _sw
+            _sw.log_line("[PV] paint=%.1fms mode=%s thumbs=%d size=%dx%d" %
+                         ((time.perf_counter() - t0) * 1000.0, mode,
+                          len(getattr(self, "thumbs", {}) or {}),
+                          self.width(), self.height()))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def paintEvent(self, _ev):
+        _t0 = time.perf_counter()
         if self._fit_pending:
             self._fit_pending = False
             QTimer.singleShot(0, self.fit_all)
+        if getattr(self, "_preview_off", False):
+            p = QPainter(self)
+            self._paint_off(p)
+            p.end()
+            self._probe_paint(_t0, "off")
+            return
+        # ★ 2026-11-12：后台预览线程早已停用（`_render_thread=None`），但这里
+        #   仍保留 `_back` 分支。现场出现过旧进程/旧缓存里 `_back` 非空 ⇒
+        #   父控件先 blit 一张**带标题条的旧预览**，QLabel 又画一遍内容，
+        #   看起来就是“标题条重复/卡片错位”。彻底不再使用 `_back`。
+        p = QPainter(self)
+        try:
+            self._paint_preview(p)
+        finally:
+            p.end()
+        self._probe_paint(_t0, self.mode)
+
+    def _paint_off(self, p):
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor("#151515"))
+        p.fillRect(self.rect(), QBrush(_CheckerTile.image()))
+        p.setPen(QColor(200, 200, 200, 220))
+        p.setFont(QFont("Microsoft YaHei", 13, QFont.Bold))
+        p.drawText(self.rect(), Qt.AlignCenter, "预览已关闭")
+        p.setFont(QFont("Microsoft YaHei", 9))
+        p.setPen(QColor(160, 160, 160, 220))
+        p.drawText(self.rect().adjusted(0, 26, 0, 0), Qt.AlignCenter,
+                   "「设置 ▸ 预览画面设置」里勾选「显示预览画面」可恢复")
+
+    def _paint_preview(self, p):
+        """把整张预览画到 `p`（GUI 只画背景/边框/文字；图片内容由 QLabel 画）。"""
+        self._sync_card_labels()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor("#151515"))
+        p.fillRect(self.rect(), QBrush(_CheckerTile.image()))
         if self.mode == "single":
             self._paint_single(p)
         else:
@@ -757,40 +844,120 @@ class OutputPreview(QWidget):
         p.setPen(QColor(220, 220, 220, 180))
         p.setFont(_font_zoom())
         p.drawText(8, self.height() - 8, "%d%%" % int(round(self.zoom * 100)))
-        p.end()
+
+    # ---------- 每屏 QLabel（图片内容交给 Qt C++ 画） ----------
+    def _card_inner_rect(self, sr):
+        """卡片内容区：边框 2px、标题 18px、底部留 14px 给分辨率文字。"""
+        x, y = int(sr.x()) + 2, int(sr.y()) + 20
+        w = max(1, int(sr.width()) - 4)
+        h = max(1, int(sr.height()) - 20 - 14)
+        return QRect(x, y, w, h)
+
+    def _unique_screens(self):
+        """按 id 去重（配置被合并/重复 apply 时避免同一张卡画两遍标题条）。"""
+        out, seen = [], set()
+        for s in (self.screens or []):
+            sid = str(s.get("id") or "")
+            key = sid or id(s)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out
+
+    def _sync_card_labels(self):
+        """不再使用 QLabel 叠在预览上；清掉历史遗留 label，避免双标题条。"""
+        for lbl in list(getattr(self, "_card_labels", {}).values()):
+            try:
+                lbl.hide()
+                lbl.deleteLater()
+            except Exception:                                  # noqa: BLE001
+                pass
+        try:
+            self._card_labels.clear()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _update_card_pixmaps(self):
+        self._sync_card_labels()
+
+    # ---------- 后台渲染线程 ----------
+    def resizeEvent(self, ev):
+        try:
+            self._render_size = (max(1, int(self.width())), max(1, int(self.height())))
+        except Exception:                                      # noqa: BLE001
+            pass
+        super().resizeEvent(ev)
+
+    def showEvent(self, ev):
+        self._render_active = True
+        try:
+            self._render_size = (max(1, int(self.width())), max(1, int(self.height())))
+        except Exception:                                      # noqa: BLE001
+            pass
+        super().showEvent(ev)
+
+    def hideEvent(self, ev):
+        self._render_active = False
+        super().hideEvent(ev)
+
+    def _render_loop(self):
+        """后台把预览画到 QImage；GUI 线程只 blit，避免抢 GIL 拖慢引擎。
+
+        2026-11-11 现场实测：5 块屏卡片的 paintEvent 纯绘制 2.4ms，但和
+        解码/引擎抢 GIL 后 wall time 20~120ms。放到独立线程后，GUI 每帧
+        只做一次 drawImage；渲染线程即使被抢占，界面也不会卡住。
+        """
+        while not self._render_stop:
+            try:
+                if (not self._render_active) or getattr(self, "_preview_off", False):
+                    time.sleep(0.05)
+                    continue
+                w, h = getattr(self, "_render_size", (0, 0))
+                if w < 8 or h < 8:
+                    time.sleep(0.05)
+                    continue
+                img = QImage(int(w), int(h), QImage.Format_ARGB32)
+                p = QPainter(img)
+                try:
+                    # 快照：渲染期间 GUI 可能换掉 thumbs dict；QImage 本身不可变
+                    self._paint_thumbs = dict(getattr(self, "thumbs", {}) or {})
+                    self._paint_preview(p)
+                finally:
+                    p.end()
+                    self._paint_thumbs = None
+                with self._back_lock:
+                    self._back = img
+                self.render_ready.emit()
+            except Exception:                                  # noqa: BLE001
+                try:
+                    time.sleep(0.05)
+                except Exception:                              # noqa: BLE001
+                    pass
+            time.sleep(0.01)                                   # 目标 ~30fps；有 GIL 等待时自然降速
+
 
     def _paint_multi(self, p):
-        # ★ U6（用户第 6 条 BUG）：单路模式下**预览区是黑的**。根因：预览自 S1 #2 起
-        #   一律按"每屏一个框"画（按屏 id 取缩略图），而**单路模式下引擎只产
-        #   `__combined__` 一张缩略图** ⇒ 每块屏 `content=None` → `_paint_frame` 填黑。
-        #   这里兜底：单路时从 `__combined__` 里按该屏 layout 占比**裁出属于它的那块**。
-        comb = self.thumbs.get("__combined__")
-        cw = ch = 0
-        try:
-            if self.cfg:
-                cw, ch = OM.combined_size(self.cfg)
-        except Exception:                                          # noqa: BLE001
-            cw = ch = 0
-        for s in self.screens:
+        _t_all = time.perf_counter()
+        _rows = []
+        # ★ 2026-11-12：回到“父控件直接画 320px 缩略图 + 标题条”，
+        #   不再用 QLabel。现场截图出现“标题条画两遍/卡片错位”，根因是
+        #   QLabel 与父控件两套几何/绘制叠加；现在只有一套绘制，彻底不会重复。
+        _th = getattr(self, "_paint_thumbs", None) or self.thumbs
+        for s in self._unique_screens():
+            _t_one = time.perf_counter()
             r = OM._normalize_preview_rect(s.get("preview_rect"))
             if not r:
                 continue
             sr = self._rect_screen(*r)
-            content = self.thumbs.get(s.get("id"))
-            if (content is None and comb is not None and not comb.isNull()
-                    and int(cw) > 0 and int(ch) > 0):
-                try:
-                    lx, ly, lw, lh = OM.screen_rect(self.cfg, s)
-                    sx = max(0, int(round(lx * comb.width() / float(cw))))
-                    sy = max(0, int(round(ly * comb.height() / float(ch))))
-                    sw = max(1, int(round(lw * comb.width() / float(cw))))
-                    sh = max(1, int(round(lh * comb.height() / float(ch))))
-                    sw = max(1, min(sw, comb.width() - sx))
-                    sh = max(1, min(sh, comb.height() - sy))
-                    content = comb.copy(sx, sy, sw, sh)
-                except Exception:                                  # noqa: BLE001
-                    content = None
-            self._paint_frame(p, s, sr, content=content)
+            content = _th.get(str(s.get("id") or ""))
+            self._paint_frame(p, s, sr, content=content, transparent_center=False)
+            _rows.append("%s:%.0f" % (str(s.get("name") or "?")[:10],
+                                      (time.perf_counter() - _t_one) * 1000.0))
+            try:
+                time.sleep(0)          # 每张卡让出 GIL，别把引擎/GUI 饿住
+            except Exception:                                  # noqa: BLE001
+                pass
         # 选中框
         s = self._screen(self.selected_id)
         if s is not None:
@@ -800,6 +967,14 @@ class OutputPreview(QWidget):
                 p.setPen(_dash_pen("#ffffff", 2))
                 p.setBrush(Qt.NoBrush)
                 p.drawRect(sr.adjusted(-2, -2, 2, 2))
+        if os.environ.get("AUTOVJ_DRAW_PROBE") == "1":
+            try:
+                import stallwatch as _sw
+                _sw.log_line("[PVM] cards=%.1fms %s" %
+                             ((time.perf_counter() - _t_all) * 1000.0,
+                              " ".join(_rows)))
+            except Exception:                                  # noqa: BLE001
+                pass
 
     def _paint_single(self, p):
         cw, ch = OM.combined_size(self.cfg)
@@ -809,7 +984,7 @@ class OutputPreview(QWidget):
         p.setPen(QPen(QColor("#555555"), 1))
         p.setBrush(Qt.NoBrush)
         p.drawRect(canvas)
-        thumb = self.thumbs.get("__combined__")
+        thumb = (getattr(self, "_paint_thumbs", None) or self.thumbs).get("__combined__")
         if thumb is not None and not thumb.isNull():
             p.drawImage(canvas, thumb, QRectF(0, 0, thumb.width(), thumb.height()))
         # 源屏幕布局框
@@ -1119,6 +1294,12 @@ class ScreenDialog(QDialog):
                 self.type.setCurrentIndex(_ti)
             self.type.setEnabled(False)
             try:
+                _si = self.source.findData(str(_s.get("source_id") or ""))
+                if _si >= 0:
+                    self.source.setCurrentIndex(_si)
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
                 _w, _h = OM.effective_size(self.cfg, _s)
                 self.w.setValue(int(_w))
                 self.h.setValue(int(_h))
@@ -1142,8 +1323,27 @@ class ScreenDialog(QDialog):
             screen["height"] = max(16, int(v["height"]))
             if t == "independent":
                 screen["follow_main"] = False     # 手填过尺寸 ⇒ 不再跟随主屏
-        # （原"写回勾选结果"那段已删：图层的屏幕归属由「+ 图层」在建立时决定）
             screen["color"] = v["color"]
+        elif t == "split":
+            # 切分屏：对话框里的源屏/分辨率也要真正生效（分辨率反算 UV）
+            sid = str(v.get("source_id") or screen.get("source_id") or "")
+            if sid:
+                screen["source_id"] = sid
+            src = OM.source_screen(self.cfg, screen)
+            try:
+                sw, sh = OM.effective_size(self.cfg, src)
+            except Exception:                              # noqa: BLE001
+                sw = sh = 0
+            uv = list(screen.get("uv") or [0, 0, 1, 1])
+            if sw > 0:
+                uv[2] = max(uv[0] + 0.002,
+                            min(1.0, uv[0] + max(16, int(v["width"])) / float(sw)))
+            if sh > 0:
+                uv[3] = max(uv[1] + 0.002,
+                            min(1.0, uv[1] + max(16, int(v["height"])) / float(sh)))
+            screen["uv"] = uv
+            screen["width"] = max(16, int(v["width"]))
+            screen["height"] = max(16, int(v["height"]))
         return screen
 
     def _fill_sources(self):
@@ -1592,7 +1792,7 @@ class OutputStudio(QWidget):
         bar.addWidget(QLabel("模式"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("多屏多路输出", "multi")
-        self.mode_combo.addItem("多屏整合单路输出", "single")
+        self.mode_combo.addItem("多屏单路输出", "single")
         self.mode_combo.currentIndexChanged.connect(self._on_mode)
         bar.addWidget(self.mode_combo)
         self.lbl_combined = QLabel("整合画布")
@@ -1680,6 +1880,19 @@ class OutputStudio(QWidget):
         self.preview.geometry_changed.connect(self._on_preview_geometry)
         self.preview.view_changed.connect(self._save_view_state)
         left.addWidget(self.preview, 1)
+        # ★ 2026-11-11（用户图2：多屏预览右上角没有 HUD）：
+        #   多屏页面显示的是 `OutputPreview`（不是单屏那块 PreviewPanel），
+        #   它以前没有 HUD 浮层。这里给同一个预览区补一个右上角 HUD，文本由
+        #   `_update_status` 与单屏 HUD 共用。
+        self.hud = QLabel(self.preview)
+        self.hud.setStyleSheet(
+            "background:rgba(0,0,0,150);color:#9fe;padding:3px 6px;"
+            "border-radius:3px;font-size:11px;")
+        # 不折行：与单屏 HUD 一致；多行歌词/码表信息用 \n 显式换行
+        self.hud.setWordWrap(False)
+        self.hud.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.hud.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.hud.hide()
         self._build_screen_badge()          # ★ 左上角「当前屏幕」胶囊（用户第 12 条）
         # 底部卡片
         cardbox = QWidget()
@@ -1794,6 +2007,46 @@ class OutputStudio(QWidget):
         except Exception:                                          # noqa: BLE001
             pass
 
+    def layout_output_hud(self):
+        """多屏预览 HUD：贴预览区右上角（与单屏 HUD 同一份文本）。"""
+        h = getattr(self, "hud", None)
+        if h is None or not h.isVisible():
+            return
+        try:
+            pw = int(self.preview.width())
+            maxw = max(180, pw - 16)
+            h.setMaximumWidth(maxw)
+            h.adjustSize()
+            # adjustSize 在极长文本下可能仍超过最大宽度 ⇒ 显式压到 maxw
+            if h.width() > maxw:
+                h.resize(maxw, h.height())
+            x = max(8, pw - h.width() - 8)
+            h.move(x, 8)
+            h.raise_()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def set_hud(self, text):
+        """由 MainWindow._update_status 每 500ms 喂一次。"""
+        h = getattr(self, "hud", None)
+        if h is None:
+            return
+        try:
+            ui = (self.cfg.data.get("ui") or {})
+            on = bool(ui.get("hud", True))
+            pv = bool((ui.get("preview") or {}).get("on", True))
+            show = bool(str(text or "").strip()) and on and pv and self.isVisible()
+            h.setText(str(text or ""))
+            h.setVisible(show)
+            if show:
+                self.layout_output_hud()
+                # 布局/预览尺寸可能在同一轮事件里才定稿，下一轮再贴一次
+                QTimer.singleShot(0, self.layout_output_hud)
+            else:
+                h.hide()
+        except Exception:                                          # noqa: BLE001
+            pass
+
     def _refresh_screen_badge(self, cfg):
         b = getattr(self, "btn_screen_badge", None)
         if b is None:
@@ -1828,7 +2081,29 @@ class OutputStudio(QWidget):
             a.triggered.connect(lambda _c=False, sid=s2.get("id"): self.select_screen(sid))
         self.layout_screen_badge()
 
+    # ---------- 可见性 → 缩略图开关（性能） ----------
+    def _notify_thumb_consumers(self, on):
+        try:
+            self.main.engine.set_route_thumb_consumers(bool(on))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._notify_thumb_consumers(True)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._notify_thumb_consumers(False)
+
     # ---------- 配置/刷新 ----------
+    def _multi_active(self):
+        """多屏输出是否真的启用；关闭后绝不再下发输出计划。"""
+        try:
+            return bool((self.cfg.data.get("output") or {}).get("multi_enabled", False))
+        except Exception:                                      # noqa: BLE001
+            return False
+
     def active_config(self):
         return OM.active_config(self.cfg.data)
 
@@ -1955,6 +2230,16 @@ class OutputStudio(QWidget):
 
     # ---------- 引擎/主窗同步 ----------
     def sync_engine(self):
+        # ★ 关闭多屏后，残留的延后 apply/刷新绝不能再把输出计划设回去
+        if not self._multi_active():
+            self._geo_pending = False
+            t = getattr(self, "_geo_apply_timer", None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:                              # noqa: BLE001
+                    pass
+            return
         # ★ 落地前先把"拖动待应用"的排版刷一次（幂等；schema 无 pending 时零成本）
         try:
             self._flush_geometry_apply()
@@ -1971,6 +2256,9 @@ class OutputStudio(QWidget):
         self._sync_main_output_route()
 
     def apply(self):
+        if not self._multi_active():
+            self._geo_pending = False
+            return
         cfg = self.active_config()
         if not cfg:
             return
@@ -2061,7 +2349,12 @@ class OutputStudio(QWidget):
         except Exception:
             pass
         if cfg.get("mode") == "multi":
-            title = "Easy Reality Output - %s" % (name or "主屏幕")
+            # ★ 2026-11-16：多屏多路每块屏有独立窗口；`out_win` 是**主屏**的窗口，
+            #   标题必须写主屏名，不能跟着当前选中的屏改（否则切 B 屏主屏标题也变）。
+            _main = OM.main_screen(cfg) or {}
+            _main_name = names.get((_main or {}).get("id"),
+                                   (_main or {}).get("name") or name)
+            title = "Easy Reality Output - %s" % (_main_name or "主屏幕")
         else:
             title = "Easy Reality Output"
         try:
@@ -2139,6 +2432,20 @@ class OutputStudio(QWidget):
         except Exception:
             pass
         self.settings.set_screen(s, cfg, cfg.get("mode", "multi"))
+        # ★ 2026-11-11：切换选中屏幕时，右下角「输出设置」也必须跟着绑定到这块屏。
+        #   以前这里只刷新了屏幕参数表单（self.settings），旧输出面板仍停在上一块屏
+        #   ⇒ 用户在新选中的屏上改「输出显示器 = 窗口模式」，实际写进了**别的屏**
+        #   （或不写），界面看起来“多屏输出没有窗口模式”。refresh_all 里已有同样的
+        #   绑定逻辑，但 select_screen 不走 refresh_all，必须在这里补一次。
+        try:
+            if str((cfg or {}).get("mode") or "multi") == "multi":
+                self.main.output_panel.set_screen(s)
+            else:
+                self.main.output_panel.set_screen(None)
+            self.main.output_panel.set_mode(
+                "single" if str((cfg or {}).get("mode")) == "single" else "multi")
+        except Exception:                                      # noqa: BLE001
+            pass
         self._refresh_screen_badge(cfg)
         try:
             self.selection_changed.emit(self.selected_id)
@@ -2163,6 +2470,10 @@ class OutputStudio(QWidget):
         """
         if not self.isVisible():
             return
+        # ★ 诊断开关：AUTOVJ_PREVIEW_OFF=1 时输出页完全不刷新，用来测"预览本身
+        #   给引擎/GUI 增加多少开销"（不会写配置，只影响本次进程）。
+        if os.environ.get("AUTOVJ_PREVIEW_OFF") == "1":
+            return
         try:
             ui = ((self.cfg.data.get("ui") or {}).get("preview") or {})
             on = bool(ui.get("on", True))
@@ -2170,23 +2481,56 @@ class OutputStudio(QWidget):
                 if not getattr(self, "_pv_off", False):
                     self._pv_off = True
                     self.preview.set_preview_off(True)
+                    # 预览关掉 ⇒ 引擎也不用再为输出页生成缩略图
+                    self._notify_thumb_consumers(False)
                 return
             if getattr(self, "_pv_off", False):
                 self._pv_off = False
                 self.preview.set_preview_off(False)
+                self._notify_thumb_consumers(True)
             try:
-                fps = float(ui.get("fps", 60) or 60)
+                fps = float(ui.get("fps", 30) or 30)
             except (TypeError, ValueError):
-                fps = 60.0
-            interval = 1.0 / max(1.0, fps)
+                fps = 30.0
+            try:
+                _res = float(ui.get("res", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                _res = 1.0
+            _res = max(0.1, min(1.0, _res))
+            # ★ 2026-11-11：预览分辨率交给引擎缩到最终尺寸，GUI 不再二次缩放
+            #   （以前 320→80 的第二次缩放在 GUI 每帧做 6 次，既慢又增加掉帧）。
+            try:
+                self.main.engine.set_preview_res(_res)
+            except Exception:                                  # noqa: BLE001
+                pass
+            # ★ 2026-11-11（用户：多屏预览看起来不到 30 帧）：
+            #   引擎 frame_ready 会成对/成串到达，严格 1/30s 节流会把每对里的
+            #   第二帧丢掉 ⇒ 实际只有 ~11fps。选 30fps 时改为**每来一批新缩略图
+            #   就画**（引擎实际 25~30fps）；只有选 15fps 才做时间节流。
+            # ★ 2026-11-11（用户：多屏播放音乐时预览很卡）：5 屏以上时卡片最多 15fps，
+            #   主预览/输出窗口不受影响。4 屏以下仍按用户设置（默认 30fps）。
+            # ★ 2026-11-11（用户：OBS 流畅、软件内预览卡）：这里曾对 ≥4 屏把预览
+            #   硬压到 15fps；而判断用的是 `self.screens`（OutputStudio 没有这个属性），
+            #   异常被吞掉 ⇒ 这段其实**从未生效**。现在直接删除硬上限，完全按
+            #   `ui.preview.fps`（默认 30/60）走；要限速由用户设置控制。
+            interval = 0.0 if fps >= 29.0 else 1.0 / max(1.0, fps)
             now = time.perf_counter()
-            if now - float(getattr(self, "_pv_last_t", 0.0) or 0.0) < interval:
+            _last_t = float(getattr(self, "_pv_last_t", 0.0) or 0.0)
+            if interval > 0.0 and now - _last_t < interval:
                 return
             self._pv_last_t = now
+            try:
+                _rev = int(self.main.engine.latest_route_thumbs_rev())
+            except Exception:                                  # noqa: BLE001
+                _rev = 0
             th = self.main.engine.latest_route_thumbs()
-            if th is getattr(self, "_last_thumbs", None):
+            # rev 是主判据；同时保留 dict 身份兜底（测试/旧调用可能只换 dict 不升 rev）
+            if (_rev == int(getattr(self, "_last_thumb_rev", -1))
+                    and th is getattr(self, "_last_thumbs", None)):
                 return
+            self._last_thumb_rev = _rev
             self._last_thumbs = th
+            self.preview._thumb_rev = _rev
             self.preview.set_thumbs(th)
         except Exception:
             pass
@@ -2621,6 +2965,9 @@ class OutputStudio(QWidget):
                 "source_id": s.get("source_id"),
                 "pixel_size": [OM.effective_size(cfg, s)[0], OM.effective_size(cfg, s)[1]],
                 "pixel_rect": [x, y, w, h],
+                # ★ 2026-11-11（用户图1）：明确给出左上角/右下角像素坐标，
+                #   和 PNG 上画的两处角标完全同口径。
+                "pixel_pos": {"top_left": [x, y], "bottom_right": [x + w, y + h]},
                 "uv": uv, "color": s.get("color"),
             })
         with open(os.path.join(folder, base + ".json"), "w", encoding="utf-8") as f:
@@ -2635,6 +2982,11 @@ class OutputStudio(QWidget):
             _disps.append((_s, (_dx, _dy, _dw, _dh)))
             _x0 = min(_x0, _dx); _y0 = min(_y0, _dy)
             _x1 = max(_x1, _dx + _dw); _y1 = max(_y1, _dy + _dh)
+        # ★ 2026-11-11（用户图1：导出的 mapping 图显示不全）：
+        #   以前边界正好等于最右/最下屏幕的边缘，PNG 最后一列/行会被裁掉，看起来
+        #   像屏幕被切了一半。四周留 24px 画布边距，所有屏幕都完整可见。
+        _pad = 24.0
+        _x0 -= _pad; _y0 -= _pad; _x1 += _pad; _y1 += _pad
         _bw, _bh = max(1, _x1 - _x0), max(1, _y1 - _y0)
         sc = min(1.0, 4096.0 / max(_bw, _bh, 1))
         iw, ih = max(1, int(_bw * sc)), max(1, int(_bh * sc))
@@ -2659,42 +3011,101 @@ class OutputStudio(QWidget):
             #   ⚠ 两行用两种字号 ⇒ 先量高度再整体居中，否则 UV 行会往下漂、小格里被裁。
             pw, ph = OM.effective_size(cfg, s)
             uv = OM.screen_uv(cfg, s)
-            # ★ 小框自适应：框太小就**只画名字一行**，别让三行叠在一起（用户图1）
+            # ★ 2026-11-11（用户：L1 显示不完全）：以前只按**高度**缩字号，
+            #   窄屏（L1 203×597）的 UV 行比格子宽得多，直接左右被裁。
+            #   现在名字/分辨率/UV 三组文字都按**可用宽度**逐级缩字号；
+            #   UV 还放不下就拆成两行（→ 前 / → 后），保证完整显示。
             _small = (r.width() < 120 or r.height() < 60)
+            _avail_w = max(20.0, r.width() - 8.0)
+            _avail_h = max(18.0, r.height() - 8.0)
             fs = int(max(8, min(40, min(max(12.0, r.width()),
                                         max(12.0, r.height())) / 6.5)))
             if _small:
                 fs = max(8, min(fs, int(r.height() / 2.2)))
+            head_lines = ([str(s.get("name") or "")] if _small else
+                          [str(s.get("name") or ""), "%d × %d" % (pw, ph)])
             f_head = QFont("Microsoft YaHei", fs, QFont.Bold)
-            f_uv = QFont("Consolas", max(7, int(fs * 0.62)))
-            head = (str(s.get("name") or "") if _small
-                    else "%s\n%d × %d" % (s.get("name") or "", pw, ph))
-            uvline = ("UV %.4f,%.4f → %.4f,%.4f" % (uv[0], uv[1], uv[2], uv[3])
-                      if not _small else "")
-            fm1 = QFontMetrics(f_head)
-            fm2 = QFontMetrics(f_uv)
-            # 小框只画一行 ⇒ 高度也按一行算，且整体 clamp 在 r 内（drawText 不越界）
-            _lines = 1 if _small else 2
-            h1 = fm1.lineSpacing() * _lines
-            h2 = 0 if _small else fm2.lineSpacing()
+
+            def _fit_width(font, lines, min_pt):
+                while font.pointSize() > min_pt:
+                    fm = QFontMetrics(font)
+                    if all(fm.horizontalAdvance(str(t)) <= _avail_w for t in lines):
+                        break
+                    font.setPointSize(font.pointSize() - 1)
+                return font
+
+            f_head = _fit_width(f_head, head_lines, 7)
+            fs = int(f_head.pointSize())
+            uv_lines = []
+            f_uv = None
+            if not _small:
+                uvline = "UV %.4f,%.4f → %.4f,%.4f" % (uv[0], uv[1], uv[2], uv[3])
+                f_uv = QFont("Consolas", max(7, int(fs * 0.62)))
+                f_uv = _fit_width(f_uv, [uvline], 6)
+                _fmu = QFontMetrics(f_uv)
+                if _fmu.horizontalAdvance(uvline) > _avail_w and "→" in uvline:
+                    _a, _b = uvline.split("→", 1)
+                    uv_lines = [_a.rstrip() + " →", _b.strip()]
+                    f_uv = _fit_width(f_uv, uv_lines, 6)
+                else:
+                    uv_lines = [uvline]
+
+            def _metrics():
+                _fm1 = QFontMetrics(f_head)
+                _h1 = _fm1.lineSpacing() * len(head_lines)
+                _h2 = 0
+                if f_uv is not None and uv_lines:
+                    _h2 = QFontMetrics(f_uv).lineSpacing() * len(uv_lines)
+                return _h1, _h2
+
+            h1, h2 = _metrics()
             total = h1 + h2 + 4
-            if total > r.height():
-                # 再降级：缩小字号直到放得下（最少 8px）
-                while fs > 8 and total > r.height():
-                    fs -= 1
-                    f_head = QFont("Microsoft YaHei", fs, QFont.Bold)
-                    fm1 = QFontMetrics(f_head)
-                    h1 = fm1.lineSpacing() * _lines
-                    total = h1 + h2 + 4
-                h1 = min(h1, max(8, int(r.height())))
+            # 高度也放不下时，名字和 UV 字号一起降（不低于 6~7pt）
+            while total > _avail_h and (f_head.pointSize() > 7
+                                        or (f_uv is not None
+                                            and f_uv.pointSize() > 6)):
+                if f_head.pointSize() > 7:
+                    f_head.setPointSize(f_head.pointSize() - 1)
+                if f_uv is not None and f_uv.pointSize() > 6:
+                    f_uv.setPointSize(f_uv.pointSize() - 1)
+                h1, h2 = _metrics()
                 total = h1 + h2 + 4
-            top = max(r.y(), r.center().y() - total / 2.0)
+            top = max(r.y() + 2, r.center().y() - total / 2.0)
             p.setFont(f_head)
             p.setPen(QColor("#ffffff"))
-            p.drawText(QRectF(r.x(), top, r.width(), h1), Qt.AlignCenter, head)
-            p.setFont(f_uv)
-            p.setPen(QColor(235, 235, 235, 235))
-            p.drawText(QRectF(r.x(), top + h1 + 2, r.width(), h2), Qt.AlignCenter, uvline)
+            p.drawText(QRectF(r.x() + 2, top, r.width() - 4, h1),
+                       Qt.AlignCenter, "\n".join(head_lines))
+            if f_uv is not None and uv_lines:
+                p.setFont(f_uv)
+                p.setPen(QColor(235, 235, 235, 235))
+                p.drawText(QRectF(r.x() + 2, top + h1 + 2,
+                                  r.width() - 4, h2),
+                           Qt.AlignCenter, "\n".join(uv_lines))
+            # ★ 2026-11-11（用户图1）：每个屏幕左上角 / 右下角标出**像素坐标**。
+            #   坐标是布局坐标（与 JSON `pixel_rect` 同口径），不是缩放后的图像坐标。
+            try:
+                _pxl = "%d,%d" % (int(round(x)), int(round(y)))
+                _pxr = "%d,%d" % (int(round(x + w)), int(round(y + h)))
+                _fpx = QFont("Consolas", max(9, min(16, int(fs * 0.75))))
+                _fmp = QFontMetrics(_fpx)
+                p.save()
+                p.setClipRect(r.adjusted(1, 1, -1, -1))
+                p.setFont(_fpx)
+                for _txt, _bx, _by in (
+                        (_pxl, r.x() + 4, r.y() + 3),
+                        (_pxr, r.right() - _fmp.horizontalAdvance(_pxr) - 4,
+                         r.bottom() - _fmp.height() - 2)):
+                    _tw = _fmp.horizontalAdvance(_txt)
+                    _th = _fmp.height()
+                    _bx = max(r.x() + 2, min(_bx, r.right() - _tw - 2))
+                    _by = max(r.y() + 1, min(_by, r.bottom() - _th - 1))
+                    p.fillRect(QRectF(_bx - 2, _by - 1, _tw + 4, _th + 1),
+                               QColor(0, 0, 0, 165))
+                    p.setPen(QColor(255, 255, 255, 240))
+                    p.drawText(QPointF(_bx, _by + _fmp.ascent()), _txt)
+                p.restore()
+            except Exception:                                  # noqa: BLE001
+                pass
         p.end()
         img.save(os.path.join(folder, base + ".png"))
 
@@ -3215,6 +3626,8 @@ class CropDialog(QDialog):
         super().__init__(parent or studio)
         self.studio = studio
         self.screen = screen
+        self._snapshot = copy.deepcopy(screen or {})
+        self._accepted = False
         self.setWindowTitle("裁切（拖框选择源屏上的区域）")
         self.resize(720, 480)
         cfg = studio.active_config()
@@ -3231,6 +3644,10 @@ class CropDialog(QDialog):
         lay.addWidget(self.lbl)
         btn = QHBoxLayout()
         btn.addStretch(1)
+        b = QPushButton("取消")
+        b.setToolTip("丢弃本次裁切并恢复打开窗口时的 UV/尺寸")
+        b.clicked.connect(self._cancel_changes)
+        btn.addWidget(b)
         b = QPushButton("完成")
         b.clicked.connect(self.accept)
         btn.addWidget(b)
@@ -3249,7 +3666,32 @@ class CropDialog(QDialog):
             self._on_commit(list(self.canvas.uv))
         except Exception:                                          # noqa: BLE001
             pass
+        self._accepted = True
         super().accept()
+
+    def _cancel_changes(self):
+        """取消：恢复打开窗口时的 UV/尺寸，并让引擎回到旧值。"""
+        if getattr(self, "_accepted", False):
+            return
+        try:
+            if isinstance(self.screen, dict):
+                self.screen.clear()
+                self.screen.update(copy.deepcopy(self._snapshot or {}))
+            self.studio.apply()
+        except Exception:                                      # noqa: BLE001
+            pass
+        super().reject()
+
+    def reject(self):
+        if not getattr(self, "_accepted", False):
+            try:
+                if isinstance(self.screen, dict):
+                    self.screen.clear()
+                    self.screen.update(copy.deepcopy(self._snapshot or {}))
+                self.studio.apply()
+            except Exception:                                  # noqa: BLE001
+                pass
+        super().reject()
 
     def set_uv(self, uv):
         """外部（右侧 UV 输入框）改了 UV ⇒ 框跟着动。"""
@@ -3450,11 +3892,11 @@ class OutputCanvasWindow(QDialog):
             pass
 
     def _apply_changes(self):
+        """「应用」：把副本里的三样东西合并回**真配置**，再写盘 + 下发引擎。"""
         try:
             self.studio._flush_geometry_apply()
         except Exception:                                          # noqa: BLE001
             pass
-        """「应用」：把副本里的三样东西合并回**真配置**，再写盘 + 下发引擎。"""
         try:
             # ⚠ 必须用**当前**的 active_config()：`studio.apply()` 之后配置对象可能被替换，
             #   窗口打开时抓的 `_real_cfg` 会变成孤儿 ⇒ 合并写了等于没写（include 失效的真因）。
@@ -3477,8 +3919,13 @@ class OutputCanvasWindow(QDialog):
             #   否则之后任何"取消/关窗"都会把视图拉回打开前的旧排版（用户重开看到旧值）。
             self._snapshot = copy.deepcopy(self.cfg)
             self._applied = True
-        except Exception:                                          # noqa: BLE001
-            pass
+        except Exception as e:                                     # noqa: BLE001
+            try:
+                QMessageBox.warning(self, "应用失败", "排版没有写入配置：\n%s: %s"
+                                    % (type(e).__name__, e))
+            except Exception:                                  # noqa: BLE001
+                pass
+            return
         self._backup = None
         self.accept()
 

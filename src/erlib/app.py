@@ -20,6 +20,7 @@ r"""erlib 界面 —— 「选曲库文件夹 → 扫描 → 勾选 → 导出 `
 import os
 import sys
 import time
+import traceback
 
 from PySide6.QtCore import QEvent, QSize, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QIcon
@@ -42,6 +43,22 @@ APP_TITLE = "ERLIB曲库分析"
 # ★ 2026-11-08：对外版本通道（RC3 → RC4）。只加在主窗标题上，
 #   `APP_TITLE` 保持原样 —— 弹窗文案与黑盒脚本的窗口查找都按它匹配。
 APP_CHANNEL = "RC4"
+
+# ★ 2026-11-12（用户反馈「打包后点进去没有之前的歌曲」）：启动诊断日志。
+#   main() 里打开日志文件后把写函数放进 _BOOT，界面/数据加载路径可以随时 _blog()；
+#   这样「窗口在、列表空」时日志里能看到 work 路径 / exists / 读到几首 / 异常栈。
+#   `ERLIB_BOOT_LOG` 环境变量可覆盖日志路径（测试时指到工作区，避免写 AppData）。
+_BOOT = {"write": None, "path": ""}
+
+
+def _blog(msg):
+    w = _BOOT.get("write")
+    if w is None:
+        return
+    try:
+        w(msg)
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 def work_path():
@@ -721,18 +738,34 @@ class ErlibWindow(QMainWindow):
 
     def _load_existing(self):
         """启动时把工作库里已有的歌列出来（这样续扫/再次导出都能看到）。"""
+        _blog("load_existing  work=%s  exists=%s"
+              % (self.work, os.path.isfile(self.work)))
         if not os.path.isfile(self.work):
             return
+        n = 0
         try:
             self.tbl.setUpdatesEnabled(False)
             with LibReader(self.work) as r:
                 for s in r.songs():
                     self._add_row(s, checked=True, reader=r)
-            m = LibReader(self.work).meta()
+                    n += 1
+                m = r.meta()
             self.root = m.get("root", "") or ""
             self._set_root(self.root)
+            _blog("load_existing OK  songs=%d  root=%r" % (n, self.root))
         except Exception as e:                                   # noqa: BLE001
+            # ★ 2026-11-12（用户反馈「打包后打开是空的」）：不能只写状态栏 ——
+            #   弹出可见提示 + 记完整异常栈，否则用户只看到空表、我们也无从查。
+            _blog("load_existing FAILED after %d rows: %r\n%s"
+                  % (n, e, traceback.format_exc()))
             self.lbl.setText("读取工作库失败：%s" % e)
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "读取工作库失败：%s\n\n工作库：%s\n\n"
+                "常见原因：1) 安全软件拦截读取；2) 内存不足；"
+                "3) 工作库文件损坏（同目录有 .bak-* 备份可恢复）。\n"
+                "详细日志：%%LOCALAPPDATA%%\\AutoVJ\\erlib_boot.log"
+                % (e, self.work))
         finally:
             self.tbl.setUpdatesEnabled(True)
             self._update_status()
@@ -958,6 +991,22 @@ class ErlibWindow(QMainWindow):
         self.tbl.setUpdatesEnabled(False)
         try:
             w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
+        except Exception as e:                                   # noqa: BLE001
+            # ★★ 2026-11-12「重新分析卡 0%」：原来这里只有 try/finally、没有 except，
+            #   构造 LibWriter 抛异常（库被占用/安全软件拦截/文件损坏）时这个槽直接
+            #   静默失败 —— 按钮状态都不变、进度条停在 0%，用户只能看到"卡 0%"。
+            _blog("LibWriter 打开失败  work=%s  err=%r\n%s"
+                  % (self.work, e, traceback.format_exc()))
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "打开工作库失败：%s\n\n"
+                "工作库路径：%s\n\n"
+                "常见原因：\n"
+                "· 另一个 ERLIB 窗口（或上次没退干净的进程）正占用它\n"
+                "· 安全软件拦截了数据库文件\n"
+                "· 文件损坏（可先把上面这个文件改名备份，软件会重建空库）\n\n"
+                "诊断日志：%s" % (e, self.work, _BOOT.get("path") or "(未写)"))
+            return
         finally:
             self.tbl.setUpdatesEnabled(True)
         # 续扫：文件里已有的先列出来并标记为已分析
@@ -1002,10 +1051,32 @@ class ErlibWindow(QMainWindow):
             self.scan_th.stop()
             self.lbl.setText("正在停止（等当前这首扫完）…")
 
+    def closeEvent(self, ev):
+        """关窗时先停后台线程，避免 QThread 在运行中被销毁（会直接 abort）。"""
+        try:
+            if self.scan_th is not None and self.scan_th.isRunning():
+                self.scan_th.stop()
+                self.scan_th.wait(5000)
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            if self.exp_th is not None and self.exp_th.isRunning():
+                self.exp_th.wait(5000)
+        except Exception:                                        # noqa: BLE001
+            pass
+        super().closeEvent(ev)
+
     def _on_prog(self, done, total, path):
         if total > 0:
             self.bar.setRange(0, total)
             self.bar.setValue(done)
+        # ★ 2026-11-12：进度也写诊断日志 —— 「卡 0%」时至少能看到扫到第几首、
+        #   是不是单首特别慢/在反复重试。
+        try:
+            _blog("scan_progress %d/%d  %s" % (done, total,
+                                               os.path.basename(path or "")))
+        except Exception:                                        # noqa: BLE001
+            pass
         left = ""
         if done > 0 and total > done:
             per = 3.0
@@ -1033,10 +1104,21 @@ class ErlibWindow(QMainWindow):
                % (st.get("ok", 0), st.get("fail", 0), st.get("skip", 0),
                   st.get("elapsed", 0) / 60.0))
         errs = st.get("errors") or []
+        mem_err = any("MemoryError" in str(b) for a, b in errs)
+        _blog("scan_done ok=%s fail=%s skip=%s elapsed=%.1fs mem_err=%s"
+              % (st.get("ok"), st.get("fail"), st.get("skip"),
+                 float(st.get("elapsed") or 0.0), mem_err))
         if errs:
             msg += "\n失败原因（前 5 条）：\n"
             msg += "\n".join("· %s\n    %s" % (a, b) for a, b in errs[:5])
             msg += "\n\n（完整原因见控制台输出）"
+        if mem_err:
+            # ★★ 2026-11-12「重新分析卡 0%」的真凶：fp 的 STFT + ORT arena 把
+            #   单首峰值顶到 ~4 GB，本机 commit 余量不足时每首都是 MemoryError。
+            #   现已降到 ~1.8 GB，但机器太满仍可能不够 ⇒ 明确告诉用户怎么办。
+            msg += ("\n\n⚠ 检测到「内存不足」（MemoryError）。\n"
+                    "请关掉浏览器等占内存的程序（或重启电脑）后再试；\n"
+                    "软件本身已把单首峰值内存从约 4 GB 降到约 1.8 GB。")
         elif st.get("ok", 0) == 0:
             msg += ("\n⚠ 一首都没扫到。请确认：\n"
                     "· 选的文件夹里真的有音频文件（flac/mp3/m4a/wav…）\n"
@@ -1056,6 +1138,7 @@ class ErlibWindow(QMainWindow):
             pass
         self.btn_stop.setEnabled(False)
         self._set_work_busy(False)                               # ★ 修复2：解除互斥
+        _blog("scan_fail %r" % (msg,))
         QMessageBox.warning(self, APP_TITLE, "扫描出错：%s" % msg)
 
     def _on_reanalyze(self):
@@ -1256,13 +1339,15 @@ class ErlibWindow(QMainWindow):
 def main():
     # ★ 2026-11-05：启动日志。打包后的 exe 出现「进程活着但不出窗口」，
     #   而源码运行正常 —— 必需有日志才知道卡在 QApplication 之前还是之后。
-    #   写到 %LOCALAPPDATA%\AutoVJ\erlib_boot.log（打包后也有写权限）。
+    # ★ 2026-11-12：支持 `ERLIB_BOOT_LOG` 覆盖路径（测试时指到工作区）；
+    #   并登记到 _BOOT，让 _load_existing 等数据路径也能写诊断。
     _blog = None
+    _bpath = os.environ.get("ERLIB_BOOT_LOG") or os.path.join(
+        os.environ.get("LOCALAPPDATA", "") or os.path.expanduser("~"),
+        "AutoVJ", "erlib_boot.log")
     try:
-        _bd = os.path.join(os.environ.get("LOCALAPPDATA", "") or os.path.expanduser("~"),
-                           "AutoVJ")
-        os.makedirs(_bd, exist_ok=True)
-        _blog = open(os.path.join(_bd, "erlib_boot.log"), "w", encoding="utf-8")
+        os.makedirs(os.path.dirname(os.path.abspath(_bpath)), exist_ok=True)
+        _blog = open(_bpath, "w", encoding="utf-8")
 
         def _log(msg):
             try:
@@ -1274,8 +1359,10 @@ def main():
         def _log(msg):
             pass
 
-    _log("start  frozen=%s  exe=%s" % (getattr(sys, "frozen", False),
-                                       sys.executable))
+    _BOOT["write"] = _log
+    _BOOT["path"] = _bpath
+    _log("start  frozen=%s  exe=%s  log=%s"
+         % (getattr(sys, "frozen", False), sys.executable, _bpath))
     from PySide6.QtWidgets import QApplication
     _log("import QApplication OK")
     app = QApplication(sys.argv)
@@ -1296,12 +1383,20 @@ def main():
     w = ErlibWindow()
     _log("ErlibWindow 构造完成 %dx%d  minW=%d"
          % (w.width(), w.height(), w.minimumWidth()))
+    _log("work=%s  exists=%s"
+         % (getattr(w, "work", "?"), os.path.isfile(getattr(w, "work", ""))))
     w.show()
     app.processEvents()
     _log("show 完成  visible=%s  geometry=%s"
          % (w.isVisible(), w.geometry()))
     w.raise_()
     w.activateWindow()
+    try:
+        import sounddevice as _sd
+        _log("sounddevice OK  devices=%d  default=%r"
+             % (len(_sd.query_devices()), getattr(_sd.default, "device", None)))
+    except Exception as e:                                       # noqa: BLE001
+        _log("sounddevice 不可用: %r" % (e,))
     _log("进入事件循环")
     return app.exec()
 

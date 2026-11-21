@@ -541,6 +541,111 @@ class ErlibDetailDialog(QDialog):
         self._refresh_grid_preview()
         self._mark_dirty()
 
+    # ★★★ 2026-11-13（用户「我主要要的是 8 拍和段落边界要对」）：
+    #   自动相位判据在个别歌上定不了（Clockwork Vespers 用户说偏 4 拍，四种判据全指向
+    #   当前相位）⇒ 手动微调入口：右键 ±1 / ±4 拍，写 `grid_manual.anchors`。
+    def _nudge_grid(self, beats):
+        """整首八拍线平移 `beats` 拍（写手动 anchors；保存后导出/切分一起跟随）。"""
+        try:
+            bl = float(self._beat_len_now() or 0.0)
+        except Exception:                                        # noqa: BLE001
+            bl = 0.0
+        if bl <= 0.0:
+            QMessageBox.information(self, "八拍线微调", "还没有可用的 BPM / 拍长。")
+            return False
+        d = float(beats) * bl
+        segs = self.wave.segments()
+        if segs:
+            # 多 BPM 分段：每段自己的 anchor 一起平移（段长不变）
+            for s in segs:
+                try:
+                    s["anchor"] = round(float(s.get("anchor") or 0.0) + d, 4)
+                except (TypeError, ValueError):
+                    pass
+            self.wave.set_segments(segs)
+        else:
+            a = float((self._grid or {}).get("anchor") or 0.0)
+            span = 8.0 * bl
+            self.wave.set_anchors([round((a + d) % span, 4)])
+            # 2026-11-18（用户要求）：不再记录相位校准表，重扫后完全由算法决定。
+        self._refresh_grid_preview()
+        self._mark_dirty()
+        return True
+
+    # ★★★ 2026-11-13（用户「段落边界差 8 拍」+ 偶数八拍规则）：
+    #   单条边界挪 8 拍会把两侧段长变成奇数（违反 16 拍整数倍），
+    #   所以只提供「从某点起整条尾巴平移 8 拍」—— Cothurnus 的「中段1 后移 8 拍」
+    #   正是这类操作；平移后尾巴被挤没就并进前一段。
+    #   注意：动的是**能量段落**（songs.sections），不是 BPM 分段。
+    def _shift_tail(self, sec, beats):
+        """把 `sec` 之后的能量段落边界整体平移 `beats` 拍（写回 songs.sections）。"""
+        try:
+            bl = float(self._beat_len_now() or 0.0)
+        except Exception:                                        # noqa: BLE001
+            bl = 0.0
+        if bl <= 0.0:
+            QMessageBox.information(self, "尾巴平移", "还没有可用的 BPM / 拍长。")
+            return False
+        secs = [dict(x) for x in (self._sections or [])]
+        if len(secs) < 2:
+            QMessageBox.information(self, "尾巴平移", "这首歌还没有能量段落，先「按 BPM 重新分段」。")
+            return False
+        d = float(beats) * bl
+        eps = 1e-6
+        out = [dict(x) for x in secs]
+        for x in out[:-1]:
+            try:
+                t = float(x.get("t1") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if t > sec + eps:
+                x["t1"] = t + d
+        for x in out[1:]:
+            try:
+                t = float(x.get("t0") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if t > sec + eps:
+                x["t0"] = t + d
+        out[0]["t0"] = 0.0
+        # 尾巴被挤没：末段 <= 1 拍 ⇒ 并进前一段
+        if len(out) >= 2:
+            try:
+                tail_len = float(out[-1]["t1"]) - float(out[-1]["t0"])
+            except (TypeError, ValueError):
+                tail_len = 0.0
+            if tail_len <= max(0.05, 1.0 * bl):
+                out[-2]["t1"] = out[-1]["t1"]
+                out.pop()
+        # 单调性护栏
+        for i in range(1, len(out)):
+            a0 = float(out[i - 1]["t1"])
+            t0 = float(out[i]["t0"])
+            if t0 < a0 - 1e-3:
+                out[i]["t0"] = a0
+            if float(out[i]["t1"]) <= float(out[i]["t0"]):
+                out[i]["t1"] = float(out[i]["t0"]) + 1e-3
+        try:
+            w = LibWriter(self.work, root=self.root, resume=True, app_ver="erlib")
+            try:
+                n = w.update_sections(self.sid, out, out)
+            finally:
+                w.close()
+            if not n:
+                QMessageBox.warning(self, "尾巴平移", "保存失败（工作库里找不到这首歌）。")
+                return False
+        except Exception as e:                                   # noqa: BLE001
+            QMessageBox.warning(self, "尾巴平移", "保存失败：%s" % e)
+            return False
+        self._sections = out
+        self._sections_raw = out
+        try:
+            self.wave.set_energy_sections([dict(x) for x in out])
+        except Exception:                                        # noqa: BLE001
+            pass
+        self._mark_dirty()
+        return True
+
     def _build_seg_menu(self, sec):
         """构造右键菜单（**只构造不弹出** —— 便于单测；`_on_wave_context_menu` 负责 exec）。
 
@@ -568,6 +673,25 @@ class ErlibDetailDialog(QDialog):
         menu.addSeparator()
         acts["half"] = menu.addAction("整段 ÷2 BPM（半速歧义）")
         acts["dbl"] = menu.addAction("整段 ×2 BPM（倍速歧义）")
+        menu.addSeparator()
+        # ★★★ 2026-11-13（用户「我主要要的是 8 拍和段落边界要对」）：
+        #   自动相位判据在个别歌上定不了（如 Clockwork Vespers 用户说整体偏 4 拍，
+        #   但重音/连拍/换和弦/kick 四种判据都指向当前相位）⇒ 给八拍线一个手动微调。
+        #   写进 `grid_manual.anchors`（`effective_grid` 取 anchors[0]），拍网整体平移；
+        #   ±4 拍时 beat 线位置不变、只有八拍线翻半句 —— 正是用户要的效果。
+        acts["nudge_p1"] = menu.addAction("八拍线延后 1 拍（+1）")
+        acts["nudge_m1"] = menu.addAction("八拍线提前 1 拍（−1）")
+        acts["nudge_p4"] = menu.addAction("八拍线延后 4 拍（+4）")
+        acts["nudge_m4"] = menu.addAction("八拍线提前 4 拍（−4）")
+        acts["reset_phase"] = menu.addAction("八拍线恢复自动相位")
+        acts["reset_phase"].setEnabled(bool(self.wave.anchors())
+                                       or bool(self.wave.segments()))
+        # ★★★ 2026-11-13（「段落边界差 8 拍」）：整条尾巴平移，
+        #   单条边界 ±8 拍会破坏偶数段长，这是唯一合法的 8 拍修正。
+        acts["tail_p8"] = menu.addAction("从 %.1fs 起整条尾巴后移 8 拍" % float(sec))
+        acts["tail_m8"] = menu.addAction("从 %.1fs 起整条尾巴前移 8 拍" % float(sec))
+        acts["tail_p8"].setEnabled(len(self._sections or []) >= 2)
+        acts["tail_m8"].setEnabled(len(self._sections or []) >= 2)
         menu.addSeparator()
         acts["clear"] = menu.addAction("清除全部分段（回到自动网格）")
         # 首段不能删（网格必须从 0 开始）；单段也没有「删除本段」的意义
@@ -633,6 +757,16 @@ class ErlibDetailDialog(QDialog):
                 self._refresh_grid_preview()
                 self._mark_dirty()
             return True
+        if key in ("nudge_p1", "nudge_m1", "nudge_p4", "nudge_m4"):
+            return self._nudge_grid({"nudge_p1": 1, "nudge_m1": -1,
+                                     "nudge_p4": 4, "nudge_m4": -4}[key])
+        if key == "reset_phase":
+            self.wave.set_anchors([])
+            self._refresh_grid_preview()
+            self._mark_dirty()
+            return True
+        if key in ("tail_p8", "tail_m8"):
+            return self._shift_tail(sec, 8 if key == "tail_p8" else -8)
         if key == "clear":
             self.wave.set_segments([])
             self._refresh_grid_preview()

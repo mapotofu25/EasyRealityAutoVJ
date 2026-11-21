@@ -116,6 +116,17 @@ DEFAULTS = {
         #   看一次可见视频源的最高帧率，把有效合成帧率压到源帧率（最低 24fps）。
         #   用户仍可在「渲染帧率」里设更低的上限；关闭此项则完全按 render_fps 跑。
         "fps_follow_source": True,
+        # ★ 2026-11-12：停止 VJ / 冻结 / 黑场时的空闲帧率。
+        #   这些状态下输出窗口已隐藏、Spout/NDI 也被 `running` 门控，只有主界面
+        #   预览还需要更新。默认 15fps：预览仍然实时，但解码/合成/GUI 缩放开销
+        #   约为 30fps 时的一半。设 30 可恢复原来的“停止也全速预览”。
+        "idle_fps": 15,
+        # ★ 2026-11-12：运行中但长时间没有音频（还没放歌/放完歌）时的「静音待机」。
+        #   画面停在上一次合成帧，播放器全部挂起，引擎/GUI 按 silent_standby_fps 跑。
+        #   音频一回来下一 tick 自动恢复，不影响演出。
+        "silent_standby_sec": 8.0,
+        "silent_standby_fps": 2.0,
+        "silent_standby_level": 0.002,
         # GPU 合成（QPainter on QOpenGLPaintDevice）：像素已验证与 CPU 一致。
         # ⚠ 默认关闭：实测引擎定时器下只能跑 ~24fps（GPU 回读/上下文同步），
         #   而 CPU 路径可稳定 30fps。需要“省 CPU 优先于帧率”的静态图场景可手动开。
@@ -182,10 +193,11 @@ DEFAULTS = {
         "out_dur": 1.5,               # 切出过渡时长（秒）：0.1 ~ 3
         "switch_sec": 0.0,            # 素材切换速度（秒）：Kv 显示期间每隔 N 秒轮换素材，0=不轮换
     },
-    "beat": {                         # 逐拍交替参数（模式为"逐拍交替"时生效）
+    "beat": {                         # 逐拍交替（独立开关，仅前景层 · 仅 drop 段）
+        "enabled": False,             # 总开关（默认关闭；老「模式=逐拍交替」迁移时自动打开）
         "pick_mode": "seq",           # seq / rand
         "interval_beats": 1,          # A↔B 交替间隔（拍）：1/4 1/2 1 2 4 8 16
-        "bars_per_pair": 2,
+        "bars_per_pair": 2,           # 旧版换对周期（仅兼容保留；现在换对跟段落走）
         "end_action": "loop",         # loop / reverse
     },
     "postfx": {                       # 后处理特效链（合成后、输出前）
@@ -331,6 +343,8 @@ class Config:
         # ★ 进程内写锁：串行化多线程 save()（后台扫描线程 + GUI 线程会并发调）。
         #   必须在 load()/`_migrate()` 之前创建 —— `_migrate()` 里就会调 save()。
         self._save_lock = threading.Lock()
+        self._timer_lock = threading.Lock()
+        self._pending_timer = None
         self.load()
         self._migrate()
 
@@ -404,6 +418,29 @@ class Config:
         except Exception:
             pass
 
+        # ★ 2026-11-21：逐拍交替从「素材切换节奏」里独立出来。
+        #   老配置 mode.manual == "beat" ⇒ 改成 normal 并打开独立开关；
+        #   每块屏的 params.mode.manual == "beat" 同样迁移，开关写到该屏 params.beat。
+        try:
+            _b = self.data.setdefault("beat", {})
+            if "enabled" not in _b:
+                _b["enabled"] = False
+            _md = self.data.setdefault("mode", {})
+            if str(_md.get("manual") or "") == "beat":
+                _md["manual"] = "normal"
+                _b["enabled"] = True
+                self.save()
+            for _c in ((self.data.get("output") or {}).get("configs") or []):
+                for _s in (_c.get("screens") or []):
+                    _pm = (_s.get("params") or {}).get("mode") or {}
+                    if str(_pm.get("manual") or "") == "beat":
+                        _pm["manual"] = "normal"
+                        _pb = (_s.setdefault("params", {})).setdefault("beat", {})
+                        _pb["enabled"] = True
+                        self.save()
+        except Exception:
+            pass
+
     # ---------- IO ----------
     def load(self):
         """读配置。**坏文件不能让软件打不开**：解析失败时退回 .bak，再不行就用默认值，
@@ -445,6 +482,29 @@ class Config:
         """别名：语义上更明确（供定时器调用）。"""
         self.flush()
 
+    def _schedule_flush(self):
+        """合并窗口到期后补写一次：避免“最后一次修改后没有下一次 save”丢盘。"""
+        try:
+            with self._timer_lock:
+                t = self._pending_timer
+                if t is not None and t.is_alive():
+                    return
+                t = threading.Timer(SAVE_COALESCE_SEC + 0.05, self._flush_from_timer)
+                t.daemon = True
+                self._pending_timer = t
+                t.start()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _flush_from_timer(self):
+        try:
+            with self._timer_lock:
+                self._pending_timer = None
+            if getattr(self, "_dirty", False):
+                self.save(force=True)
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def save(self, force: bool = False):
         """**原子写 + 多线程安全**：先写临时文件再替换，避免写一半被强杀 → 配置文件损坏。
 
@@ -469,6 +529,7 @@ class Config:
             _now = time.monotonic()
             if _now - float(getattr(self, "_last_write_t", 0.0)) < SAVE_COALESCE_SEC:
                 self._dirty = True
+                self._schedule_flush()
                 return
         with self._save_lock:
             self._last_write_t = time.monotonic()

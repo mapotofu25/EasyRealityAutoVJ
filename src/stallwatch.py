@@ -18,6 +18,7 @@
 日志：`%LOCALAPPDATA%\\AutoVJ\\ui_stall.log`
 """
 import os
+import queue
 import sys
 import threading
 import time
@@ -35,17 +36,45 @@ def log_path():
     return os.path.join(os.environ.get("LOCALAPPDATA", ""), "AutoVJ", "ui_stall.log")
 
 
+# ★ 2026-11-11（现场：GUI 线程 150~600ms 停顿）：`log_line()` 原来在**调用线程**
+#   上 `makedirs + open(append)`。`[OUT]` 每秒最多一行、`[DRAW]/[PV]` 探针每帧一行，
+#   磁盘一忙就把 GUI 自己卡住，而且卡顿日志本身又放大卡顿。
+#   现在只入队（微秒级），真正的写盘在后台 `autovj-stall-log` 线程；队列满就丢诊断行。
+_LOGQ = queue.Queue(maxsize=2048)
+
+
+def _log_writer():
+    while True:
+        try:
+            path, text = _LOGQ.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if text is None:
+            return
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(text)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+try:
+    threading.Thread(target=_log_writer, name="autovj-stall-log", daemon=True).start()
+except Exception:                                                # noqa: BLE001
+    pass
+
+
 def log_line(line):
-    """从别处往这个日志里写一行（例如 `engine._locked` 的锁获取超时）。
+    """从别处往这个日志里写一行（异步：调用线程只入队，不碰磁盘）。
 
     都是"界面卡住"这一类事件，放同一个文件最方便一起看。
     """
-    p = log_path()
     try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(p, "a", encoding="utf-8") as fh:
-            fh.write("[%s] %s\n" % (stamp, line))
+        _LOGQ.put_nowait((log_path(), "[%s] %s\n" % (stamp, line)))
     except Exception:                                            # noqa: BLE001
         pass
 

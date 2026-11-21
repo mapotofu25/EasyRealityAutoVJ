@@ -41,33 +41,43 @@ def _paint_image(p, img, W, H, aspect_lock=True):
         p.drawImage(target, img, QRectF(0, 0, iw, ih))
 
 
-class _GLView(QOpenGLWidget):
-    """GPU 缩放显示：QPainter 的 OpenGL 后端把 QImage 上传后由显卡缩放。
+if QOpenGLWidget is None:
+    # ★ 2026-11-20.23：打包漏掉 Qt6OpenGL.dll 时，`import PySide6.QtOpenGLWidgets`
+    #   会抛 ImportError（DLL load failed），上面的 except 把 QOpenGLWidget 置 None。
+    #   旧代码紧接着 `class _GLView(QOpenGLWidget)` ⇒ TypeError: NoneType takes no
+    #   arguments，整个 App 连启动都起不来（用户朋友实测就是这个）。
+    #   这里改为占位类；`OutputWindow.__init__` 有 `QOpenGLWidget is not None`
+    #   判断，占位类永远不会被实例化，输出窗口自动走 _CpuView。
+    class _GLView(QWidget):
+        pass
+else:
+    class _GLView(QOpenGLWidget):
+        """GPU 缩放显示：QPainter 的 OpenGL 后端把 QImage 上传后由显卡缩放。
 
-    输出窗口最常见的卡顿源是 4K 显示器上把 720p/1080p 画布用 CPU
-    SmoothPixmapTransform 放大：实测 720p→4K 单帧 13ms wall / 34ms CPU，
-    正好顶满 60fps 预算。这里改为 GPU 纹理缩放（同一帧实测约 0.4ms）。
-    """
+        输出窗口最常见的卡顿源是 4K 显示器上把 720p/1080p 画布用 CPU
+        SmoothPixmapTransform 放大：实测 720p→4K 单帧 13ms wall / 34ms CPU，
+        正好顶满 60fps 预算。这里改为 GPU 纹理缩放（同一帧实测约 0.4ms）。
+        """
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._img = None
-        self.aspect_lock = True
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        try:
-            self.setUpdateBehavior(QOpenGLWidget.NoPartialUpdate)
-        except Exception:
-            pass
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._img = None
+            self.aspect_lock = True
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            try:
+                self.setUpdateBehavior(QOpenGLWidget.NoPartialUpdate)
+            except Exception:
+                pass
 
-    def set_frame(self, img):
-        self._img = img
-        self.update()
+        def set_frame(self, img):
+            self._img = img
+            self.update()
 
-    def paintGL(self):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-        _paint_image(p, self._img, self.width(), self.height(), self.aspect_lock)
-        p.end()
+        def paintGL(self):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            _paint_image(p, self._img, self.width(), self.height(), self.aspect_lock)
+            p.end()
 
 
 class _CpuView(QWidget):
@@ -84,10 +94,23 @@ class _CpuView(QWidget):
         self.update()
 
     def paintEvent(self, _ev):
+        import os
+        import time
+        _t0 = time.perf_counter()
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         _paint_image(p, self._img, self.width(), self.height(), self.aspect_lock)
         p.end()
+        if os.environ.get("AUTOVJ_DRAW_PROBE") == "1":
+            try:
+                import stallwatch as _sw
+                _sw.log_line("[OW] paint=%.1fms size=%dx%d img=%s" %
+                             ((time.perf_counter() - _t0) * 1000.0,
+                              self.width(), self.height(),
+                              "%dx%d" % (self._img.width(), self._img.height())
+                              if self._img is not None else "None"))
+            except Exception:                                  # noqa: BLE001
+                pass
 
 
 class OutputWindow(QWidget):
@@ -437,7 +460,17 @@ class OutputWindow(QWidget):
             self.show()
 
     def set_borderless(self, on: bool):
-        flags = Qt.FramelessWindowHint | Qt.Window if on else Qt.Window
+        # ⚠ setWindowFlags 是整体替换：必须自己保留「窗口置顶」，
+        #   否则用户勾了置顶后一碰无边框，置顶就丢了。
+        flags = Qt.Window
+        if on:
+            flags |= Qt.FramelessWindowHint
+        try:
+            if (self.cfg["output"].get("always_top")
+                    or bool(self.windowFlags() & Qt.WindowStaysOnTopHint)):
+                flags |= Qt.WindowStaysOnTopHint
+        except Exception:                                      # noqa: BLE001
+            pass
         self._set_flags_keep_state(lambda: self.setWindowFlags(flags))
 
     def set_always_top(self, on: bool):

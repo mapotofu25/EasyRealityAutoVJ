@@ -260,6 +260,13 @@ ZH2EN = {
     "输出显示器": "Output Display",
     "选择后输出窗口会全屏到对应显示器（适合双屏演出）":
         "The output window will go fullscreen on the selected display (for dual-screen shows)",
+    "输出显示器已被占用": "Output Display Already in Use",
+    "显示器 {} 已经被「{}」占用。\n多屏多路下，每块屏幕必须使用不同的输出显示器。":
+        "Display {} is already used by “{}”.\n"
+        "In multi-screen multi-route mode, every screen must use a different output display.",
+    "　·　已占用（{}）": "　·　occupied by {}",
+    "该显示器已被「{}」占用，不能重复选择":
+        "This display is already used by “{}” and cannot be selected again",
     "Spout 输出": "Spout Output",
     # ★ 2026-10-30：复选框标签带用途说明（全角括号，中文排版更规整）。
     #   「本地」= 只有同一台电脑上的程序能收；「局域网」= 通过网络发给别的设备。
@@ -482,6 +489,17 @@ ZH2EN = {
     "重扫此素材的动态/铺满度": "Rescan this clip's motion / coverage",
     "全量重扫素材": "Rescan all media",
     "按动态档给本层自动挑素材": "Auto-pick clips by motion tier",
+    "打开后：本层从「手动图层」变成「自动匹配图层」。\n"
+    "· 原来手动挑的素材会被自动素材池替换；\n"
+    "· 按曲风 / 动态档 / 图层角色，从素材库重新挑画面；\n"
+    "· 素材池会重建，手动固定的素材不再生效（码表图层不适用）。\n"
+    "关闭后回到手动模式，需要重新挑素材。":
+        "When on, this layer changes from a manual layer to an auto-match layer.\n"
+        "· Manually picked clips are replaced by the auto clip pool;\n"
+        "· Clips are re-picked from the library by genre / motion tier / layer role;\n"
+        "· The clip pool is rebuilt; manually fixed clips no longer apply "
+        "(not used by cue-sheet layers).\n"
+        "When off, it returns to manual mode and you need to pick clips again.",
     "自动（按动态档匹配画面）": "Auto (match by motion tier)",
     "自动图层会按「低/中/高动态」实时替换画面，手动拖入的素材不生效":
         "Auto layers swap clips by motion tier; manually dropped clips are ignored",
@@ -571,9 +589,16 @@ ZH2EN = {
     # ==================== 占位符模板（供 i18n.Tf 使用）====================
     "已有扫描在进行中，请稍候。": "A scan is already running, please wait.",
     "扫描正在进行中，请稍后再清除。": "A scan is running, please try again later.",
+    "删除全部指纹、节拍网格与自动段落（保留手动标注与码表）；"
+    "同时清理已从曲库删除的歌残留的指纹":
+        "Delete all fingerprints, beat grids and auto sections (manual edits "
+        "and cue sheets are kept); also cleans fingerprints left behind by "
+        "tracks already removed from the library",
     # ★ 2026-10-30：文案随「清除分析数据」的语义一起改（只清本机算法产物，
     #   码表与导入的曲库分析包一律保留）。中文原文是 key，必须与 ui_main 逐字一致。
     "将清除**本机曲库的自动分析结果**：指纹、BPM、节拍网格、自动段落。\n"
+    "（包括已从曲库删除、但仍留在指纹库里的历史指纹——删歌后导入包仍在报重复，"
+    "点这里就能清干净。）\n"
     "以下内容一律保留：\n"
     "  · 音乐文件与曲库列表\n"
     "  · 手工标注（手改的 BPM / 拍锚点 / 段落）\n"
@@ -581,6 +606,8 @@ ZH2EN = {
     "  · **导入的曲库分析包**：节拍网格、封面、指纹":
         "This clears **this machine's auto-analysis**: fingerprints, BPM, beat grid, "
         "auto sections.\n"
+        "(Including stale fingerprints of songs already removed from the library — "
+        "if imports still report duplicates after deleting tracks, this cleans them.)\n"
         "These are always kept:\n"
         "  · Music files and the library list\n"
         "  · Manual edits (hand-set BPM / beat anchors / sections)\n"
@@ -1054,6 +1081,8 @@ ZH2EN = {
         "(or 192.168.1.100:47811)",
     # ★ 2026-10-08（erlib 第二步）：导入曲库分析包（DJ 机扫好的曲风/封面/指纹/网格）
     "导入曲库分析包": "Import analysis package",
+    "导入 %v/%m": "Import %v/%m",
+    "导入中…": "Importing…",
     "导入 erlib 导出的 .eravjlib（DJ 机扫好的曲风/封面/指纹/节拍网格）":
         "Import .eravjlib exported by erlib "
         "(genre / cover / fingerprint / grid scanned on the DJ machine)",
@@ -1070,14 +1099,33 @@ ZH2EN = {
         "(no audio file on this machine; identified by fingerprint)",
     "导入包曲目": "Imported Track",
     # ---- 曲库删除 / 批量删除（2026-10-09）----
+    "删除已勾选": "Delete Checked",
+    "删除当前勾选的曲目（本机曲库 + 导入库）；码表派生行请到「码表」页删除该表":
+        "Delete the checked tracks (local library + imported library); "
+        "cue-sheet rows must be removed by deleting the sheet on the Cue Sheets page",
+    "请先勾选要删除的曲目。": "Check the tracks you want to delete first.",
+    "勾选的都是码表派生行，曲库里没有可删除的实体。\n"
+    "请到「码表」页删除对应码表，这些行会自动消失。":
+        "All checked rows come from cue sheets; there are no library entries to delete.\n"
+        "Delete the cue sheet on the Cue Sheets page and these rows will disappear.",
+    "删除已勾选的 {} 首？": "Delete the {} checked track(s)?",
+    "· 本机曲库：{} 首（会删除指纹/分析数据，音频文件不动）":
+        "· Local library: {} track(s) (fingerprints/analysis are deleted; audio files are kept)",
+    "· 导入库：{} 首（会删除封面/指纹）":
+        "· Imported library: {} track(s) (covers/fingerprints are deleted)",
+    "· 另有 {} 首码表派生行不会删除（请到「码表」页处理）":
+        "· {} cue-sheet row(s) will not be deleted (manage them on the Cue Sheets page)",
+    "删除后无法在软件内撤销。": "This cannot be undone inside the app.",
+    "删除失败：{}": "Delete failed: {}",
     "从曲库移除（{} 首）": "Remove from library ({} tracks)",
     "从导入库移除": "Remove from imported library",
     "从导入库移除（{} 首）": "Remove from imported library ({} tracks)",
     "\n…等共 {} 首": "\n…{} tracks in total",
-    "从曲库移除这 {} 首？\n\n{}\n\n只从曲库列表移除（连同曲风/网格等分析数据）；音频文件本身不会被删除。":
+    "从曲库移除这 {} 首？\n\n{}\n\n会从曲库列表移除，并删除它们的指纹/节拍网格等分析数据（之后不再识别这些歌）；音频文件本身不会被删除。":
         "Remove these {} tracks from the library?\n\n{}\n\n"
-        "This only removes them from the library list (together with the "
-        "genre/grid analysis data); the audio files themselves are not deleted.",
+        "They are removed from the library list, and their fingerprints/grid "
+        "analysis are deleted (they will no longer be recognized); the audio "
+        "files themselves are not deleted.",
     "从导入库移除这 {} 首？\n\n它们的曲风、封面与指纹会一起删除 —— 删除后就不再认得这些歌；本机自己扫描的曲目不受影响。":
         "Remove these {} tracks from the imported library?\n\n"
         "Their genre, cover and fingerprints are deleted as well — they will "
@@ -1153,8 +1201,10 @@ ZH2EN = {
     "码表": "Cue sheet",
     "码表曲目": "Cue Sheet Track",
     "   ｜ 含码表 {} 首": "   | incl. {} from cue sheets",
-    "码表曲目跟随码表：请到「码表」页删除该表":
-        "Cue-sheet tracks follow their sheet: delete the sheet on the “Cue Sheets” page",
+    "码表曲目跟随码表：打开「码表」页处理…":
+        "Cue-sheet tracks follow their sheet: open the “Cue Sheets” page to manage…",
+    "在「码表」页删除这张表后，这些派生行会自动消失":
+        "Delete the sheet on the “Cue Sheets” page and these derived rows disappear automatically",
     "来自码表（本机曲库未收录；码表删除后这行自动消失）":
         "From a cue sheet (not in the local library; this row disappears "
         "when the sheet is deleted)",

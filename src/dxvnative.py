@@ -92,17 +92,44 @@ def block_bytes(w, h, fmt):
     return (int(w) // 4) * (int(h) // 4) * (8 if int(fmt) == 1 else 16)
 
 
+_TLS = threading.local()
+
+
+def _dst_buf(n):
+    """每线程复用的解包缓冲：**不再每帧 create_string_buffer(8MB)**。
+
+    ★ 2026-11-11（现场：多屏预览卡 / py-spy 里 `create_string_buffer` 常驻）：
+      旧实现每帧新分配并清零 1080p 的 8.3MB 缓冲，再在 glctx 里 `from_buffer_copy`
+      整幅复制一次。两层缓冲都在 GIL 下走，10 层解码时把 GUI/引擎线程切得很碎。
+      这里按线程复用一块（只增不减），glctx 再用 `from_buffer` **零拷贝**取地址。
+      安全性：`unpack()` 的返回值和 `worker.decode()` 在同一个解码循环里同步消费，
+      下一帧才会覆写这块缓冲；调用方绝不能把返回的 memoryview 留到下一帧。
+    """
+    n = int(n)
+    cap = int(getattr(_TLS, "cap", 0) or 0)
+    if cap < n:
+        cap = max(n, n + (n >> 3))          # 多留 12.5%，分辨率小变不重分配
+        buf = ctypes.create_string_buffer(cap)
+        _TLS.buf = buf
+        _TLS.mv = memoryview(buf).cast("B")
+        _TLS.cap = cap
+    return _TLS.mv
+
+
 def unpack(payload, fmt, raw, out_len):
     """还原 BC 块流；失败返回 None（调用方回退软解）"""
     d = _load()
     if d is None or not payload or out_len <= 0:
         return None
     blob = bytes(payload)
-    dst = ctypes.create_string_buffer(int(out_len))
+    mv = _dst_buf(out_len)
+    dst = (ctypes.c_char * int(out_len)).from_buffer(mv)   # 零拷贝取地址
     rc = d.dxv_unpack(blob, len(blob), dst, int(out_len), int(fmt), int(raw))
     if rc != 0:
         return None
-    return dst.raw
+    # ★ 2026-11-11：返回**复用缓冲上的 memoryview**（不 copy）。glctx 直接用它
+    #   调 glCompressedTexImage2D；同一解码线程同步消费，下一帧才覆写。
+    return mv[:int(out_len)]
 
 
 def frame_blocks(payload, w, h):

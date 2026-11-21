@@ -314,12 +314,17 @@ def _dur(v):
 def _local_dur(rec):
     """本机 meta（`cfg["music_meta"][路径]`）的时长（秒）；没有 ⇒ None。
 
-    ⚠ BPM 与时长都在 `meta[路径]["grid"]` 里（曲库扫描建库时写入），不在顶层。
+    ⚠ BPM 与时长在 `meta[路径]["grid"]` 里（曲库扫描建库时写入）；旧配置可能
+      只写在顶层 `duration`/`dur` —— 与 `engine._cue_local_dur` 同一优先级。
     """
-    g = rec.get("grid") if isinstance(rec, dict) else None
-    if not isinstance(g, dict):
+    if not isinstance(rec, dict):
         return None
-    return _dur(g.get("dur"))
+    g = rec.get("grid") if isinstance(rec.get("grid"), dict) else {}
+    for v in (g.get("dur"), rec.get("duration"), rec.get("dur")):
+        d = _dur(v)
+        if d is not None:
+            return d
+    return None
 
 
 def _meta_key(title, artist, dur):
@@ -333,7 +338,13 @@ def _meta_key(title, artist, dur):
         d = int(round(float(dur or 0.0) / 2.0) * 2)
     except (TypeError, ValueError):
         d = 0
-    return "%s|%s|%d" % (_norm(artist), _norm(title), d)
+    # ★ 2026-11-18：必须**逐字**复用 `Identity.meta_key` —— 这里原来自己
+    #   用 `_norm()`（多去了 master/remaster）算，和码表里存的 meta_id 不同公式
+    #   ⇒ 本机有这首歌也会判成“未覆盖”，派生行重复。
+    try:
+        return cuesheet.Identity.meta_key(title, artist, d)
+    except Exception:                                            # noqa: BLE001
+        return "%s|%s|%d" % (_norm(artist), _norm(title), d)
 
 
 def _covered(track, rec):
@@ -471,6 +482,40 @@ def _track_key(track):
     return "%s|%s" % (_norm(track.get("title")), _norm(track.get("artist")))
 
 
+def _add_imported_coverage(local):
+    """把**导入库**（`imported_meta.db`）也并入“本机已有”索引。
+
+    ★ 2026-11-17（用户：曲库里有两个 Can We Believe That）：
+      码表派生行原先只查 `music_meta`（本机扫描曲库），所以“导入库里已经有
+      同一首歌”时仍会再冒出一行码表派生行。两行同名，用户以为 md5/指纹没生效。
+      导入库没有本机路径，这里用 `@imported:<sid>` 占位；只用于 `covers()` 判定，
+      不会当作真实文件路径写回界面。
+    """
+    try:
+        import config as _cfg
+        import imported_lib as _IL
+        for _r in (_IL.display_rows(_cfg.app_base_dir()) or []):
+            if not isinstance(_r, dict):
+                continue
+            try:
+                _sid = int(_r.get("sid") or -1)
+            except (TypeError, ValueError):
+                _sid = -1
+            if _sid < 0:
+                continue
+            _dur = float(_r.get("dur") or 0.0)
+            local.add({
+                "title": str(_r.get("title") or ""),
+                "artist": str(_r.get("artist") or ""),
+                # `_LocalIndex.add` 的时长口径是 `grid.dur`；只给 duration 会变成 None。
+                "grid": {"dur": _dur},
+                "duration": _dur,
+            }, "@imported:%d" % _sid)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return local
+
+
 def library_rows(cfg, index=None):
     """码表曲目 → 曲库**派生行**（只列"本机曲库没覆盖"的）。
 
@@ -508,6 +553,8 @@ def library_rows(cfg, index=None):
     if isinstance(mm, dict):
         for _path, rec in mm.items():
             local.add(rec, _path)
+    # ★ 导入库也算“本机已有”：避免同一首出现“导入库一行 + 码表派生一行”。
+    _add_imported_coverage(local)
     # ★ 0 级：导入码表时用**指纹内容重合率**算好的对账表（`fp_id → 本机路径`）。
     #   `fp_id` 相等只能判"完全同一个 PCM"，判不了"同一首的不同压制版本"（用户 2026-10-30）。
     try:

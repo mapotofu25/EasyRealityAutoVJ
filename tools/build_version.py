@@ -57,8 +57,9 @@ def version_str(date_key, seq):
 
 
 def zip_name(date_key, seq):
-    y, m, d = date_key.split("-")
-    return "EasyRealityAutoVJ_测试版%s%s%02d.zip" % (m, d, seq)
+    # ★ 2026-11-21：1.0 正式版 —— 发布包固定叫 EasyRealityAutoVJ_1.0.zip
+    #   （不再带「测试版 + 日期号」；内部构建号仍写 _build_ver.py 供日志/兼容比较）
+    return "EasyRealityAutoVJ_1.0.zip"
 
 
 # ---------------------------------------------------------------- 读写
