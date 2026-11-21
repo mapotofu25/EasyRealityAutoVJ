@@ -147,6 +147,10 @@ def new_config(name, width=1280, height=720, spout=False, ndi=False,
     main["spout"] = bool(spout)
     main["ndi"] = bool(ndi)
     main["follow_main"] = True
+    # ★ 2026-11-21（用户：新建配置怎么把原配置图层全挪过来）：
+    #   新配置从**空图层**开始；`None` 在老配置里表示"全量"，新配置不能沿用。
+    #   之后在单屏/多屏里新建的图层会由 add_layer 自动加进当前主屏的 layers。
+    main["layers"] = []
     cid = new_id("cfg")
     return {
         "id": cid,

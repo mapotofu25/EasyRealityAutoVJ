@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QSizePolicy, QDialog, QDialogButtonBox, QGroupBox,
                                QAbstractItemView, QMenu, QToolButton)
 
+from arrow_combo import ArrowComboBox
+
 import output_model as OM
 import theme
 
@@ -1761,13 +1763,13 @@ class OutputStudio(QWidget):
         self.top_bar = QWidget()
         self.top_bar.setObjectName("studioTopBar")
         bar = QHBoxLayout(self.top_bar)
-        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setContentsMargins(0, 1, 0, 2)
         bar.setSpacing(6)
         # 配置下拉（当前配置）+ 配置管理菜单
         # ★ 用户第 2 条：原来「＋新建 / 复制 / 重命名 / 删除」四个按钮各占一格，
         #   在页签行里根本放不下 ⇒ 合并成一个「配置 ▾」菜单按钮（原来那个「配置」
         #   文字标签也去掉了：下拉框本身就显示了当前配置名，重复）。
-        self.cfg_combo = QComboBox()
+        self.cfg_combo = ArrowComboBox()
         self.cfg_combo.setMinimumWidth(130)
         self.cfg_combo.setToolTip("输出配置：一整套屏幕 + mapping 设置")
         self.cfg_combo.currentIndexChanged.connect(self._on_config_combo)
@@ -1777,9 +1779,6 @@ class OutputStudio(QWidget):
         self.btn_cfg_menu.setText("配置")
         self.btn_cfg_menu.setToolTip("配置管理：新建 / 复制当前 / 重命名 / 删除当前")
         self.btn_cfg_menu.setPopupMode(QToolButton.InstantPopup)
-        # 文字里不再写 ▾，并隐藏 Qt 自带的菜单指示，避免与左边下拉框叠成两个箭头。
-        self.btn_cfg_menu.setStyleSheet(
-            "QToolButton::menu-indicator{image:none;width:0px;}")
         self._cfg_menu = QMenu(self.btn_cfg_menu)
         self.act_cfg_new = self._cfg_menu.addAction("新建配置…")
         self.act_cfg_new.triggered.connect(lambda _c=False: self.add_config())
@@ -1938,8 +1937,7 @@ class OutputStudio(QWidget):
             self.btn_cfg_menu.setStyleSheet(
                 "QToolButton{background:%s;color:%s;border:1px solid %s;"
                 "border-radius:4px;padding:2px 8px;min-height:18px;}"
-                "QToolButton:hover{background:%s;}"
-                "QToolButton::menu-indicator{image:none;width:0px;}" % (
+                "QToolButton:hover{background:%s;}" % (
                     v("btn"), v("text"), v("border"), v("btn_hov")))
         except Exception:                                          # noqa: BLE001
             pass

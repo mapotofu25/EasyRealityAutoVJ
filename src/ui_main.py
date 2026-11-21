@@ -58,6 +58,7 @@ from engine import (AutoVJEngine, Layer, MODE_LABELS, BLEND_MODES, BLEND_LABELS,
                     SWITCH_MANUAL)
 from output_window import OutputWindow
 from hotkeys import HotkeyManager
+from arrow_combo import ArrowComboBox
 from panels import (LayerStackPanel, PreviewPanel, AudioSourceDialog, MiniLevel,
                     LibraryGrid, CollapsibleSection, CLIP_MIME, LIB_THUMB_SIZES,
                     NewLayerDialog, I18nDialog, MusicLibraryPanel)
@@ -5623,45 +5624,35 @@ class MainWindow(QMainWindow):
             bar.setObjectName("previewToolbar")
             bar.setStyleSheet(
                 "QWidget#previewToolbar QComboBox{background:%s;color:%s;"
-                "border:1px solid %s;border-radius:3px;padding:1px 4px;"
-                "font-size:11px;min-height:22px;}"
+                "border:1px solid %s;border-radius:3px;padding:2px 6px;}"
                 "QWidget#previewToolbar QToolButton,"
                 "QWidget#previewToolbar QPushButton{background:%s;color:%s;"
-                "border:1px solid %s;border-radius:3px;padding:2px 6px;"
-                "font-size:11px;min-height:22px;}"
+                "border:1px solid %s;border-radius:3px;padding:4px 10px;}"
                 "QWidget#previewToolbar QCheckBox{color:%s;background:transparent;}"
                 "QWidget#previewToolbar QLabel{color:%s;background:transparent;}"
                 % (v("panel2"), v("text"), v("border"), v("btn"), v("text"),
                    v("border"), v("text"), v("text")))
             lay = _QH(bar)
-            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setContentsMargins(0, 0, 0, 2)
             lay.setSpacing(5)
             # ---- 输出配置（与多屏顶栏同一份数据） ----
-            self.single_cfg_combo = QComboBox()
-            self.single_cfg_combo.setMinimumWidth(96)
-            self.single_cfg_combo.setMaximumWidth(168)
+            self.single_cfg_combo = ArrowComboBox()
+            self.single_cfg_combo.setMinimumWidth(130)
+            self.single_cfg_combo.setMaximumWidth(200)
             self.single_cfg_combo.setToolTip("输出配置：一整套屏幕 + mapping 设置")
             self.single_cfg_combo.currentIndexChanged.connect(
                 self._on_single_config_combo)
             lay.addWidget(self.single_cfg_combo)
-            # ★ 2026-11-21（用户）：单屏也要有明确的「应用」入口。
-            #   下拉切换本来就即时生效，这个按钮用于"重新应用当前选择"，
-            #   多屏里删/改了配置后回到单屏也能一键对齐。
-            self.single_cfg_apply = QToolButton()
-            self.single_cfg_apply.setText("应用")
-            self.single_cfg_apply.setToolTip("重新应用当前输出配置到单屏输出")
-            self.single_cfg_apply.clicked.connect(
-                lambda _c=False: self._on_single_config_combo(
-                    self.single_cfg_combo.currentIndex()))
-            lay.addWidget(self.single_cfg_apply)
             self.single_cfg_menu = QToolButton()
             self.single_cfg_menu.setText("配置")
             self.single_cfg_menu.setToolTip("配置管理：新建 / 复制当前 / 重命名 / 删除当前")
             self.single_cfg_menu.setPopupMode(QToolButton.InstantPopup)
-            # 菜单按钮只保留 Qt 自带的弹出指示；文字里不要再写 ▾，
-            # 否则会和下拉框的箭头叠成两个（用户 2026-11-21 截图）。
+            # 与多屏顶栏的「配置」按钮同一套尺寸（用户：单屏/多屏 UI 大小要一致）。
             self.single_cfg_menu.setStyleSheet(
-                "QToolButton::menu-indicator{image:none;width:0px;}")
+                "QToolButton{background:%s;color:%s;border:1px solid %s;"
+                "border-radius:4px;padding:2px 8px;min-height:18px;}"
+                "QToolButton:hover{background:%s;}" % (
+                    v("btn"), v("text"), v("border"), v("btn_hov")))
             menu = QMenu(self.single_cfg_menu)
             act = menu.addAction("新建配置…")
             act.triggered.connect(lambda _c=False: self._single_cfg_new())
@@ -5758,6 +5749,11 @@ class MainWindow(QMainWindow):
     def _apply_active_output_config_single(self):
         """多屏关闭时：把活动配置里主屏的旧字段应用到单路输出。"""
         try:
+            import output_model as _om
+            _om.sync_legacy_output(self.cfg.data)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
             out = self.cfg["output"]
             w = max(160, min(7680, int(out.get("width", 1280) or 1280)))
             h = max(120, min(4320, int(out.get("height", 720) or 720)))
@@ -5797,6 +5793,12 @@ class MainWindow(QMainWindow):
         # 单屏下拉跟真配置对齐（多屏里删/改过配置后，这里要立即反映）
         try:
             self._refresh_single_cfg_combo()
+        except Exception:                                      # noqa: BLE001
+            pass
+        # ★ 2026-11-21（用户：切到另一套配置，单屏图层没变化）：
+        #   活动配置变了 ⇒ 单屏图层栈必须按新主屏的 layers 重建。
+        try:
+            self.refresh_all_layer_blocks()
         except Exception:                                      # noqa: BLE001
             pass
 
@@ -5928,8 +5930,11 @@ class MainWindow(QMainWindow):
                 old.layout().removeWidget(box)
             if multi:
                 st = getattr(self, "output_studio", None)
-                btn = getattr(st, "btn_open_lib", None)
-                lay = btn.parentWidget().layout() if btn is not None and btn.parentWidget() else None
+                lay = getattr(st, "top_row2", None)
+                if lay is None:
+                    btn = getattr(st, "btn_open_lib", None)
+                    lay = (btn.parentWidget().layout()
+                           if btn is not None and btn.parentWidget() else None)
                 if lay is not None:
                     lay.addWidget(box)
                 box.show()

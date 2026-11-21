@@ -302,6 +302,17 @@ def _as_md5(v):
     return t
 
 
+def _pkey(p):
+    """路径归一化 key（Windows 大小写/斜杠不敏感）。"""
+    s = str(p or "").strip()
+    if not s:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(s.replace("/", os.sep)))
+    except Exception:                                          # noqa: BLE001
+        return s.replace("/", "\\").lower()
+
+
 def _dur(v):
     """任意值 → 正数秒（float）；无效/≤0 ⇒ None。"""
     try:
@@ -377,7 +388,7 @@ class _LocalIndex:
     这里把本机曲库压成集合/字典 ⇒ 每条 track 只做 O(1) 查表。
     """
 
-    __slots__ = ("fp", "md5", "meta", "names", "same", "files")
+    __slots__ = ("fp", "md5", "meta", "names", "same", "files", "paths")
 
     def __init__(self):
         # ★ 2026-10-30：四个容器都**存"本机路径"**（原来只存值/集合）。
@@ -394,6 +405,9 @@ class _LocalIndex:
         #   标题/艺人/时长，只有 `music_library` 的路径；用 basename 也能认出
         #   码表里的同一首，避免"码表一行 + 本机一行"。
         self.files = {}            # 归一化文件名（basename, 小写） -> 本机路径
+        # 当前曲库里实际存在的路径（归一化 -> 原路径）。
+        # 用于校验 `fp_same`：旧映射可能指向已经移出曲库的文件，不能拿它隐藏码表行。
+        self.paths = {}
         # ★★ 0 级：`cfg["cue"]["fp_same"]`（`fp_id → 本机路径`）—— 由
         #   `cue_fp_pack.match_pack_local()` 在导入时用**指纹内容重合率**算出来的。
         #   为什么它必须排在 `fp_id` 相等之前（用户 2026-10-30：「我期望的是用指纹对比」
@@ -413,6 +427,7 @@ class _LocalIndex:
         p = str(path or "")
         base = ""
         if p and not p.startswith("@"):
+            self.paths.setdefault(_pkey(p), p)
             base = os.path.basename(p.replace("\\", "/")).strip().lower()
             if base:
                 self.files.setdefault(base, p)
@@ -453,7 +468,9 @@ class _LocalIndex:
         if fp0 and self.same:
             p0 = str(self.same.get(fp0) or "")
             if p0:
-                return p0
+                hit = self.paths.get(_pkey(p0))
+                if hit:
+                    return hit
         # ① 指纹签名
         fp = str(track.get("fp_id") or "")
         if fp and fp in self.fp:
