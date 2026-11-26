@@ -9894,6 +9894,10 @@ class AutoVJEngine(QObject):
         """
         if not bool(getattr(self, "_gui_covered", False)):
             return set()
+        # 单屏显示器输出窗不是多屏 route，但它确实在显示主屏画面：
+        # 不能因为主窗被它盖住就把主屏合成停掉，否则输出全黑、KV 也没有。
+        if bool(getattr(self, "_single_out_full", False)):
+            return set()
         plan = getattr(self, "_out_cfg", None)
         if not plan:
             return set()
@@ -10690,7 +10694,8 @@ class AutoVJEngine(QObject):
                 self._route_thumb_rev = int(getattr(self, "_route_thumb_rev", 0)) + 1
                 self._rate_thumbs = int(getattr(self, "_rate_thumbs", 0)) + 1
                 self._route_thumbs = thumbs
-            if (not bool(getattr(self, "_gui_covered", False))
+            if ((not bool(getattr(self, "_gui_covered", False))
+                     or bool(getattr(self, "_single_out_full", False)))
                     and self._gpu_frame_consumers and frame is not None):
                 if self._publish_gui_frame(frame):
                     return True
@@ -10729,7 +10734,8 @@ class AutoVJEngine(QObject):
         _priv = bool(_disp) and sel in (_disp or {})
         if _priv:
             frame = _disp[sel]
-        if (not bool(getattr(self, "_gui_covered", False))
+        if ((not bool(getattr(self, "_gui_covered", False))
+                 or bool(getattr(self, "_single_out_full", False)))
                 and self._gpu_frame_consumers and frame is not None):
             if self._publish_gui_frame(frame, private=_priv):
                 return True
