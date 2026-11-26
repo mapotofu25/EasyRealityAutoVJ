@@ -310,7 +310,7 @@ def render_main(job_q, preview_name, preview_seq, log_path):
                          "blackout": bool(sc.get("blackout")),
                          "layers": layers, "lut": lut}
                 readback = bool(sc.get("display") or sc.get("spout")
-                                or sc.get("preview"))
+                                or sc.get("preview") or sc.get("sink"))
                 try:
                     out = stage.compose(scene, readback=readback)
                 except Exception as e:                         # noqa: BLE001

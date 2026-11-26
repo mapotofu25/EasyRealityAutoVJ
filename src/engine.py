@@ -8821,17 +8821,12 @@ class AutoVJEngine(QObject):
     def _render_enabled(self):
         """默认启用一屏一进程 GPU 输出；AUTOVJ_GPU_RENDER=0 可强制回 CPU。
 
-        单屏演出台不使用独立 GPU 渲染进程：它只提供低分辨率预览帧，
-        单屏输出窗会拿到这张小图再放大（画面发糊）；单屏直接走 CPU 1:1。
+        单屏输出也走 GPU 渲染进程，但通过 capture sink 取**原生分辨率**
+        成品帧给输出窗；480×270 的 preview 只给主界面预览，不会拿来放大。
         """
         _env = str(os.environ.get("AUTOVJ_GPU_RENDER", "")).strip()
         if _env == "0":
             return False
-        try:
-            if not bool((self.cfg["output"] or {}).get("multi_enabled", False)):
-                return False
-        except Exception:                                      # noqa: BLE001
-            pass
         if _env == "1":
             return True
         try:
@@ -8920,12 +8915,6 @@ class AutoVJEngine(QObject):
         """把当前场景写进共享内存并投给一屏一进程渲染器。成功返回 True。"""
         if not getattr(self, "_render_active", False):
             return False
-        try:
-            if not bool((self.cfg["output"] or {}).get("multi_enabled", False)):
-                self._close_render_client("单屏模式不使用 GPU 渲染进程")
-                return False
-        except Exception:                                      # noqa: BLE001
-            pass
         for c in list((getattr(self, "_render_clients", None) or {}).values()):
             if c is not None and not c.alive():
                 self._close_render_client("子进程已退出")
@@ -8963,6 +8952,7 @@ class AutoVJEngine(QObject):
                              "layers": self._main_screen_layers(),
                              "main": True, "display": bool(_md >= 0),
                              "display_monitor": _md if _md >= 0 else 0,
+                             "capture": bool(getattr(self, "_single_out_full", False)),
                              "alpha": bool(getattr(self, "_alpha_out", False))})
             _hidden = set(getattr(self, "_hidden_sids", None) or ())
             _shown = set(getattr(self, "_display_route_ids", None) or ())
@@ -9152,14 +9142,24 @@ class AutoVJEngine(QObject):
         cli = getattr(self, "_render_client", None)
         try:
             _th = {}
+            _route_full = {}
             for _c in list((getattr(self, "_render_clients", None) or {}).values()):
                 try:
                     _th.update(_c.poll_thumbs() or {})
                 except Exception:                      # noqa: BLE001
                     pass
+                if bool(getattr(self, "_single_out_full", False)):
+                    try:
+                        _route_full.update(_c.poll_route_frames() or {})
+                    except Exception:                  # noqa: BLE001
+                        pass
             if _th:
                 self._route_thumbs = _th
                 self._route_thumb_rev = int(getattr(self, "_route_thumb_rev", 0)) + 1
+            if _route_full:
+                _f = next(iter(_route_full.values()))
+                if _f is not None and not _f.isNull():
+                    self._latest_output_frame = _f
         except Exception:                                  # noqa: BLE001
             pass
         if cli is None:

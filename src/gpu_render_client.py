@@ -348,7 +348,7 @@ class GpuRenderClient:
                 ow = int(sc.get("out_w") or w)
                 oh = int(sc.get("out_h") or h)
                 sink = None
-                if sc.get("ndi"):
+                if sc.get("ndi") or sc.get("capture"):
                     _s = self._ensure_sink(sid, ow, oh)
                     sink = {"name": _s["name"], "w": ow, "h": oh}
                 _t = self._ensure_thumb(sid)
