@@ -9526,6 +9526,10 @@ class MainWindow(QMainWindow):
         #   单屏/窗口模式下会把输出窗一起藏掉，表现为“打不开显示器输出”。
         try:
             if bool(getattr(self.engine, "gpu_native_display", lambda: False)()):
+                try:
+                    self.engine.set_single_out_full(False)
+                except Exception:                          # noqa: BLE001
+                    pass
                 for _w in [self.out_win] + list((self.out_wins or {}).values()):
                     try:
                         if _w is not None:
@@ -9548,6 +9552,10 @@ class MainWindow(QMainWindow):
         except Exception:                                          # noqa: BLE001
             multi_route = False
         if multi_route:
+            try:
+                self.engine.set_single_out_full(False)
+            except Exception:                                  # noqa: BLE001
+                pass
             self._ensure_multi_output_windows()
             return
         self._hide_extra_output_windows()
@@ -9556,6 +9564,10 @@ class MainWindow(QMainWindow):
         if idx <= -2:
             # ★ S2 #14：「关闭」⇒ 不弹输出窗口（默认行为）。引擎照常合成，
             #   Spout/NDI 发送不受影响（它们不走显示器窗口）。
+            try:
+                self.engine.set_single_out_full(False)
+            except Exception:                                  # noqa: BLE001
+                pass
             try:
                 self.out_win.hide()
             except Exception:                                     # noqa: BLE001
@@ -9571,6 +9583,10 @@ class MainWindow(QMainWindow):
             self.out_win.show_fullscreen_on(screens[idx])
         else:
             self.out_win.show_windowed()
+        try:
+            self.engine.set_single_out_full(True)
+        except Exception:                                      # noqa: BLE001
+            pass
         try:
             self.engine.set_frame_consumers(
                 bool(self.preview_panel.preview_on()) or self.out_win.isVisible())
@@ -13658,7 +13674,12 @@ class MainWindow(QMainWindow):
         #   按**自己的屏**喂帧；这里不能再把"当前选中屏"的帧塞给主屏窗口。
         if ow is not None and not getattr(self, "out_wins", None):
             try:
-                ow.set_frame(img)
+                _full = None
+                try:
+                    _full = self.engine.latest_output_frame()
+                except Exception:                              # noqa: BLE001
+                    _full = None
+                ow.set_frame(_full or img)
             except Exception:
                 pass
         _t1 = time.perf_counter()

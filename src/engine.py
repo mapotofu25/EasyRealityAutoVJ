@@ -1123,7 +1123,9 @@ class AutoVJEngine(QObject):
         self._fx_hold_pick = None
         self._fx_hold_due = 0.0
         # Spout 输出（懒加载，运行在引擎线程）
-        self._latest_frame = None      # 最新合成帧（frame_ready 只投序号，帧放这）
+        self._latest_frame = None      # 预览帧（按 preview.res 缩过，frame_ready 只投序号）
+        self._latest_output_frame = None  # 单屏输出窗口用的原生分辨率帧
+        self._single_out_full = False  # 单屏输出窗可见时，才为它保留整帧副本
         self._frame_seq = 0            # 帧序号（绘制端用来去重）
         # ---- 多屏输出（2026-11-08）----
         #   `_out_cfg` 是活动配置的深拷贝；None = 还没启用多屏，走旧单路逻辑。
@@ -3672,6 +3674,23 @@ class AutoVJEngine(QObject):
         QImage 是隐式共享的，`_tick_locked` 每帧都**新建**一个对象再替换引用，
         所以绘制端拿到的是当时的快照，引擎随后替换不会影响它 —— 无需加锁。
         """
+        return self._latest_frame
+
+    def set_single_out_full(self, on):
+        """单屏显示器输出窗可见时，要求保留一份原生分辨率帧。
+
+        主预览的 `_latest_frame` 会按 preview.res 缩到 480×270 等小图；
+        输出窗不能吃这张小图（会被放大到 1080p，画面发糊）。
+        """
+        self._single_out_full = bool(on)
+        if not self._single_out_full:
+            self._latest_output_frame = None
+
+    def latest_output_frame(self):
+        """单屏输出窗口用的原生分辨率帧；没有时退回预览帧。"""
+        f = getattr(self, "_latest_output_frame", None)
+        if f is not None and not f.isNull():
+            return f
         return self._latest_frame
 
     # ⚠⚠ 这里也**故意不加 @_locked**（与 `latest_frame` / `modes_snapshot` 同类，已在
@@ -10732,6 +10751,14 @@ class AutoVJEngine(QObject):
             return False
         self._gui_pub_t = now
         self._latest_frame = self._gui_scaled(frame, private=private)
+        # 单屏输出窗吃整帧原生分辨率；主预览继续吃上面那张 preview.res 小图。
+        if getattr(self, "_single_out_full", False):
+            try:
+                self._latest_output_frame = frame.copy()
+            except Exception:                                  # noqa: BLE001
+                self._latest_output_frame = self._latest_frame
+        else:
+            self._latest_output_frame = None
         try:
             time.sleep(0)          # 预缩放后让出 GIL，GUI 可立即重绘
         except Exception:                                      # noqa: BLE001
