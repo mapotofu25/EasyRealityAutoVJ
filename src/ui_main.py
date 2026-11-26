@@ -6376,6 +6376,13 @@ class MainWindow(QMainWindow):
                     self.engine.set_output_config(None)
                 except Exception:                                 # noqa: BLE001
                     pass
+                # 引擎要等下一 tick 才关闭 GPU 渲染进程；等它关掉后再按单屏
+                # 配置重开输出窗，避免刚切回单屏时被 native 透传守卫挡住。
+                try:
+                    from PySide6.QtCore import QTimer as _QT
+                    _QT.singleShot(250, self.apply_output_screen)
+                except Exception:                                 # noqa: BLE001
+                    pass
                 try:
                     import output_model as _om
                     _om.sync_legacy_output(self.cfg.data)
@@ -9131,9 +9138,8 @@ class MainWindow(QMainWindow):
         try:
             _engine_gpu_out = False
             try:
-                _engine_gpu_out = bool(self.engine is not None and (
-                    self.engine.gpu_native_display()
-                    or getattr(self.engine, "render_process_active", lambda: False)()))
+                _engine_gpu_out = bool(self.engine is not None and
+                                       self.engine.gpu_native_display())
             except Exception:                              # noqa: BLE001
                 _engine_gpu_out = False
             if _engine_gpu_out:
@@ -9536,10 +9542,12 @@ class MainWindow(QMainWindow):
         self._sync_frame_consumers()
 
     def apply_output_screen(self, screen=None):
-        # ★ 2026-11-26：独立 GPU 渲染进程已经开原生主屏窗；Qt 输出窗一律不建/立即隐藏，
-        #   否则它会盖在原生 1080p 窗上面，看起来像"只渲染了左上角 1280x720"。
+        # ★ 2026-11-26：只有**原生 GLFW 输出窗**才需要把 Qt 输出窗藏起来。
+        #   GPU 渲染进程已启用但 native=False（窗口模式/未绑定显示器）时，
+        #   Qt 输出窗仍应正常显示；以前只判断 render_process_active()，
+        #   单屏/窗口模式下会把输出窗一起藏掉，表现为“打不开显示器输出”。
         try:
-            if bool(getattr(self.engine, "render_process_active", lambda: False)()):
+            if bool(getattr(self.engine, "gpu_native_display", lambda: False)()):
                 for _w in [self.out_win] + list((self.out_wins or {}).values()):
                     try:
                         if _w is not None:
