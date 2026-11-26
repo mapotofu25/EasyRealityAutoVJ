@@ -389,26 +389,12 @@ class SettingsPanel(QWidget):
         self.render_fps.addItems(["60", "30", "20"])
         self.render_fps.setToolTip("引擎每秒合成多少次画面；素材多为 25 到 30fps，选 60 时约有一半是把同一帧重复合成 —— 机器吃紧（同时开 VDJ、直播、录制）就选 30，能省约一半渲染 CPU，画面仍跟得上素材")
         gp.addWidget(self.render_fps, 0, 1)
-        # ★ 2026-11-26（用户：1080p 输出 17~21 帧、CPU 47%）：内部分辨率倍率。
-        #   1080p 输出默认按 2/3（1280×720）合成，输出窗/投影由 GPU 放大；
-        #   实测 7 层 + 2 路 Spout 从 14~25 帧回到 30 帧。要原生 1080p 选 100%。
-        gp.addWidget(QLabel("渲染精度"), 1, 0)
-        self.render_scale = QComboBox()
-        self.render_scale.addItems(["自动（单屏 1080p / 多屏 720p）", "100%（原生）",
-                                    "75%", "67%", "50%"])
-        self.render_scale.setToolTip(
-            "内部分辨率倍率。自动：单屏按输出原生分辨率（1080p）合成，保证显示器输出清晰；"
-            "多屏 CPU 回退仍按 2/3（1280×720）合成，再由显卡放大。"
-            "100% = 所有模式都用原生输出分辨率，最清晰但多图层可能掉帧。")
-        gp.addWidget(self.render_scale, 1, 1)
         self.chk_gpu = QCheckBox("GPU 加速（DXV 硬件解压）")
         self.chk_gpu.setToolTip("用显卡加速 DXV 解码与画面合成，降低 CPU 占用；解压失败或显卡不支持时自动回退软解，不影响播放")
-        gp.addWidget(self.chk_gpu, 2, 0, 1, 2)
-        # ★ 2026-11-09 用户要求：去掉「安全视频解码」开关（普通视频固定走 OpenCV，省 CPU）。
-        #   原来这一行是 chk_safe_decode（2, 0），删掉后 chk_fps_follow 上移到第 2 行。
+        gp.addWidget(self.chk_gpu, 1, 0, 1, 2)
         self.chk_fps_follow = QCheckBox("跟随素材帧率（省 CPU，推荐）")
         self.chk_fps_follow.setToolTip("素材 25~30fps 时不再按 60fps 重复合成同一帧；有 60fps 素材时自动回到 60。手动选 60 但此项开启时，仍会按素材帧率封顶。")
-        gp.addWidget(self.chk_fps_follow, 3, 0, 1, 2)
+        gp.addWidget(self.chk_fps_follow, 2, 0, 1, 2)
         ga.setRowStretch(4, 1)
         # ★ 2026-11-11：不要给最后一行 stretch（会把 3 行内容撑开、行距变成一大片空白）。
         #   额外高度放到第 4 行（空行）上，内容始终贴顶。
@@ -743,7 +729,6 @@ class SettingsPanel(QWidget):
         self.sens.currentIndexChanged.connect(lambda i: main.engine_cfg("mode", "sensitivity", i))
         self.intensity.currentIndexChanged.connect(main.set_intensity)
         self.render_fps.currentIndexChanged.connect(main.set_render_fps)
-        self.render_scale.currentIndexChanged.connect(main.set_render_scale)
         self.chk_fps_follow.stateChanged.connect(
             lambda s: main.engine.set_fps_follow_source(bool(s)))
         self.chk_gpu.stateChanged.connect(main.set_gpu_decode)
@@ -8498,23 +8483,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def set_render_scale(self, i):
-        """渲染精度（0=自动 / 1=100% / 2=75% / 3=67% / 4=50%）。"""
-        vals = [0.0, 1.0, 0.75, (2.0 / 3.0), 0.5]
-        try:
-            v = vals[max(0, min(len(vals) - 1, int(i)))]
-        except (TypeError, ValueError):
-            return
-        try:
-            self.cfg.set("perf", "render_scale", v)
-            self.cfg.save()
-        except Exception:
-            pass
-        try:
-            self.engine.set_render_scale(v)
-        except Exception:
-            pass
-
     def set_gpu_decode(self, s):
         """GPU 解码（实验）开关 —— 立即生效，但只作用于**新开的播放器**：
         已在播的素材要等下一次切换才会换到 GPU 路径（不打断正在进行的演出）。
@@ -9644,27 +9612,6 @@ class MainWindow(QMainWindow):
         except Exception:
             _rf = 60
         self.settings.render_fps.setCurrentIndex({60: 0, 30: 1, 20: 2}.get(_rf, 0))
-        # 渲染精度：0/缺省 = 自动；1.0/0.75/0.667/0.5 对应下拉项
-        try:
-            _rs = float((self.cfg["perf"] or {}).get("render_scale", 0) or 0)
-        except (TypeError, ValueError):
-            _rs = 0.0
-        if _rs <= 0:
-            _ri = 0
-        elif _rs >= 0.95:
-            _ri = 1
-        elif _rs >= 0.72:
-            _ri = 2
-        elif _rs >= 0.58:
-            _ri = 3
-        else:
-            _ri = 4
-        try:
-            self.settings.render_scale.blockSignals(True)
-            self.settings.render_scale.setCurrentIndex(_ri)
-            self.settings.render_scale.blockSignals(False)
-        except Exception:
-            pass
         try:
             _ff = bool((self.cfg["perf"] or {}).get("fps_follow_source", True))
             self.settings.chk_fps_follow.blockSignals(True)

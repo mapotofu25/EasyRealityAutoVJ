@@ -1298,11 +1298,8 @@ class AutoVJEngine(QObject):
         # 任一路由需要 alpha ⇒ 禁用 GPU 合成（GPU 回读会换掉画布格式，见 `_compose_to`）。
         # 与 `_alpha_out`（主画布格式）分开：主屏可以不透明、旁屏透明。
         self._any_alpha = bool(self._alpha_out)
-        # ★ 2026-11-26（用户：1080p 输出 17~21 帧、CPU 47%）：**内部分辨率**
-        #   与输出分辨率解耦。1080p 输出默认按 2/3（1280×720）合成，再由输出窗
-        #   GPU 放大；实测 7 层 + 2 路 Spout 从 14~25 帧回到 28~31 帧。
-        #   `perf.render_scale` = 0（自动）/0.5~1.0；环境变量 AUTOVJ_RENDER_SCALE
-        #   可临时覆盖（1.0 = 原来的 1080p 全分辨率合成）。
+        # ★ 2026-11-26：输出设置多少就渲染多少。内部画布固定 1:1 输出分辨率，
+        #   不再按 2/3 降采样后由输出窗放大（那会让单屏显示器画面发糊）。
         self._render_scale = self._resolve_render_scale()
         try:
             _ow = int(self.cfg["output"].get("width", 1280) or 1280) * self._render_scale
@@ -1413,54 +1410,22 @@ class AutoVJEngine(QObject):
         return max(2, int(round(float(w) * s))), max(2, int(round(float(h) * s)))
 
     def _resolve_render_scale(self):
-        """内部分辨率倍率：0/缺省 = 自动（1080p 输出用 2/3，其它 1.0）。"""
-        v = 0.0
-        try:
-            v = float(os.environ.get("AUTOVJ_RENDER_SCALE", "0") or 0)
-        except (TypeError, ValueError):
-            v = 0.0
-        if v <= 0.0:
-            try:
-                v = float((self.cfg["perf"] or {}).get("render_scale", 0) or 0)
-            except (TypeError, ValueError, KeyError):
-                v = 0.0
-        if v <= 0.0:
-            try:
-                _h = int(self.cfg["output"].get("height", 1080) or 1080)
-            except (TypeError, ValueError, KeyError):
-                _h = 1080
-            # ★ 2026-11-26：单屏显示输出默认按原生分辨率合成。旧「自动」
-            #   对 1080p 一律 2/3（1280×720），单屏显示器输出再放大到 1080p，
-            #   画面明显发糊。多屏 GPU 输出的显示帧由渲染进程按输出分辨率合成，
-            #   这里只保留多屏 CPU 回退的 2/3 省算力策略。
-            try:
-                _multi = bool((self.cfg["output"] or {}).get("multi_enabled", False))
-            except Exception:                                  # noqa: BLE001
-                _multi = False
-            v = (2.0 / 3.0) if (_h >= 1080 and _multi) else 1.0
-        return max(0.25, min(1.0, float(v)))
+        """输出设置多少就渲染多少：内部画布固定 1:1 原生输出分辨率。"""
+        return 1.0
 
     def set_render_scale(self, scale):
-        """设置内部分辨率倍率（GUI 线程调用；0 = 自动）。画布在下一次 tick 重建。"""
-        try:
-            v = float(scale or 0.0)
-        except (TypeError, ValueError):
-            return
-        if v <= 0.0:
-            v = self._resolve_render_scale()
-        v = max(0.25, min(1.0, v))
+        """兼容旧调用：不再支持降低内部分辨率，固定 1:1。"""
         try:
             with self._tick_lock:
-                if abs(v - float(getattr(self, "_render_scale", 1.0))) < 1e-4:
+                if abs(float(getattr(self, "_render_scale", 1.0)) - 1.0) < 1e-4:
                     return
-                self._render_scale = v
+                self._render_scale = 1.0
                 self._latest_frame = None
                 if self._out_cfg:
-                    # 下一次 tick 走 `_rebuild_output_plan()`，按新倍率重建所有画布
                     self._plan_rev_ready = -1
                 else:
-                    _w = int(round(int(self.cfg["output"].get("width", 1280) or 1280) * v))
-                    _h = int(round(int(self.cfg["output"].get("height", 720) or 720) * v))
+                    _w = int(self.cfg["output"].get("width", 1280) or 1280)
+                    _h = int(self.cfg["output"].get("height", 720) or 720)
                     self.canvas = QImage(max(2, _w), max(2, _h),
                                          self._canvas_format())
                     self._clear_canvas(self.canvas)
