@@ -8817,10 +8817,19 @@ class AutoVJEngine(QObject):
             pass
 
     def _render_enabled(self):
-        """默认启用一屏一进程 GPU 输出；AUTOVJ_GPU_RENDER=0 可强制回 CPU。"""
+        """默认启用一屏一进程 GPU 输出；AUTOVJ_GPU_RENDER=0 可强制回 CPU。
+
+        单屏演出台不使用独立 GPU 渲染进程：它只提供低分辨率预览帧，
+        单屏输出窗会拿到这张小图再放大（画面发糊）；单屏直接走 CPU 1:1。
+        """
         _env = str(os.environ.get("AUTOVJ_GPU_RENDER", "")).strip()
         if _env == "0":
             return False
+        try:
+            if not bool((self.cfg["output"] or {}).get("multi_enabled", False)):
+                return False
+        except Exception:                                      # noqa: BLE001
+            pass
         if _env == "1":
             return True
         try:
@@ -8909,6 +8918,12 @@ class AutoVJEngine(QObject):
         """把当前场景写进共享内存并投给一屏一进程渲染器。成功返回 True。"""
         if not getattr(self, "_render_active", False):
             return False
+        try:
+            if not bool((self.cfg["output"] or {}).get("multi_enabled", False)):
+                self._close_render_client("单屏模式不使用 GPU 渲染进程")
+                return False
+        except Exception:                                      # noqa: BLE001
+            pass
         for c in list((getattr(self, "_render_clients", None) or {}).values()):
             if c is not None and not c.alive():
                 self._close_render_client("子进程已退出")
