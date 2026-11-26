@@ -86,4 +86,4 @@ ERLIB 单文件版已放在工具包里，不再单独发布附件。
 > 本软件含快速闪烁画面，光敏性癫痫者请勿使用；演出前请充分测试。
 > Windows 可能提示“未知发布者”，这是未做代码签名，点“更多信息 → 仍要运行”即可。
 
-反馈：QQ 1793170435　项目：https://github.com/mapotofu25/EasyRealityAutoVJ
+反馈群：ERAVJ 交流群 543643838　项目：https://github.com/mapotofu25/EasyRealityAutoVJ
