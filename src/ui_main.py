@@ -394,11 +394,12 @@ class SettingsPanel(QWidget):
         #   实测 7 层 + 2 路 Spout 从 14~25 帧回到 30 帧。要原生 1080p 选 100%。
         gp.addWidget(QLabel("渲染精度"), 1, 0)
         self.render_scale = QComboBox()
-        self.render_scale.addItems(["自动（1080p 按 720p）", "100%（原生）",
+        self.render_scale.addItems(["自动（单屏 1080p / 多屏 720p）", "100%（原生）",
                                     "75%", "67%", "50%"])
         self.render_scale.setToolTip(
-            "内部分辨率倍率。自动：1080p 输出按 2/3（1280×720）合成，再由显卡放大到输出分辨率；"
-            "大幅降低 CPU/合成耗时，画面略软。100% = 原生输出分辨率，最清晰但 1080p 多图层可能掉帧。")
+            "内部分辨率倍率。自动：单屏按输出原生分辨率（1080p）合成，保证显示器输出清晰；"
+            "多屏 CPU 回退仍按 2/3（1280×720）合成，再由显卡放大。"
+            "100% = 所有模式都用原生输出分辨率，最清晰但多图层可能掉帧。")
         gp.addWidget(self.render_scale, 1, 1)
         self.chk_gpu = QCheckBox("GPU 加速（DXV 硬件解压）")
         self.chk_gpu.setToolTip("用显卡加速 DXV 解码与画面合成，降低 CPU 占用；解压失败或显卡不支持时自动回退软解，不影响播放")
@@ -6328,6 +6329,11 @@ class MainWindow(QMainWindow):
                     self.engine.set_frame_consumers(True)
                 except Exception:                                 # noqa: BLE001
                     pass
+                # 多屏开启后重新按“自动”口径决定内部倍率（多屏 CPU 回退 2/3）
+                try:
+                    self.engine.set_render_scale(0)
+                except Exception:                                 # noqa: BLE001
+                    pass
                 self.lbl_status.setText(T("多屏输出已开启"))
             else:
                 # ★ 先落地/取消所有延后任务：拖动预览后的 250ms 几何应用如果晚于
@@ -6378,6 +6384,10 @@ class MainWindow(QMainWindow):
                     pass
                 # 引擎要等下一 tick 才关闭 GPU 渲染进程；等它关掉后再按单屏
                 # 配置重开输出窗，避免刚切回单屏时被 native 透传守卫挡住。
+                try:
+                    self.engine.set_render_scale(0)
+                except Exception:                                 # noqa: BLE001
+                    pass
                 try:
                     from PySide6.QtCore import QTimer as _QT
                     _QT.singleShot(250, self.apply_output_screen)

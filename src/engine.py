@@ -1429,7 +1429,15 @@ class AutoVJEngine(QObject):
                 _h = int(self.cfg["output"].get("height", 1080) or 1080)
             except (TypeError, ValueError, KeyError):
                 _h = 1080
-            v = (2.0 / 3.0) if _h >= 1080 else 1.0
+            # ★ 2026-11-26：单屏显示输出默认按原生分辨率合成。旧「自动」
+            #   对 1080p 一律 2/3（1280×720），单屏显示器输出再放大到 1080p，
+            #   画面明显发糊。多屏 GPU 输出的显示帧由渲染进程按输出分辨率合成，
+            #   这里只保留多屏 CPU 回退的 2/3 省算力策略。
+            try:
+                _multi = bool((self.cfg["output"] or {}).get("multi_enabled", False))
+            except Exception:                                  # noqa: BLE001
+                _multi = False
+            v = (2.0 / 3.0) if (_h >= 1080 and _multi) else 1.0
         return max(0.25, min(1.0, float(v)))
 
     def set_render_scale(self, scale):
