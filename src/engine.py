@@ -7997,25 +7997,14 @@ class AutoVJEngine(QObject):
             if getattr(self, "_bu_flash_key", None) != _key:
                 self._bu_flash_key = _key
                 self._bu_last_step = -1
-            # 前 8 拍不闪；之后 4 拍 → 2 拍 → 1 拍 → 1/2 拍 → 1/4 拍。
+            # 1~8 拍不闪；9~16 每 4 拍；17~24 每 2 拍；
+            # 25~28 每 1 拍；29~30 每 1/2 拍；31~32 抽空不闪。
             elapsed_beats = (pos - start) / bl
-            if elapsed_beats < 8.0:
+            interval = self._build_up_flash_interval(elapsed_beats)
+            if interval <= 0.0:
                 self._bu_flash_until = 0.0
                 self._bu_last_step = -1
                 return 0
-            if elapsed_beats < 12.0:
-                interval = 4.0
-            elif elapsed_beats < 16.0:
-                interval = 2.0
-            elif elapsed_beats < 20.0:
-                interval = 1.0
-            elif elapsed_beats < 24.0:
-                interval = 0.5
-            else:
-                # ★ 2026-11-25（用户：1/4 和 1/2 速度差不多、闪得不够快）：
-                #   最后 8 拍加密到 **1/4 拍**，并把占空比固定到 ~50%；
-                #   否则 1/2 的脉冲本来就占 35%、1/4 只占 50%，30fps 下看着几乎一样。
-                interval = 0.25
             # ★ 用「第几个分频格」触发，而不是时间取模：
             #   这样每 2 拍一定触发一次，不会因为识别位置每几秒才刷新一次
             #   而跳过一半的脉冲（用户实测“该两拍一次却像四拍一次”）。
@@ -8023,8 +8012,8 @@ class AutoVJEngine(QObject):
             if step != getattr(self, "_bu_last_step", -1):
                 self._bu_last_step = step
                 period = interval * bl
-                # 1/2 与 1/4 都保持 ~50% 占空比，才能明显看出 1/4 更快；
-                # 更慢的档位仍封顶 0.12s（不要整拍常亮）。
+                # 1/2 拍档也保持 ~50% 占空比，30fps 下能看清；更慢的档位仍封顶
+                # 0.12s（不要整拍常亮）。
                 pulse = min(0.12, max(0.05, period * 0.5), period * 0.55)
                 self._bu_flash_until = now + pulse
             if now < float(getattr(self, "_bu_flash_until", 0.0) or 0.0):
@@ -8032,6 +8021,29 @@ class AutoVJEngine(QObject):
         except Exception:                                      # noqa: BLE001
             pass
         return 0
+
+    @staticmethod
+    def _build_up_flash_interval(elapsed_beats):
+        """按 Build Up 已过拍数返回闪白间隔（拍）；0 = 不闪。
+
+        1~8: 不闪 / 9~16: 每 4 拍 / 17~24: 每 2 拍 /
+        25~28: 每 1 拍 / 29~30: 每 1/2 拍 / 31~32: 抽空不闪。
+        """
+        try:
+            b = float(elapsed_beats)
+        except (TypeError, ValueError):
+            return 0.0
+        if b < 8.0:
+            return 0.0
+        if b < 16.0:
+            return 4.0
+        if b < 24.0:
+            return 2.0
+        if b < 28.0:
+            return 1.0
+        if b < 30.0:
+            return 0.5
+        return 0.0
 
     def _paint_build_up_flash(self, canvas, alpha):
         if not alpha or canvas is None:
