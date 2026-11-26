@@ -398,7 +398,10 @@ def save(sheet: CueSheet, path, media_paths=None, embed=False,
             m["_src"] = p                          # 仅本次写包用，不写进 json
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    # ★ 2026-11-18：先写临时文件再原子替换 —— 直接 `ZipFile(path,"w")` 会在
+    #   打开瞬间截断旧包；导出中途失败/磁盘满/进程崩溃 ⇒ 用户的旧码表也没了。
+    tmp_path = "%s.tmp.%d" % (path, os.getpid())
+    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         if embed:
             for m in t["media"]:
                 p = m.pop("_src", None)
@@ -427,6 +430,14 @@ def save(sheet: CueSheet, path, media_paths=None, embed=False,
             if not name:
                 continue
             z.writestr(name, bytes(blob))
+    try:
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     return path
 
 

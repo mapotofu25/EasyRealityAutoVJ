@@ -32,6 +32,11 @@ import threading
 import time
 import traceback
 
+try:
+    from PySide6.QtGui import QImage
+except Exception:                                              # noqa: BLE001
+    QImage = None
+
 
 class SpoutOut:
     """Spout 发送端。`send()` 可在渲染线程安全调用（只拷贝+入队）。"""
@@ -69,7 +74,8 @@ class SpoutOut:
         try:
             while True:
                 item = self._q.get_nowait()
-                if item is not None:
+                if item is not None and not (QImage is not None
+                                             and isinstance(item[0], QImage)):
                     with self._lock:
                         self._free.append(item[0])
         except queue.Empty:
@@ -163,7 +169,8 @@ class SpoutOut:
         except queue.Full:
             try:
                 old = self._q.get_nowait()
-                if old is not None:
+                if old is not None and not (QImage is not None
+                                            and isinstance(old[0], QImage)):
                     with self._lock:
                         self._free.append(old[0])
             except queue.Empty:
@@ -178,6 +185,51 @@ class SpoutOut:
     def is_dead(self):
         """发送端是否已被 close（close 后 send 永久失败，必须由调用方重建）。"""
         return bool(self._dead)
+
+    def send_image(self, img):
+        """渲染线程调用：**只入队一个 QImage 引用**（不拷贝、不转格式）。
+
+        ★ 2026-11-25（用户：开 NDI+Spout 掉到 20 帧）：
+          旧 `send()` 要在渲染线程做两次整帧操作 ——
+            ① 若画布是直通 ARGB32：`convertToFormat(Premultiplied)`（1080p ~1.2ms）
+            ② 拷进发送缓冲（1080p ~1.4ms）
+          多一路 NDI 又各做一遍，两路合计 ~5ms/帧，正好把 30fps 顶到 20fps。
+          现在引擎只做**一次**私有快照，NDI / Spout **共用同一张 QImage**；
+          发送线程直接读它的 `bits()`（只读，不修改），渲染线程零拷贝入队。
+
+        ⚠ 调用方必须保证 `img` 之后不再被修改（引擎传的是私有 copy / 转换结果）。
+        """
+        if self._dead:
+            with self._lock:
+                self._err = "sender 已关闭（is_dead）"
+            return False
+        if img is None or img.isNull():
+            return False
+        try:
+            w, h = int(img.width()), int(img.height())
+            if w <= 0 or h <= 0:
+                return False
+            self._size = (w, h)
+            self.start()
+            try:
+                self._q.put_nowait((img, w, h))
+            except queue.Full:
+                try:
+                    old = self._q.get_nowait()
+                    if old is not None and not isinstance(old[0], QImage):
+                        with self._lock:
+                            self._free.append(old[0])
+                except queue.Empty:
+                    pass
+                try:
+                    self._q.put_nowait((img, w, h))
+                except queue.Full:
+                    pass
+            return True
+        except Exception as e:                                     # noqa: BLE001
+            with self._lock:
+                self._err = str(e)[:160]
+            return False
 
     def last_error(self):
         """返回最近一次发送线程异常（字符串）；None = 正常。取走即清。"""
@@ -214,14 +266,25 @@ class SpoutOut:
                 if item is None:
                     break
                 buf, w, h = item
+                is_img = QImage is not None and isinstance(buf, QImage)
                 t0 = time.perf_counter()
                 try:
-                    s.sendImage(buf, w, h, GL_BGRA_EXT, False, 0)
+                    if is_img:
+                        img = buf
+                        if img.format() == QImage.Format_ARGB32:
+                            img = img.convertToFormat(
+                                QImage.Format_ARGB32_Premultiplied)
+                        s.sendImage(memoryview(img.bits()), int(w), int(h),
+                                    GL_BGRA_EXT, False, 0)
+                    else:
+                        s.sendImage(buf, w, h, GL_BGRA_EXT, False, 0)
                 finally:
                     # 缓冲交还给渲染线程复用（限制上限，分辨率切换时旧尺寸自然淘汰）
-                    with self._lock:
-                        if len(self._free) < self._buf_max:
-                            self._free.append(buf)
+                    # QImage 快照不归池管：发送线程用完直接丢引用即可。
+                    if not is_img:
+                        with self._lock:
+                            if len(self._free) < self._buf_max:
+                                self._free.append(buf)
                 dt = (time.perf_counter() - t0) * 1000
                 with self._lock:
                     self._sent += 1

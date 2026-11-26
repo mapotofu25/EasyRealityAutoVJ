@@ -89,21 +89,22 @@ def _by_score(group, target, jitter=0.25):
                   + random.random() * jitter)
 
 
-def match_clips(energy, library, role="bg", n=6, tier=None):
-    """从素材库挑 n 个素材（按动态档 + 能量，不再看曲风）。
+def match_clips(energy, library, role="bg", n=8, tier=None, exclude_paths=None):
+    """从素材库挑素材（按动态档 + 能量，不再看曲风）。
 
-    :param energy: 0..1 能量
-    :param library: {path: MediaItem}
-    :param role:   图层角色 "fg" / "bg"
-    :param tier:   None / "low" / "mid" / "high" —— 段落/实时档位给出的**强制档**：
-                   None 时按 `energy` 自判（与档位阈值同一套 0.40 / 0.75）。
-    :return: 素材列表（可能为空 —— 该角色下没有任何可用素材）
+    :param n: 最多返回几个；``None``/``<=0`` = 返回该档全部候选。
+    :param exclude_paths: 刚进过池/刚播过的素材路径；优先避开，数量不够时才回填。
     """
-    cands = [m for m in library.values()
-             if getattr(m, "roles", {}).get(role)
-             and not getattr(m, "excluded", False)]
-    if not cands:
+    all_cands = [m for m in library.values()
+                 if getattr(m, "roles", {}).get(role)
+                 and not getattr(m, "excluded", False)]
+    if not all_cands:
         return []
+    _ex = {str(p) for p in (exclude_paths or ()) if p}
+    cands = [m for m in all_cands if str(getattr(m, "path", "")) not in _ex]
+    excluded = [m for m in all_cands if str(getattr(m, "path", "")) in _ex]
+    if not cands:                     # 全被排除：只能回填，绝不返回空池
+        cands, excluded = excluded, []
 
     eff = tier if tier in ("low", "mid", "high") else (
         "high" if energy >= TIER_HI else ("low" if energy < TIER_LO else "mid"))
@@ -143,4 +144,14 @@ def match_clips(energy, library, role="bg", n=6, tier=None):
         no_flash = [m for m in picked if DYNAMIC_FLICKER not in _tags(m)]
         picked = no_flash or picked
 
-    return picked[:n]
+    if n is None or int(n) <= 0:
+        return picked
+    lim = int(n)
+    out = picked[:lim]
+    if len(out) < lim:
+        for m in excluded:
+            if len(out) >= lim:
+                break
+            if m not in out:
+                out.append(m)
+    return out

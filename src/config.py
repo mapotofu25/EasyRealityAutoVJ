@@ -153,6 +153,11 @@ DEFAULTS = {
         "device_by_source": {},
         "mono": True,
         "sample_rate": 0,              # 0=自动（跟随设备原生采样率，避免重采样；推荐）
+        # ★ 2026-11-22（1.2 Beta1）：声卡采集后的手动数字增益。
+        #   只影响软件分析与表头，不改现场 PA；已削波无法恢复。
+        "gain_enabled": False,
+        "gain_db": 0.0,                # -12 ~ +12 dB
+        "gain_by_device": {},          # {"source|device": {"enabled": bool, "db": float}}
         "gain": 1.0,                # 已废弃（2026-09-25 移除增益滑块）：保留只为兼容旧配置
         # ASIO 用哪两路**输入通道**（0 基）。⚠ ASIO 抓不到别的程序播出来的声音
         # （没有 loopback 概念），只能选硬件输入；有些驱动的输入自带 Loopback 通道，
@@ -277,7 +282,7 @@ DEFAULTS = {
         "spout_enabled": False,       # Spout 输出：把画面发给本机 OBS/Resolume 等
         # Spout/NDI 是否发送 Alpha（透明通道）。默认关＝原来的不透明 BGRA；
         # 开启后画布改用 ARGB32（直通 alpha），显示器窗口仍按黑底显示。
-        "alpha_enabled": False,
+        "alpha_enabled": True,
         # ★★ 2026-10-30（用户要求）：两个输出的默认名**固定**，并各自带括号说明。
         #   原来两个都叫 `EasyRealityAutoVJ` —— 在 OBS 的源列表里**完全分不出来**，
         #   用户不知道该选哪个。它们的本质差异就一条：
@@ -311,6 +316,7 @@ DEFAULTS = {
     "clip_score": {},             # 每素材动态分 0~1：path -> float
     "clip_roles": {},             # 每素材角色：path -> {"fg":bool,"bg":bool}
     "clip_excluded": {},          # 排除自动匹配的素材（logo 等固定素材）：path -> True
+    "clip_scanned": {},           # ★ 已扫描分析（excluded 视频也记；不代表有标签）：path -> True
     "dyn_tag_ver": 0,             # 动态标签版本：动态检测算法升级时 +1，启动时 <当前版本 触发一次重扫
     "music_library": [],          # 音乐曲库：音频文件路径列表（演出前分析用）
     "music_meta": {},             # 每首歌的曲风：path -> {"artist","title","genre","zh":[],"source"}
@@ -350,6 +356,22 @@ class Config:
 
     def _migrate(self):
         """一次性迁移：只在缺标记位时改，**不覆盖用户手动改过的值**。"""
+        # ★ 2026-11-25：Alpha 输出固定开启，旧配置里关掉的也强制打开
+        try:
+            out = self.data.setdefault("output", {})
+            changed = False
+            if out.get("alpha_enabled") is not True:
+                out["alpha_enabled"] = True
+                changed = True
+            for cfg in (out.get("configs") or []):
+                for sc in ((cfg or {}).get("screens") or []):
+                    if isinstance(sc, dict) and sc.get("alpha") is not True:
+                        sc["alpha"] = True
+                        changed = True
+            if changed:
+                self.save()
+        except Exception:
+            pass
         # ★ 2026-11-08 优化版：旧配置里 gpu_decode 默认是 False；迁移一次到 True。
         #   用户之后在界面里手动关掉，会写入 _gpu_decode_auto 标记，不再覆盖。
         try:

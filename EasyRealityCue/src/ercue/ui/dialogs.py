@@ -17,7 +17,7 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout,
 )
@@ -46,9 +46,12 @@ def report_text(report) -> str:
 # 导出决策
 # ==========================================================================
 class ExportDecision:
-    """导出弹窗的结果。`proceed=False` 表示用户取消。"""
+    """导出弹窗的结果。`proceed=False` 表示用户取消。
 
-    def __init__(self, proceed: bool, embed: bool = False):
+    ★ 2026-11-26：素材默认**始终一起打包**；`embed` 保留给测试/命令行显式指定。
+    """
+
+    def __init__(self, proceed: bool, embed: bool = True):
         self.proceed = bool(proceed)
         self.embed = bool(embed)
 
@@ -75,9 +78,12 @@ def red_dot_icon(size: int = 10) -> QIcon:
 # 导出前检查弹窗
 # ==========================================================================
 class ExportCheckDialog(QDialog):
-    """展示导出前检查清单 + 「内嵌素材」勾选 + 「仍然导出 / 取消」。"""
+    """展示导出前检查清单 + 「仍然导出 / 取消」。
 
-    def __init__(self, report, embed_default=False, parent=None):
+    ★ 2026-11-26（用户要求）：去掉「内嵌素材」勾选；导出默认把素材一起打包。
+    """
+
+    def __init__(self, report, embed_default=True, parent=None):
         super().__init__(parent)
         self.setWindowTitle("导出前检查")
         self.setMinimumWidth(520)
@@ -94,9 +100,10 @@ class ExportCheckDialog(QDialog):
             txt.setStyleSheet("color:%s;" % theme.c("missing"))
         v.addWidget(txt)
 
-        self.chk_embed = QCheckBox("把素材一起打包进 .ercue（超过 1 GB 会提醒，别人换机也能打开）")
-        self.chk_embed.setChecked(bool(embed_default))
-        v.addWidget(self.chk_embed)
+        embed_hint = QLabel("素材会一起打包进 .ercue（别人换机也能打开）。")
+        embed_hint.setWordWrap(True)
+        embed_hint.setStyleSheet("color:%s;" % theme.c("fg_dim"))
+        v.addWidget(embed_hint)
 
         hint = QLabel("缺素材不会写进包：别人拿到后对应片段会显示「文件丢失」。"
                       "可先「仍然导出」，回头用「指定素材目录…」重挂。")
@@ -122,13 +129,13 @@ class ExportCheckDialog(QDialog):
             self.btn_go.setFocus()
 
 
-def ask_export(parent, report, embed_default=False) -> ExportDecision:
-    """弹导出前检查对话框。**没有 QApplication 时直接放行（不阻塞）**。"""
+def ask_export(parent, report, embed_default=True) -> ExportDecision:
+    """弹导出前检查对话框。`embed_default` 保留兼容参数，导出始终内嵌素材。"""
     if QApplication.instance() is None:
-        return ExportDecision(True, embed_default)
+        return ExportDecision(True, True)
     dlg = ExportCheckDialog(report, embed_default, parent)
     ok = dlg.exec() == QDialog.Accepted
-    return ExportDecision(ok, dlg.chk_embed.isChecked())
+    return ExportDecision(ok, True)
 
 
 # ==========================================================================

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """★ BPM 自动识别核心（零 Qt，纯 numpy/stdlib）—— **逐字移植自 `AutoVJ/src/beatgrid.py`**。
 
 ⚠⚠ **与 `<工作区>\\AutoVJ\\src\\beatgrid.py` 逐字一致：改一端必须改另一端。**

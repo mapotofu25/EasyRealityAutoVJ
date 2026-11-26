@@ -51,11 +51,13 @@ from . import dialogs, theme
 from . import identity_scan                            # ★ 哈希序列缓存 / 导出补算共用实现
 from .identity_scan import IdentityScanWorker
 from .media_wave import MediaWaveWorker
+from .media_probe import MediaProbeWorker
 from .panels import MediaPanel, PkgPanel, TrackPanel
 from .preview import PreviewCanvas
 from .props_panel import PropsPanel
 from .section_stack import SectionStack, make_tabs, wrap_scroll
 from .timeline_widget import CueTimeline, mmss
+from .thread_guard import orphan_thread
 
 log = logging.getLogger("ercue.ui.window")
 
@@ -74,9 +76,11 @@ def _app_version() -> str:
         return "0.0.0-dev"
 
 
-APP_VERSION = "1.0"
-# 内部比较/写包用日期构建号（码表包 min_app_version 是日期串，不能用 "1.0" 比）
-APP_VERSION_NUM = _app_version()
+APP_VERSION = (_app_version()) + "-RC4"
+
+# ★ 2026-11-26：对外产品版本（1.3 正式版）。`APP_VERSION` 继续保留构建日期号，
+#   供 `.ercue` 的 min_app_version 兼容比较使用；窗口标题/关于只显示这个。
+PRODUCT_VERSION = "1.3 正式版"
 UNDO_CAP = 50
 # 滑杆 seek 防抖：拖动停止这么久之后才真正给音频重定位一次（P1，避免每帧重启音频）
 SEEK_DEBOUNCE_MS = 100
@@ -311,7 +315,7 @@ class MainWindow(QMainWindow):
         """
         super().__init__(parent)
         self.setWindowTitle("EasyRealityCue —— DJ 码表编排编辑器 · %s"
-                            % APP_VERSION.rsplit("-", 1)[-1])
+                            % PRODUCT_VERSION)
         self.resize(1240, 800)
         self.setStyleSheet(theme.stylesheet())
         # ★★ 2026-11-03 03:56（用户：「鼠标悬停在选项上滚轮会调整选项，经常误操作，去掉」）：
@@ -348,6 +352,8 @@ class MainWindow(QMainWindow):
         self._bpm_force_old = 0.0                 # 重算前的 BPM（日志"原 X → 新 Y"用）
         # ★ T07（需求 11）：素材音轨波形的后台 worker（**按需**起，见 `_ensure_clip_waves`）
         self._wave_worker = None
+        self._probe_worker = None
+        self._shutting_down = False
         self._pending_seek_sec = None             # 滑杆拖动待落地的音频 seek（防抖）
         self._sig = {"sheet": 0}                  # B1 哨兵：统计下拉框级联信号次数
         self.thumbs_enabled = True
@@ -960,16 +966,32 @@ class MainWindow(QMainWindow):
         if not path or not os.path.isfile(path) or not zipfile.is_zipfile(path):
             return None
         dest = str(path) + ".media"
+        _sizes = {}
         try:
             with zipfile.ZipFile(path) as z:
-                has_media = any(n.startswith(ercue_io.MEDIA_DIR + "/") and not n.endswith("/")
-                                for n in z.namelist())
+                for zi in z.infolist():
+                    if (zi.filename.startswith(ercue_io.MEDIA_DIR + "/")
+                            and not zi.filename.endswith("/")):
+                        _sizes[zi.filename.split("/", 1)[1]] = int(zi.file_size)
         except zipfile.BadZipFile:
             return None
-        if not has_media:
+        if not _sizes:
             return None
-        if os.path.isdir(dest) and os.listdir(dest):
-            return dest                            # 已解过 → 幂等跳过
+        # ★ 2026-11-18：只看"目录非空"会在重新导出同名素材后继续播旧文件。
+        #   按 member 的文件大小判断，任何一首大小变了就重解（extract 会覆盖）。
+        if os.path.isdir(dest):
+            try:
+                _ok = True
+                for _n, _sz in _sizes.items():
+                    _p = os.path.join(dest, _n)
+                    if (not os.path.isfile(_p)
+                            or os.path.getsize(_p) != _sz):
+                        _ok = False
+                        break
+                if _ok:
+                    return dest                     # 同名同大小 → 幂等跳过
+            except OSError:
+                pass
         ercue_io.extract_media(path, dest)         # 失败会抛，交给调用方报错
         return dest
 
@@ -1000,7 +1022,7 @@ class MainWindow(QMainWindow):
         identity_scan.clear_hash_cache()               # ★ C3：缓存只属于"当前这张表"
         self._remount_media()
         # ★ 兼容提示（规格书 §3.2）：接上 capability_report，**一律不阻断导入**。
-        warn, _miss_dir = ercue_io.capability_report(sheet, app_version=APP_VERSION_NUM,
+        warn, _miss_dir = ercue_io.capability_report(sheet, app_version=APP_VERSION,
                                                      media_dir=sess.dir or None)
         miss = [m.name for m in sheet.media
                 if not os.path.isfile(sess.media_paths.get(m.clip_id) or "")]
@@ -1500,38 +1522,29 @@ class MainWindow(QMainWindow):
             self._warn_missing_bpm()
 
         # ③ 弹窗（只在交互模式；测试 _interactive=False 时绝不阻塞）
-        do_embed = bool(self._embed_pref) if embed is None else bool(embed)
+        # ★ 2026-11-26（用户要求）：不再提供「是否内嵌素材」的勾选；
+        #   UI 导出默认把素材一起打包。`embed` 参数仅保留给测试/命令行显式覆盖。
+        do_embed = True if embed is None else bool(embed)
         if self._interactive and not force:
-            decision = dialogs.ask_export(self, report, embed_default=do_embed)
+            decision = dialogs.ask_export(self, report, embed_default=True)
             if not decision.proceed:
                 self._log("已取消导出。")
                 return False
-            do_embed = decision.embed
+            do_embed = True
 
-        # ④ 内嵌素材体积**提醒**（超 1 GB ⇒ 弹窗询问，用户可选继续内嵌或改不内嵌）
-        #    ⚠ 2026-10-17 用户要求：取消原 500MB 硬上限（旧行为是"超限就自动取消内嵌、不给选择"）
+        # ④ 内嵌素材体积**提醒**（超 1 GB ⇒ 只提示，不再给“不内嵌”的选项）
         if do_embed:
             over, total, _names = self._embed_size_check()
             human = precheck.human_mb(total)
             if over:
                 if self._interactive and not force:
                     from PySide6.QtWidgets import QMessageBox
-                    r = QMessageBox.question(
+                    QMessageBox.information(
                         self, "内嵌素材较大（超过 1 GB）",
                         "本次要内嵌的素材共 %s，超过 1 GB。\n\n"
-                        "导出的 .ercue 会比较大：导出、拷贝、对方打开都会慢一些。\n"
-                        "是否仍然内嵌？\n\n"
-                        "（选「No」＝只导出码表不内嵌素材，"
-                        "对方机器需要有同一素材库）" % human,
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.Yes)
-                    if r != QMessageBox.Yes:
-                        do_embed = False
-                        self._log("素材共 %s（超过 1 GB）：选择不内嵌。" % human)
-                    else:
-                        self._log("素材共 %s（超过 1 GB）：确认继续内嵌。" % human)
-                else:
-                    self._log("⚠ 内嵌素材共 %s（超过 1 GB）。" % human)
+                        "导出的 .ercue 会比较大：导出、拷贝、对方打开都会慢一些，"
+                        "但素材会一起带走，换机可直接打开。" % human)
+                self._log("⚠ 内嵌素材共 %s（超过 1 GB，已一起打包）。" % human)
         self._embed_pref = bool(do_embed)
         self.cfg.set("embed_media", bool(do_embed))
 
@@ -1584,7 +1597,7 @@ class MainWindow(QMainWindow):
         try:
             ercue_io.save(s.sheet, path, media_paths=s.media_paths, embed=do_embed,
                           app_version=APP_VERSION,
-                          generator={"tool": "EasyRealityCue", "version": APP_VERSION},
+                          generator={"tool": "EasyRealityCue", "version": PRODUCT_VERSION},
                           thumbs=thumbs_map, fp_packs=fp_map)
         except Exception as e:                         # noqa: BLE001
             log.exception("导出失败: %s", path)
@@ -1665,39 +1678,82 @@ class MainWindow(QMainWindow):
             #   透明区变不透明黑 ⇒ 盖死下层 + 淡出末尾黑屏）。
             #   用 `_probed` 标记保证**每个素材只探一次**，不会每次加都重探。
             if new_ref or not getattr(ref, "_probed", False):
-                self._probe_media_ref(ref, p)          # ★ B4：探测时长 / alpha 写进 MediaRef
+                self._queue_media_probe(ref, p)        # ★ B4：后台探测时长 / alpha
             ids.append(ref.clip_id)
             self._log("已加素材：%s" % name)
         self._mark_dirty()
         self._refresh_all()
         return ids
 
-    @staticmethod
-    def _probe_media_ref(ref, path):
-        """★ B4：把 `probe.probe()` 的**时长 / alpha** 结论写进 `MediaRef`。
+    def _queue_media_probe(self, ref, path):
+        """把素材探测排到后台（**不阻塞添加素材**）。
 
-        只在**尚未探测过**时调用（用实例属性 `_probed` 记住，不写进 .ercue）；
-        探测失败（`error` 非空 / 抛异常）**容错跳过**，绝不阻断导入
-        —— 探测不到的素材照常能编辑，只是 precheck 少一条超长提示。
+        每个素材只排一次；`_probed` 仍只在成功后由主线程置位，失败可重试。
         """
         if ref is None or not path or not os.path.isfile(path):
+            return False
+        if getattr(ref, "_probed", False):
+            return False
+        if getattr(self, "_shutting_down", False):
+            return False
+        w = getattr(self, "_probe_worker", None)
+        if w is None:
+            w = MediaProbeWorker(self)
+            w.done.connect(self._on_media_probed)
+            w.failed.connect(self._on_media_probe_failed)
+            self._probe_worker = w
+        s = self.session
+        key = str(getattr(s, "key", "") or "") if s is not None else ""
+        return bool(w.request(key, ref.clip_id, path))
+
+    def _on_media_probed(self, session_key, clip_id, path, data):
+        """后台探测回执：只写回**原码表**里仍指向同一路径的同一个 clip。"""
+        if getattr(self, "_shutting_down", False):
+            return
+        sess = (self.sessions or {}).get(str(session_key))
+        if sess is None or getattr(sess, "sheet", None) is None:
+            return
+        cid = str(clip_id or "")
+        want = os.path.abspath(str(path or ""))
+        got = os.path.abspath(str((sess.media_paths or {}).get(cid) or ""))
+        if not cid or not want or got != want:
+            return                                    # 素材已删/换路径/码表已换
+        ref = next((m for m in sess.sheet.media if m.clip_id == cid), None)
+        if ref is None:
             return
         try:
-            from ercue.media.probe import probe
-            r = probe(path)
-        except Exception:                              # noqa: BLE001
-            log.exception("素材探测失败: %s", path)
-            return
-        if r is None or not getattr(r, "ok", False):
-            return
-        if float(getattr(r, "duration_sec", 0.0) or 0.0) > 0.0:
-            ref.duration_sec = float(r.duration_sec)
-        ref.has_alpha = bool(r.has_alpha)
-        # ★ 记住"已探测过"（实例属性，不写进 .ercue）⇒ 再次加同一素材时不会重复探测。
+            dur = float((data or {}).get("duration_sec") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            dur = 0.0
+        if dur > 0.0:
+            ref.duration_sec = dur
+        ref.has_alpha = bool((data or {}).get("has_alpha", False))
         try:
             ref._probed = True
-        except Exception:                                        # noqa: BLE001
+        except Exception:                                      # noqa: BLE001
             pass
+        sess.dirty = True
+        if sess is self.session:
+            try:
+                self._refresh_media_panel()
+            except Exception:                                  # noqa: BLE001
+                log.exception("刷新素材面板失败")
+            try:
+                self._mark_dirty()
+            except Exception:                                  # noqa: BLE001
+                log.exception("标记素材探测结果失败")
+        else:
+            # 非当前码表：更新内存并排进自动保存，不碰界面。
+            try:
+                if self._autosave_enabled:
+                    self._autosave_pending.add(sess.key)
+                    self._autosave_timer.start()
+            except Exception:                                  # noqa: BLE001
+                log.exception("安排素材探测结果自动保存失败")
+
+    def _on_media_probe_failed(self, session_key, clip_id, reason):
+        if not getattr(self, "_shutting_down", False):
+            log.warning("素材探测跳过: %s (%s)", clip_id, reason)
 
     def remove_media(self, clip_id):
         s = self.session
@@ -1793,13 +1849,16 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # 曲目
     # ==================================================================
-    def add_track(self, title="新曲目", artist="", duration_sec=0.0, bpm=0.0) -> int:
+    def add_track(self, title="", artist="", duration_sec=0.0, bpm=0.0) -> int:
         s = self.session
         if s is None:
             return -1
         self._push_undo()
         te = ercue_io.new_track(title, artist, duration_sec, bpm)
-        te.identity.title = title or "新曲目"
+        # ★ 2026-11-18（用户）：「导入音频」时若文件没有标签，曲名直接用**文件名**，
+        #   不要再留「新曲目」这种占位名。这里只做空值兜底；真正读文件名在
+        #   `import_audio_as_new_track` / `import_track_audio` 里（都能拿到路径）。
+        te.identity.title = title or ""
         te.identity.ensure_meta_id()
         if not te.track_key:
             te.track_key = te.identity.meta_id[:12] or "t%d" % (len(s.sheet.tracks) + 1)
@@ -1880,8 +1939,8 @@ class MainWindow(QMainWindow):
           现在合成一步 —— 选一个音频就是一条曲目。否则按钮去掉之后，空码表根本没法开始。
         ★ 抽成独立方法（不塞在对话框回调里）：无头测试要直接驱动它，不能弹文件框。
         """
-        base = os.path.splitext(os.path.basename(str(path or "")))[0]
-        if self.add_track(title=base or "新曲目") < 0:
+        base = os.path.splitext(os.path.basename(str(path or "")))[0].strip()
+        if self.add_track(title=base) < 0:
             return False
         return self.import_track_audio(path)
 
@@ -1895,8 +1954,14 @@ class MainWindow(QMainWindow):
         meta = self._read_audio_meta(path)
         self._push_undo()
         idt = tr.identity
+        # ★ 2026-11-18（用户）：demo / 未打标签的文件导入后不要再显示「新曲目」——
+        #   没有 title 标签时，曲名 = **音频文件名**（去掉扩展名）。
+        #   也覆盖"先建了空曲目、再往里导入音频"的旧工程（标题还是「新曲目」）。
+        stem = os.path.splitext(os.path.basename(str(path or "")))[0].strip()
         if meta["title"]:
             idt.title = meta["title"]
+        elif not str(idt.title or "").strip() or str(idt.title).strip() == "新曲目":
+            idt.title = stem
         if meta["artist"]:
             idt.artist = meta["artist"]
         if meta["duration_sec"]:
@@ -2315,7 +2380,13 @@ class MainWindow(QMainWindow):
         if it is None:
             return
         self._push_undo()
-        it.xform = dict(xform) if isinstance(xform, dict) else {"scale": 1.0, "x": 0.0, "y": 0.0}
+        # ★ 2026-11-18：预览拖拽/滚轮只传 scale/x/y，不能整份替换 xform，
+        #   否则属性面板里设的 `rot`（以及未来新键）会被静默清 0。
+        _xf = dict(getattr(it, "xform", None) or {})
+        if isinstance(xform, dict):
+            _xf.update({k: v for k, v in xform.items()
+                        if k in ("scale", "x", "y")})
+        it.xform = _xf or {"scale": 1.0, "x": 0.0, "y": 0.0}
         it.crop = (list(crop) if isinstance(crop, (list, tuple)) and len(crop) == 4 else None)
         it.normalized()
         self._sync_props_selection()
@@ -2973,6 +3044,25 @@ class MainWindow(QMainWindow):
     def _preload_audio(self):
         """换歌 / 切码表后**后台预载整首**（不阻塞 GUI，P2）。"""
         path = self._audio_path()
+        # ★ 2026-11-18：旧工程里的「新曲目」占位名 —— 一旦它已经绑了音频文件，
+        #   打开/选中时就把曲名补成文件名（导入时已修，这里负责存量工程）。
+        tr = self._track()
+        if path and tr is not None and os.path.isfile(path):
+            _idt = tr.identity
+            _t = str(_idt.title or "").strip()
+            if not _t or _t == "新曲目":
+                _stem = os.path.splitext(os.path.basename(path))[0].strip()
+                if _stem:
+                    _idt.title = _stem
+                    # ★ 2026-11-18：旧占位工程可能带着**上一首**的 file_name；
+                    #   重命名时必须一起纠正，否则导出的指纹会按旧文件名回绑。
+                    _idt.file_name = os.path.basename(path)
+                    _idt.meta_id = Identity.meta_key(_idt.title, _idt.artist,
+                                                     _idt.duration_sec)
+                    tr.track_key = _idt.meta_id or tr.track_key
+                    self._mark_dirty()
+                    self._log("曲名由占位名改为文件名：%s" % _stem)
+                    self._refresh_all()
         if path and os.path.isfile(path) and not (self.audio.loaded and self.audio.loaded_path == path):
             self.audio.load(path)                      # 异步；同路径在解码时内部幂等
             if self.audio.loading:
@@ -3202,6 +3292,9 @@ class MainWindow(QMainWindow):
                     w.wait(int(wait_ms))
                 except Exception:                       # noqa: BLE001
                     pass
+            # ★ 2026-11-18：有界等待超时后不能把 running 的 QThread 留在
+            #   即将销毁的窗口下面 ⇒ 摘父对象、保活到 finished。
+            orphan_thread(w)
 
     def _start_audio_poll(self):
         """解码中就轮询状态，用于恢复 ▶ 按钮 / 记录日志（不阻塞）。"""
@@ -3236,7 +3329,10 @@ class MainWindow(QMainWindow):
         path = self._audio_path()
         if not path or not os.path.isfile(path):
             return False
-        if not self.audio.loaded:
+        # ★ 2026-11-18：必须同时看 loaded_path。只判断 `.loaded` 时，
+        #   切轨/删轨后会把**上一首**的音频当成当前轨道播放（位置/时长全错）。
+        if (not self.audio.loaded
+                or os.path.abspath(self.audio.loaded_path or "") != os.path.abspath(path)):
             self.audio.load(path)                      # 异步发起（本次不播，就绪后再按 ▶）
             if self.audio.loading:
                 self._start_audio_poll()
@@ -3731,6 +3827,15 @@ class MainWindow(QMainWindow):
 
     def shutdown(self):
         """关闭时释放解码器与后台线程、音频（A4/A6/P2）。"""
+        self._shutting_down = True
+        try:
+            w = getattr(self, "_probe_worker", None)
+            self._probe_worker = None
+            if w is not None:
+                w.stop()
+                orphan_thread(w)
+        except Exception:                              # noqa: BLE001
+            log.exception("停止素材探测线程失败")
         # ★ T02（R7）：**先 flush 自动保存**（要在停任何东西之前），保证最后一次改动落盘。
         try:
             self._flush_autosave()
@@ -3776,6 +3881,8 @@ class MainWindow(QMainWindow):
         try:
             if self._wave_worker is not None:           # ★ T07：停素材波形线程（有界等待）
                 self._wave_worker.stop()
+                # ★ 2026-11-18：等待未结束 ⇒ 转孤儿，别让窗口销毁 running 线程
+                orphan_thread(self._wave_worker)
                 self._wave_worker = None
         except Exception:                              # noqa: BLE001
             log.exception("停止素材波形线程失败")

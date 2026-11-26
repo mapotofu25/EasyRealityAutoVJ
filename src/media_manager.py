@@ -104,6 +104,27 @@ def _qimage_owned(arr, w, h, qfmt):
     return img
 
 
+def premultiply_for_compose(img):
+    """把「直通 alpha」的 ARGB32 帧转成预乘格式；其它格式原样返回。
+
+    ★★★ 2026-11-25（用户：开 NDI+Spout / 多屏都掉到 20 帧）：
+      引擎画布已改为 `Format_ARGB32_Premultiplied`（见 `engine._canvas_format`）。
+      Qt 把**直通 ARGB32 源图**画到预乘画布时，会在每一次 drawImage 内部逐像素
+      做一次 premultiply —— 实测 1080p 单层多花 **~1.2ms/帧**，6 层就是 ~7ms。
+      这里在**解码线程**里先转一次（Qt 的 SIMD 转换，1080p ≈1.2ms），渲染线程
+      只画预乘源图（6 层 6.3ms vs 直通源 13.5ms）。
+
+      ⚠ 必须只在解码/加载线程调用；渲染线程里对每帧视频调用等于没省。
+    """
+    try:
+        if img is not None and not img.isNull() \
+                and img.format() == QImage.Format_ARGB32:
+            return img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    except Exception:                                          # noqa: BLE001
+        pass
+    return img
+
+
 from config import app_base_dir
 THUMB_DIR = os.path.join(app_base_dir(), "thumbs")
 os.makedirs(THUMB_DIR, exist_ok=True)
@@ -505,6 +526,7 @@ class MediaItem:
         self.disabled_tags = []              # [中文tag, ...] 被用户取消的自动标签（重扫不复活）
         self.roles = {"fg": False, "bg": False}   # 多重角色：前景/背景
         self.excluded = False                # 排除自动打标/匹配（logo 等固定素材）
+        self.scanned = False                 # ★ 已扫描分析（excluded 视频也会置 True；不代表有标签）
         # ★ 2026-10-30（用户「给素材打分 0-1」）：动态分，None = 还没扫过。
         #   三档只决定进哪个池，这个分决定池里挑谁（`match_engine.match_clips`）。
         self.score = None
@@ -1723,8 +1745,11 @@ class AvAlphaPlayer(_DecoderHealth):
                                 arr, (max(1, int(w * sc)), max(1, int(h * sc))),
                                 interpolation=_RESIZE_INTERP)
                             h, w = arr.shape[:2]
-                    img = QImage(arr.data, w, h, 4 * w, self._qfmt)
                     self._img = _qimage_owned(arr, w, h, self._qfmt)
+                    if self.out_alpha:
+                        # ★ 解码线程里预乘一次（渲染线程每帧就不用再转，见
+                        #   `premultiply_for_compose` 的性能说明）
+                        self._img = premultiply_for_compose(self._img)
                     self._pts = fsec                      # ★ 与 _img 同源（可 None）
                     ok = True
                 except Exception:                              # noqa: BLE001
@@ -2348,6 +2373,14 @@ class GpuDxvPlayer(_DecoderHealth):
                 return max(1, int(w * s)), max(1, int(h * s))
         return w, h
 
+    def _finish(self, img):
+        """解码线程收尾：带 alpha 的帧在这里预乘一次（渲染线程每帧就不用转）。
+
+        见 `premultiply_for_compose`：Qt 画「直通 ARGB32」源图到预乘画布时会在
+        drawImage 内部逐帧转换，1080p 每层多 ~1.2ms；解码线程先转掉最省。
+        """
+        return premultiply_for_compose(img) if self.out_alpha else img
+
     # ---------------- 两条取帧生成器（各自无限循环） ----------------
     def _rewind(self):
         """回到片头；seek 失败则重开容器。False = 无法继续（生成器收尾）。"""
@@ -2438,7 +2471,7 @@ class GpuDxvPlayer(_DecoderHealth):
                     self._pts = pts
                     # ⚠ GPU 回读缓冲是 **worker 内部复用**的（glctx._buf，下一帧会原地覆盖），
                     #   必须整幅 copy；不能像软解那样借缓冲。
-                    yield QImage(arr.data, dw, dh, 4 * dw, self._qfmt).copy()
+                    yield self._finish(QImage(arr.data, dw, dh, 4 * dw, self._qfmt).copy())
             except Exception:                                          # noqa: BLE001
                 pass
             if seeked:
@@ -2522,7 +2555,7 @@ class GpuDxvPlayer(_DecoderHealth):
                                      if _pts is not None else None)
                     except Exception:
                         self._pts = None
-                    yield _qimage_owned(arr, w, h, self._qfmt)
+                    yield self._finish(_qimage_owned(arr, w, h, self._qfmt))
                     now = time.perf_counter()
                     if now >= next_probe:
                         next_probe = now + self._GPU_REPROBE_SECS
@@ -2591,7 +2624,7 @@ class GpuDxvPlayer(_DecoderHealth):
                                      if _pts is not None else None)
                     except Exception:
                         self._pts = None
-                    yield _qimage_owned(arr, w, h, self._qfmt)
+                    yield self._finish(_qimage_owned(arr, w, h, self._qfmt))
             except Exception:                                      # noqa: BLE001
                 pass
             if seeked:
@@ -2680,7 +2713,7 @@ class GpuDxvPlayer(_DecoderHealth):
                 bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
                 got += 1
                 self._pts = pts
-                yield _qimage_owned(bgra, w, h, self._qfmt)
+                yield self._finish(_qimage_owned(bgra, w, h, self._qfmt))
             if self._dead:
                 return
             empty = 0 if got else empty + 1
@@ -2881,7 +2914,8 @@ class GifPlayer:
             img = reader.read()
             if img.isNull():
                 break
-            self.frames.append(img)
+            # ★ 2026-11-25：GIF 帧在加载时预乘一次（渲染线程只画预乘源图）。
+            self.frames.append(premultiply_for_compose(img))
             d = reader.nextImageDelay()
             self.delays.append(max(d, 30) / 1000.0)
             if len(self.frames) > 300:
@@ -2947,7 +2981,9 @@ class GifPlayer:
 
 class ImagePlayer:
     def __init__(self, path):
-        self.img = QImage(path)
+        # ★ 2026-11-25：带 alpha 的 PNG/静态图在加载时预乘一次；否则渲染线程
+        #   每帧 drawImage 都要在 Qt 内部逐像素转换（1080p 每层 ~1.2ms）。
+        self.img = premultiply_for_compose(QImage(path))
 
     def set_max_size(self, w, h):
         """静态图只缩一次（不是每帧）。

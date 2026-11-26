@@ -42,6 +42,15 @@ cmd = [
     "--collect-all", "onnxruntime",
     "--collect-all", "mutagen",
     "--collect-all", "av",
+    # 2026-11-26 独立 GPU 渲染进程：moderngl/glcontext/glfw 含 DLL，
+    # multiprocessing.spawn 子进程在冻结包里必须能 import 到。
+    "--collect-all", "moderngl",
+    "--collect-all", "glcontext",
+    "--collect-all", "glfw",
+    "--hidden-import", "gpu_render_proc",
+    "--hidden-import", "gpu_render_client",
+    "--hidden-import", "gpu_stage_mgl",
+    "--hidden-import", "gpu_compose_layers",
     "--hidden-import", "cffi",
     "--hidden-import", "tags_def",
     "--hidden-import", "tagger",

@@ -82,12 +82,11 @@ def find_audio(root, follow=True):
 
 def decode(path):
     """解码成「单声道 float32 + 采样率 + 时长」。失败抛异常（由调用方吞）。"""
-    import soundfile as sf
-    info = sf.info(path)
-    dur = float(info.duration)
-    data, sr = sf.read(path, dtype="float32", always_2d=True)
-    sig = np.mean(data, axis=1).astype(np.float32, copy=False)
-    return sig, int(sr), dur
+    # ★ 2026-11-22：soundfile 对个别 FLAC 会报 "decoder lost sync"；
+    #   统一走 audio_decode（PyAV 兜底），波形/网格才不会整首消失。
+    from audio_decode import decode_mono
+    sig, sr, dur = decode_mono(path, maxsec=None)
+    return sig, int(sr), float(dur)
 
 
 def read_tags(path):

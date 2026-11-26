@@ -59,8 +59,11 @@ def version_str(date_key, seq):
 
 
 def zip_name(date_key, seq):
-    """压缩包名：EasyRealityCue_<版本>.zip"""
+    """压缩包名：EasyRealityCue_<构建版本>.zip"""
     return "EasyRealityCue_%s.zip" % version_str(date_key, seq)
+
+
+PRODUCT_VERSION = "1.3 正式版"
 
 
 def version_from_zip_name(name):
@@ -142,7 +145,7 @@ def stamp_docs(ver):
     for i in range(min(8, len(lines))):
         body = lines[i].rstrip("\r\n")
         if pat.match(body.strip()):
-            lines[i] = ("版本 %s" % ver) + lines[i][len(body):]
+            lines[i] = ("版本 %s（构建 %s）" % (PRODUCT_VERSION, ver)) + lines[i][len(body):]
             try:
                 with open(DOC_HEAD, "w", encoding="utf-8", newline="") as f:
                     f.write("".join(lines))

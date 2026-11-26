@@ -14,11 +14,12 @@ try:
 except Exception:                      # 源码模式 / 未经打包
     BUILD_DATE, BUILD_SEQ, BUILD_VER, ZIP_NAME = "", 0, "dev", ""
 
-# ★ 2026-11-21：1.1 正式版。对外只显示「1.1」；
-#   内部兼容比较（码表包 min_app_version）用 APP_VERSION_NUM（仍是构建日期号）。
+# ★ 2026-11-26：1.3 正式版（ERLIB Build Up 同步、曲库包 Build Up 随包）。
+#   对外显示「1.3 正式版」；内部兼容比较（码表包 min_app_version）用
+#   APP_VERSION_NUM（仍是构建日期号）。
 APP_OFFICIAL = True
 APP_CHANNEL = ""
-APP_VERSION = "1.1"
+APP_VERSION = "1.3 正式版"
 APP_VERSION_NUM = BUILD_VER or "dev"     # 仅供版本比较/日志，不直接展示
 APP_BUILD = BUILD_DATE or ""
 APP_SEQ = BUILD_SEQ

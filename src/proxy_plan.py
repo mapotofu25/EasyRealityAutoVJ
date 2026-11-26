@@ -79,8 +79,8 @@ def _meta(it):
 def _classify(it):
     if getattr(it, "kind", "") != "video":
         return None, "非视频"
-    if getattr(it, "excluded", False):
-        return None, "已排除（logo/PV 等）"
+    # ★ 2026-11-25（用户）：勾了“排除打标/匹配”的视频也要参与代理检测；
+    #   如果格式需要转码，照样列进转码列表（转完只扫描分析，不打标）。
     pp = getattr(it, "proxy_path", None)
     if pp and os.path.exists(pp):
         return None, "已有代理"
@@ -161,6 +161,7 @@ def _classify(it):
             "dur": dur,
             "fps": m["fps"],
             "alpha": bool(alpha),
+            "excluded": bool(getattr(it, "excluded", False)),
             "target": target,
             "category": category,
             "reason": reason,

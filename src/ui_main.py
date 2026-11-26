@@ -320,7 +320,7 @@ class SettingsPanel(QWidget):
         gm.addWidget(QLabel("素材切换节奏"), 0, 0)
         self.mode_combo = QComboBox()
         # ★ 2026-10-25：加回「手动」——选它之后**完全不做自动切换**，
-        #   只有你按「手动切换素材 / 下一素材 / 播放此素材」才换画面。
+        #   只有你按「下一素材」快捷键/按钮或「播放此素材」才换画面。
         #   Kv 待机层、码表、自愈看门狗都不受影响（它们本来就不走"自动换素材"）。
         self.mode_combo.addItems(["自动（推荐）", "常规切", "快切",
                                   "手动（不自动切换）"])
@@ -336,8 +336,8 @@ class SettingsPanel(QWidget):
             "· 段落边界只切一次（同一次边界不会连着切两个素材）。\n\n"
             "常规切 / 快切：固定用这一种节奏（有段落表时，段落边界仍会先切一次）。\n"
             "逐拍交替已独立成下方同名分区（只接管前景层 · 只在 drop 段生效）。\n"
-            "手动（不自动切换）：永远不自动换素材，只在素材右键「手动切换素材」、"
-            "「播放此素材」或按「下一素材」快捷键时换。Kv 待机层与码表不受影响。")
+            "手动（不自动切换）：永远不自动换素材，只在「下一素材」按钮/快捷键、"
+            "「播放此素材」时换。Kv 待机层与码表不受影响。")
         gm.addWidget(self.mode_combo, 0, 1)
         self.lbl_cur_mode = QLabel("当前节奏: -")
         self.lbl_cur_mode.setStyleSheet("color:#7ab;")
@@ -389,19 +389,30 @@ class SettingsPanel(QWidget):
         self.render_fps.addItems(["60", "30", "20"])
         self.render_fps.setToolTip("引擎每秒合成多少次画面；素材多为 25 到 30fps，选 60 时约有一半是把同一帧重复合成 —— 机器吃紧（同时开 VDJ、直播、录制）就选 30，能省约一半渲染 CPU，画面仍跟得上素材")
         gp.addWidget(self.render_fps, 0, 1)
-        self.chk_gpu = QCheckBox("GPU 解码（DXV 硬件解压）")
-        self.chk_gpu.setToolTip("让显卡硬件解压 DXV 素材（帧内 DXT 压缩块直传显存），降低解码 CPU 占用：DXT5 素材约省一半以上、超宽素材约省七成；解压失败或显卡不支持时自动回退软解，不影响播放")
-        gp.addWidget(self.chk_gpu, 1, 0, 1, 2)
+        # ★ 2026-11-26（用户：1080p 输出 17~21 帧、CPU 47%）：内部分辨率倍率。
+        #   1080p 输出默认按 2/3（1280×720）合成，输出窗/投影由 GPU 放大；
+        #   实测 7 层 + 2 路 Spout 从 14~25 帧回到 30 帧。要原生 1080p 选 100%。
+        gp.addWidget(QLabel("渲染精度"), 1, 0)
+        self.render_scale = QComboBox()
+        self.render_scale.addItems(["自动（1080p 按 720p）", "100%（原生）",
+                                    "75%", "67%", "50%"])
+        self.render_scale.setToolTip(
+            "内部分辨率倍率。自动：1080p 输出按 2/3（1280×720）合成，再由显卡放大到输出分辨率；"
+            "大幅降低 CPU/合成耗时，画面略软。100% = 原生输出分辨率，最清晰但 1080p 多图层可能掉帧。")
+        gp.addWidget(self.render_scale, 1, 1)
+        self.chk_gpu = QCheckBox("GPU 加速（DXV 硬件解压）")
+        self.chk_gpu.setToolTip("用显卡加速 DXV 解码与画面合成，降低 CPU 占用；解压失败或显卡不支持时自动回退软解，不影响播放")
+        gp.addWidget(self.chk_gpu, 2, 0, 1, 2)
         # ★ 2026-11-09 用户要求：去掉「安全视频解码」开关（普通视频固定走 OpenCV，省 CPU）。
         #   原来这一行是 chk_safe_decode（2, 0），删掉后 chk_fps_follow 上移到第 2 行。
         self.chk_fps_follow = QCheckBox("跟随素材帧率（省 CPU，推荐）")
         self.chk_fps_follow.setToolTip("素材 25~30fps 时不再按 60fps 重复合成同一帧；有 60fps 素材时自动回到 60。手动选 60 但此项开启时，仍会按素材帧率封顶。")
-        gp.addWidget(self.chk_fps_follow, 2, 0, 1, 2)
+        gp.addWidget(self.chk_fps_follow, 3, 0, 1, 2)
         ga.setRowStretch(4, 1)
         # ★ 2026-11-11：不要给最后一行 stretch（会把 3 行内容撑开、行距变成一大片空白）。
-        #   额外高度放到第 3 行（空行）上，内容始终贴顶。
-        gp.setRowStretch(2, 0)
-        gp.setRowStretch(3, 1)
+        #   额外高度放到第 4 行（空行）上，内容始终贴顶。
+        gp.setRowStretch(3, 0)
+        gp.setRowStretch(4, 1)
         # 同上：注册统一在下面做
 
         # ---- 颜色渲染（一键调色：让同一批素材看起来不一样）----
@@ -731,6 +742,7 @@ class SettingsPanel(QWidget):
         self.sens.currentIndexChanged.connect(lambda i: main.engine_cfg("mode", "sensitivity", i))
         self.intensity.currentIndexChanged.connect(main.set_intensity)
         self.render_fps.currentIndexChanged.connect(main.set_render_fps)
+        self.render_scale.currentIndexChanged.connect(main.set_render_scale)
         self.chk_fps_follow.stateChanged.connect(
             lambda s: main.engine.set_fps_follow_source(bool(s)))
         self.chk_gpu.stateChanged.connect(main.set_gpu_decode)
@@ -894,7 +906,7 @@ class SettingsPanel(QWidget):
                 sc = None
             color = "#7ab"
             if sc is None:
-                txt = "作用范围：全局（单屏）"
+                txt = "作用范围：全局（普通演出台）"
             else:
                 name = str(sc.get("name") or "-")
                 ids = {str(x) for x in (sc.get("layers") or [])}
@@ -906,12 +918,18 @@ class SettingsPanel(QWidget):
                             n_fg += 1
                 except Exception:                              # noqa: BLE001
                     n_fg = 0
+                _is_main = str(sc.get("type") or "") == "main"
                 if n_fg:
-                    txt = "作用范围：屏幕「%s」（该屏前景层 %d 个）" % (name, n_fg)
+                    if _is_main:
+                        txt = ("作用范围：主屏幕「%s」（单屏 / 多屏共用；"
+                               "该屏前景层 %d 个）" % (name, n_fg))
+                    else:
+                        txt = "作用范围：屏幕「%s」（该屏前景层 %d 个）" % (name, n_fg)
                 else:
                     color = "#ffb74d"
-                    txt = ("作用范围：屏幕「%s」—— 该屏没有前景层，"
-                           "逐拍交替不会生效；请切到有前景层的屏幕再设置" % name)
+                    txt = ("作用范围：%s屏幕「%s」—— 该屏没有前景层，"
+                           "逐拍交替不会生效；请切到有前景层的屏幕再设置"
+                           % ("主" if _is_main else "", name))
             lbl.setText(txt)
             lbl.setStyleSheet("color:%s;font-size:11px;" % color)
 
@@ -1060,17 +1078,12 @@ class OutputPanel(QWidget):
         # ---- Spout/NDI Alpha ----
         # ★ 2026-11-08（用户要求）：输出设置里加 Alpha 开关，只作用于 Spout/NDI；
         #   显示器窗口仍按黑底显示（物理显示器/HDMI 没有 alpha 通道）。
-        self.chk_alpha = QCheckBox(T("Spout/NDI 输出 Alpha（透明通道）"))
+        self.chk_alpha = QCheckBox(T("Spout/NDI 输出 Alpha（透明通道）"), self)
+        self.chk_alpha.setChecked(True)
+        self.chk_alpha.hide()          # ★ 2026-11-25：Alpha 输出固定开启，不再给开关
         self.chk_alpha.setToolTip(T(
-            "【按屏保存】多路下勾选的是**当前这块屏**：只有勾了 Alpha 的屏用透明画布发送，\n"
-            "没勾的屏仍是实底（Alpha=255）。单路下就是全局一张输出。\n"
-            "• 只影响 Spout / NDI；显示器窗口仍按不透明黑底显示（物理显示器没有 Alpha）。\n"
-            "• 发送格式是**预乘 Alpha**（Premultiplied）：OBS 的 Spout2 源必须把\n"
-            "  Composite mode 选 Premultiplied Alpha；NDI 接收端也必须开启 Alpha。\n"
-            "• 必须素材本身带 Alpha，且该屏没有全屏不透明图层把画面盖住；否则 Alpha 全是 255。\n"
-            "• 取证：%LOCALAPPDATA%\\AutoVJ\\output_health.log 的「Alpha 取证」行会写明\n"
-            "  每路实际 alpha 的最小/最大值与透明占比。"))
-        go.addWidget(self.chk_alpha, 7, 0, 1, 2)
+            "【固定开启】多路下每块屏都按预乘 Alpha 发送；\n"
+            "OBS 的 Spout2 源把 Composite mode 选 Premultiplied Alpha。"))
         # ★ 2026-10-30（用户：「把下面多余的那行文字去掉」）：完整名已经直接显示在
         #   NDI 那一行上了，再补一行小字是重复 ⇒ 只保留 label 的 tooltip 做解释。
         # ★ 2026-10-18 用户要求：**「NDI 传输音频」这一行从界面删除**（复选框 + 提示）。
@@ -1206,8 +1219,7 @@ class OutputPanel(QWidget):
         for w in (getattr(self, "lbl_output_screen", None),
                   getattr(self, "screen_combo", None),
                   getattr(self, "chk_spout", None),
-                  getattr(self, "chk_ndi", None),
-                  getattr(self, "chk_alpha", None)):
+                  getattr(self, "chk_ndi", None)):
             if w is not None:
                 try:
                     w.setVisible(True)
@@ -1270,7 +1282,7 @@ class OutputPanel(QWidget):
                 disp = -2
             sp = bool(screen.get("spout", False))
             nd = bool(screen.get("ndi", False))
-            al = bool(screen.get("alpha", False))
+            al = True          # Alpha 输出固定开启，不再按屏开关
         _bs = (self.resolution, self.screen_combo, self.chk_spout, self.chk_ndi,
                self.chk_alpha)
         for _w in _bs:
@@ -1901,8 +1913,30 @@ def merge_scan_tags(existing_tags, manual_tags, disabled_tags, *,
     return tags
 
 
+def is_scanned(m):
+    """该素材是否已完成扫描分析（不是"有没有标签"）。
+
+    ★ 2026-11-25（用户：勾了排除的 logo 也要进代理检测/扫描，但不要打标）：
+      excluded 只影响打标/匹配，不再影响"是否扫过"。excluded 视频扫完后
+      `scanned=True` 但 `tags` 仍为空，必须靠这个字段区分，否则会被反复补扫。
+    老配置没有 `scanned` 字段：有标签或有动态分即视为已扫过。
+    """
+    try:
+        if str(getattr(m, "kind", "")) in ("image", "gif"):
+            return True
+        if bool(getattr(m, "scanned", False)):
+            return True
+        if getattr(m, "tags", None):
+            return True
+        if getattr(m, "score", None) is not None:
+            return True
+    except Exception:                                          # noqa: BLE001
+        return False
+    return False
+
+
 def pick_unscanned(library):
-    """挑出**从未扫描过**的素材路径（= `_populate_grid` 在「全部」档会隐藏的那批）。
+    """挑出**从未扫描分析过**的视频路径（图片/GIF 永远不扫）。
 
     ★★ 2026-10-31（用户「素材库怎么不显示图片」「导入图片也没反应」）：
       `_populate_grid` 里 `scanned = bool(it.all_tags())`，未扫描的素材在**任何工作档**
@@ -1912,17 +1946,15 @@ def pick_unscanned(library):
     条件（与 `DynTagScanThread.run()` 的增量挑选保持一致）：
       · kind == **video**（图片 / GIF 都不打标 —— 用户 2026-11-12：
         “gif 也是图片，不要打标”）
-      · 未被标记「排除」（刻意不参与自动匹配的 logo 素材）
-      · `tags` 为空（= 从未扫出过结果）
+      · `scanned` 尚未完成（老配置回退看 tags/score）
+      · **不再排除 excluded**：勾了排除的视频也要扫描/代理检测，只是不写标签
     """
     out = []
     for m in (library or {}).values():
         try:
             if m.kind != "video":
                 continue
-            if getattr(m, "excluded", False):
-                continue
-            if m.tags:
+            if is_scanned(m):
                 continue
             out.append(m.path)
         except Exception:                                          # noqa: BLE001
@@ -1948,11 +1980,11 @@ def passes_lib_filter(it, dyn_idx):
         若仍按标签判，它会被当成"未扫描"。
     """
     excluded = bool(getattr(it, "excluded", False))
-    scanned = bool(it.all_tags()) or getattr(it, "kind", "") in ("image", "gif")
+    scanned = is_scanned(it)
     if dyn_idx == 5:
         return excluded
     if dyn_idx == 6:
-        return (not scanned) and (not excluded)
+        return not scanned
     if dyn_idx == 0:
         return True
     if excluded or not scanned:
@@ -2027,6 +2059,25 @@ class DynTagScanThread(QThread):
         except Exception:                                      # noqa: BLE001
             kind, metrics, cov, has_alpha = ("video", {}, None, False)
         metrics = metrics or {}
+        # ★ 2026-11-25（用户：勾了排除的 logo 也要扫描/转码，但不要打标）：
+        #   excluded 只影响匹配/打标，不影响扫描完成状态。
+        #   这里只记录 scanned + alpha，绝不写 tags/score/roles。
+        if bool(getattr(m, "excluded", False)):
+            try:
+                m.scanned = True
+                m._has_alpha = bool(has_alpha)
+                m.tags = []
+                m.score = None
+                m.roles = {"fg": False, "bg": False}
+                for _k in ("clip_tags", "clip_score", "clip_roles"):
+                    try:
+                        self.main.cfg[_k].pop(m.path, None)
+                    except Exception:                      # noqa: BLE001
+                        pass
+                self.main.cfg["clip_scanned"][m.path] = True
+            except Exception:                              # noqa: BLE001
+                pass
+            return
         # 先定角色，再按角色选动态算法（前景 p95 / 背景整帧）
         role = auto_roles(kind, has_alpha, coverage=cov)
         _rk = "fg" if role.get("fg") else "bg"
@@ -2073,24 +2124,25 @@ class DynTagScanThread(QThread):
             self.main.cfg["clip_score"][m.path] = float(_sc)
         m.roles = role
         self.main.cfg["clip_roles"][m.path] = dict(m.roles)
+        # ★ 2026-11-25：扫描完成状态独立于标签（excluded 走上面的早返回分支）
+        m.scanned = True
+        self.main.cfg["clip_scanned"][m.path] = True
 
     def run(self):
         """扫描线程：4 路并发检测（演出中限 2 路），结果统一回写。"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        all_items = [m for m in self.main.library.values()
-                     if not getattr(m, "excluded", False)]
+        # ★ 2026-11-25：excluded 视频也参与扫描（但不打标）；图片/GIF 仍然不扫。
+        all_items = [m for m in self.main.library.values() if m.kind == "video"]
         if self.paths:
             want = set(self.paths)
-            items = [m for m in all_items
-                     if m.path in want and m.kind == "video"]
+            items = [m for m in all_items if m.path in want]
         elif self.force:
-            # 全局扫描：只扫视频，图片/GIF 一律不扫描
-            items = [m for m in all_items if m.kind == "video"]
+            # 全量扫描：所有视频（含已排除，但不打标）
+            items = list(all_items)
         else:
-            # 扫描打标：只补没有标签的视频，已有标签不碰
-            items = [m for m in all_items
-                     if m.kind == "video" and not m.tags]
+            # 扫描打标：补未扫描的视频；excluded 扫描但不打标
+            items = [m for m in all_items if not is_scanned(m)]
         total = len(items)
         try:
             _cpu = max(1, int(os.cpu_count() or 4))
@@ -3123,6 +3175,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Easy Reality AutoVJ")
         self.resize(1500, 900)
         self.cfg = Config()
+        self._user_output_changed = False
+        self._force_all_displays_closed()
         self._migrate_library_paths()
         set_lang(self.cfg["lang"])
 
@@ -3272,6 +3326,10 @@ class MainWindow(QMainWindow):
             m = self.library.get(p)
             if m is not None:
                 m.excluded = True
+        for p, _v in (self.cfg["clip_scanned"] or {}).items():
+            m = self.library.get(p)
+            if m is not None:
+                m.scanned = bool(_v)
 
         self._cur_layer = 0
         # ★ 2026-10-30 用户「大砍刀」：曲风→画面标签映射整条删除
@@ -3343,7 +3401,20 @@ class MainWindow(QMainWindow):
         # （2026-11-17：用户报 UI 按键要等几秒；重复 showFullScreen 是主因之一）
         self._out_win_state = {}
         self._display_timer = QTimer(self)
-        self._display_timer.setInterval(33)
+        # ★ 2026-11-25（真机：输出窗口只有 15~22 帧，引擎却是 29 帧）：
+        #   QTimer 默认是 CoarseTimer，33ms 会被 Windows 15.6ms 时钟量化成
+        #   31.2/46.8ms，实测输出窗口只剩 ~17 帧。输出帧定时器必须用 PreciseTimer。
+        self._display_timer.setTimerType(Qt.PreciseTimer)
+        # ★ 2026-11-25（两块屏 30fps）：33ms 标称 30.3Hz，任何一次 GUI 重绘延迟都会
+        #   掉到 25fps；改成 30ms（33.3Hz）留出相位余量，引擎没有新帧时按对象身份跳过。
+        # ★ 2026-11-26：15ms 轮询（每帧两次机会）。引擎帧按 31~33ms 到达，
+        #   30ms 定时器遇到任何一次 GUI 重绘延迟就漏掉一整帧（现场 22~27/s）。
+        #   同帧按对象身份判重，轮询加倍不会重复上传纹理。
+        try:
+            _dt_ms = int(os.environ.get("AUTOVJ_DISPLAY_MS", "15") or 15)
+        except (TypeError, ValueError):
+            _dt_ms = 15
+        self._display_timer.setInterval(max(10, min(100, _dt_ms)))
         self._display_timer.timeout.connect(self._on_display_windows_tick)
         self._display_timer.start()
         # 输出窗口与预览统一走一个 slot（帧在引擎侧，这里只收序号后各自去取）
@@ -3406,6 +3477,17 @@ class MainWindow(QMainWindow):
             self._enforce_kv_top()      # ★ 读档顺序可能把 KV 挤下去 ⇒ 启动先纠正一次
             self._build_hotkeys()
             self._load_settings_to_ui()
+            # ★ 2026-11-26（用户：每次打开都把显示器输出改成关闭）：UI/多屏卡片
+            #   构建过程中会把非主屏 display 写回 -1；这里在 UI 全部建完后再压一次，
+            #   并立即刷新引擎计划，保证本次启动绝不弹任何输出窗。
+            self._force_all_displays_closed()
+            try:
+                _cb = self.output_panel.screen_combo
+                _cb.blockSignals(True)
+                _cb.setCurrentIndex(0)
+                _cb.blockSignals(False)
+            except Exception:                                  # noqa: BLE001
+                pass
             self._init_recognizer()
         # ★ 启动后**延迟**把上次绑定的码表重新装载回图层（不能在构造里做：load 要走 zip + 解包）。
         #   ⚠ `is_cuesheet` / `cuesheet_id` 随图层持久化，但**表本身不持久化** ⇒ 不恢复的话，
@@ -3414,6 +3496,13 @@ class MainWindow(QMainWindow):
         try:
             from PySide6.QtCore import QTimer as _QT
             _QT.singleShot(300, self._restore_cue_sheets)
+            # ★ 2026-11-25：每次启动自动收起所有显示器/输出窗口（单屏、多屏都收起）。
+            #   NDI/Spout 的发送配置不动；只关“窗口/显示器”这一路。
+            _QT.singleShot(0, self._startup_close_outputs)
+            _QT.singleShot(300, self._startup_close_outputs)
+            _QT.singleShot(900, self._startup_close_outputs)
+            _QT.singleShot(1800, self._startup_close_outputs)
+            _QT.singleShot(3000, self._startup_close_outputs)
         except Exception:                                        # noqa: BLE001
             pass
 
@@ -3728,7 +3817,7 @@ class MainWindow(QMainWindow):
         gpu_sep = QFrame()
         gpu_sep.setFrameShape(QFrame.VLine)
         tb.addWidget(gpu_sep)
-        self.btn_gpu = QPushButton("GPU 解码")
+        self.btn_gpu = QPushButton("GPU 加速")
         self.btn_gpu.setCheckable(True)
         self.btn_gpu.setMinimumHeight(32)
         self.btn_gpu.setToolTip("开启后用显卡硬件解压 DXV 素材，降低解码 CPU 占用；显卡不支持或素材解不了会自动回退软解，不会黑屏。只作用于普通图层，待机层不受影响。已在播的素材要等下次切换才换路径")
@@ -3927,6 +4016,11 @@ class MainWindow(QMainWindow):
         self._hl_timer.timeout.connect(lambda: self._layers_call("refresh_playing"))
         self._hl_timer.start(1000)
         self.engine.frame_ready.connect(self._on_engine_frame)
+        try:
+            self.engine.native_display_changed.connect(
+                self._on_native_display_changed)
+        except Exception:                                      # noqa: BLE001
+            pass
         self.refresh_grid()
         self.refresh_all_layer_blocks()
         self._fill_tag_combo()
@@ -5725,6 +5819,11 @@ class MainWindow(QMainWindow):
             out["active_config"] = str(cid)
             import output_model as _om
             _om.ensure_output_configs(self.cfg.data)
+            # ★ 2026-11-26：新活动配置的主屏 params 搬进全局（主屏=全局）
+            try:
+                self._migrate_main_screen_params_to_global()
+            except Exception:                                  # noqa: BLE001
+                pass
             _om.sync_legacy_output(self.cfg.data)
             self.cfg.save()
         except Exception as e:                                 # noqa: BLE001
@@ -6052,8 +6151,14 @@ class MainWindow(QMainWindow):
                     _sname = "-"
                 # ★ Kv / 演出行为 / 画面效果现在**引擎侧也按屏生效**（每屏一份实例）⇒
                 #   文案可以直接写清"这三组只作用于本屏"，不用再留"哪些是全局"的模糊说法。
-                _base = Tf("单路 · 当前屏幕：{}（Kv / 演出行为 / 画面效果只作用于这块屏；"
-                           "性能与输出设置是全局的）", _sname)
+                # ★ 2026-11-26：主屏幕 = 全局设置（单屏/多屏共用），文案要说清楚。
+                _is_main_cur = str((_cur or {}).get("type") or "") == "main"
+                if _is_main_cur:
+                    _base = Tf("单路 · 主屏幕：{}（Kv / 演出行为 / 画面效果 = 全局设置，"
+                               "与普通演出台共用；性能与输出设置也是全局的）", _sname)
+                else:
+                    _base = Tf("单路 · 当前屏幕：{}（Kv / 演出行为 / 画面效果只作用于这块屏；"
+                               "性能与输出设置是全局的）", _sname)
                 if _n_ov > 0:
                     lbl.setText(_base + Tf("　·　当前 {} 块屏各有独立参数，每帧多跑 {} 次调色"
                                            "（1080p 约 +4.4ms/屏）", _n_ov, _n_ov))
@@ -6084,6 +6189,10 @@ class MainWindow(QMainWindow):
             return
         sid = str(getattr(st, "selected_id", "") or "")
         s = _om.screen_by_id(cfg, sid) if (cfg and sid) else None
+        # ★ 2026-11-26：没点选屏幕时默认就是主屏幕（主屏幕设置 = 单屏设置），
+        #   不再整组置灰；否则面板显示"未选中"而引擎仍在用主屏参数。
+        if s is None:
+            s = _om.main_screen(cfg)
         if s is None:
             rf.setStyleSheet("")
             rc.setEnabled(False)
@@ -6139,7 +6248,10 @@ class MainWindow(QMainWindow):
                 box.setVisible(True)
         else:
             rc.setEnabled(True)
-            lbl.setText("以下设置作用于当前屏幕「%s」" % (s.get("name") or "主屏幕"))
+            if t == "main":
+                lbl.setText("以下设置作用于主屏幕（= 全局设置，单屏 / 多屏共用）")
+            else:
+                lbl.setText("以下设置作用于当前屏幕「%s」" % (s.get("name") or "主屏幕"))
             if box is not None:
                 box.setVisible(False)
 
@@ -6248,7 +6360,7 @@ class MainWindow(QMainWindow):
                                self.output_panel.btn_reset_win,
                                self.output_panel.lbl_output_screen,
                                self.output_panel.screen_combo, self.output_panel.chk_spout,
-                               self.output_panel.chk_ndi, self.output_panel.chk_alpha):
+                               self.output_panel.chk_ndi):
                         try:
                             _w.setVisible(True)
                         except Exception:                      # noqa: BLE001
@@ -6267,6 +6379,17 @@ class MainWindow(QMainWindow):
                 try:
                     import output_model as _om
                     _om.sync_legacy_output(self.cfg.data)
+                except Exception:                                 # noqa: BLE001
+                    pass
+                # ★ 2026-11-26：普通演出台必须把右侧面板回填成**全局值**。
+                #   以前只切布局不回填 ⇒ 面板留着多屏主屏幕的旧值，和引擎实际读的
+                #   全局值不一致（用户看到"面板关、演出却开"或反过来）。
+                try:
+                    self._reload_screen_params_ui()
+                except Exception:                                 # noqa: BLE001
+                    pass
+                try:
+                    self.settings.sync_beat_section()
                 except Exception:                                 # noqa: BLE001
                     pass
                 try:
@@ -7313,18 +7436,35 @@ class MainWindow(QMainWindow):
         import hashlib as _hl
         ids = set()
         try:
+            _lib = self.cfg["music_library"] or []
+        except Exception:                                        # noqa: BLE001
+            _lib = []
+        _visible_lib = {str(p) for p in _lib if isinstance(p, str) and p}
+        try:
             _meta = self.cfg["music_meta"] or {}
         except Exception:                                        # noqa: BLE001
             _meta = {}
-        for _v in (_meta.values() if isinstance(_meta, dict) else []):
+        for _p, _v in (_meta.items() if isinstance(_meta, dict) else []):
+            if str(_p) not in _visible_lib:
+                continue                    # 已从曲库管理删除的歌，不再允许识别
             try:
                 ids.add(int(_v.get("song_id")))
             except Exception:                                    # noqa: BLE001
                 pass
-        try:
-            _lib = self.cfg["music_library"] or []
-        except Exception:                                        # noqa: BLE001
-            _lib = []
+        # ★ 2026-11-25：本机优先。曲库管理里可见的本地曲目按文件名建立
+        #   「同名 → 本机 song_id」；导入包里同名的重复项不再加入白名单，
+        #   避免指纹库两条一模一样时随到导入包 ID（用户要求：本地 > 曲包 > 码表）。
+        _local_sid_by_name = {}
+        for _p in _lib:
+            if not isinstance(_p, str) or not _p:
+                continue
+            try:
+                _m = _meta.get(_p) if isinstance(_meta, dict) else None
+                _sid = int(_m.get("song_id")) if isinstance(_m, dict) else 0
+            except Exception:                                    # noqa: BLE001
+                _sid = 0
+            if _sid:
+                _local_sid_by_name[os.path.basename(_p).lower()] = _sid
         for _p in _lib:
             if isinstance(_p, str) and _p:
                 try:
@@ -7348,8 +7488,10 @@ class MainWindow(QMainWindow):
             from config import app_base_dir as _abd
             _cn = _il.open_meta(_abd())
             try:
-                for (_sid,) in _cn.execute("SELECT song_id FROM songs"):
+                for (_sid, _fn) in _cn.execute("SELECT song_id, file_name FROM songs"):
                     try:
+                        if _fn and os.path.basename(str(_fn)).lower() in _local_sid_by_name:
+                            continue        # 本机已有同名曲目 ⇒ 本地优先，跳过导入重复项
                         ids.add(int(_sid))
                     except Exception:                            # noqa: BLE001
                         pass
@@ -7368,6 +7510,11 @@ class MainWindow(QMainWindow):
             dev = ""
         if t == "linein":
             t = "mic"
+        try:
+            self.audio.set_input_gain(bool(a.get("gain_enabled", False)),
+                                      float(a.get("gain_db", 0.0) or 0.0))
+        except Exception:                                      # noqa: BLE001
+            pass
         self.audio.start(t, dev, mono=bool(self.cfg["audio"].get("mono", True)),
                          sr=int(self.cfg["audio"].get("sample_rate", 0) or 0),
                          ch0=int(self.cfg["audio"].get("asio_ch0", 0) or 0),
@@ -7375,18 +7522,27 @@ class MainWindow(QMainWindow):
         self.cfg["audio"].update({"source_type": t, "device_name": dev})
         self.cfg.save()
 
-    def apply_audio_settings(self, source_type, device, sr, mono, ch0=0, ch1=1):
+    def apply_audio_settings(self, source_type, device, sr, mono, ch0=0, ch1=1,
+                             gain_enabled=False, gain_db=0):
         """音源对话框应用：保存配置并重启采集
 
         ⚠ 原来的 `gain` 参数已去掉（2026-09-25）：那个滑块没接进分析链路，
         而且能量算法对整体增益免疫（实测 0.5~4x 完全无差别），留着只会误导。
+        ★ 1.2 Beta1：`gain_enabled/gain_db` 是**采集后的数字增益**，已接进
+        `_capture_loop`（只影响分析/表头，不改 NDA 音频透传）。
         """
         upd = {"source_type": source_type, "device_name": device,
-               "sample_rate": int(sr), "mono": bool(mono)}
+               "sample_rate": int(sr), "mono": bool(mono),
+               "gain_enabled": bool(gain_enabled),
+               "gain_db": float(max(-12, min(12, int(gain_db))))}
         if source_type == "asio":
             upd["asio_ch0"], upd["asio_ch1"] = int(ch0), int(ch1)
         self.cfg["audio"].update(upd)
         self.cfg.save()
+        try:
+            self.audio.set_input_gain(bool(gain_enabled), float(gain_db))
+        except Exception:                                      # noqa: BLE001
+            pass
         self.audio.start(source_type, device, mono=mono, sr=int(sr), ch0=ch0, ch1=ch1)
 
     def open_audio_dialog(self):
@@ -7398,8 +7554,9 @@ class MainWindow(QMainWindow):
 
         统计口径与 `pick_unscanned()` 完全一致：
           · 只算 video（**静态图片 / GIF 都不打标，不算**）
-          · `excluded=True`（右键“排除自动打标/匹配”的 logo/PV）不算
-          · 已有 `tags` 的不算
+          · `excluded=True`（右键“排除自动打标/匹配”的 logo/PV）**也算** ——
+            它们会进代理检测/扫描，只是不写标签
+          · 已 `scanned` 的不算（老配置回退看 tags/score）
         """
         try:
             n = len(pick_unscanned(self.library))
@@ -7489,16 +7646,44 @@ class MainWindow(QMainWindow):
             self.output_panel.set_gate(running)
         except Exception:
             pass
+        # ★ 2026-11-25：GPU 解码/GPU 合成开关在运行中锁死（停止后才能改）
+        for _ctl in (getattr(self, "btn_gpu", None),
+                     getattr(getattr(self, "settings", None), "chk_gpu", None)):
+            try:
+                _ctl.setEnabled(not running)
+            except Exception:                                  # noqa: BLE001
+                pass
         # ★ S1 #1：运行中不许切多屏/切模式（现场切错会黑屏）
         try:
             self._sync_multi_controls()
         except Exception:                                         # noqa: BLE001
             pass
         if running:
-            # 每次开始 VJ 都按设置应用（全屏→该屏；窗口→按分辨率重置大小），
-            # 解决：之前仅在窗口隐藏时才调，导致窗口已可见时开始VJ不重置的bug
-            self.apply_output_screen()
-            self.out_win.raise_()
+            # 2026-11-26：停止再开始后，只在音频已经静音/未运行时重启采集；
+            # 不改变引擎的静默待机策略（待机 2fps 是正常行为）。
+            try:
+                _st = self.audio.state
+                if (not _st.running) or float(getattr(_st, "silent_sec", 0.0) or 0.0) >= 1.0:
+                    self.start_audio()
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                self.engine.resume_after_vj_start()
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                self._sync_frame_consumers()
+            except Exception:                                  # noqa: BLE001
+                pass
+            # ★ 2026-11-25：开始 VJ **不再自动打开显示器/输出窗口**。
+            #   用户要求启动后所有屏幕/窗口输出保持关闭，要看画面自己点「输出」。
+            #   已经手动打开的输出窗口才重新套一次几何/全屏设置。
+            try:
+                if self.out_win.isVisible():
+                    self.apply_output_screen()
+                    self.out_win.raise_()
+            except Exception:                                  # noqa: BLE001
+                pass
         else:
             # 停止：自动关闭所有输出窗口（主界面预览仍在实时显示）
             try:
@@ -7519,13 +7704,37 @@ class MainWindow(QMainWindow):
                     or self._any_output_window_visible())
             except Exception:
                 pass
-            # ★ 2026-11-11：演出中推迟的自动图层素材格重建，在停止时补一次
-            if getattr(self, "_auto_sync_pending", False):
-                self._auto_sync_pending = False
+            # ★ 2026-11-26：演出中推迟的自动图层整行重建，在停止时补一次。
+            _pend = bool(getattr(self, "_auto_sync_pending", None))
+            _defer = bool(getattr(self, "_auto_sync_deferred", False))
+            if _pend or _defer:
+                self._auto_sync_pending = set()
+                self._auto_sync_deferred = False
                 try:
                     self.refresh_all_layer_blocks()
                 except Exception as e:                         # noqa: BLE001
                     self._log_ui_error("toggle_run.deferred_layer_sync", e)
+
+    def _ensure_audio_after_start(self):
+        """开始 VJ 1.5s 后兜底：音频线程假运行/无电平时重启采集，复位待机。"""
+        try:
+            if not bool(getattr(self.engine, "running", False)):
+                return
+            st = self.audio.state
+            _sil = float(getattr(st, "silent_sec", 0.0) or 0.0)
+            _lvl = float(getattr(st, "level", 1.0) or 0.0)
+            if (not st.running) or _sil >= 1.0 or _lvl < 0.002:
+                self.start_audio()
+                try:
+                    self.engine.resume_after_vj_start()
+                except Exception:                              # noqa: BLE001
+                    pass
+                try:
+                    self._sync_frame_consumers()
+                except Exception:                              # noqa: BLE001
+                    pass
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def toggle_blackout(self):
         self.engine.set_blackout(not self.engine.blackout)
@@ -7650,23 +7859,95 @@ class MainWindow(QMainWindow):
         except Exception:                                      # noqa: BLE001
             return False
 
+    def _migrate_main_screen_params_to_global(self):
+        """把主屏幕残留的 params 合并进全局并清空（一次性，幂等）。
+
+        ★ 2026-11-26：主屏幕从本版起固定使用**全局设置**（单屏/多屏共用）。
+          旧配置/旧版本在 `screen["params"]` 里存过主屏 override；如果不搬走，
+          升级后这些值会被引擎忽略（静默失效）。这里把它们合并到全局：
+            · 普通段（auto/color/kv/beat/mode）直接 update；
+            · postfx.effects 二级字典逐键合并，避免整个 effects 被覆盖。
+          其它新建屏的 params 原样保留。
+        """
+        try:
+            import output_model as _om
+            cfg = _om.active_config(self.cfg.data)
+            main = _om.main_screen(cfg)
+            if main is None:
+                return
+            p = main.get("params") or {}
+            if not isinstance(p, dict) or not p:
+                if "params" in main:
+                    main["params"] = {}
+                return
+            for sec, val in p.items():
+                if not isinstance(val, dict):
+                    try:
+                        self.cfg[sec] = val
+                    except Exception:                          # noqa: BLE001
+                        pass
+                    continue
+                if sec == "postfx":
+                    for k, v in val.items():
+                        if k == "effects" and isinstance(v, dict):
+                            dst = self.cfg["postfx"].setdefault("effects", {})
+                            for ek, ev in v.items():
+                                if isinstance(ev, dict):
+                                    dst.setdefault(ek, {}).update(ev)
+                                else:
+                                    dst[ek] = ev
+                        else:
+                            self.cfg["postfx"][k] = v
+                else:
+                    try:
+                        self.cfg[sec].update(val)
+                    except Exception:                          # noqa: BLE001
+                        try:
+                            self.cfg[sec] = val
+                        except Exception:                      # noqa: BLE001
+                            pass
+            main["params"] = {}
+            self.cfg.save()
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _params_target_screen(self):
-        """★ U7：多屏模式下选中某块屏 ⇒ 返回它（参数按屏存）；否则 None（改全局）。"""
+        """★ U7：多屏模式下选中某块屏 ⇒ 返回它（参数按屏存）；否则 None（改全局）。
+
+        ★ 2026-11-26：**主屏幕的设置就是单屏设置**。
+          · 单路输出（cfg.mode == "single"）→ 主屏幕；
+          · 多路输出但还没点选屏幕 → 主屏幕；
+          · 多路输出且选中了独立屏/复制屏/切分屏 → 那块屏。
+          这样单屏/多屏切换时，主屏幕的 Kv / 演出行为 / 画面效果 / 逐拍交替
+          永远是同一份值，不会出现"面板显示关、演出却按开"的错位。
+        """
         try:
             if not self._multi_ui_active():
                 return None
             import output_model as _om
             cfg = _om.active_config(self.cfg.data)
+            if not cfg:
+                return None
+            if str(cfg.get("mode") or "multi") == "single":
+                return _om.main_screen(cfg)
             st = getattr(self, "output_studio", None)
             sid = str(getattr(st, "selected_id", "") or "") if st is not None else ""
-            return _om.screen_by_id(cfg, sid) if sid else None
+            sc = _om.screen_by_id(cfg, sid) if sid else None
+            return sc if sc is not None else _om.main_screen(cfg)
         except Exception:                                          # noqa: BLE001
             return None
 
     def store_screen_param(self, sec, key, val):
-        """单路：把这次改动写成**当前屏**的 override（与全局相同则自动删键）。返回是否已按屏存。"""
+        """单路：把这次改动写成**当前屏**的 override（与全局相同则自动删键）。返回是否已按屏存。
+
+        ★ 2026-11-26：**主屏幕永远使用全局设置**（单屏/多屏共用同一份）。
+          选中主屏幕时返回 False ⇒ 调用方写全局，不再往主屏 params 里塞 override。
+          其它新建屏/独立屏仍按屏存。
+        """
         sc = self._params_target_screen()
         if sc is None:
+            return False
+        if str(sc.get("type") or "") == "main":
             return False
         try:
             import output_model as _om
@@ -7689,16 +7970,29 @@ class MainWindow(QMainWindow):
         只有写入侧按屏、读取侧还是全局 ⇒ 用户会看到"我改的值没保存"。
         这里对**有控件的键**逐项回填（blockSignals 防止回填触发写回）；多路/未选中屏 ⇒ 不动，
         仍由 `_load_settings_to_ui()` 显示全局值。
+
+        ★ 2026-11-26：普通演出台（无按屏目标）也必须能回填全局值。
+          以前 `sc is None` 直接 return ⇒ 从多屏切回普通演出台时，面板还留着
+          主屏幕的旧值（例如逐拍交替显示开、实际引擎读全局是关）。
         """
         sc = self._params_target_screen()
-        if sc is None:
-            return
-        try:
-            import output_model as _om
-            eff = _om.effective_params(self.cfg.data, sc)
-        except Exception as e:                                     # noqa: BLE001
-            self._log_ui_error("_reload_screen_params_ui.eff", e)
-            return
+        if sc is None or str(sc.get("type") or "") == "main":
+            # 普通演出台 / 主屏幕：面板就是全局一份（与引擎 `_out_cfg=None`
+            # 或主屏忽略 override 时同源）
+            try:
+                eff = {"auto": self.cfg["auto"], "postfx": self.cfg["postfx"],
+                       "color": self.cfg["color"], "kv": self.cfg["kv"],
+                       "beat": self.cfg["beat"], "mode": self.cfg["mode"]}
+            except Exception as e:                             # noqa: BLE001
+                self._log_ui_error("_reload_screen_params_ui.global", e)
+                return
+        else:
+            try:
+                import output_model as _om
+                eff = _om.effective_params(self.cfg.data, sc)
+            except Exception as e:                             # noqa: BLE001
+                self._log_ui_error("_reload_screen_params_ui.eff", e)
+                return
         auto = eff.get("auto") or {}
         post = eff.get("postfx") or {}
         col = eff.get("color") or {}
@@ -7978,9 +8272,13 @@ class MainWindow(QMainWindow):
           ⇒ 永远"还没到期" ⇒ 一开机就被上次的颜色锁死（用户报"颜色一直不变"）。
         """
         import time
+        _ts = time.time()
         if not self.store_screen_param("color", "manual_color", name):
             self.cfg["color"]["manual_color"] = name
-        self.cfg["color"]["manual_t"] = time.time()
+        # ★ 2026-11-26：manual_t 也要按屏存。以前只把颜色存到屏参数、时间戳写全局，
+        #   切屏后"10 秒手动锁定"会按全局时间提前/延后失效。
+        if not self.store_screen_param("color", "manual_t", _ts):
+            self.cfg["color"]["manual_t"] = _ts
         self.cfg.save()
         self.settings.sync_color_palette(name)
 
@@ -8078,7 +8376,18 @@ class MainWindow(QMainWindow):
         """
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, \
             QCheckBox, QDialogButtonBox
-        e = self.cfg["postfx"]["effects"].get(key) or {}
+        # ★ 2026-11-26：详情对话框必须显示**当前屏的生效值**。以前固定读全局
+        #   `cfg["postfx"]["effects"]` ⇒ 选中独立屏时看到的是全局/别的屏的参数。
+        try:
+            _sc = self._params_target_screen()
+            if _sc is not None and str(_sc.get("type") or "") != "main":
+                import output_model as _om
+                e = (((_om.effective_params(self.cfg.data, _sc)
+                       .get("postfx") or {}).get("effects") or {}).get(key) or {})
+            else:
+                e = self.cfg["postfx"]["effects"].get(key) or {}
+        except Exception:                                      # noqa: BLE001
+            e = self.cfg["postfx"]["effects"].get(key) or {}
         name = self.settings.postfx_checks.get(key)
         dlg = QDialog(self)
         dlg.setWindowTitle(f"效果设置 - {name.text() if name else key}")
@@ -8130,7 +8439,7 @@ class MainWindow(QMainWindow):
 
     def save_layers(self):
         """图层属性变化后持久化"""
-        self.engine.push_layers_to_cfg()
+        self.engine.push_layers_to_cfg_now()
         self.cfg.save()
         # ★ 用户第 10 条：多屏模式下有 N 个图层栈（每屏一个）⇒ 任何一处改了图层属性
         #   （可见性/透明度/混合/名称/Solo…）都要**广播**刷新，不能只刷当前那块。
@@ -8172,12 +8481,38 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def set_render_scale(self, i):
+        """渲染精度（0=自动 / 1=100% / 2=75% / 3=67% / 4=50%）。"""
+        vals = [0.0, 1.0, 0.75, (2.0 / 3.0), 0.5]
+        try:
+            v = vals[max(0, min(len(vals) - 1, int(i)))]
+        except (TypeError, ValueError):
+            return
+        try:
+            self.cfg.set("perf", "render_scale", v)
+            self.cfg.save()
+        except Exception:
+            pass
+        try:
+            self.engine.set_render_scale(v)
+        except Exception:
+            pass
+
     def set_gpu_decode(self, s):
         """GPU 解码（实验）开关 —— 立即生效，但只作用于**新开的播放器**：
         已在播的素材要等下一次切换才会换到 GPU 路径（不打断正在进行的演出）。
         只作用于普通图层，Kv 待机层不受影响（铁律）。
         工具条按钮与设置面板勾选框**双向同步**，从哪边切都行。
         """
+        if bool(getattr(self.engine, "running", False)):
+            # 运行中禁止切 GPU 路径（和「多屏输出」同一条现场规则）
+            for ctl in (getattr(self, "btn_gpu", None),
+                        getattr(getattr(self, "settings", None), "chk_gpu", None)):
+                if ctl is not None:
+                    ctl.blockSignals(True)
+                    ctl.setEnabled(False)
+                    ctl.blockSignals(False)
+            return
         import media_manager as mm
         on = bool(s)
         # 同步另一个入口（blockSignals 避免来回触发）
@@ -8203,8 +8538,8 @@ class MainWindow(QMainWindow):
             ok, msg = mm.gpu_status()
             if not ok:
                 QMessageBox.information(
-                    self, T( T("GPU 解码")),
-                    Tf("这台机器暂时用不了 GPU 解码，已自动回退软解：\n{}", msg))
+                    self, T( T("GPU 加速")),
+                    Tf("这台机器暂时用不了 GPU 加速，已自动回退软解：\n{}", msg))
 
     def set_mode_selection(self, i):
         if i == 0:
@@ -8397,6 +8732,7 @@ class MainWindow(QMainWindow):
 
     def set_output_screen(self, i):
         """输出显示器（S2 #14）：下拉索引 0=关闭(-2) / 1=窗口模式(-1) / 2..=显示器 0.."""
+        self._user_output_changed = True
         # U2：多路 + 绑定屏 ⇒ 存到该屏（切屏读自己的）
         _sc = self._bound_screen_for_output()
         if _sc is not None:
@@ -8790,17 +9126,209 @@ class MainWindow(QMainWindow):
 
     def _on_display_windows_tick(self):
         """把引擎为每屏复制的最新帧送到各自的输出窗口。"""
+        # GPU 合成器的原生 GLFW 窗已经接管主屏显示。Qt 输出窗若还 Visible，
+        # 会继续在 GUI 定时器里上传 1080p，把 engine 的 GPU 合成拖到 10fps。
         try:
+            _engine_gpu_out = False
+            try:
+                _engine_gpu_out = bool(self.engine is not None and (
+                    self.engine.gpu_native_display()
+                    or getattr(self.engine, "render_process_active", lambda: False)()))
+            except Exception:                              # noqa: BLE001
+                _engine_gpu_out = False
+            if _engine_gpu_out:
+                # 旧单路 out_win 也必须隐藏：它是 1280x720 的 CPU 视图，
+                # 留在最上层会把原生 1080p 窗挡住，看起来像"只渲染了左上角"。
+                try:
+                    if self.out_win is not None and self.out_win.isVisible():
+                        self.out_win.hide()
+                except Exception:                          # noqa: BLE001
+                    pass
+                for _w in list(self.out_wins.values()):
+                    try:
+                        if _w.isVisible():
+                            _w.hide()
+                    except Exception:                      # noqa: BLE001
+                        pass
+                try:
+                    self.engine.set_display_routes(set())
+                except Exception:                          # noqa: BLE001
+                    pass
+                return
+        except Exception:                                      # noqa: BLE001
+            pass
+        if os.environ.get("AUTOVJ_SCENE_DEBUG") == "1":
+            try:
+                import stallwatch as _sw
+                _fr = self.engine.display_frames() if self.engine is not None else {}
+                _sc = self.engine.display_scenes() if self.engine is not None else {}
+                _sw.log_line("[SCENE] tick wins=%d frames=%d scenes=%d"
+                             % (len(self.out_wins or {}), len(_fr or {}), len(_sc or {})))
+            except Exception:                              # noqa: BLE001
+                pass
+        try:
+            if os.environ.get("AUTOVJ_OW_PROBE") == "1":
+                self._ow_ticks = int(getattr(self, "_ow_ticks", 0)) + 1
             if not self.out_wins:
                 return
             frames = self.engine.display_frames() if self.engine is not None else {}
-            if not frames:
+            luts = self.engine.display_luts() if self.engine is not None else {}
+            scenes = self.engine.display_scenes() if self.engine is not None else {}
+            try:
+                _flash = float(getattr(self.engine, "_bu_flash_alpha", 0) or 0.0) / 255.0
+            except Exception:                                  # noqa: BLE001
+                _flash = 0.0
+            if not frames and not scenes:
                 return
-            for sid, win in list(self.out_wins.items()):
+            # ★ 2026-11-26：引擎已经完成「GPU 合成 + 最终调色 + 闪白」，
+            #   输出窗只负责把成品帧贴到屏幕。旧的「GPU 视图逐层套 LUT」
+            #   路径（_gpu_color_offload / _gpu_scene_mode）会造成二次调色和
+            #   逐层 LUT 花屏，这里永久关闭。
+            try:
+                if getattr(self.engine, "_gpu_color_offload", False):
+                    self.engine.set_gpu_color_offload(False)
+                if getattr(self.engine, "_gpu_scene_mode", False):
+                    self.engine.set_gpu_scene_mode(False)
+                if os.environ.get("AUTOVJ_SCENE_DEBUG") == "1":
+                    try:
+                        import stallwatch as _sw
+                        _sw.log_line(
+                            "[SCENE] ui engine-frame mode wins=%d frames=%d"
+                            % (len(self.out_wins), len(frames or {})))
+                    except Exception:                      # noqa: BLE001
+                        pass
+            except Exception:                              # noqa: BLE001
+                pass
+            # 引擎已把 LUT/闪白画进帧里；输出窗不能再套一次。
+            _flash = 0.0
+            # ★ 2026-11-26：主屏优先。多一个 1080p 窗口却没人看时，旧实现会
+            #   和主屏抢同一个 GUI 定时器（两个 GL 视图各上传 8MB/帧 ⇒ 主屏
+            #   只剩 17~21 帧）。主屏在时，窗口模式(-1)的副屏限 5fps（监视窗）；
+            #   没有主屏（只开一块副屏）时不限，保持原来的 30fps。
+            _ow_now = time.perf_counter()
+            _items = list(self.out_wins.items())
+            _items.sort(key=lambda kv: (0 if getattr(kv[1], "_sid_type", "") == "main"
+                                        else 1))
+            _main_vis = any(getattr(w, "_sid_type", "") == "main" and w.isVisible()
+                            for _, w in _items)
+            _vis_n = sum(1 for _, w in _items if w.isVisible())
+            _cap_secondary = bool(_main_vis and _vis_n >= 2)
+            _last_t = getattr(self, "_ow_sent_t", None)
+            if _last_t is None:
+                _last_t = {}
+                self._ow_sent_t = _last_t
+            for sid, win in _items:
+                if (_cap_secondary
+                        and getattr(win, "_sid_type", "") != "main"
+                        and int(getattr(win, "_sid_display", -2)) == -1):
+                    _dt = _ow_now - float(_last_t.get(sid, 0.0) or 0.0)
+                    if _dt < (1.0 / 5.0) * 0.85:
+                        continue
+                    _last_t[sid] = _ow_now
+                scene = scenes.get(sid) if scenes else None
+                if scene is not None and win.isVisible() and win.is_gpu_view():
+                    try:
+                        win.set_scene(scene, scene.get("lut"), _flash)
+                        if os.environ.get("AUTOVJ_OW_PROBE") == "1":
+                            self._ow_n = int(getattr(self, "_ow_n", 0)) + 1
+                    except Exception:                      # noqa: BLE001
+                        pass
+                    continue
                 img = frames.get(sid)
                 if img is not None and win.isVisible():
-                    win.set_frame(img)
+                    # ★ 2026-11-25（真机：多屏两路 GUI 与引擎抢 GIL，引擎掉到 20 帧）：
+                    #   显示帧是 30fps 发布的，但引擎只有 20~30 帧；旧实现每 33ms
+                    #   都把**同一张图**再 set_frame/update 一次，白烧 GUI 的 QPainter
+                    #   GIL 时间。这里按对象身份判重：没有新帧就不重绘。
+                    last = getattr(self, "_ow_last_img", None)
+                    if last is None:
+                        last = {}
+                        self._ow_last_img = last
+                    if last.get(sid) is img:
+                        continue
+                    last[sid] = img
+                    win.set_frame(img, None, _flash)
+                    # ★ 2026-11-25：`AUTOVJ_OW_PROBE=1` 时每秒写一行实际喂给
+                    #   输出窗口的帧数（真机验收「显示器到底多少帧」用；平时零成本）。
+                    if os.environ.get("AUTOVJ_OW_PROBE") == "1":
+                        self._ow_n = int(getattr(self, "_ow_n", 0)) + 1
+                        _ns = getattr(self, "_ow_n_sid", None)
+                        if _ns is None:
+                            _ns = {}
+                            self._ow_n_sid = _ns
+                        _ns[sid] = int(_ns.get(sid, 0)) + 1
         except Exception:                                          # noqa: BLE001
+            if os.environ.get("AUTOVJ_SCENE_DEBUG") == "1":
+                try:
+                    import traceback as _tb
+                    import stallwatch as _sw
+                    _sw.log_line("[SCENE] tick EXC " + _tb.format_exc().splitlines()[-1])
+                except Exception:                          # noqa: BLE001
+                    pass
+        try:
+            if os.environ.get("AUTOVJ_OW_PROBE") == "1":
+                now = time.perf_counter()
+                t0 = float(getattr(self, "_ow_t", 0.0) or 0.0)
+                if not t0:
+                    self._ow_t = now
+                elif now - t0 >= 1.0:
+                    n = int(getattr(self, "_ow_n", 0))
+                    _tk = int(getattr(self, "_ow_ticks", 0))
+                    _ns = dict(getattr(self, "_ow_n_sid", None) or {})
+                    self._ow_n = 0
+                    self._ow_ticks = 0
+                    self._ow_n_sid = {}
+                    self._ow_t = now
+                    import stallwatch
+                    stallwatch.log_line("[OW] set_frame=%d/s ticks=%d windows=%d per=%s"
+                                        % (n, _tk, len(self.out_wins or {}),
+                                           " ".join("%s:%d" % (k[:8], v)
+                                                    for k, v in _ns.items())))
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _startup_close_outputs(self):
+        """启动时收起所有输出窗口/显示器；NDI、Spout、Alpha 配置保持不变。"""
+        # 用户已经手动点过“输出显示器”→ 后续启动校正定时器不能再把窗口关掉。
+        if bool(getattr(self, "_user_output_changed", False)):
+            return
+        # 2026-11-26：不仅“收起”，还要把持久化设置改成「关闭」，
+        # 这样下次启动、单屏/多屏都不会再自动弹显示器输出。
+        try:
+            self._force_all_displays_closed()
+            _cb = self.output_panel.screen_combo
+            _cb.blockSignals(True)
+            _cb.setCurrentIndex(0)
+            _cb.blockSignals(False)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            import output_model as _om
+            _c = _om.active_config(self.cfg.data)
+            if _c is not None:
+                self.engine.set_output_config(_c)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            self.out_win.hide()
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            self._hide_extra_output_windows()
+        except Exception:                                      # noqa: BLE001
+            pass
+        for win in list(getattr(self, "out_wins", {}).values()):
+            try:
+                win.hide()
+            except Exception:                                  # noqa: BLE001
+                pass
+        try:
+            self.engine.set_display_routes(set())
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            self.engine.set_frame_consumers(bool(self.preview_panel.preview_on()))
+        except Exception:                                      # noqa: BLE001
             pass
 
     def _hide_extra_output_windows(self):
@@ -8822,6 +9350,31 @@ class MainWindow(QMainWindow):
         self.out_wins = {}
         self._out_win_state = {}
 
+    def _on_native_display_changed(self, on):
+        """GPU 合成器接管/释放原生主屏输出窗时，同步 Qt 输出窗。"""
+        try:
+            if on:
+                # 原生 GLFW 窗已经是主屏输出；Qt 窗必须彻底隐藏，否则它仍在
+                # GUI 定时器里上传 1080p，和 engine 的 GPU 合成抢 GIL/GPU。
+                try:
+                    if self.out_win is not None and self.out_win.isVisible():
+                        self.out_win.hide()
+                except Exception:                          # noqa: BLE001
+                    pass
+                for _sid, _w in list(self.out_wins.items()):
+                    try:
+                        _w.hide()
+                    except Exception:                          # noqa: BLE001
+                        pass
+                try:
+                    self.engine.set_display_routes(set())
+                except Exception:                          # noqa: BLE001
+                    pass
+                return
+            self.apply_output_screen()
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def _ensure_multi_output_windows(self):
         """多屏多路：每块屏一个输出窗口，各自全屏到自己的 `display` 显示器。
 
@@ -8839,7 +9392,21 @@ class MainWindow(QMainWindow):
         screens = [s for s in (cfg.get("screens") or [])
                    if s.get("include", True) is not False
                    and str(s.get("type") or "") != "copy"]
+        # GPU 合成器已经用原生 GLFW 窗口接管主屏显示；不要再开 Qt 主输出窗
+        # （两个窗口会互相遮挡，而且 Qt 窗口的 GL 上传正是慢帧来源）。
+        try:
+            _native_main = bool(self.engine.gpu_native_display())
+        except Exception:                                      # noqa: BLE001
+            _native_main = False
         qscreens = QGuiApplication.screens()
+        # ★ 2026-11-26：窗口模式(-1)的**非主屏**只有在该屏被选中时才有监视窗。
+        #   旧行为是后台每块屏也常驻一个 1080p 窗口，和主屏抢同一个 GUI 定时器，
+        #   主屏实际只剩 17~21 帧。Spout/NDI 仍按 30fps 发送，不受影响。
+        try:
+            _sel_sid = str((getattr(self.output_panel, "_screen", None) or {})
+                           .get("id") or "")
+        except Exception:                                      # noqa: BLE001
+            _sel_sid = ""
         wanted = {}
         used_disp = {}
         for s in screens:
@@ -8851,6 +9418,11 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 disp = -2
             if disp == -2:
+                continue
+            if _native_main and str(s.get("type") or "") == "main":
+                continue
+            if (disp == -1 and str(s.get("type") or "") != "main"
+                    and sid != _sel_sid):
                 continue
             # 防御旧脏配置：同一台物理显示器只允许一块屏；后来的退回窗口模式。
             if disp >= 0:
@@ -8885,6 +9457,40 @@ class MainWindow(QMainWindow):
                     except Exception:                          # noqa: BLE001
                         pass
                 self.out_wins[sid] = win
+            try:
+                # ★ 2026-11-25：多路输出 + GPU 加速开 ⇒ 强制新纹理视图；
+                #   单路仍旧按原规则（1:1 CPU，明显放大才 GPU），不动现有多屏单路。
+                _gpu_on = True
+                try:
+                    _gpu_on = bool((self.cfg.get("perf") or {}).get(
+                        "gpu_decode", True))
+                except Exception:                          # noqa: BLE001
+                    _gpu_on = True
+                # 2026-11-26：主屏 / 全屏副屏仍用 GLTextureView（真机单窗实测
+                #   引擎 31、输出 30；CPU 视图会因 QPainter 持 GIL 把引擎拖到
+                #   27）。窗口模式(-1)的副屏用 CPU 视图，并由 `_on_display_-
+                #   windows_tick` 限到 5fps —— 它只是监视窗，不能和主屏抢 GUI。
+                try:
+                    _sid_type = str(s.get("type") or "")
+                    _sid_disp = int(disp)
+                except Exception:                              # noqa: BLE001
+                    _sid_type, _sid_disp = "", -2
+                _force = bool(_gpu_on and (_sid_type == "main" or _sid_disp >= 0)
+                              and os.environ.get("AUTOVJ_FORCE_CPU_VIEW") != "1")
+                win._force_gl = bool(_force
+                                     or os.environ.get("AUTOVJ_FORCE_GL_VIEW") == "1")
+                win._sid_type = _sid_type
+                win._sid_display = _sid_disp
+                try:
+                    win._sync_view_backend()
+                except Exception:                          # noqa: BLE001
+                    pass
+            except Exception:                                 # noqa: BLE001
+                pass
+            try:
+                win._alpha_screen = bool(s.get("alpha"))
+            except Exception:                                  # noqa: BLE001
+                pass
             title = "Easy Reality Output - %s" % (s.get("name") or sid)
             try:
                 if win.windowTitle() != title:
@@ -8930,6 +9536,23 @@ class MainWindow(QMainWindow):
         self._sync_frame_consumers()
 
     def apply_output_screen(self, screen=None):
+        # ★ 2026-11-26：独立 GPU 渲染进程已经开原生主屏窗；Qt 输出窗一律不建/立即隐藏，
+        #   否则它会盖在原生 1080p 窗上面，看起来像"只渲染了左上角 1280x720"。
+        try:
+            if bool(getattr(self.engine, "render_process_active", lambda: False)()):
+                for _w in [self.out_win] + list((self.out_wins or {}).values()):
+                    try:
+                        if _w is not None:
+                            _w.hide()
+                    except Exception:                      # noqa: BLE001
+                        pass
+                try:
+                    self.engine.set_display_routes(set())
+                except Exception:                          # noqa: BLE001
+                    pass
+                return
+        except Exception:                                      # noqa: BLE001
+            pass
         # ★ 2026-11-16：多屏**多路**下每块屏一个输出窗口；单路/普通演出台仍用全局一份。
         try:
             import output_model as _om
@@ -8973,6 +9596,11 @@ class MainWindow(QMainWindow):
         self.out_win.reset_window_size()
 
     def _load_settings_to_ui(self):
+        # ★ 2026-11-26：主屏幕 = 全局设置。先把旧主屏 params 搬进全局（幂等）。
+        try:
+            self._migrate_main_screen_params_to_global()
+        except Exception:                                      # noqa: BLE001
+            pass
         a = self.cfg["auto"]
         # 配置 -1=关闭、0~3=低~极高；下拉索引 = 配置值 + 1（0=关闭）。
         # 钳到有效档位，脏配置越界时 setCurrentIndex 会被 Qt 忽略 → 界面与配置对不上
@@ -8998,6 +9626,27 @@ class MainWindow(QMainWindow):
         except Exception:
             _rf = 60
         self.settings.render_fps.setCurrentIndex({60: 0, 30: 1, 20: 2}.get(_rf, 0))
+        # 渲染精度：0/缺省 = 自动；1.0/0.75/0.667/0.5 对应下拉项
+        try:
+            _rs = float((self.cfg["perf"] or {}).get("render_scale", 0) or 0)
+        except (TypeError, ValueError):
+            _rs = 0.0
+        if _rs <= 0:
+            _ri = 0
+        elif _rs >= 0.95:
+            _ri = 1
+        elif _rs >= 0.72:
+            _ri = 2
+        elif _rs >= 0.58:
+            _ri = 3
+        else:
+            _ri = 4
+        try:
+            self.settings.render_scale.blockSignals(True)
+            self.settings.render_scale.setCurrentIndex(_ri)
+            self.settings.render_scale.blockSignals(False)
+        except Exception:
+            pass
         try:
             _ff = bool((self.cfg["perf"] or {}).get("fps_follow_source", True))
             self.settings.chk_fps_follow.blockSignals(True)
@@ -9258,6 +9907,12 @@ class MainWindow(QMainWindow):
             历史上正是这个原因让 15 首错的本地网格差点全被放进网格模式。
         """
         meta = self.cfg["music_meta"] or {}
+        # ★ 2026-11-25：只在「曲库管理里仍然可见」的本地曲目才注入网格/标记；
+        #   已经从曲库删掉、看不到了的歌，不允许再用旧 meta 偷偷生效。
+        try:
+            _visible_lib = {str(x) for x in (self.cfg["music_library"] or [])}
+        except Exception:                                      # noqa: BLE001
+            _visible_lib = set()
         out = {}
         # song_id → 曲目路径：手动「八拍相位翻转」要按路径持久化到 cfg["music_meta"][path]
         self._grid_path_by_sid = {}
@@ -9267,6 +9922,8 @@ class MainWindow(QMainWindow):
             _bg = None
         for p, m in meta.items():
             if not isinstance(m, dict):
+                continue
+            if str(p) not in _visible_lib:
                 continue
             sid = m.get("song_id")
             g = m.get("grid")
@@ -9303,13 +9960,32 @@ class MainWindow(QMainWindow):
                     # 手动八拍相位翻转（见 engine.flip_phrase_now）：存的是开关标记，
                     # 注入时换算成 4 拍偏移。落盘键故意放在 grid **外面**（同级的
                     # `grid_flip`），否则重扫重建 grid 时会被覆盖掉。
-                    "flip": 4.0 if m.get("grid_flip") else 0.0}
+                    "flip": 4.0 if m.get("grid_flip") else 0.0,
+                    # ★ 2026-11-24：手动 Build Up（多个标记），引擎据此闪白
+                    "build_up": m.get("build_ups") or m.get("build_up")}
             if g_eff.get("segments"):
                 item["segments"] = g_eff["segments"]
             if g_eff.get("anchors"):
                 item["anchors"] = g_eff["anchors"]
             out[sid] = item
             self._grid_path_by_sid[sid] = p
+        # ★ 2026-11-25：曲库管理里只显示一条，但同一文件可能有「本机 + 导入包」两个 song_id。
+        #   以**本机可见条目**为准：按文件名把它的 Build Up 同步给导入包识别 ID，
+        #   避免引擎认到隐藏 ID 时看不到/不生效。
+        _bu_by_name = {}
+        _local_sid_by_name = {}
+        for _p, _m in meta.items():
+            if str(_p) not in _visible_lib:
+                continue
+            if isinstance(_m, dict) and (_m.get("build_ups") or _m.get("build_up")):
+                _bu_by_name[os.path.basename(str(_p)).lower()] = (
+                    _m.get("build_ups") or _m.get("build_up"))
+            try:
+                _lsid = int((_m or {}).get("song_id") or 0)
+            except Exception:                                  # noqa: BLE001
+                _lsid = 0
+            if _lsid:
+                _local_sid_by_name[os.path.basename(str(_p)).lower()] = _lsid
         # ★★ 2026-10-08（erlib 第二步）：合并「导入的曲库分析包」里的离线网格。
         #   导入的歌在本机**没有文件**，所以不可能出现在 `cfg["music_meta"]` 里；
         #   它们单独存在 `imported_lib`（按 song_id 索引）。
@@ -9319,20 +9995,45 @@ class MainWindow(QMainWindow):
             from config import app_base_dir
             import imported_lib as _IL
             _imp = _IL.lookup_grids(app_base_dir())
+            _imp_names = _IL.lookup_file_names(app_base_dir())
+            _imp_bu_sid, _imp_bu_name = _IL.lookup_build_ups(app_base_dir())
             for _sid, _g in _imp.items():
                 if _sid in out:
+                    continue
+                _fn = _imp_names.get(int(_sid), "")
+                _fn_key = os.path.basename(str(_fn)).lower() if _fn else ""
+                _local_sid = _local_sid_by_name.get(_fn_key) if _fn_key else None
+                _bu = _g.get("build_up") or _imp_bu_sid.get(int(_sid)) or (
+                    _imp_bu_name.get(_fn_key) if _fn_key else None)
+                if _local_sid:
+                    # 本机已有同名曲目 ⇒ 网格仍以本机为准，但 Build Up 是
+                    # “这首歌的手工标记”，必须从导入包补到本机 song_id 上；
+                    # 否则 DJ 机导出的标记在演出机永远不生效。
+                    if _local_sid in out and not out[_local_sid].get("build_up") and _bu:
+                        out[_local_sid]["build_up"] = _bu
                     continue
                 _manual = _g.get("manual") if isinstance(_g.get("manual"), dict) else None
                 _gel = _bg.effective_grid(_g, _manual) if _bg is not None else dict(_g)
                 _item = {"bpm": _gel.get("bpm"), "beat_len": _gel.get("beat_len"),
                          "anchor": _gel.get("anchor"), "conf": _g.get("conf"),
                          "src": _gel.get("src") or _g.get("src"),
-                         "dur": _g.get("dur"), "flip": _g.get("flip") or 0.0}
+                         "dur": _g.get("dur"), "flip": _g.get("flip") or 0.0,
+                         "build_up": _bu}
                 if _gel.get("segments"):
                     _item["segments"] = _gel["segments"]
                 if _gel.get("anchors"):
                     _item["anchors"] = _gel["anchors"]
+                if not _item.get("build_up"):
+                    _bu = _bu_by_name.get(os.path.basename(str(_fn)).lower()) if _fn else None
+                    if _bu:
+                        _item["build_up"] = _bu
                 out[_sid] = _item
+            # 网格被 src/conf 门槛过滤掉、但包里有 Build Up 的歌：
+            # 只要本机有同名曲目且本机没标记，也把手工标记补过去。
+            for _fn_key, _bu in _imp_bu_name.items():
+                _local_sid = _local_sid_by_name.get(_fn_key)
+                if (_local_sid in out and not out[_local_sid].get("build_up")):
+                    out[_local_sid]["build_up"] = _bu
             if _imp:
                 print("[曲库] 合并导入包：+%d 条离线网格" % len(_imp))
         except Exception:                                        # noqa: BLE001
@@ -10353,6 +11054,39 @@ class MainWindow(QMainWindow):
             print("[曲库] 删除指纹失败：%s" % e)
             return (0, 0)
 
+    def _force_all_displays_closed(self):
+        """启动时把所有输出显示统一设为「关闭（不弹出输出窗口）」。
+
+        用户要求：不论单屏还是多屏配置，每次打开软件都不要自动弹显示器输出；
+        Spout/NDI 路由保持原样。关闭值 = display -2 / output.screen -2。
+        """
+        changed = False
+        try:
+            o = self.cfg.data.setdefault("output", {})
+            if int(o.get("screen", -2) or -2) != -2:
+                o["screen"] = -2
+                changed = True
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            for cfg in (self.cfg.data.get("output", {}).get("configs") or []):
+                for s in (cfg.get("screens") or []):
+                    try:
+                        if int(s.get("display", -2) if s.get("display") is not None
+                               else -2) != -2:
+                            s["display"] = -2
+                            changed = True
+                    except Exception:                          # noqa: BLE001
+                        s["display"] = -2
+                        changed = True
+        except Exception:                                      # noqa: BLE001
+            pass
+        if changed:
+            try:
+                self.cfg.save()
+            except Exception:                                  # noqa: BLE001
+                pass
+
     def _migrate_library_paths(self):
         """便携式路径迁移：软件换了目录/盘符后，config 里的旧素材绝对路径会失效
         （表现为素材库清空、必须重新导入）。按「素材库」目录锚点把旧路径重映射到
@@ -11032,6 +11766,9 @@ class MainWindow(QMainWindow):
         exclude = not all(bool(getattr(m, "excluded", False)) for m in items)
         for m in items:
             m.excluded = exclude
+            # 排除/恢复都重新走一次扫描：排除时只分析不打标，恢复时才重新打标。
+            m.scanned = False
+            self.cfg["clip_scanned"].pop(m.path, None)
             if exclude:
                 m.tags = []
                 m.roles = {"fg": False, "bg": False}
@@ -11074,13 +11811,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, T("打开文件所在位置"), str(e)[:200])
 
     def _scan_scope_items(self, paths=None, force=False):
-        items = [m for m in self.library.values()
-                 if m.kind == "video" and not getattr(m, "excluded", False)]
+        # ★ 2026-11-25：excluded 视频也要进代理检测/转码（只影响打标/匹配）；
+        #   图片/GIF 永远不在此列。
+        items = [m for m in self.library.values() if m.kind == "video"]
         if paths:
             want = set(paths)
             items = [m for m in items if m.path in want]
         elif not force:
-            items = [m for m in items if not m.tags]
+            items = [m for m in items if not is_scanned(m)]
         return items
 
     def _ask_proxy_plan(self, plan):
@@ -11426,8 +12164,8 @@ class MainWindow(QMainWindow):
         范围严格跟原逻辑：
           · paths 给定 → 只这些；
           · force=True → 全库（含已打标）；
-          · 否则 → 全库未打标视频。
-        静态图片 / GIF / excluded 不参与。
+          · 否则 → 全库未扫描视频。
+        静态图片 / GIF 不参与；**excluded 视频参与代理检测/转码/扫描，但不打标**。
         """
         if getattr(self, "_tag_scan", None) is not None and self._tag_scan.isRunning():
             QMessageBox.information(self, T("扫描素材"), "已有扫描在进行中，请稍候。")
@@ -11440,7 +12178,7 @@ class MainWindow(QMainWindow):
             return
         items = self._scan_scope_items(paths, force)
         if not items:
-            self.statusBar().showMessage("没有需要打标的视频（图片/GIF/已排除素材不扫）", 6000)
+            self.statusBar().showMessage("没有需要扫描的视频（图片/GIF 不参与）", 6000)
             return
         if paths:
             scope = "选中素材 %d 个" % len(items)
@@ -11865,26 +12603,20 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.setToolTipsVisible(True)      # ★ 长条目拆短后，括号里的说明挪进悬停提示
         a_ren = m.addAction("重命名…")
-        # ★ 2026-10-25：文案**固定**为「停止切换本层素材」，不再随状态改名。
-        #   用户明确要求：前面已经打了勾，勾本身就表示"已停住"，文案跟着变反而让人以为
-        #   是另一个功能（截图里"✓ 恢复切换本层素材"就是这么来的）。勾 = 已停止切换。
-        _stopped = lay.fixed >= 0
-        a_fix = m.addAction("停止切换本层素材")
-        a_fix.setCheckable(True)
-        a_fix.setChecked(_stopped)
-        a_fix.setToolTip(T("本层停在这一张素材上，不再自动换；也挡不住你手动切"))
-        # ★ 2026-10-25：「手动切换素材」**只放在这里**。
-        #   素材右键菜单里曾也放了一份，和「播放此素材」重复（都是把本层切到某一格，
-        #   一个指定、一个顺移），用户直接指出"是不是重复了" ⇒ 素材菜单里删掉。
-        #   图层菜单没有"选哪一格"的能力，这一项才是唯一能单层前进一格的操作。
-        a_step = m.addAction("手动切换素材")
-        a_step.setToolTip(T("立刻切到本层的下一个素材（不影响其它图层与节奏）"))
-        a_step.setEnabled(len(getattr(lay, "clips", []) or []) >= 2
-                          and not bool(getattr(lay, "auto_mode", False))
-                          and not bool(getattr(lay, "is_kv", False)))
+        # ★ 2026-11-26（用户）：手动图层恢复「停止切换素材」；自动层/Kv 不显示，
+        #   码表图层走另一套菜单。勾选后「下一素材」只跳过这一层，不影响别的层。
+        a_stop = None
+        if (not bool(getattr(lay, "auto_mode", False))
+                and not bool(getattr(lay, "is_kv", False))):
+            a_stop = m.addAction("停止切换素材")
+            a_stop.setCheckable(True)
+            a_stop.setChecked(bool(getattr(lay, "stop_switch", False)))
+            a_stop.setToolTip(T("勾选后，点「下一素材」时本层不会切换。\n"
+                                "只对手动图层生效；Kv 图层有自己的切换速度设置，不受影响。"))
         a_sil = m.addAction("无声音时隐藏本层")
         a_sil.setCheckable(True)
         a_sil.setChecked(bool(lay.hide_silent))
+        a_sil.setToolTip(T("静音时停止显示本层（无声音时隐藏）"))
         # ★ 2026-11-16（用户要求）：删掉「静音时暂停播放」——只保留「无声音时隐藏本层」。
         #   旧配置里 pause_silent=True 的层在加载时会被强制关掉（见 engine.rebuild_from_cfg）。
         a_solo = m.addAction("Solo")
@@ -11934,18 +12666,9 @@ class MainWindow(QMainWindow):
         elif act == a_ren:
             self._cur_layer = idx
             self.layer_rename()
-        elif act == a_fix:
-            if lay.fixed >= 0:
-                lay.fixed = -1
-            elif lay.cur >= 0:
-                lay.fixed = lay.cur
+        elif act == a_stop and a_stop is not None:
+            lay.stop_switch = not bool(getattr(lay, "stop_switch", False))
             self.save_layers()
-        elif act == a_step:
-            try:
-                self.engine.manual_switch_layer(idx)
-                self._layers_call("refresh_playing")
-            except Exception:                                    # noqa: BLE001
-                pass
         elif act == a_sil:
             lay.hide_silent = not lay.hide_silent
             self.save_layers()
@@ -11962,6 +12685,7 @@ class MainWindow(QMainWindow):
         elif act == a_rst:
             lay.blend, lay.opacity, lay.speed = "normal", 1.0, 1.0
             lay.hide_silent, lay.pause_silent, lay.solo, lay.fixed = False, False, False, -1
+            lay.stop_switch = False
             lay.img_scale, lay.img_x, lay.img_y = 1.0, 0.0, 0.0
             lay.use_alpha = True
             lay.lock_motion = False
@@ -12080,7 +12804,7 @@ class MainWindow(QMainWindow):
                     self._log_ui_error("move_layer_drag.membership", e)
             # 3) 落盘 + 刷新所有图层栈（多屏时连块一起重建，过滤器才跟着变）
             try:
-                self.engine.push_layers_to_cfg()
+                self.engine.push_layers_to_cfg_now()
             except Exception:                                      # noqa: BLE001
                 pass
             self.cfg.save()
@@ -12154,6 +12878,7 @@ class MainWindow(QMainWindow):
         new.opacity, new.blend = lay.opacity, lay.blend
         new.speed, new.hide_silent = lay.speed, lay.hide_silent
         new.pause_silent = lay.pause_silent
+        new.stop_switch = bool(getattr(lay, "stop_switch", False))
         new.fixed = lay.fixed
         self.engine.layers.insert(idx, new)
         self._enforce_kv_top()
@@ -12172,23 +12897,13 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         a_play = m.addAction("播放此素材")
         a_play.setEnabled(media is not None and not is_auto)   # 自动图层素材由自动匹配管理
-        # ★ 2026-10-25（用户指出重复后删掉）：这里**不再放「手动切换素材」**。
-        #   素材菜单的每一项都是"对**这一格**做事"，而「播放此素材」已经能把这层切到
-        #   任意一格 —— 再挂一个"顺移下一个"就是同义重复，菜单里并排两项反而让人犹豫。
-        #   「手动切换素材」只留在**图层右键菜单**：那里没有"选哪一格"的能力，
-        #   它才是唯一能单层前进一格的操作（不重复，也不缺能力）。
+        # ★ 2026-11-26（用户要求）：右键菜单不再放「手动切换素材」；
+        #   手动切换只保留主界面「下一素材」按钮/快捷键，以及这里的「播放此素材」。
+        # ★ 2026-10-25：素材菜单的每一项都是"对**这一格**做事"，「播放此素材」
+        #   已经能把这层切到任意一格；"顺移下一个"是重复操作，所以从不放在这里。
         a_size = m.addAction("素材大小与位置…")
         a_size.setEnabled(media is not None)
-        # ★ 2026-10-25（用户要求）：菜单文案改成「停止切换本层素材」——
-        #   它做的事就是"这一层停在这张图上"，不是"设为默认素材"，旧文案容易被理解反。
-        #   文案**固定不变**：已停住时前面就是个勾（勾 = 已停止切换），
-        #   别再改成"恢复切换"——那会让人以为点了是另一个功能。
-        _fixed_here = (media is not None and lay.fixed >= 0
-                       and 0 <= lay.fixed < len(lay.clips) and lay.clips[lay.fixed] is media)
-        a_fix = m.addAction("停止切换本层素材")
-        a_fix.setCheckable(True)
-        a_fix.setEnabled(not is_auto)
-        a_fix.setChecked(_fixed_here)
+        # ★ 2026-11-26（用户要求）：删除「停止切换本层素材」。
         m.addSeparator()
         a_rm = m.addAction(theme.danger_icon(), "从本层移除")
         a_rm.setEnabled(media is not None and not is_auto)
@@ -12224,13 +12939,6 @@ class MainWindow(QMainWindow):
             try:
                 self.engine._switch_layer_to(lay, lay.clips.index(media))
                 self._layers_call("refresh_playing")
-            except ValueError:
-                pass
-        elif act == a_fix and media is not None:
-            try:
-                i = lay.clips.index(media)
-                lay.fixed = -1 if lay.fixed == i else i
-                self.save_layers()
             except ValueError:
                 pass
         elif act == a_rm and media is not None:
@@ -12325,14 +13033,13 @@ class MainWindow(QMainWindow):
             lay.is_cuesheet = True
             lay.cuesheet_id = os.path.basename(str(sheet_entry.get("path") or ""))
         # 「自动图层应该跟着音乐走」：新建**自动**图层默认勾选「无声音时隐藏本层」。
-        # 仅限自动图层；手动图层保持现有默认（不勾选）；Kv 待机层本就有独立的静音逻辑
-        # （无声音切入），不能叠加 hide_silent，故排除。
-        # ⚠ 取舍说明：用户原话「添加两个自动图层时自动勾选」也可能指"只有当已存在 ≥1 个
-        #   自动图层时再添加才勾选"。这里按**更符合常理**的理解实现——只要新建的是自动图层
-        #   就默认勾选（自动图层本就应随音乐静音而隐藏）。若要改成"第二条自动图层才勾选"，
-        #   只需在此处加 `and any(getattr(l, "auto_mode", False) for l in self.engine.layers)`。
+        # ★ 2026-11-26（用户）：新建**手动**图层也默认勾选「无声音时隐藏本层」
+        #   和「停止切换素材」。Kv/码表层不套用这两个默认值（Kv 有自己的切换速度）。
         if auto and not is_kv:
             lay.hide_silent = True
+        elif not is_kv and not is_cue:
+            lay.hide_silent = True
+            lay.stop_switch = True
         if role == "fg" and not is_kv:
             lay.blend = "add"   # 前景（特效/覆盖）默认用"添加"混合，叠加发光才正常
         _at = self._layer_insert_index(is_kv, is_cue, len(self.engine.layers))
@@ -12369,9 +13076,10 @@ class MainWindow(QMainWindow):
                     self._log_ui_error("layer_add.push_plan", _e)
         except Exception as e:                                    # noqa: BLE001
             self._log_ui_error("layer_add.bind_screen", e)
-        if auto:
-            # 立即匹配一次（绕过 3s 间隔），让新建自动图层马上有画面
-            self.engine._refresh_auto_layers(self.audio.state.snapshot(), force=True)
+        # ★ 2026-11-26：不再在 GUI 线程立即 _refresh_auto_layers(force=True)。
+        #   它会同步匹配 + 打开解码器（大素材几百 ms~1 秒），和加图层重建叠在一起
+        #   就是软件卡十几秒。新层 clips 为空，引擎下一帧（≤33ms）会自动补池；
+        #   用户几乎无感，但 GUI 不会再被解码器初始化卡住。
         try:
             self._cur_layer = self.engine.layers.index(lay)
         except ValueError:
@@ -12416,12 +13124,68 @@ class MainWindow(QMainWindow):
         from PySide6.QtCore import QTimer as _QT
         _QT.singleShot(0, self._refresh_blocks_after_binding_now)
 
+    def _refresh_multi_block_filters(self):
+        """多屏页：只更新各块的图层过滤集（不销毁/重建整块）。
+
+        ★ 2026-11-26（用户：加/删图层卡十几秒）：加/删图层只改变
+          `screens[].layers` 过滤集，屏幕数量/布局没变。以前走
+          `_rebuild_multi_blocks(force=True)` ⇒ 把所有块/面板销毁重建，
+          237ms~1.4s 起步，缩略图多时更久。现在只调 `panel.set_layer_ids()`
+          （面板内部按 lid 增量复用行），并更新签名，避免下一帧又整块重建。
+        """
+        try:
+            import output_model as _om
+            st = getattr(self, "output_studio", None)
+            if st is None:
+                return False
+            cfg = st.active_config()
+            if not cfg:
+                return False
+            blocks = getattr(self, "_multi_blocks", None) or []
+            if not blocks:
+                return False
+            all_ids = [str(l.lid) for l in self.engine.layers]
+            for sid, blk, _body in blocks:
+                s = _om.screen_by_id(cfg, str(sid))
+                if s is None:
+                    continue
+                used = [str(x) for x in _om.effective_layers(cfg, s, all_ids)]
+                filt = None if len(used) >= len(all_ids) else used
+                if str(s.get("type") or "") == "main":
+                    panel = getattr(self, "layers_panel", None)
+                else:
+                    panel = (getattr(self, "_screen_panels", None) or {}).get(str(sid))
+                if panel is None:
+                    return False
+                panel.set_layer_ids(filt)
+                try:
+                    self._fit_block_height(blk, panel)
+                except Exception:                          # noqa: BLE001
+                    pass
+            screens = list(cfg.get("screens") or [])
+            sig = tuple(str(s.get("id")) for s in screens)
+            filt_sig = tuple(
+                (str(s.get("id")), str(s.get("type")), str(s.get("source_id") or ""),
+                 tuple(sorted(str(x) for x in (s.get("layers") or [])))
+                 if s.get("layers") is not None else None)
+                for s in screens)
+            self._multi_block_sig = (sig, filt_sig)
+            try:
+                self._refresh_block_styles(cfg)
+            except Exception:                              # noqa: BLE001
+                pass
+            return True
+        except Exception as e:                             # noqa: BLE001
+            self._log_ui_error("_refresh_multi_block_filters", e)
+            return False
+
     def _refresh_blocks_after_binding_now(self):
         try:
             _multi = bool(getattr(self, "_multi_page", None) is not None
                           and self.perf_stack.currentWidget() is self._multi_page)
             if _multi:
-                self._rebuild_multi_blocks(force=True)
+                if not self._refresh_multi_block_filters():
+                    self._rebuild_multi_blocks(force=True)
             else:
                 self.refresh_all_layer_blocks()
         except Exception as e:                                    # noqa: BLE001
@@ -12472,7 +13236,7 @@ class MainWindow(QMainWindow):
         self._sync_layers()
 
     def _sync_layers(self):
-        self.engine.push_layers_to_cfg()
+        self.engine.push_layers_to_cfg_now()
         self.cfg.save()
         self.refresh_all_layer_blocks()
         self._cur_layer = min(self._cur_layer, max(0, len(self.engine.layers) - 1))
@@ -12540,14 +13304,44 @@ class MainWindow(QMainWindow):
         """自动图层素材池被重算：刷新对应行素材格 + 播放高亮。
 
         ★ 2026-11-11（用户图1：正在播放的黄底没了）：**运行中也要同步素材格**。
-          之前为了省卡顿把运行中的 `sync_layer` 推迟到停止后，结果 `lay.clips`
-          已经换成新池，而格子里还是旧池 ⇒ 高亮按路径永远对不上。
-          现在 `_fill_row` 只读已有缩略图（`icon_cached`，不再在 GUI 线程解码），
-          重建 10 格级别的开销已经很小，必须保持数据同步。
+        但同步会扫缩略图/磁盘，换池时连续做多次会把 GUI 和引擎一起拖慢。
+        现在只立刻更新“正在播放”高亮；素材格用 180ms 合并刷新，一次最多刷一轮。
         """
-        for i in (idxs or []):
-            self._layers_call("sync_layer", i)
-        self._layers_call("refresh_playing", idxs)
+        try:
+            self._auto_sync_pending.update(int(i) for i in (idxs or []))
+        except Exception:                                     # noqa: BLE001
+            self._auto_sync_pending = set(idxs or [])
+        try:
+            self._layers_call("refresh_playing", idxs)
+        except Exception:                                     # noqa: BLE001
+            pass
+        t = getattr(self, "_auto_sync_timer", None)
+        if t is None:
+            from PySide6.QtCore import QTimer as _QT
+            t = _QT(self)
+            t.setSingleShot(True)
+            t.setInterval(180)
+            t.timeout.connect(self._flush_auto_layers_sync)
+            self._auto_sync_timer = t
+        if not t.isActive():
+            t.start()
+
+    def _flush_auto_layers_sync(self):
+        idxs = sorted(getattr(self, "_auto_sync_pending", set()) or [])
+        self._auto_sync_pending = set()
+        # ★ 2026-11-26：多屏输出优化后，演出中也要同步自动图层素材池。
+        #   `sync_layer` 只重建**路径真的变了**的行，缩略图用已有缓存；缺图交给后台补。
+        #   随后立刻重刷黄框，保证新池里正在播放的那个格子马上高亮。
+        for i in idxs:
+            try:
+                self._layers_call("sync_layer", i)
+            except Exception:                                  # noqa: BLE001
+                pass
+        if idxs:
+            try:
+                self._layers_call("refresh_playing", idxs)
+            except Exception:                                  # noqa: BLE001
+                pass
 
     # ================= 输出/语言 =================
     def show_output(self):
@@ -12788,6 +13582,11 @@ class MainWindow(QMainWindow):
         # 防御：万一将来从非 GUI 线程发来，仍然编组回 GUI 线程，绝不跨线程画控件。
         try:
             if QThread.currentThread() is not self.thread():
+                # ★ 2026-11-26：把序号也存下来。以前只置 `_draw_scheduled`，
+                #   `singleShot` 回调用的是**旧** `_pending_seq`，重 UI 停顿后
+                #   可能直接判"已画过"返回 ⇒ 预览停住不再更新。
+                if seq > int(getattr(self, "_pending_seq", -1)):
+                    self._pending_seq = seq
                 if not self._draw_scheduled:
                     self._draw_scheduled = True
                     QTimer.singleShot(0, self._draw_latest_frame)
@@ -12810,29 +13609,36 @@ class MainWindow(QMainWindow):
         self._cover_check_t = now
         cover = False
         try:
-            ow = getattr(self, "out_win", None)
-            if ow is not None and ow.isVisible() and self.isVisible() and not self.isMinimized():
-                same_screen = False
-                try:
-                    s1, s2 = ow.screen(), self.screen()
-                    same_screen = bool(s1 is not None and s2 is not None
-                                       and s1.geometry() == s2.geometry())
-                except Exception:
-                    same_screen = False
-                # 几何上盖住还不够：主窗可能被 Alt+Tab 提到输出窗上面（输出未置顶时）。
-                # 取主窗中心点，看实际最上层窗口是不是输出窗 —— 只做一次，缓存 0.4s。
-                on_top = False
+            wins = []
+            ow0 = getattr(self, "out_win", None)
+            if ow0 is not None:
+                wins.append(ow0)
+            for w in (getattr(self, "out_wins", None) or {}).values():
+                if w is not None and w not in wins:
+                    wins.append(w)
+            if wins and self.isVisible() and not self.isMinimized():
+                # 取主窗中心点，看实际最上层窗口是不是**任意一个**输出窗
+                # （多屏多路时不是主屏那个 out_win，而是 out_wins 里的窗口）。
+                on_top = None
                 try:
                     pt = self.mapToGlobal(self.rect().center())
                     wgt = QApplication.widgetAt(pt)
-                    on_top = (wgt is not None and wgt.window() is ow)
+                    on_top = wgt.window() if wgt is not None else None
                 except Exception:
-                    on_top = False
-                if on_top:
-                    if ow.isFullScreen():
-                        cover = same_screen
+                    on_top = None
+                if on_top is not None and on_top in wins:
+                    if on_top.isFullScreen():
+                        try:
+                            s1, s2 = on_top.screen(), self.screen()
+                            # 必须是**同一块物理屏**；只比较 geometry 会把
+                            # 另一块同分辨率的显示器误判成盖住主窗（双 1080p 必现），
+                            # 引擎于是停发 GUI 预览帧，主界面就黑屏/定格。
+                            cover = bool(s1 is not None and s2 is not None
+                                         and s1 is s2)
+                        except Exception:
+                            cover = False
                     else:
-                        cover = ow.frameGeometry().contains(self.frameGeometry())
+                        cover = on_top.frameGeometry().contains(self.frameGeometry())
         except Exception:
             cover = False
         self._cover_main = cover
@@ -12850,13 +13656,19 @@ class MainWindow(QMainWindow):
         self._preview_cover_t = now
         got = False
         try:
-            ow = getattr(self, "out_win", None)
+            wins = []
+            ow0 = getattr(self, "out_win", None)
+            if ow0 is not None:
+                wins.append(ow0)
+            for w in (getattr(self, "out_wins", None) or {}).values():
+                if w is not None and w not in wins:
+                    wins.append(w)
             pv = getattr(getattr(self, "preview_panel", None), "view", None)
-            if (ow is not None and pv is not None and ow.isVisible()
+            if (wins and pv is not None
                     and pv.isVisible() and pv.width() > 1 and pv.height() > 1):
                 pt = pv.mapToGlobal(pv.rect().center())
                 wgt = QApplication.widgetAt(pt)
-                got = bool(wgt is not None and wgt.window() is ow)
+                got = bool(wgt is not None and wgt.window() in wins)
         except Exception:
             got = False
         self._preview_cover = got
@@ -12885,14 +13697,29 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         _t1 = time.perf_counter()
-        self._update_preview(img, allow=not self._preview_covered())
-        _t2 = time.perf_counter()
+        # ★ 2026-11-25（真机：输出窗口全屏盖住主窗时，GUI 预览/输出页仍在
+        #   每帧重绘，把 GUI 线程拖到 13~16 帧）：主窗被输出窗完全盖住时，
+        #   这些绘制用户根本看不见，直接跳过，把 GUI 时间留给输出窗口。
+        _cover = False
         try:
-            os_obj = getattr(self, "output_studio", None)
-            if os_obj is not None:
-                os_obj.on_frame()
-        except Exception:
+            _cover = self._covered_by_output()
+        except Exception:                                      # noqa: BLE001
+            _cover = False
+        try:
+            self.engine.set_gui_covered(_cover)
+        except Exception:                                      # noqa: BLE001
             pass
+        if not _cover:
+            self._update_preview(img, allow=not self._preview_covered())
+            _t2 = time.perf_counter()
+            try:
+                os_obj = getattr(self, "output_studio", None)
+                if os_obj is not None:
+                    os_obj.on_frame()
+            except Exception:
+                pass
+        else:
+            _t2 = time.perf_counter()
         _t3 = time.perf_counter()
         if _probe:
             import stallwatch as _sw
@@ -12938,6 +13765,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _update_preview(self, img, allow=True):
+        # 2026-11-26：预览必须一直可见；输出窗改用 GPU 纹理视图，
+        # 不再通过暂停预览来换帧率。
         self.preview_panel.set_frame(img, allow=allow)
         # ⚠ 播放高亮**不在这里刷**：已交给独立的 1 秒定时器（`self._hl_timer`）。
         #   这条旧通路是"每 6 帧 ≈10fps 重建整张高亮表"，而预览帧在换页/隐藏时根本不来

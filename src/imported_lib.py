@@ -46,11 +46,17 @@ _SCHEMA = (
     " sections TEXT DEFAULT '', sections_raw TEXT DEFAULT '',"
     # ★ 2026-11-18：身份字段与段落来源标记随包导入（ERLIB format 新增列）。
     " fp_id TEXT DEFAULT '', file_md5 TEXT DEFAULT '',"
-    " sections_auto INTEGER DEFAULT 1)",
+    " sections_auto INTEGER DEFAULT 1,"
+    # ★ 2026-11-26：ERLIB 手动 Build Up（{start,beats}）随包导入。
+    " build_up TEXT DEFAULT '')",
     "CREATE INDEX IF NOT EXISTS idx_imp_name ON songs(file_name)",
     # ★ 2026-10-27 曲库识别增强：导入歌的波形（zlib 压缩 JSON BLOB）。
     "CREATE TABLE IF NOT EXISTS waveforms ("
     " song_id INTEGER PRIMARY KEY, data BLOB)",
+    # ★ 2026-11-26：导入时用户选择「跳过本机已有曲目」——这些歌不写 songs 行，
+    #   但包里的手动 Build Up 不能丢。按文件名单独存，演出机按同名曲目合并。
+    "CREATE TABLE IF NOT EXISTS skipped_build_ups ("
+    " file_name TEXT PRIMARY KEY, build_up TEXT)",
 )
 
 
@@ -98,7 +104,8 @@ def _migrate(conn):
                        ("sections_raw", " sections_raw TEXT DEFAULT ''"),
                        ("fp_id", " fp_id TEXT DEFAULT ''"),
                        ("file_md5", " file_md5 TEXT DEFAULT ''"),
-                       ("sections_auto", " sections_auto INTEGER DEFAULT 1")):
+                       ("sections_auto", " sections_auto INTEGER DEFAULT 1"),
+                       ("build_up", " build_up TEXT DEFAULT ''")):
         if _col in cols:
             continue
         try:
@@ -183,8 +190,9 @@ def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None
         "INSERT OR REPLACE INTO songs ("
         " song_id, file_name, file_size, duration, artist, title, rel_path,"
         " genres, styles, source, level, ai_zh, grid, cover_path, imported_at,"
-        " pack, manual, sections, sections_raw, fp_id, file_md5, sections_auto)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " pack, manual, sections, sections_raw, fp_id, file_md5, sections_auto,"
+        " build_up)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (int(sid), m.get("file_name", ""), int(m.get("file_size") or 0),
          float(m.get("duration") or 0.0), m.get("artist", ""),
          m.get("title", ""), m.get("rel_path", ""),
@@ -193,7 +201,15 @@ def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None
          cover_path or "", time.time(), str(pack or ""),
          _j(manual_val), _j(m.get("sections")), _j(m.get("sections_raw")),
          str(m.get("fp_id") or ""), str(m.get("file_md5") or ""),
-         int(m.get("sections_auto", 1) or 0)))
+         int(m.get("sections_auto", 1) or 0), _j(m.get("build_up"))))
+    # 这首歌已经正式导入 ⇒ 之前“跳过重复”时暂存的文件名标记可以删掉，
+    # 避免同一个文件以后又用旧包里的 Build Up 覆盖新数据。
+    try:
+        _fn = os.path.basename(str(m.get("file_name") or "")).lower()
+        if _fn:
+            conn.execute("DELETE FROM skipped_build_ups WHERE file_name=?", (_fn,))
+    except Exception:                                            # noqa: BLE001
+        pass
     if waveform is not None:
         try:
             import waveform as _wf
@@ -211,6 +227,44 @@ def add_song(conn, sid, meta, cover_path="", pack="", manual=None, waveform=None
             pass
 
 
+def add_skipped_build_up(conn, file_name, build_up):
+    """导入时跳过重复曲目，但把包里的 Build Up 按文件名暂存下来。
+
+    不写 `songs`（否则曲库会多一条重复），只写 `skipped_build_ups`；
+    `lookup_build_ups()` 会把它并入“同名文件”的标记，演出机本地曲目也能生效。
+    """
+    name = os.path.basename(str(file_name or "")).lower()
+    if not name:
+        return
+    try:
+        v = _j(build_up) if build_up else ""
+        if v:
+            conn.execute("INSERT OR REPLACE INTO skipped_build_ups"
+                         " (file_name, build_up) VALUES (?,?)", (name, v))
+        else:
+            conn.execute("DELETE FROM skipped_build_ups WHERE file_name=?", (name,))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def lookup_file_names(base_dir):
+    """`{song_id: file_name}` —— 用于把本机曲目的手工标记映射到导入包里同一首歌。"""
+    out = {}
+    try:
+        if not os.path.isfile(meta_db_path(base_dir)):
+            return out
+        c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
+        try:
+            for sid, fn in c.execute("SELECT song_id, file_name FROM songs"):
+                if fn:
+                    out[int(sid)] = str(fn)
+        finally:
+            c.close()
+    except Exception:                                          # noqa: BLE001
+        pass
+    return out
+
+
 def lookup_grids(base_dir):
     """`{sid: grid}` —— 给 `engine.set_song_grids()` 用。
 
@@ -223,16 +277,20 @@ def lookup_grids(base_dir):
     try:
         if not os.path.isfile(meta_db_path(base_dir)):
             return out
-        c = sqlite3.connect(meta_db_path(base_dir), timeout=30.0)
+        # ★ 2026-11-26：走 open_meta（会跑幂等迁移），保证旧库已有 build_up 列。
+        c = open_meta(base_dir)
         try:
-            for sid, g, manual in c.execute(
-                    "SELECT song_id, grid, manual FROM songs"):
+            for sid, g, manual, build_up in c.execute(
+                    "SELECT song_id, grid, manual, build_up FROM songs"):
                 g = _p(g)
                 if not isinstance(g, dict):
                     continue
                 manual = _p(manual)
                 if not isinstance(manual, dict):
                     manual = None
+                build_up = _p(build_up)
+                if not isinstance(build_up, (dict, list)):
+                    build_up = None
                 user_marked = bool(
                     manual and (manual.get("bpm_manual")
                                 or manual.get("anchors")
@@ -263,7 +321,8 @@ def lookup_grids(base_dir):
                                  "src": g.get("src"), "dur": g.get("dur"),
                                  "segments": list(g.get("segments") or []),
                                  "anchors": list(g.get("anchors") or []),
-                                 "flip": 0.0, "manual": manual}
+                                 "flip": 0.0, "manual": manual,
+                                 "build_up": build_up}
         finally:
             c.close()
     except Exception:                                            # noqa: BLE001
@@ -273,6 +332,46 @@ def lookup_grids(base_dir):
 
 # ★ 2026-10-30 用户「大砍刀」：`lookup_genres()`（给 engine.set_song_genres 用）随
 #   曲风识别一并删除。包里的 genres 列保留不动（老包照常导入，只是不再读）。
+
+
+def lookup_build_ups(base_dir):
+    """`{sid: build_up}` 以及 `{小写文件名: build_up}`。
+
+    为什么需要按文件名再建一份：
+      ERLIB 的 `song_id` 是 DJ 机器上**文件完整路径**的 md5；同一首歌在演出机
+      本地曲库里路径不同 ⇒ song_id 也不同。导入包里的 Build Up 如果只按包内
+      song_id 注入，演出机播放本地文件（用本地 song_id 识别）时永远命中不了。
+      文件名是跨机器最稳定的对应关系（与现有 `lookup_file_names()` 同口径）。
+    """
+    by_sid, by_name = {}, {}
+    try:
+        if not os.path.isfile(meta_db_path(base_dir)):
+            return by_sid, by_name
+        c = open_meta(base_dir)
+        try:
+            for sid, fn, bu in c.execute(
+                    "SELECT song_id, file_name, build_up FROM songs"):
+                v = _p(bu)
+                if not isinstance(v, (dict, list)) or not v:
+                    continue
+                by_sid[int(sid)] = v
+                name = os.path.basename(str(fn or "")).lower()
+                if name:
+                    by_name[name] = v
+            # 导入时选择「跳过本机已有曲目」的手动标记（不建 songs 行）。
+            try:
+                for fn, bu in c.execute(
+                        "SELECT file_name, build_up FROM skipped_build_ups"):
+                    v = _p(bu)
+                    if isinstance(v, (dict, list)) and v:
+                        by_name[str(fn or "").lower()] = v
+            except Exception:                                    # noqa: BLE001
+                pass
+        finally:
+            c.close()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return by_sid, by_name
 
 
 def lookup_sections(base_dir):
@@ -680,6 +779,7 @@ def clear(base_dir):
         try:
             c.execute("DELETE FROM songs")
             c.execute("DELETE FROM waveforms")
+            c.execute("DELETE FROM skipped_build_ups")
             c.commit()
         finally:
             c.close()

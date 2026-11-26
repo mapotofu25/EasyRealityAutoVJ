@@ -311,6 +311,27 @@ def main():
         from PySide6.QtCore import QTimer as _QT2
         _QT2.singleShot(0, _do_auto_start)
 
+    # ★ 2026-11-25 真机验收入口：`--apply-output` / `AUTOVJ_APPLY_OUTPUT=1`
+    #   启动后按当前输出配置真正打开输出窗口/全屏显示器。
+    #   正常启动不带该参数 ⇒ 行为与之前完全一致（仍由用户改设置/开始 VJ 触发）。
+    try:
+        _apply_out = ("--apply-output" in sys.argv
+                      or str(os.environ.get("AUTOVJ_APPLY_OUTPUT", "")).strip()
+                      in ("1", "true", "yes"))
+    except Exception:                                             # noqa: BLE001
+        _apply_out = False
+    if _apply_out:
+        from PySide6.QtCore import QTimer as _QT3
+
+        def _do_apply_output():
+            try:
+                fn = getattr(win, "apply_output_screen", None)
+                if callable(fn):
+                    fn()
+            except Exception:                                     # noqa: BLE001
+                pass
+        _QT3.singleShot(1800, _do_apply_output)
+
     if _open_out:
         def _do_open_out_window():
             try:
@@ -335,4 +356,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # PyInstaller + multiprocessing.spawn：冻结后子进程靠这个入口直接进目标函数，
+    # 绝不能再跑一遍 Qt 主窗口初始化。
+    try:
+        import multiprocessing as _mp
+        _mp.freeze_support()
+    except Exception:                                          # noqa: BLE001
+        pass
     main()

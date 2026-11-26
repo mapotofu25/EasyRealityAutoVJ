@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""打「工具集」1.0 压缩包 —— ERLIB / 音频发送端 / NDI自检 / 音源诊断 合成一个 zip。
+r"""打「工具集」1.3 压缩包 —— ERLIB / 音频发送端 / NDI自检 / 音源诊断 合成一个 zip。
 
 包内结构：
     工具集/
@@ -22,10 +22,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.dirname(ROOT)
 LEGACY = r"P:\ERAVJ"
 OUT_DIR = os.path.join(ROOT, "发行版")
-OUT = os.path.join(OUT_DIR, "EasyReality_Tools_1.0.zip")
+OUT = os.path.join(OUT_DIR, "EasyReality_Tools_1.3.zip")
 TOP = "工具集"
 
-README_TXT = """Easy Reality — 工具集 1.0（2026.11.21）
+README_TXT = r"""Easy Reality — 工具集 1.3（2026.11.26）
 ================================================================
 主程序 EasyRealityAutoVJ 和码表编辑器 EasyRealityCue 有各自独立的包，
 这个包里是配套工具。四个软件怎么配合：
@@ -36,10 +36,13 @@ README_TXT = """Easy Reality — 工具集 1.0（2026.11.21）
     音频发送端      ->  B 机没有歌文件时，把 A 机的声音实时送过去
 
 --------------------------------------------------------------
-1) ERLIB曲库分析.exe          跑在 DJ 机
+1) ERLIB曲库分析.exe          跑在 DJ 机（单文件版，双击即可）
    选文件夹 -> 开始扫描 -> 勾选 -> 导出 .eravjlib。
    扫出来的东西：封面 / 音频指纹 / 节拍网格 / BPM / 能量段落。
+   1.3 新增：歌曲详情页可以手动标记 Build Up（**可标多个**：每次点一下按钮标一个，
+   双击标记可取消），随 .eravjlib 一起导出，演出端导入后按这些标记做 Build Up 闪白。
    导出时**不带音频文件**，演出机拿这个包就能认出正在放的是哪首。
+   单文件版首次启动会解压到程序所在目录，稍等几秒。
 
 2) EasyReality_音频发送端.exe  跑在放歌机（A 机）
    选输入设备 -> 填目标端口（默认 47811）-> 开始。
@@ -69,7 +72,7 @@ ITEMS = [
     (os.path.join(LEGACY, "EasyReality_音频发送端", "dist_sender",
                   "EasyReality_音频发送端.exe"),
      "EasyReality_音频发送端.exe"),
-    (os.path.join(WORKSPACE, "ERLIB曲库分析_单文件_2026.11.20_8线程.exe"),
+    (os.path.join(WORKSPACE, "ERLIB_曲库分析", "ERLIB曲库分析_1.3正式版.exe"),
      "ERLIB曲库分析.exe"),
     (os.path.join(LEGACY, "AutoVJ", "NDI局域网测试", "NDI接收自检.exe"),
      "NDI接收自检.exe"),
@@ -83,9 +86,13 @@ ITEMS = [
      "音源排查说明.txt"),
 ]
 
+# 文件夹版工具：(源目录, 包内目录)。目前全部是单文件，留空。
+DIR_ITEMS = []
+
 
 def main():
     miss = [p for p, _n in ITEMS if not os.path.isfile(p)]
+    miss += [p for p, _n in DIR_ITEMS if not os.path.isdir(p)]
     if miss:
         print("缺文件：")
         for m in miss:
@@ -95,16 +102,33 @@ def main():
     if os.path.isfile(OUT):
         os.remove(OUT)
     total = 0
+    n_items = 0
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for src, name in ITEMS:
             z.write(src, "%s/%s" % (TOP, name))
             total += os.path.getsize(src)
+            n_items += 1
             print("  + %-40s %8.1f MB" % (name, os.path.getsize(src) / 1e6))
+        for src, dest in DIR_ITEMS:
+            dn = os.path.basename(src.rstrip("\\/"))
+            d_total = 0
+            d_n = 0
+            for root, _dirs, files in os.walk(src):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    rel = os.path.relpath(p, src)
+                    z.write(p, "%s/%s/%s" % (TOP, dest, rel))
+                    total += os.path.getsize(p)
+                    d_total += os.path.getsize(p)
+                    d_n += 1
+                    n_items += 1
+            print("  + %-40s %8.1f MB（文件夹 %d 文件）"
+                  % (dn + "/", d_total / 1e6, d_n))
         z.writestr("%s/使用说明_工具集.txt" % TOP, README_TXT.encode("utf-8"))
         print("  + %-40s %8.1f KB" % ("使用说明_工具集.txt",
                                       len(README_TXT.encode("utf-8")) / 1e3))
     print("\n完成：%s（%d 项 / 原始 %.1f MB / 压缩后 %.1f MB）"
-          % (OUT, len(ITEMS) + 1, total / 1e6, os.path.getsize(OUT) / 1e6))
+          % (OUT, n_items + 1, total / 1e6, os.path.getsize(OUT) / 1e6))
     return 0
 
 

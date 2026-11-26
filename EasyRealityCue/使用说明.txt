@@ -1,5 +1,5 @@
 EasyRealityCue —— DJ 码表（Cue Sheet）编排编辑器
-版本 2026.11.08.03
+版本 1.3 正式版（构建 2026.11.26.02）
 （上面这行的版本号在每次打包时由 tools\build_version.py 自动改写，无需手改）
 
 一、这是什么
@@ -89,8 +89,8 @@ EasyRealityCue —— DJ 码表（Cue Sheet）编排编辑器
      · 导出前会做检查，清单显示在弹窗与日志里：
          -【缺素材】会**阻止导出**（默认焦点在「取消」，也可选「仍然导出」）；
          -【超长】片段落点超出曲目总长，或时长超过素材本身。
-     · 「把素材一起打包进 .ercue」默认**关闭**；勾上则内嵌素材（**没有体积上限**，
-       超过 1 GB 会弹窗提醒、由你选择是否继续内嵌）。
+     · 素材默认**一起打包进 .ercue**（没有“是否内嵌”的开关）；超过 1 GB 只提醒，
+       不再让你选择是否内嵌。别人换机拿到包就能直接打开。
      · 【新增】导出会自动把**用到的素材缩略图**放进包内 `thumbs/<clip_id>.png`
        （长边 ≤256、保留透明度；后台生成带进度条、不卡界面；同一素材第二次导出走缓存）。
        导出成功的弹窗会写「已带 N 张缩略图」。演出端没有这些图也能正常工作。
@@ -130,14 +130,6 @@ EasyRealityCue —— DJ 码表（Cue Sheet）编排编辑器
   第三方组件：PySide6（LGPL-3.0）/ PyAV + FFmpeg（PyAV 为 BSD-3；FFmpeg 核心 LGPL-3.0，
   随包内含 GPL 的 libx264 / libx265）/ numpy（BSD-3）/ mutagen（GPL-2.0-or-later）/
   sounddevice（MIT）/ PyInstaller（GPL-2.0-or-later WITH bootloader-exception）。
-  思路来源（**仅参考思路，未取用这些项目的代码**；`fp_core.py` / `bpm_core.py` 是从
-  演出端移植过来的同一套判据，均为本项目独立实现）：
-  · VJVision（ichiryu，MIT）—— 音频指纹峰值检测、决策状态机；
-  · KVJ / KDJ（kumoSleeping，GPL-3.0）—— 变速识别的打分方式与「结果能不能作准」的口径
-    （白化频带相关、互不重叠的多次印证、得分 / 最弱窗 / 领先三档判据、BPM 按倍率显示）；
-  · Genre Police AutoVJ（lbnandy，MIT）—— 「演出前分析曲库 + 现场识别曲目 + NDI/Spout 输出」
-    的整体思路。
-  完整署名见主仓库的 NOTICE.md。
 
 八、给维护者的打包注记
   · 版本号：由 tools\build_version.py 生成（日期 + 当日序号，如 2026.10.01.06），

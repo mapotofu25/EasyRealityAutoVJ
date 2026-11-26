@@ -316,6 +316,7 @@ ZH2EN = {
         "Falls back to software decoding automatically if it fails or the GPU is unsupported - "
         "playback is never affected. Off by default; test a full round of clips before going live",
     "GPU 解码": "GPU Decoding",
+    "GPU 加速": "GPU Acceleration",
     "开启后用显卡硬件解压 DXV 素材，降低解码 CPU 占用；显卡不支持或素材解不了会自动回退软解，不会黑屏。只作用于普通图层，待机层不受影响。已在播的素材要等下次切换才换路径":
         "Decode DXV clips with GPU hardware decompression to cut decoding CPU. Falls back to "
         "software automatically if the GPU or a clip is unsupported - never a black screen. "

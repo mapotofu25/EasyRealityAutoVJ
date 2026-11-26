@@ -846,6 +846,9 @@ class AudioState:
     def __init__(self):
         self.lock = threading.Lock()
         self.level = 0.0            # RMS 0..1
+        # ★ 2026-11-22（1.2 Beta1）：声卡原始峰值（增益前）与削波标记。
+        self.input_peak = 0.0       # 本块原始峰值 0..1（未加软件增益）
+        self.input_clip = False     # 本块是否已到/超过满幅
         self.bass = 0.0             # 低频能量 0..1（平滑）
         self.mid = 0.0
         self.high = 0.0
@@ -943,6 +946,7 @@ class AudioState:
             return {
                 "level": self.level, "bass": self.bass, "mid": self.mid,
                 "high": self.high, "energy": self.energy, "bpm": self.bpm,
+                "input_peak": self.input_peak, "input_clip": self.input_clip,
                 "bpm_display": self.bpm_display, "bpm_locked": self.bpm_locked,
                 "lib_bpm": self.lib_bpm,
                 # ★ 2026-11-02：离线 BPM 锚点（素材倍速优先用它）
@@ -2171,6 +2175,10 @@ class AudioEngine:
         self._gen = 0            # 采集代际编号：start/stop 递增，旧采集自动失效
         self._asio_cap = None    # 当前 ASIO 会话（切设备/停止时要关掉，见 _run_asio）
         self.energy_scale = 1.0  # 能量伽马校正，运行时实时透传给采集分析器
+        # ★ 2026-11-22（1.2 Beta1）：采集后的手动数字增益（dB）。
+        #   只作用于分析/表头/指纹缓冲，不作用于 NDI 音频透传。
+        self.input_gain_db = 0.0
+        self.input_gain_linear = 1.0
         self._jobs = queue.Queue()
         # ★ 2026-10-30 用户「大砍刀」：曲风识别（`_genre_buf` / `_genre_sr` /
         #   `_genre_loop` / `autovj-genre` 线程 / `state.genre_tags`）整条删除。
@@ -2382,6 +2390,16 @@ class AudioEngine:
         return result or {"system": [], "mic": [], "asio": []}
 
     # ---------------- 采集生命周期 ----------------
+    def set_input_gain(self, enabled, db):
+        """设置采集后的数字增益（-12~+12 dB）；关闭时归 1.0。"""
+        try:
+            v = float(db) if enabled else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        v = max(-12.0, min(12.0, v))
+        self.input_gain_db = v
+        self.input_gain_linear = 10.0 ** (v / 20.0)
+
     def start(self, source_type="system", device_name="", mono=True, sr=48000,
               ch0=0, ch1=1):
         """切换设备/重启采集。用代际编号替代共享停止标志：
@@ -4140,6 +4158,14 @@ class AudioEngine:
                     err_streak = 0
                     _empty_streak = 0
                     _blk_ok += 1
+                    # 原始峰值（软件增益前）：给音源对话框做“已削波”提示。
+                    try:
+                        _pk = float(np.max(np.abs(data))) if getattr(data, "size", 0) else 0.0
+                        with st.lock:
+                            st.input_peak = _pk
+                            st.input_clip = bool(_pk >= 0.999)
+                    except Exception:                          # noqa: BLE001
+                        pass
                     _lan_last_t = time.perf_counter()
                     if _is_lan_mic and (_lan_gap_warned or _lan_gap_cleared):
                         _lan_gap_cleared = _lan_gap_warned = False
@@ -4166,6 +4192,8 @@ class AudioEngine:
                 try:
                     # ---- 分析/转发段 ----
                     # ★★ 2026-10-10：本段异常**绝不停止采集**（见段尾 except 注释）。
+                    # 采集后的手动数字增益（1.2 Beta1）：只喂分析/指纹，不动 NDI 透传。
+                    _gain = float(getattr(self, "input_gain_linear", 1.0) or 1.0)
                     if mono:
                         # ---- 左声道死零兜底（仅在 mono 且立体声时）----
                         if data.ndim == 2 and data.shape[1] >= 2:
@@ -4200,9 +4228,15 @@ class AudioEngine:
                             _fed = data[:, 1:2]
                         else:
                             _fed = data[:, :1]
+                        if _gain != 1.0:
+                            _fed = np.clip(np.asarray(_fed, dtype=np.float32) * _gain,
+                                           -1.0, 1.0)
                         analyzer.feed(_fed, st)
                     else:
                         _fed = data
+                        if _gain != 1.0:
+                            _fed = np.clip(np.asarray(_fed, dtype=np.float32) * _gain,
+                                           -1.0, 1.0)
                         analyzer.feed(_fed, st)
                     # ★ 2026-11-02：同一块再喂给离线锚点（内部只做一次 mean + 环形写，
                     #   约几微秒；真正的分析在 `BpmAnchor` 自己的线程里）
@@ -4302,6 +4336,10 @@ class AudioEngine:
                     try:
                         fp_sig = (np.asarray(data).mean(axis=1)
                                   if getattr(data, "ndim", 1) == 2 else data)
+                        _fg = float(getattr(self, "input_gain_linear", 1.0) or 1.0)
+                        if _fg != 1.0:
+                            fp_sig = np.clip(np.asarray(fp_sig, dtype=np.float32) * _fg,
+                                             -1.0, 1.0)
                         with self._audio_buf_lock:
                             self._fp_buf.write(fp_sig)
                     except Exception:

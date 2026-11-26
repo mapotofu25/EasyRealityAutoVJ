@@ -22,11 +22,11 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QEvent, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QDialog, QDoubleSpinBox,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog,
                                QLabel, QMenu, QMessageBox, QPushButton,
-                               QVBoxLayout)
+                               QVBoxLayout, QWidget)
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
@@ -100,15 +100,13 @@ class _ResegmentWorker(QThread):
         try:
             import numpy as np
             import beatgrid as _bg
-            import soundfile as sf
+            from audio_decode import decode_mono
 
             if self.isInterruptionRequested():
                 return
-            data, sr = sf.read(self._path, dtype="float32", always_2d=True)
+            sig, sr, _dur = decode_mono(self._path, maxsec=None)
             if self.isInterruptionRequested():
                 return
-            sig = np.mean(data, axis=1)
-            del data
             m2, s2 = _bg.resample(sig, sr, _bg.SR_TARGET)
             del sig
             if self.isInterruptionRequested():
@@ -242,6 +240,8 @@ class MusicDetailDialog(QDialog):
         self.wave.segmentsChanged.connect(self._on_segments_changed)
         self.wave.playheadMoved.connect(self._on_playhead_moved)
         self.wave.contextMenuRequested.connect(self._on_wave_context_menu)
+        self.wave.buildUpChanged.connect(self._on_build_up_changed)
+        self.wave.buildUpCancelled.connect(self._on_build_up_cancelled)
         # 操作提示（用户点名要 ERCUE 的键位：Ctrl+滚轮缩放）
         self.wave.setToolTip("Ctrl+滚轮 缩放 · Shift+滚轮 / 普通滚轮 平移 · "
                              "拖动可移动播放头（播放从这里开始） · 右键编辑 BPM 分段")
@@ -273,6 +273,21 @@ class MusicDetailDialog(QDialog):
             "自动 BPM 差半拍、或半速/倍速判错导致分段碎掉时点它。")
         self.btn_resec.clicked.connect(lambda: self._resegment_by_bpm(ask=True))
         bar.addWidget(self.btn_resec)
+        # ★ 2026-11-24：手动 Build Up（32 拍，起点吸附八拍线）
+        #   ★ 2026-11-26：支持多个标记；点一次按钮只放一个，再点再放。
+        self.btn_build = QPushButton("标记 Build Up")
+        self.btn_build.setCheckable(True)
+        self.btn_build.setToolTip("点一下后在波形上移动：洋红色 32 拍段落会跟随鼠标并吸附八拍线；\n"
+                                  "在波形上单击确定（一次只放一个）；要标多个就再点一次按钮；\n"
+                                  "双击已标记的段落可取消该段；点其他位置或 Esc 取消。")
+        self.btn_build.clicked.connect(self._toggle_build_up)
+        bar.addWidget(self.btn_build)
+        self.lbl_build_hint = QLabel("（双击标记可取消）")
+        self.lbl_build_hint.setStyleSheet("color:#888;font-size:11px;")
+        bar.addWidget(self.lbl_build_hint)
+        self.lbl_build = QLabel("Build Up：未标记")
+        self.lbl_build.setStyleSheet("color:#ff6ae6;")
+        bar.addWidget(self.lbl_build)
         v.addLayout(bar)
 
         # ★ 2026-10-28：右侧「八拍起点 / BPM 分段」整块去掉 —— 波形占满宽度；
@@ -294,6 +309,14 @@ class MusicDetailDialog(QDialog):
         self.btn_close.clicked.connect(self.close)
         bot.addWidget(self.btn_close)
         v.addLayout(bot)
+
+        # Build Up 放置模式下，点波形以外的任何控件 = 取消（用户要求）
+        try:
+            self.installEventFilter(self)
+            for _w in self.findChildren(QWidget):
+                _w.installEventFilter(self)
+        except Exception:                                     # noqa: BLE001
+            pass
 
         self._dirty = False
         self._update_title()
@@ -367,6 +390,8 @@ class MusicDetailDialog(QDialog):
         self.wave.set_waveform(self._wf)
         self.wave.set_grid(self._grid)
         self.wave.set_manual(mm)
+        self.wave.set_build_ups(m.get("build_ups") or m.get("build_up"))
+        self._update_build_label()
         # ★ 2026-10-28：自动分析出的多 BPM 段要显示出来（用户手动分段优先）。
         #   只做「显示」，不写进 grid_manual —— 见 `_effective_manual` 里的同源判断。
         if not mm.get("segments") and (self._grid or {}).get("segments"):
@@ -1336,6 +1361,108 @@ class MusicDetailDialog(QDialog):
         except Exception as e:                                   # noqa: BLE001
             QMessageBox.warning(self, "歌曲详情", "保存失败：%s" % e)
             return False
+
+    # ---------------- Build Up ----------------
+    def _toggle_build_up(self, checked):
+        if not checked:
+            self.wave.cancel_build_up()
+            self.btn_build.setText("标记 Build Up")
+            return
+        if self.wave._beat_len() <= 0:
+            self.btn_build.setChecked(False)
+            QMessageBox.information(self, "Build Up",
+                                    "这首歌还没有节拍网格，无法对齐八拍线。请先扫描分析。")
+            return
+        self.wave.begin_build_up(32)
+        self.btn_build.setText("点击波形确定…")
+        self.lbl_build.setText("Build Up：移动鼠标选起点，单击波形确定；Esc 取消")
+        self.lbl_build.setStyleSheet("color:#ffd166;")
+
+    def _on_build_up_cancelled(self):
+        self.btn_build.setChecked(False)
+        self.btn_build.setText("标记 Build Up")
+        self._update_build_label()
+
+    def _refresh_engine_grids(self):
+        """Build Up 改完后，让引擎的 song_id→grid 映射立即更新（不用重开软件）。"""
+        try:
+            w = self.parent()
+            while w is not None:
+                fn = getattr(w, "_inject_song_grids", None)
+                if callable(fn):
+                    fn()
+                    return
+                w = w.parent()
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    def _on_build_up_changed(self, bu):
+        try:
+            lst = self.wave._norm_build_ups(bu)
+            meta = self.cfg["music_meta"]
+            rec = meta.get(self.path)
+            if not isinstance(rec, dict):
+                rec = {}
+                meta[self.path] = rec
+            if lst:
+                rec["build_ups"] = [dict(x) for x in lst]
+                # 单个时保留旧键，方便旧版本/旧包仍能读到这一段。
+                if len(lst) == 1:
+                    rec["build_up"] = dict(lst[0])
+                else:
+                    rec.pop("build_up", None)
+            else:
+                rec.pop("build_ups", None)
+                rec.pop("build_up", None)
+            self.cfg.save()
+            self._meta = rec
+            self._refresh_engine_grids()
+        except Exception as e:                                # noqa: BLE001
+            QMessageBox.warning(self, "Build Up", "保存失败：%s" % e)
+            return
+        self.wave.set_build_ups(lst)
+        self.btn_build.setChecked(False)
+        self.btn_build.setText("标记 Build Up")
+        self._update_build_label()
+
+    def _update_build_label(self):
+        lst = self.wave.build_ups()
+        if not lst:
+            self.lbl_build.setText("Build Up：未标记")
+            self.lbl_build.setStyleSheet("color:#ff6ae6;")
+            return
+        def _t(bu):
+            s = max(0.0, float(bu.get("start") or 0.0))
+            return "%d:%04.1f" % (int(s) // 60, s - (int(s) // 60) * 60)
+        if len(lst) == 1:
+            bu = lst[0]
+            self.lbl_build.setText("Build Up：%s · %d拍"
+                                   % (_t(bu), int(bu.get("beats") or 32)))
+        else:
+            self.lbl_build.setText("Build Up：%d 个标记（%s … %s）"
+                                   % (len(lst), _t(lst[0]), _t(lst[-1])))
+        self.lbl_build.setStyleSheet("color:#ff6ae6;")
+
+    def eventFilter(self, obj, ev):
+        try:
+            if (ev.type() == QEvent.Type.MouseButtonPress
+                    and self.wave.mode() == "buildup"
+                    and obj is not self.wave and obj is not self.btn_build):
+                self.wave.cancel_build_up()
+                self.btn_build.setChecked(False)
+                self.btn_build.setText("标记 Build Up")
+        except Exception:                                     # noqa: BLE001
+            pass
+        return super().eventFilter(obj, ev)
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape and self.wave.mode() == "buildup":
+            self.wave.cancel_build_up()
+            self.btn_build.setChecked(False)
+            self.btn_build.setText("标记 Build Up")
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
 
     def _save(self):
         manual = self._effective_manual()

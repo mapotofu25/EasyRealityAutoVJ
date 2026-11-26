@@ -3070,6 +3070,8 @@ class _DropViewport(QWidget):
 
 # "这个格子正在播"的标记 role（给 _PlayBorderDelegate 画金边用）
 PLAY_ROLE = Qt.UserRole + 7
+# "上一段（换池时被换下）"标记 role：只展示，不参与播放/拖动
+PREV_ROLE = Qt.UserRole + 8
 
 
 class _PlayBorderDelegate(QStyledItemDelegate):
@@ -3227,6 +3229,8 @@ class ClipRow(QListWidget):
         if self.cue_mode:
             return
         it = self.itemAt(pos)
+        if it is not None and it.data(PREV_ROLE):
+            return
         m = it.data(Qt.UserRole) if it else None
         self.menu_requested.emit(self.layer_idx, m, self.mapToGlobal(pos))
 
@@ -4419,48 +4423,144 @@ class LayerStackPanel(QWidget):
         return super().eventFilter(obj, ev)
 
     # ---- 重建 ----
+    def _create_row_widget(self, i, lay):
+        """建一整行（头 + 分隔条 + 素材格）。`rebuild` 新建行时复用。"""
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        # ★ 2026-11-09（用户第 6 条）：原来是 6 ⇒ 两列间总宽 = 6+6(竖条)+6 = 18。
+        #   现在竖条改宽 18（热区）且不再画线，间距必须改 0，总宽仍是 18 ⇒ 几何零变化。
+        rl.setSpacing(0)
+        hdr = self._build_header(i, lay)
+        hdr._layer_idx = i
+        hdr.setAcceptDrops(True)
+        hdr.installEventFilter(self)
+        row._layer_idx = i
+        row._lid = str(getattr(lay, "lid", "") or "")
+        row.setAcceptDrops(True)
+        row.installEventFilter(self)
+        rl.addWidget(hdr)
+        # ★ 2026-11-06：两个面板之间那条竖 = 可拖动的列宽分隔条（所有行一起变）
+        rl.addWidget(_ColDivider(self))
+        grid = ClipRow(i)
+        grid.set_cell_height(self.cell_h)          # ★ 用户设定的行高（全局）
+        # ★ 码表图层：只读格子（见 `ClipRow.set_cue_mode`）
+        grid.set_cue_mode(bool(getattr(lay, "is_cuesheet", False)))
+        grid.dropped.connect(self.main.clips_dropped_to_layer)
+        grid.reordered.connect(self.main.clips_reordered)
+        grid.cross_moved.connect(self.main.clips_cross_moved)
+        grid.menu_requested.connect(self.main.clip_menu)
+        # ★ 2026-11-18：图层拖动要能落在**素材格**上（按高度算插到该行前/后）
+        try:
+            grid.installEventFilter(self)
+            grid.viewport().installEventFilter(self)
+        except Exception:                                  # noqa: BLE001
+            pass
+        rl.addWidget(grid, 1)
+        return row, hdr, grid
+
+    @staticmethod
+    def _clip_sig_of(lay):
+        try:
+            if getattr(lay, "is_cuesheet", False):
+                return None
+            paths = [str(getattr(c, "path", "")) for c in (lay.clips or [])]
+            if getattr(lay, "auto_mode", False):
+                prev = getattr(lay, "_prev_pool_clip", None)
+                if prev is not None:
+                    paths.append("PREV:" + str(getattr(prev, "path", "")))
+            return tuple(paths)
+        except Exception:                                  # noqa: BLE001
+            return None
+
     def rebuild(self):
+        """按当前过滤集重建行。
+
+        ★ 2026-11-26（用户：删/加图层软件卡十几秒）：以前**删掉所有行**再逐层
+          重建，几十个格子的缩略图（QPixmap 从盘上读 + Smooth 缩放）全部重来，
+          一次加/删图层 GUI 卡 1~10 秒，输出/预览一起饿死。
+          现在：按 `lid` **复用旧行和素材格**，只重建变化了的行头（行头里有
+          序号闭包，必须换）+ 变化的素材格；未变化的行直接搬回布局。
+        """
+        # 1) 先把旧行摘下来，按 lid 存池（无 lid 的直接丢弃）
+        old = {}
         while self.vbox.count() > 1:
             w = self.vbox.takeAt(0).widget()
-            if w:
-                w.deleteLater()
+            if w is None:
+                continue
+            lid = str(getattr(w, "_lid", "") or "")
+            if lid and lid not in old:
+                old[lid] = w
+            else:
+                try:
+                    w.setParent(None)
+                    w.deleteLater()
+                except Exception:                          # noqa: BLE001
+                    pass
         self.rows = []
         self._row_sig.clear()
         for i, lay in self._visible_layers():      # ★ 只建**该显示**的行（过滤见 `layer_ids`）
-            row = QWidget()
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            # ★ 2026-11-09（用户第 6 条）：原来是 6 ⇒ 两列间总宽 = 6+6(竖条)+6 = 18。
-            #   现在竖条改宽 18（热区）且不再画线，间距必须改 0，总宽仍是 18 ⇒ 几何零变化。
-            rl.setSpacing(0)
-            hdr = self._build_header(i, lay)
-            hdr._layer_idx = i
-            hdr.setAcceptDrops(True)
-            hdr.installEventFilter(self)
-            row._layer_idx = i
-            row.setAcceptDrops(True)
-            row.installEventFilter(self)
-            rl.addWidget(hdr)
-            # ★ 2026-11-06：两个面板之间那条竖 = 可拖动的列宽分隔条（所有行一起变）
-            rl.addWidget(_ColDivider(self))
-            grid = ClipRow(i)
-            grid.set_cell_height(self.cell_h)          # ★ 用户设定的行高（全局）
-            # ★ 码表图层：只读格子（见 `ClipRow.set_cue_mode`）
-            grid.set_cue_mode(bool(getattr(lay, "is_cuesheet", False)))
-            grid.dropped.connect(self.main.clips_dropped_to_layer)
-            grid.reordered.connect(self.main.clips_reordered)
-            grid.cross_moved.connect(self.main.clips_cross_moved)
-            grid.menu_requested.connect(self.main.clip_menu)
-            # ★ 2026-11-18：图层拖动要能落在**素材格**上（按高度算插到该行前/后）
-            try:
-                grid.installEventFilter(self)
-                grid.viewport().installEventFilter(self)
-            except Exception:                                  # noqa: BLE001
-                pass
-            rl.addWidget(grid, 1)
-            self.vbox.insertWidget(self.vbox.count() - 1, row)
+            lid = str(getattr(lay, "lid", "") or "")
+            row = old.pop(lid, None) if lid else None
+            if row is not None:
+                # 2) 复用：行头/素材格都保留；序号闭包改成运行时读 `f._layer_idx`
+                try:
+                    rl = row.layout()
+                    hdr = rl.itemAt(0).widget() if rl.count() > 0 else None
+                    if hdr is None:
+                        raise RuntimeError("no header")
+                    hdr._layer_idx = i
+                    try:
+                        _g = getattr(hdr, "_grip", None)
+                        if _g is not None:
+                            _g._idx = i
+                    except Exception:                      # noqa: BLE001
+                        pass
+                    for _w in hdr.findChildren(QWidget):
+                        if hasattr(_w, "_layer_idx"):
+                            try:
+                                _w._layer_idx = i
+                            except Exception:              # noqa: BLE001
+                                pass
+                    row._layer_idx = i
+                    grid = rl.itemAt(2).widget() if rl.count() > 2 else None
+                except Exception:                          # noqa: BLE001
+                    row, hdr, grid = None, None, None
+                if grid is None:
+                    row, hdr, grid = self._create_row_widget(i, lay)
+                    self.rows.append((hdr, grid))
+                    self.vbox.insertWidget(self.vbox.count() - 1, row)
+                    self._fill_row(i, lay)
+                    row._clip_sig = self._clip_sig_of(lay)
+                    continue
+                grid.layer_idx = i
+                _cue = bool(getattr(lay, "is_cuesheet", False))
+                if bool(getattr(grid, "cue_mode", False)) != _cue:
+                    grid.set_cue_mode(_cue)
+                    _sig = None
+                else:
+                    _sig = self._clip_sig_of(lay)
+                self.rows.append((hdr, grid))
+                self.vbox.insertWidget(self.vbox.count() - 1, row)
+                if _cue or _sig != getattr(row, "_clip_sig", object()):
+                    self._fill_row(i, lay)
+                    row._clip_sig = _sig
+                else:
+                    self._row_sig[i] = _sig
+                continue
+            # 3) 新行
+            row, hdr, grid = self._create_row_widget(i, lay)
             self.rows.append((hdr, grid))
+            self.vbox.insertWidget(self.vbox.count() - 1, row)
             self._fill_row(i, lay)
+            row._clip_sig = self._clip_sig_of(lay)
+        # 4) 真正删掉的行
+        for w in old.values():
+            try:
+                w.setParent(None)
+                w.deleteLater()
+            except Exception:                              # noqa: BLE001
+                pass
         self.refresh_playing()
 
     @staticmethod
@@ -4534,12 +4634,13 @@ class LayerStackPanel(QWidget):
         f.setFixedWidth(self.header_w)          # ★ 可拖动分隔条改的全局左列宽
         f.setObjectName("layerHeader")
         f._lay = lay   # apply_theme 重设样式时取回图层属性
+        f._layer_idx = idx
         # 注意：必须用 #id 作用域，否则会串到下拉弹出列表导致文字看不清；
         # 也不能用 #layerHeader QPushButton 这类带 ID 的兜底规则，否则会盖掉按钮自身 :checked 状态色
         f.setStyleSheet(self._header_style(lay))
         f.setContextMenuPolicy(Qt.CustomContextMenu)
         f.customContextMenuRequested.connect(
-            lambda pos, i=idx: self.main.layer_menu(i, f.mapToGlobal(pos)))
+            lambda pos: self.main.layer_menu(int(f._layer_idx), f.mapToGlobal(pos)))
         h = QHBoxLayout(f)
         # ★★ 2026-11-06（用户：「图标下面显示不全了」+「行高缩小了素材间距也该缩」）：
         #   整行的高度 = max(图层头最小高, 格子高)。原来图层头被**里面的控件**撑到 73px
@@ -4613,7 +4714,7 @@ class LayerStackPanel(QWidget):
         name.setProperty("_i18nDynamic", True)
         name.setToolTip(lay.name + T("\n双击重命名"))
         name.setStyleSheet(self._name_style())
-        name.clicked.connect(lambda _c=False, i=idx: self.main.on_layer_pick(i))
+        name.clicked.connect(lambda _c=False: self.main.on_layer_pick(int(f._layer_idx)))
         name.installEventFilter(self)  # 双击重命名由 MainWindow 处理
         name._layer_idx = idx
         name._is_name = True
@@ -4630,7 +4731,7 @@ class LayerStackPanel(QWidget):
         cmb_cue.setProperty("_i18nDynamic", True)   # 文本是表名（用户数据）
         cmb_cue.setVisible(bool(getattr(lay, "is_cuesheet", False)))
         self._fill_cue_combo(cmb_cue, lay)
-        cmb_cue.activated.connect(lambda _k, i=idx: self._on_cue_combo(i))
+        cmb_cue.activated.connect(lambda _k: self._on_cue_combo(int(f._layer_idx)))
         _row1.addWidget(cmb_cue)
 
         op = QSlider(Qt.Horizontal)
@@ -4650,7 +4751,7 @@ class LayerStackPanel(QWidget):
         btn_alpha.setToolTip("保留素材自带透明通道（点亮=透明区域透出下层；关闭=透明区域填黑）")
         btn_alpha.setStyleSheet(self._btn_alpha_style())
         _grid.addWidget(btn_alpha, 1, 0)
-        btn_alpha.toggled.connect(lambda st, i=idx: self._set(i, "use_alpha", bool(st)))
+        btn_alpha.toggled.connect(lambda st: self._set(int(f._layer_idx), "use_alpha", bool(st)))
 
         # ★★ 2026-11-06（用户：「这个锁的图标有点意义不明，别人一看以为是锁定当前素材」）：
         #   语义是「**画面**别跟着音乐动」（`lock_motion`：不随能量脉冲缩放、不随氛围漂移），
@@ -4664,7 +4765,7 @@ class LayerStackPanel(QWidget):
         btn_lock.setToolTip("锁定画面：只固定这一层的画面（不随脉冲缩放/漂移），与选素材无关")
         btn_lock.setStyleSheet(self._btn_lock_style())
         _grid.addWidget(btn_lock, 1, 1)
-        btn_lock.toggled.connect(lambda st, i=idx: self._set(i, "lock_motion", bool(st)))
+        btn_lock.toggled.connect(lambda st: self._set(int(f._layer_idx), "lock_motion", bool(st)))
 
         blend = QComboBox()
         blend.setFixedWidth(74)
@@ -4685,7 +4786,7 @@ class LayerStackPanel(QWidget):
             btn_role.setObjectName("btnRole")
             btn_role.setToolTip("图层角色（自动匹配按此挑素材）：点击在前景/背景间切换")
             btn_role.setStyleSheet(self._role_style(lay.role))
-            btn_role.clicked.connect(lambda _c=False, i=idx: self.main.toggle_layer_role(i))
+            btn_role.clicked.connect(lambda _c=False: self.main.toggle_layer_role(int(f._layer_idx)))
             _row1.addWidget(btn_role)
 
         # 两行都靠左排（stretch 放在末尾），否则控件会被拉到整行宽
@@ -4693,11 +4794,11 @@ class LayerStackPanel(QWidget):
         _row2.addStretch(1)
 
         # 事件
-        btn_vis.toggled.connect(lambda s, i=idx, b=btn_vis: self._set_visible(i, s, b))
-        btn_solo.toggled.connect(lambda s, i=idx: self._set(i, "solo", bool(s)))
-        op.valueChanged.connect(lambda v, i=idx, b=btn_vis: self._set_opacity(i, v))
+        btn_vis.toggled.connect(lambda s, b=btn_vis: self._set_visible(int(f._layer_idx), s, b))
+        btn_solo.toggled.connect(lambda s: self._set(int(f._layer_idx), "solo", bool(s)))
+        op.valueChanged.connect(lambda v, b=btn_vis: self._set_opacity(int(f._layer_idx), v))
         blend.currentIndexChanged.connect(
-            lambda j, i=idx: self._set_blend(i, BLEND_MODES[j]))
+            lambda j: self._set_blend(int(f._layer_idx), BLEND_MODES[j]))
         # 记住控件，便于刷新
         f._btn_vis, f._btn_solo, f._name, f._op, f._blend, f._btn_alpha, f._btn_lock = (
             btn_vis, btn_solo, name, op, blend, btn_alpha, btn_lock)
@@ -5171,10 +5272,30 @@ class LayerStackPanel(QWidget):
             it.setToolTip(m.name)
             it.setSizeHint(QSize(cw, h))
             grid.addItem(it)
+        # ★ 2026-11-26（用户：换池时把刚换下来的上一段也留在素材池里）：
+        #   只展示、不参与拖动/右键/播放；黄色高亮只给当前播放的那个。
+        if getattr(lay, "auto_mode", False):
+            prev = getattr(lay, "_prev_pool_clip", None)
+            try:
+                _cur_paths = {str(getattr(c, "path", "")) for c in (lay.clips or [])}
+                _pp = str(getattr(prev, "path", "")) if prev is not None else ""
+            except Exception:                                  # noqa: BLE001
+                _cur_paths, _pp = set(), ""
+            if prev is not None and _pp and _pp not in _cur_paths:
+                icon = prev.icon_cached(iw, ih)
+                if icon.isNull():
+                    need.append(prev)
+                it = QListWidgetItem(icon, "")
+                it.setData(Qt.UserRole, prev)
+                it.setData(PREV_ROLE, True)
+                it.setToolTip("%s\n（上一段 · 换池时已换下）" % prev.name)
+                it.setSizeHint(QSize(cw, h))
+                it.setFlags(Qt.ItemIsEnabled)      # 只展示：不可选/不可拖/无右键
+                grid.addItem(it)
         if need:
             self._ensure_row_thumbs(need)
         try:
-            self._row_sig[idx] = tuple(str(getattr(c, "path", "")) for c in (lay.clips or []))
+            self._row_sig[idx] = self._clip_sig_of(lay)
         except Exception:                                      # noqa: BLE001
             pass
 
@@ -5191,7 +5312,7 @@ class LayerStackPanel(QWidget):
                 and self._pos_of(idx) is not None):
             lay = self.main.engine.layers[idx]
             if not getattr(lay, "is_cuesheet", False):
-                sig = tuple(str(getattr(c, "path", "")) for c in (lay.clips or []))
+                sig = self._clip_sig_of(lay)
                 if self._row_sig.get(idx) == sig:
                     return
                 self._row_sig[idx] = sig
@@ -5755,6 +5876,9 @@ class AudioSourceDialog(I18nDialog):
         self._devs = {"system": [], "mic": [], "asio": []}
         self._scanner = None
         self._scanning = False      # 重入守卫：扫描进行中（结构上防止信号重入 ⇒ 栈溢出）
+        self._gain_loading = False
+        self._gain_dirty = False
+        self._orig_gain = (False, 0)
 
         lay = QVBoxLayout(self)
         g = QGridLayout()
@@ -5825,7 +5949,27 @@ class AudioSourceDialog(I18nDialog):
 
         self.chk_mono = QCheckBox("单声道分析")
         self.chk_mono.setToolTip("只取左声道做分析。不省 CPU，作用是在左右声道反相时避免低频被平均抵消")
-        g.addWidget(self.chk_mono, 3, 0, 1, 3)
+        g.addWidget(self.chk_mono, 3, 0)
+        # ★ 2026-11-22（1.2 Beta1）：手动输入增益（-12~+12 dB）。
+        #   开关不开 ⇒ 滑块灰色不可拖；只影响软件分析与表头，不改现场 PA。
+        self.chk_gain = QCheckBox("输入增益")
+        self.chk_gain.setToolTip("开关声卡采集后的数字增益补偿；不开启时滑块不可用")
+        self.chk_gain.toggled.connect(self._on_gain_toggled)
+        g.addWidget(self.chk_gain, 3, 1)
+        self.lbl_gain = QLabel("增益")
+        self.gain = QSlider(Qt.Horizontal)
+        self.gain.setRange(-12, 12)
+        self.gain.setSingleStep(1)
+        self.gain.setPageStep(3)
+        self.gain.setValue(0)
+        self.gain.setToolTip("声卡采集后的数字增益：-12 ~ +12 dB。\n"
+                             "只影响软件分析/表头，不改现场 PA；已削波无法恢复。")
+        self.gain.valueChanged.connect(self._on_gain_changed)
+        self.lbl_gain_val = QLabel("+0 dB")
+        self.lbl_gain_val.setMinimumWidth(52)
+        g.addWidget(self.lbl_gain, 4, 0)
+        g.addWidget(self.gain, 4, 1)
+        g.addWidget(self.lbl_gain_val, 4, 2)
 
         # ★ ASIO 输入通道（用户问「ASIO 能采集指定输出吗」）——
         #   事实：ASIO **没有 loopback 概念**，抓不到别的程序播出来的声音，
@@ -5837,14 +5981,14 @@ class AudioSourceDialog(I18nDialog):
         self.cb_ch1 = QComboBox()
         for cb in (self.cb_ch0, self.cb_ch1):
             cb.setMinimumWidth(120)
-        g.addWidget(self.lbl_ch, 4, 0)
-        g.addWidget(self.cb_ch0, 4, 1)
-        g.addWidget(self.cb_ch1, 4, 2)
+        g.addWidget(self.lbl_ch, 5, 0)
+        g.addWidget(self.cb_ch0, 5, 1)
+        g.addWidget(self.cb_ch1, 5, 2)
 
         self.lbl_ch_hint = QLabel("")
         self.lbl_ch_hint.setWordWrap(True)
         self.lbl_ch_hint.setStyleSheet("color:" + theme.V("muted") + ";font-size:11px;")
-        g.addWidget(self.lbl_ch_hint, 5, 0, 1, 3)
+        g.addWidget(self.lbl_ch_hint, 6, 0, 1, 3)
         self._asio_ch = []          # 当前驱动的输入通道列表
         lay.addLayout(g)
 
@@ -5855,6 +5999,19 @@ class AudioSourceDialog(I18nDialog):
             "#meterBox{background:#111;border:1px solid " + theme.V("border") + ";}"
             "#meterBox QLabel{color:" + theme.V("text") + ";}")
         mv = QVBoxLayout(meter_box)
+        # ★ 2026-11-22：真正的“削波红灯”（常驻，亮=削波），不是只有一行文字。
+        clip_row = QHBoxLayout()
+        clip_row.setSpacing(6)
+        self.clip_led = QLabel()
+        self.clip_led.setFixedSize(12, 12)
+        self.clip_led.setStyleSheet(
+            "background:#3a1010;border:1px solid #552222;border-radius:6px;")
+        self.clip_txt = QLabel("削波")
+        self.clip_txt.setStyleSheet("color:#9a9a9a;font-size:11px;")
+        clip_row.addWidget(self.clip_led)
+        clip_row.addWidget(self.clip_txt)
+        clip_row.addStretch(1)
+        mv.addLayout(clip_row)
         self.bars = {}
         for key, name, color in (("level", "总电平", "#4fc3f7"), ("bass", "低频", "#7ddf7d"),
                                  ("mid", "中频", "#ffd54f"), ("high", "高频", "#ff8a65")):
@@ -5873,6 +6030,22 @@ class AudioSourceDialog(I18nDialog):
             mv.addLayout(row)
             self.bars[key] = bar
         lay.addWidget(meter_box)
+
+        # ★ 2026-11-22：声卡端削波提示（增益前检测；软件增益救不回来）。
+        self.lbl_clip = QLabel("")
+        self.lbl_clip.setWordWrap(True)
+        self.lbl_clip.setStyleSheet("color:#ff5252;font-size:11px;font-weight:bold;")
+        self.lbl_clip.hide()
+        lay.addWidget(self.lbl_clip)
+        # ★ 2026-11-22：原始峰值 vs 补偿后峰值（避免“看着满了其实已爆”）。
+        self.lbl_peak = QLabel("原始峰值 0% · 补偿后 0%")
+        self.lbl_peak.setStyleSheet("color:#9a9a9a;font-size:11px;")
+        lay.addWidget(self.lbl_peak)
+        self.lbl_quiet = QLabel("")
+        self.lbl_quiet.setStyleSheet("color:#e0a030;font-size:11px;")
+        self.lbl_quiet.hide()
+        lay.addWidget(self.lbl_quiet)
+        self._quiet_ticks = 0
 
         self.lbl_dev = QLabel(T("当前采集设备: ") + "-")
         self.lbl_dev.setProperty("_i18nDynamic", True)   # 后面会拼接设备名，动态重建
@@ -6012,6 +6185,79 @@ class AudioSourceDialog(I18nDialog):
             return legacy, False     # 可能是本类型，但没确认过 → 静默处理
         return "", False
 
+    def _sync_gain_enabled(self, *_a):
+        """增益开关关闭时，滑块与数值灰掉且不可拖。"""
+        on = bool(self.chk_gain.isChecked())
+        for w in (self.lbl_gain, self.gain, self.lbl_gain_val):
+            try:
+                w.setEnabled(on)
+            except Exception:                                  # noqa: BLE001
+                pass
+        # Qt 禁用态在深色主题下仍可能画蓝色滑轨 ⇒ 显式压成灰色，保证“整个选项灰掉”。
+        try:
+            if on:
+                self.gain.setStyleSheet("")
+            else:
+                self.gain.setStyleSheet(
+                    "QSlider::groove:horizontal{height:4px;background:%s;border-radius:2px;}"
+                    "QSlider::sub-page:horizontal{background:%s;border-radius:2px;}"
+                    "QSlider::handle:horizontal{background:%s;width:12px;margin:-4px 0;"
+                    "border-radius:6px;}"
+                    % (theme.V("border"), theme.V("border"), theme.V("muted")))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _on_gain_changed(self, v):
+        self.lbl_gain_val.setText("%+d dB" % int(v))
+        self._gain_dirty = True
+        self._live_gain()
+
+    def _on_gain_toggled(self, _on):
+        self._sync_gain_enabled()
+        if not getattr(self, "_gain_loading", False):
+            self._gain_dirty = True
+            self._live_gain()
+
+    def _live_gain(self):
+        """拖动/开关时实时作用到采集，但不写配置；点取消会还原。"""
+        if getattr(self, "_gain_loading", False):
+            return
+        try:
+            on = bool(self.chk_gain.isChecked())
+            db = int(self.gain.value()) if on else 0
+            self.main.audio.set_input_gain(on, db)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _gain_key(self):
+        try:
+            dev = (self.device.currentText() or "").strip()
+        except Exception:                                      # noqa: BLE001
+            dev = ""
+        if dev.startswith(("（", "(")) or dev in ("正在扫描…", T("正在扫描…"), "Scanning…"):
+            dev = str((self.main.cfg["audio"] or {}).get("device_name") or "").strip()
+        return "%s|%s" % (self._src_key(), dev)
+
+    def _load_gain_for_device(self, force=False):
+        """按“音源类型 + 设备名”取回该设备上次的增益；没有记录则保持当前值。"""
+        try:
+            a = self.main.cfg["audio"]
+            rec = (a.get("gain_by_device") or {}).get(self._gain_key())
+            self._gain_loading = True
+            if isinstance(rec, dict):
+                self.chk_gain.setChecked(bool(rec.get("enabled", False)))
+                self.gain.setValue(max(-12, min(12, int(round(float(rec.get("db", 0) or 0))))))
+            elif force:
+                self.chk_gain.setChecked(False)
+                self.gain.setValue(0)
+            self._sync_gain_enabled()
+            self._gain_dirty = False
+        except Exception:                                      # noqa: BLE001
+            pass
+        finally:
+            self._gain_loading = False
+        self._live_gain()
+
     def _load_from_cfg(self):
         a = self.main.cfg["audio"]
         idx = {"system": 0, "mic": 1, "linein": 2, "asio": 3, "lan": 4}.get(
@@ -6025,6 +6271,16 @@ class AudioSourceDialog(I18nDialog):
         #   而且算法两层自适应归一化天生对整体增益免疫（实测 0.5~4x 能量完全相同）。
         #   配置键 audio.gain 保留只为兼容旧配置，不再读取。
         self.chk_mono.setChecked(bool(a.get("mono", True)))
+        # ★ 1.2 Beta1：手动增益开关/数值
+        self.chk_gain.setChecked(bool(a.get("gain_enabled", False)))
+        try:
+            _gdb = int(round(float(a.get("gain_db", 0) or 0)))
+        except (TypeError, ValueError):
+            _gdb = 0
+        self.gain.setValue(max(-12, min(12, _gdb)))
+        self._sync_gain_enabled()
+        self._orig_gain = (bool(self.chk_gain.isChecked()), int(self.gain.value()))
+        self._gain_dirty = False
         self._want_dev = ""      # 由 _fill_devices 按当前音源类型去配置里取
         self._sync_ch_visible()
         try:
@@ -6211,6 +6467,10 @@ class AudioSourceDialog(I18nDialog):
                 self.device.setCurrentIndex(0)
         self.device.blockSignals(False)
 
+        # ★ 按“音源类型 + 设备名”取回该设备上次的增益（没有记录则保持当前值）。
+        if not getattr(self, "_gain_dirty", False):
+            self._load_gain_for_device(force=False)
+
         # 提示只在「这台设备确实属于本类型、且用户确认过」时才给，
         # 否则就会出现「切到麦克风却提示扬声器掉线」的误报。
         if not items:
@@ -6221,6 +6481,15 @@ class AudioSourceDialog(I18nDialog):
                    want))
         else:
             self.lbl_hint.setText("")
+
+    def reject(self):
+        """取消/关窗：把实时预览过的增益还原到打开对话框前的值。"""
+        try:
+            on, db = getattr(self, "_orig_gain", (False, 0))
+            self.main.audio.set_input_gain(bool(on), int(db))
+        except Exception:                                      # noqa: BLE001
+            pass
+        super().reject()
 
     def _on_btn(self, btn):
         """按**标准按钮角色**分派（不能用按钮文本判断）。
@@ -6254,7 +6523,8 @@ class AudioSourceDialog(I18nDialog):
             self.scan_devices()
 
     def _on_device_changed(self, _i=0):
-        """换了设备/驱动 ⇒ ASIO 的话重新取一遍输入通道名。"""
+        """换了设备/驱动 ⇒ 取该设备上次的增益；ASIO 再重取输入通道名。"""
+        self._load_gain_for_device(force=True)
         if self._src_key() != "asio":
             return
         self.scan_devices()
@@ -6271,6 +6541,12 @@ class AudioSourceDialog(I18nDialog):
             #   所以我们永远沿用驱动当前值（原生侧传 sr=0）⇒ 这里强制归零。
             sr = 0
         mono = self.chk_mono.isChecked()
+        gain_on = bool(self.chk_gain.isChecked())
+        try:
+            gain_db = int(self.gain.value())
+        except (TypeError, ValueError):
+            gain_db = 0
+        gain_db = max(-12, min(12, gain_db))
         # 按音源类型分别记住设备：切回该类型时能自动选中，
         # 且「设备掉线」提示不会把别的类型的设备名拿来误报。
         a = self.main.cfg["audio"]
@@ -6278,6 +6554,13 @@ class AudioSourceDialog(I18nDialog):
         dbs[t] = dev
         a["device_by_source"] = dbs
         a["device_name"] = dev          # 与 source_type 配对，引擎启动时读它
+        a["gain_enabled"] = bool(gain_on)
+        a["gain_db"] = float(gain_db)
+        try:
+            a.setdefault("gain_by_device", {})[self._gain_key()] = {
+                "enabled": bool(gain_on), "db": float(gain_db)}
+        except Exception:                                      # noqa: BLE001
+            pass
         if t == "asio":
             # ASIO 的"用哪两路输入"也存下来（默认 0/1 = 前两路）
             try:
@@ -6287,7 +6570,8 @@ class AudioSourceDialog(I18nDialog):
                 a["asio_ch0"], a["asio_ch1"] = 0, 1
         self.main.apply_audio_settings(t, dev, sr, mono,
                                         int(a.get("asio_ch0", 0) or 0),
-                                        int(a.get("asio_ch1", 1) or 1))
+                                        int(a.get("asio_ch1", 1) or 1),
+                                        bool(gain_on), int(gain_db))
         self._want_dev = dev
         self.accept()
 
@@ -6295,6 +6579,48 @@ class AudioSourceDialog(I18nDialog):
         snap = self.main.audio.state.snapshot()
         for k, b in self.bars.items():
             b.setValue(int(max(0.0, min(1.0, snap.get(k, 0.0))) * 100))
+        # 声卡端已削波：红色提示；软件增益救不回来，只能降声卡输入。
+        try:
+            _raw0 = float(snap.get("input_peak", 0.0) or 0.0)
+            _on0 = bool(self.chk_gain.isChecked())
+            _db0 = int(self.gain.value()) if _on0 else 0
+            _comp0 = min(1.0, _raw0 * (10.0 ** (_db0 / 20.0)))
+            _clip = bool(snap.get("input_clip")) or _raw0 >= 0.999
+            _clip_gain = _comp0 >= 0.999
+            if _clip or _clip_gain:
+                self.clip_led.setStyleSheet(
+                    "background:#ff2a2a;border:1px solid #ff9a9a;border-radius:6px;")
+                self.clip_txt.setStyleSheet("color:#ff5252;font-size:11px;font-weight:bold;")
+                self.clip_txt.setText(T("削波（原始）") if _clip else T("削波（增益后）"))
+                self.lbl_clip.setText(T("⚠ 输入已削波：请降低声卡输入增益；软件增益无法恢复"))
+                self.lbl_clip.show()
+            else:
+                self.clip_led.setStyleSheet(
+                    "background:#3a1010;border:1px solid #552222;border-radius:6px;")
+                self.clip_txt.setStyleSheet("color:#9a9a9a;font-size:11px;")
+                self.clip_txt.setText(T("削波"))
+                self.lbl_clip.hide()
+        except Exception:                                          # noqa: BLE001
+            pass
+        # 原始峰值 / 补偿后峰值（避免“表头满了其实声卡已经爆了”）。
+        try:
+            _raw = float(snap.get("input_peak", 0.0) or 0.0)
+            _on = bool(self.chk_gain.isChecked())
+            _db = int(self.gain.value()) if _on else 0
+            _comp = min(1.0, _raw * (10.0 ** (_db / 20.0)))
+            self.lbl_peak.setText(Tf("原始峰值 {:.0f}% · 补偿后 {:.0f}%",
+                                     _raw * 100.0, _comp * 100.0))
+            if _raw < 0.010:
+                self._quiet_ticks += 1
+            else:
+                self._quiet_ticks = 0
+            if self._quiet_ticks >= 20:
+                self.lbl_quiet.setText(T("输入偏小：可打开「输入增益」适当补偿"))
+                self.lbl_quiet.show()
+            else:
+                self.lbl_quiet.hide()
+        except Exception:                                          # noqa: BLE001
+            pass
         self.lbl_dev.setText(T("当前采集设备: ") + (snap.get("device_desc") or "-"))
         # ★★ 2026-10-22：**ASIO 状态必须显式显示**。
         #   旧行为：ASIO 打开失败会静默回退到系统声音，界面没有任何提示

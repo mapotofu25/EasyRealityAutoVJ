@@ -440,6 +440,12 @@ def import_into(pkg_path, base_dir, on_progress=None, clear_first=False,
                 # ★ 2026-10-31：本机已有的那些歌**整首跳过**（元数据 + 封面 + 指纹都不写）
                 if sid in skip:
                     n_skip += 1
+                    # ★ 2026-11-26：跳过重复曲目时，包里的手动 Build Up 不能一起丢。
+                    #   按文件名暂存，演出机同名本地曲目仍能生效。
+                    try:
+                        IL.add_skipped_build_up(conn, s.get("file_name"), s.get("build_up"))
+                    except Exception:                            # noqa: BLE001
+                        pass
                     continue
                 # ★ 2026-11-01：逐首判"网格是否旧算法算的"。
                 #   优先取 grid JSON 里的 `grid_ver`（新包逐首都带），缺失时退回

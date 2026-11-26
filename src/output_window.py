@@ -13,6 +13,14 @@ try:
 except Exception:                                              # noqa: BLE001
     QOpenGLWidget = None
 
+# ★ 2026-11-25（Arena 路线第 1 步）：真正的纹理 blit 视图。
+#   旧 `_GLView` 用 QPainter 在 QOpenGLWidget 上画 QImage，真机两个输出窗全黑；
+#   新视图用 QOpenGLTexture + shader，不走 QPainter。
+try:
+    from gl_view import GLTextureView as _GLTextureView
+except Exception:                                              # noqa: BLE001
+    _GLTextureView = None
+
 
 def _frame_target(img, W, H, aspect_lock=True):
     iw, ih = img.width(), img.height()
@@ -26,13 +34,21 @@ def _frame_target(img, W, H, aspect_lock=True):
 
 
 def _paint_image(p, img, W, H, aspect_lock=True):
-    p.fillRect(0, 0, W, H, Qt.black)
     if img is None or img.isNull():
+        p.fillRect(0, 0, W, H, Qt.black)
         return
     got = _frame_target(img, W, H, aspect_lock)
     if got is None:
+        p.fillRect(0, 0, W, H, Qt.black)
         return
     target, (iw, ih) = got
+    # ★ 2026-11-25：1:1 不透明铺满整窗时可以不清黑底；但**带 alpha 的图必须清黑**，
+    #   否则透明区会露出控件底色。有黑边/缩放时也要清。
+    _full = (abs(target.x()) < 0.5 and abs(target.y()) < 0.5
+             and abs(target.width() - W) < 0.5
+             and abs(target.height() - H) < 0.5)
+    if img.hasAlphaChannel() or not _full:
+        p.fillRect(0, 0, W, H, Qt.black)
     if (abs(target.x()) < 0.5 and abs(target.y()) < 0.5
             and abs(target.width() - iw) < 0.5
             and abs(target.height() - ih) < 0.5):
@@ -69,15 +85,28 @@ else:
             except Exception:
                 pass
 
-        def set_frame(self, img):
+        def set_frame(self, img, lut=None, flash=0.0):
             self._img = img
             self.update()
 
         def paintGL(self):
+            import os
+            import time
+            _t0 = time.perf_counter()
             p = QPainter(self)
             p.setRenderHint(QPainter.SmoothPixmapTransform)
             _paint_image(p, self._img, self.width(), self.height(), self.aspect_lock)
             p.end()
+            if os.environ.get("AUTOVJ_DRAW_PROBE") == "1":
+                try:
+                    import stallwatch as _sw
+                    _sw.log_line("[OW] glpaint=%.1fms size=%dx%d img=%s" %
+                                 ((time.perf_counter() - _t0) * 1000.0,
+                                  self.width(), self.height(),
+                                  "%dx%d" % (self._img.width(), self._img.height())
+                                  if self._img is not None else "None"))
+                except Exception:                          # noqa: BLE001
+                    pass
 
 
 class _CpuView(QWidget):
@@ -89,7 +118,7 @@ class _CpuView(QWidget):
         self.aspect_lock = True
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
-    def set_frame(self, img):
+    def set_frame(self, img, lut=None, flash=0.0):
         self._img = img
         self.update()
 
@@ -119,12 +148,14 @@ class OutputWindow(QWidget):
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.cfg = config
+        self._alpha_screen = False
         self.setWindowTitle("Easy Reality Output")
         self.setObjectName("AutoVJOutputWindow")
         self._img = None
         self.aspect_lock = bool(self.cfg["output"].get("aspect_lock", True))
         self._mouse_hidden = False
         self._win_geom = None   # 最近一次窗口模式的几何（退出全屏时还原用）
+        self._borderless_full = False   # 无边框全屏窗口模式（Resolume 风格）
         self._drag_pos = None   # 无边框窗口拖拽用
 
         # 尺寸永远按设置里的输出分辨率（用户选 1080p 就按 1080p 建窗口）；
@@ -153,9 +184,23 @@ class OutputWindow(QWidget):
         self._layout.addWidget(self._cpu_view)
         self._view = self._cpu_view
         self._gpu_enabled = bool(self.cfg["output"].get("gpu_display", True))
-        if QOpenGLWidget is not None and self._gpu_enabled:
+        if (QOpenGLWidget is not None and self._gpu_enabled
+                and _GLTextureView is not None):
             try:
-                self._gl_view = _GLView(self)
+                # ★ 2026-11-25：绑定「GPU 加速」开关（perf.gpu_decode）。
+                #   开：多路输出/放大用新纹理视图；关：保持原 _GLView/CPU。
+                #   `AUTOVJ_GL_VIEW=1` 仍可用于强制实验验证。
+                import os as _os
+                _gpu_on = True
+                try:
+                    _gpu_on = bool((self.cfg.get("perf") or {}).get(
+                        "gpu_decode", True))
+                except Exception:                          # noqa: BLE001
+                    _gpu_on = True
+                _ViewCls = (_GLTextureView
+                            if (_gpu_on or str(_os.environ.get("AUTOVJ_GL_VIEW", "")) == "1")
+                            else _GLView)
+                self._gl_view = _ViewCls(self)
                 self._gl_view.aspect_lock = self.aspect_lock
                 self._gl_view.hide()
                 self._layout.addWidget(self._gl_view)
@@ -170,20 +215,41 @@ class OutputWindow(QWidget):
         #   提前 return ⇒ 输出窗口画面整段冻住（用户报「拖任何窗口都会卡」）。
         super().moveEvent(e)
 
-    def set_frame(self, img: QImage):
+    def set_frame(self, img: QImage, lut=None, flash=0.0):
         self._img = img
-        key = (img.width(), img.height(), self.width(), self.height(), self.aspect_lock)
+        key = (img.width(), img.height(), self.width(), self.height(),
+               self.aspect_lock, bool(getattr(self, "_force_gl", False)))
         if key != self._backend_key:
             self._backend_key = key
             self._sync_view_backend()
         try:
-            self._view.set_frame(img)
-        except Exception:
-            self.update()
+            self._view.set_frame(img, lut, flash)
+        except TypeError:
+            try:
+                self._view.set_frame(img)
+            except Exception:                                  # noqa: BLE001
+                pass
+        except Exception:                                      # noqa: BLE001
+            try:
+                self.update()
+            except Exception:                                  # noqa: BLE001
+                pass
         self._frame_n = getattr(self, "_frame_n", 0) + 1
         if self._frame_n % 120 == 0:
             self._check_gl_view()
             self._sync_view_backend()
+
+    def set_scene(self, scene, lut=None, flash=0.0):
+        """GPU 场景：由 GLTextureView 逐层合成；CPU 视图不支持。"""
+        if not self.is_gpu_view():
+            return
+        try:
+            self._view.set_scene(scene, lut, flash)
+        except Exception:                                      # noqa: BLE001
+            pass
+        self._frame_n = getattr(self, "_frame_n", 0) + 1
+        if self._frame_n % 120 == 0:
+            self._check_gl_view()
 
     def debug_backend(self):
         """诊断用：当前实际在画的视图（CPU / GPU）与是否有效。"""
@@ -194,20 +260,36 @@ class OutputWindow(QWidget):
         except Exception:
             return type(getattr(self, "_view", None)).__name__
 
+    def is_gpu_view(self):
+        try:
+            return (self._view is self._gl_view
+                    and isinstance(self._view, _GLTextureView))
+        except Exception:                                      # noqa: BLE001
+            return False
+
     def _want_gpu(self):
         """只在真正需要放大时用 GPU（1:1 输出 CPU 更稳，且成本可忽略）。"""
         if not self._gpu_enabled or self._gl_view is None or self._img is None:
             return False
+        # ★ 2026-11-25（两块屏都要 30fps）：≥2 个输出窗口时强制 GPU 视图。
+        #   真机 A/B：两个 1080p CPU 视图会把 GUI 线程的 QPainter/GIL 占满，
+        #   引擎从 30 掉到 22~25；GPU 视图 paintGL 仅 0.1~0.4ms，引擎回到 30~31。
+        if bool(getattr(self, "_force_gl", False)):
+            return True
+        # 真机 A/B：AUTOVJ_GL_DISPLAY=1 强制 GPU 视图（默认仍按放大倍率）
+        try:
+            import os as _os
+            if str(_os.environ.get("AUTOVJ_GL_DISPLAY", "")).strip() in (
+                    "1", "true", "yes"):
+                return True
+        except Exception:                                      # noqa: BLE001
+            pass
         got = _frame_target(self._img, self.width(), self.height(), self.aspect_lock)
         if got is None:
             return False
         target, (iw, ih) = got
         if iw <= 0 or ih <= 0:
             return False
-        # 2026-11-08：只有真正的大倍率放大（≥1.8×，例如 1080p→4K）才用 GPU。
-        # 720p/1080p 画布全屏到 1080p 时（1.5×）CPU 只要约 3~4ms/帧，改用 CPU
-        # 反而更稳：QOpenGLWidget 会和 Spout / GPU 解码抢同一个显卡驱动，
-        # 码表演出时容易出现 GUI 线程长时间卡住（[OUT] backlog 飙到几十）。
         return (target.width() >= iw * 1.80) or (target.height() >= ih * 1.80)
 
     def _sync_view_backend(self):
@@ -248,6 +330,8 @@ class OutputWindow(QWidget):
             return
         try:
             ok = bool(gl.isValid())
+            if ok and hasattr(gl, "is_ready"):
+                ok = bool(gl.is_ready())
         except Exception:
             ok = False
         if not ok:
@@ -287,9 +371,13 @@ class OutputWindow(QWidget):
         self._drag_pos = None
         super().mouseReleaseEvent(e)
 
+    def is_output_fullscreen(self):
+        """是否处于“无边框全屏窗口”模式（Resolume 风格）。"""
+        return bool(getattr(self, "_borderless_full", False) or self.isFullScreen())
+
     def _remember_window_geom(self):
         """进入全屏前记住窗口位置/尺寸（全屏会把窗口撑成整屏，切回来必须还原）"""
-        if not self.isFullScreen():
+        if not self.is_output_fullscreen():
             g = self.geometry()
             # 全屏时窗口会被撑满，只在正常状态下记录
             scr = self.screen() or QGuiApplication.primaryScreen()
@@ -301,18 +389,27 @@ class OutputWindow(QWidget):
                 self._win_geom = [g.x(), g.y(), g.width(), g.height()]
 
     def show_fullscreen_on(self, screen):
-        """全屏输出到指定显示器（QScreen）——铺满整屏，画面按宽高比缩放"""
+        """无边框全屏窗口输出到指定显示器（Resolume 风格）。
+
+        不使用 showFullScreen() 的原生独占全屏：改成无边框顶层窗口铺满
+        screen.geometry()，这样 OBS/Resolume 等采集端能按普通窗口捕获。
+        """
         self._remember_window_geom()
+        self._borderless_full = True
         try:
+            flags = Qt.Window | Qt.FramelessWindowHint
+            if self.cfg["output"].get("always_top"):
+                flags |= Qt.WindowStaysOnTopHint
+            self.setWindowFlags(flags)
+            self.setWindowState(Qt.WindowNoState)
             wh = self.windowHandle()
             if wh is not None:
                 wh.setScreen(screen)
             self.setGeometry(screen.geometry())
+            self.show()
+            self.raise_()
         except Exception:
             pass
-        self.showFullScreen()
-        # 进入全屏后再确认几次几何：Windows 多屏 / DPI 缩放下 showFullScreen 偶尔只占一角，
-        # 表现为「全屏了但画面缩在左上角」（用户实测反馈）
         self._reassert_fullscreen_later(screen)
 
     def _reassert_fullscreen_later(self, screen):
@@ -320,7 +417,7 @@ class OutputWindow(QWidget):
             QTimer.singleShot(delay, lambda s=screen: self._reassert_fullscreen(s))
 
     def _reassert_fullscreen(self, screen):
-        if not self.isFullScreen():
+        if not self.is_output_fullscreen():
             return
         try:
             g = screen.geometry()
@@ -331,6 +428,13 @@ class OutputWindow(QWidget):
 
     def show_windowed(self):
         """恢复普通窗口模式：每次都按设置的输出分辨率重置窗口大小"""
+        self._borderless_full = False
+        try:
+            if not self.cfg["output"].get("always_top"):
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            self.setWindowState(Qt.WindowNoState)
+        except Exception:                                      # noqa: BLE001
+            pass
         self.showNormal()
         self.apply_window_size()
         g = self.geometry()
@@ -338,8 +442,14 @@ class OutputWindow(QWidget):
 
     def reset_window_size(self):
         """手动重置窗口大小：退出全屏，按输出分辨率强制重置并显示"""
-        if self.isFullScreen():
-            self.setWindowState(Qt.WindowNoState)
+        if self.is_output_fullscreen():
+            self._borderless_full = False
+            try:
+                if not self.cfg["output"].get("always_top"):
+                    self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+                self.setWindowState(Qt.WindowNoState)
+            except Exception:                                  # noqa: BLE001
+                pass
             self.showNormal()
         self.apply_window_size()
         self.show()
@@ -435,14 +545,12 @@ class OutputWindow(QWidget):
         self.move(x, y)
 
     def toggle_fullscreen(self):
-        if self.isFullScreen():
+        if self.is_output_fullscreen():
             self.show_windowed()
         else:
-            self._remember_window_geom()
-            self.showFullScreen()
             scr = self.screen() or QGuiApplication.primaryScreen()
             if scr is not None:
-                self._reassert_fullscreen_later(scr)
+                self.show_fullscreen_on(scr)
 
     def _set_flags_keep_state(self, apply_flags):
         """改窗口标志时**保持「全屏 / 可见」状态不变**。
@@ -451,11 +559,13 @@ class OutputWindow(QWidget):
         （表现为「全屏下改边框/置顶，画面缩回窗口」）。这里记下改前状态、改完恢复回去；
         **非全屏行为与改动前逐值一致**（原来就是 `if visible: self.show()`）。
         """
-        was_fullscreen = self.isFullScreen()
+        was_fullscreen = self.is_output_fullscreen()
         visible = self.isVisible()
         apply_flags()
         if was_fullscreen:
-            self.showFullScreen()
+            scr = self.screen() or QGuiApplication.primaryScreen()
+            if scr is not None:
+                self.show_fullscreen_on(scr)
         elif visible:
             self.show()
 
@@ -524,7 +634,7 @@ class OutputWindow(QWidget):
         （选 1080p → 窗口被拖小 → 下次启动变回小尺寸）。
         """
         g = None
-        if not self.isFullScreen():
+        if not self.is_output_fullscreen():
             g = self.geometry()
         elif getattr(self, "_win_geom", None):
             g = self._win_geom

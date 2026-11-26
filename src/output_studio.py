@@ -2516,6 +2516,14 @@ class OutputStudio(QWidget):
             #   异常被吞掉 ⇒ 这段其实**从未生效**。现在直接删除硬上限，完全按
             #   `ui.preview.fps`（默认 30/60）走；要限速由用户设置控制。
             interval = 0.0 if fps >= 29.0 else 1.0 / max(1.0, fps)
+            # ★ 2026-11-26：演出运行中，输出页的小卡片预览最多 15fps。
+            #   它们只是配置用的监看小图；30fps 刷新会占掉 GUI 线程 3~10ms
+            #   （全部持 GIL），把引擎的合成/发送饿到 20fps。主预览不受影响。
+            try:
+                if bool(getattr(self.main.engine, "running", False)):
+                    interval = max(interval, 1.0 / 15.0)
+            except Exception:                              # noqa: BLE001
+                pass
             now = time.perf_counter()
             _last_t = float(getattr(self, "_pv_last_t", 0.0) or 0.0)
             if interval > 0.0 and now - _last_t < interval:
@@ -2555,6 +2563,11 @@ class OutputStudio(QWidget):
             return
         self.cfg.data.setdefault("output", {})["active_config"] = cid
         self.selected_id = ""
+        # ★ 2026-11-26：主屏幕 = 全局设置；切配置时把该配置主屏残留 params 搬进全局
+        try:
+            self.main._migrate_main_screen_params_to_global()
+        except Exception:                                      # noqa: BLE001
+            pass
         self.apply()
         self.configs_changed.emit()
 

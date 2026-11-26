@@ -132,6 +132,13 @@ def main():
     # 把说明书放到 dist 顶层（随包发出；dist 里不保留也无所谓）
     if os.path.exists(os.path.join(ROOT, MANUAL)):
         shutil.copy(os.path.join(ROOT, MANUAL), os.path.join(DIST, MANUAL))
+    # ★ 2026-11-08：**GPL-3.0-or-later 要求随二进制分发许可全文**。
+    #   以前包里只有 exe + _internal + 使用说明.txt，用户拿到的 exe 找不到任何许可信息；
+    #   源码地址写在 使用说明.txt 的「七、许可与第三方」里。
+    for _m in ("LICENSE",):
+        _src = os.path.join(ROOT, _m)
+        if os.path.exists(_src):
+            shutil.copy(_src, os.path.join(DIST, _m))
 
     dist_size = _dir_size(DIST)
     n = 0

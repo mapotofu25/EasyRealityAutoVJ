@@ -57,9 +57,8 @@ def version_str(date_key, seq):
 
 
 def zip_name(date_key, seq):
-    # ★ 2026-11-21：1.1 正式版 —— 发布包固定叫 EasyRealityAutoVJ_1.1.zip
-    #   （内部构建号仍写 _build_ver.py 供日志/兼容比较）
-    return "EasyRealityAutoVJ_1.1.zip"
+    # ★ 2026-11-26：1.3 正式版（ERLIB Build Up 同步 / 导入包 Build Up / 素材变换修复）
+    return "EasyRealityAutoVJ_1.3正式版.zip"
 
 
 # ---------------------------------------------------------------- 读写

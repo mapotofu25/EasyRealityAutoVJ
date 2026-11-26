@@ -152,13 +152,10 @@ def resample(mono, sr0, sr_target=SR_TARGET):
 
 def load_mono(path, maxsec=240.0, sr_target=SR_TARGET):
     """读取为单声道 float32，并重采样到 `sr_target`。返回 (mono, sr)。"""
-    import soundfile as sf
-    info = sf.info(path)
-    sr0 = int(info.samplerate)
-    frames = -1 if maxsec is None else int(maxsec * sr0)
-    data, _ = sf.read(path, dtype="float32", always_2d=True, frames=frames)
-    mono = data.mean(axis=1)
-    del data
+    # ★ 2026-11-22：soundfile 对个别 FLAC 会报 "decoder lost sync"，
+    #   改走 audio_decode（PyAV 兜底），否则这首歌永远没有网格/波形。
+    from audio_decode import decode_mono
+    mono, sr0, _dur = decode_mono(path, maxsec=maxsec)
     return resample(np.ascontiguousarray(mono, dtype=np.float32), sr0, sr_target)
 
 

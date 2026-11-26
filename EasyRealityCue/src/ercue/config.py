@@ -34,7 +34,7 @@ RECENT_CAP = 10                              # 最近文件最多存几条
 DEFAULTS = {
     "recent_files": [],     # 打开/导入过的 .ercue 绝对路径（最新在前，≤ RECENT_CAP）
     "last_dir": "",         # 上次打开/导入/导出的目录（对话框默认落点）
-    "embed_media": False,   # 导出时"把素材一起打包进 .ercue"的默认勾选（默认关）
+    "embed_media": True,    # ★ 2026-11-26：导出默认把素材一起打包（不再提供关闭开关）
     # ★ T02（第三轮）：自动保存开关（**独立目录**，绝不写用户 .ercue；见 `model/session_store`）
     "autosave": True,
     # ★ T02：关窗时的"未导出提醒"（默认开；关掉即完全静默退出）
@@ -206,14 +206,14 @@ def selftest() -> bool:
     d = tempfile.mkdtemp(prefix="ercue_cfg_")
     p = os.path.join(d, "sub", "config.json")
     c = Config(p)
-    assert c.get("embed_media") is False and c.recent() == []
-    c.set("embed_media", True)
+    assert c.get("embed_media") is True and c.recent() == []
+    c.set("embed_media", False)
     c.add_recent(os.path.join(d, "a.ercue"))
     c.add_recent(os.path.join(d, "b.ercue"))
     c.add_recent(os.path.join(d, "a.ercue"))          # 去重 → a 回到最前
     assert c.recent()[0].endswith("a.ercue") and len(c.recent()) == 2, c.recent()
     c2 = Config(p)
-    assert c2.get("embed_media") is True and len(c2.recent()) == 2, c2.data
+    assert c2.get("embed_media") is False and len(c2.recent()) == 2, c2.data
     assert c2.get("last_dir") == os.path.dirname(os.path.abspath(os.path.join(d, "a.ercue")))
 
     # 2) 最近文件限量
@@ -226,7 +226,7 @@ def selftest() -> bool:
     with open(bad, "w", encoding="utf-8") as f:
         f.write("{ 这不是 json ")
     cb = Config(bad)
-    assert cb.get("embed_media") is False, "坏文件应回落默认值"
+    assert cb.get("embed_media") is True, "坏文件应回落默认值"
     assert os.path.isfile(bad + ".broken"), "坏文件应改名留档"
 
     # 4) 目录不可写 → 优雅降级（不抛）

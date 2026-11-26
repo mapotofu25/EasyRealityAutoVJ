@@ -242,7 +242,7 @@ class TrackPanel(QWidget):
         lv.setSpacing(5)
         how = QLabel(
             "一张码表按<b>曲目</b>组织（每首歌一份编排）。\n"
-            "「导入音频…」用 mutagen 读标签与时长；<b>BPM 可自动识别</b>（也可手填）——\n"
+            "「导入音频…」用 mutagen 读标签与时长（没有标签时曲名取文件名）；<b>BPM 可自动识别</b>（也可手填）——\n"
             "它只影响按小节对齐，不填也能正常导出和演出。\n"
             "选中哪一首，下面编辑的就是哪一首的编排。")
         how.setTextFormat(Qt.TextFormat.RichText)   # ★ 原写 `**曲目**`（Markdown）⇒ QLabel 只认 HTML，会显示字面星号
@@ -256,7 +256,8 @@ class TrackPanel(QWidget):
         #   导入音频里面」）：**「＋ 曲目」按钮已去掉** —— 曲目一律由「导入音频…」产生
         #   （选中音频文件即新建一条曲目）。`addTrack` 信号保留：别处（拖入音频等）仍可复用。
         b_imp = QPushButton("导入音频…")
-        b_imp.setToolTip("选一个音频文件 ⇒ 自动新建一条曲目（读标签/时长；BPM 可再点自动识别）")
+        b_imp.setToolTip("选一个音频文件 ⇒ 自动新建一条曲目（读标签/时长；"
+                         "没有标签时曲名用文件名；BPM 可再点自动识别）")
         b_imp.clicked.connect(self.importAudio.emit)
         row.addWidget(b_imp)
         b_del = QPushButton("删除曲目")

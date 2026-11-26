@@ -41,6 +41,7 @@ MODE_SELECT = "select"
 MODE_ANCHOR = "anchor"
 MODE_SEGMENT = "segment"
 MODE_BPM = "bpm"
+MODE_BUILDUP = "buildup"
 
 _HIT_PX = 6.0            # 命中标记线 / 播放头的像素阈值
 # ---- v2 布局常量（详见模块 docstring）----
@@ -138,6 +139,10 @@ class WaveformMarkWidget(QWidget):
     # ★ 2026-10-28（用户要求「多段不同的 bpm 修改改到在波形图上右键选项」）：
     #   右键菜单由**宿主窗口**弹（控件不懂业务）。参数 = (光标秒, 全局坐标 QPoint)。
     contextMenuRequested = Signal(float, object)
+    # ★ 2026-11-24：Build Up 手动标记（32 拍，起点对齐八拍线）
+    #   ★ 2026-11-26：改为**多标记** —— 一首歌可以有多个 Build Up 段。
+    buildUpChanged = Signal(object)         # list[{start,beats}]（删除后为空列表）
+    buildUpCancelled = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,6 +158,10 @@ class WaveformMarkWidget(QWidget):
         self._drag = None                  # 拖拽状态 {type: anchor/playhead, ...}
         self._rubber = None                # 分段拖选 (x0, x1)
         self._hover = -1                   # 悬停的锚点下标
+        # Build Up 标记：[{start:秒, beats:32}, ...]；preview 是放置模式下的跟随预览
+        self._build_ups = []
+        self._build_up_beats = 32
+        self._buildup_preview = None
         # ---- v2：视窗 + 播放头 ----
         self.view0 = 0.0                   # 可视窗口左端（秒）
         self.view_span = 0.0              # 可视跨度（秒）；<=0 或 >= 全曲 = 全曲可视
@@ -181,6 +190,105 @@ class WaveformMarkWidget(QWidget):
         self._anchors = sorted({float(a) for a in (m.get("anchors") or [])})
         self._segments = [dict(s) for s in (m.get("segments") or []) if isinstance(s, dict)]
         self.update()
+
+    # ---------------- Build Up 标记 ----------------
+    @staticmethod
+    def _norm_build_ups(bu):
+        """接受单个 dict / list / None，返回规范化的 list[{start,beats}]。"""
+        if isinstance(bu, dict):
+            bu = [bu]
+        if not isinstance(bu, (list, tuple)):
+            return []
+        out = []
+        for x in bu:
+            if not isinstance(x, dict):
+                continue
+            try:
+                out.append({"start": max(0.0, float(x.get("start") or 0.0)),
+                            "beats": max(1, int(x.get("beats") or 32))})
+            except (TypeError, ValueError):
+                continue
+        out.sort(key=lambda x: x["start"])
+        return out
+
+    def set_build_ups(self, bu):
+        """设置已有的 Build Up 标记列表；兼容旧的单个 dict / None。"""
+        self._build_ups = self._norm_build_ups(bu)
+        self.update()
+
+    def set_build_up(self, bu):
+        """兼容旧调用：单个 dict = 一个标记。"""
+        self.set_build_ups(bu)
+
+    def build_ups(self):
+        return [dict(x) for x in self._build_ups]
+
+    def build_up(self):
+        """兼容旧调用：返回第一个标记（无则 None）。"""
+        return dict(self._build_ups[0]) if self._build_ups else None
+
+    def begin_build_up(self, beats=32):
+        """进入放置模式：鼠标在波形上移动时显示 32 拍预览，点击确定。"""
+        self._build_up_beats = int(beats or 32)
+        self._buildup_preview = None
+        self._mode = MODE_BUILDUP
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def cancel_build_up(self):
+        was = self._mode == MODE_BUILDUP
+        self._buildup_preview = None
+        if was:
+            self._mode = MODE_SELECT
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            self.buildUpCancelled.emit()
+
+    def _build_up_at_sec(self, sec):
+        """命中包含 sec 的标记；重叠时取起点最晚的那个。返回下标或 -1。"""
+        try:
+            bl = self._beat_len()
+        except Exception:                                       # noqa: BLE001
+            bl = 0.0
+        if bl <= 0:
+            return -1
+        hit = -1
+        for i, bu in enumerate(self._build_ups):
+            start = float(bu.get("start") or 0.0)
+            beats = int(bu.get("beats") or 32)
+            if start <= float(sec) <= start + beats * bl:
+                if hit < 0 or start >= float(self._build_ups[hit].get("start") or 0.0):
+                    hit = i
+        return hit
+
+    def _remove_build_up_at(self, sec):
+        i = self._build_up_at_sec(sec)
+        if i < 0:
+            return False
+        self._build_ups.pop(i)
+        self.update()
+        self.buildUpChanged.emit(self.build_ups())
+        return True
+
+    def _build_up_start(self, sec):
+        """把秒吸附到最近的八拍头，并保证 32 拍段落不越过曲尾。"""
+        bl = self._beat_len()
+        if bl <= 0:
+            return None
+        a = 0.0
+        if self._grid:
+            try:
+                import beatgrid as _bg
+                a = float(_bg.anchor_for(self._grid, sec))
+            except Exception:                                  # noqa: BLE001
+                a = float(self._grid.get("anchor") or 0.0)
+        a += self._flip_beats() * bl
+        step = 8.0 * bl
+        start = a + round((float(sec) - a) / step) * step
+        dur = float(self._duration())
+        span = self._build_up_beats * bl
+        start = max(0.0, min(start, max(0.0, dur - span)))
+        return start
 
     def set_snap(self, on):
         self._snap = bool(on)
@@ -527,6 +635,46 @@ class WaveformMarkWidget(QWidget):
         # ---- 3) 彩色波形（按振幅渐变：青蓝 → 黄 → 红）----
         if self._wf and self._wf.get("amp"):
             self._paint_waveform(p, w, plot_top, plot_bot)
+
+        # ---- 3a) Build Up 标记（支持多个；洋红色比黄色更跳）----
+        _bu_list = [dict(x) for x in self._build_ups]
+        if isinstance(self._buildup_preview, dict):
+            _bu_list.append(dict(self._buildup_preview))
+        _bl0 = self._beat_len()
+        if _bl0 > 0:
+            for _bu in _bu_list:
+                try:
+                    _bs = float(_bu.get("start") or 0.0)
+                    _bb = int(_bu.get("beats") or 32)
+                except (TypeError, ValueError):
+                    continue
+                _be = _bs + _bb * _bl0
+                _bx0 = self._x_of_sec(_bs)
+                _bx1 = self._x_of_sec(_be)
+                if _bx1 < -2.0 or _bx0 > w + 2.0:
+                    continue
+                _is_preview = _bu is self._buildup_preview or (
+                    isinstance(self._buildup_preview, dict)
+                    and _bu.get("start") == self._buildup_preview.get("start")
+                    and _bu.get("beats") == self._buildup_preview.get("beats"))
+                p.fillRect(QRectF(_bx0, plot_top, max(1.0, _bx1 - _bx0), plot_h),
+                           QColor(255, 60, 220, 48))
+                _pen = QPen(QColor(255, 90, 225, 235), 2.0)
+                if _is_preview:
+                    _pen.setStyle(Qt.PenStyle.DashLine)
+                p.setPen(_pen)
+                p.drawLine(QPointF(_bx0, plot_top), QPointF(_bx0, plot_bot))
+                p.drawLine(QPointF(_bx1, plot_top), QPointF(_bx1, plot_bot))
+                p.setPen(QColor(255, 240, 255, 245))
+                _f = p.font()
+                _f.setPointSizeF(8.0)
+                _f.setBold(True)
+                p.setFont(_f)
+                p.drawText(QRectF(max(0.0, _bx0) + 4.0, plot_top + 3.0,
+                                  max(40.0, _bx1 - _bx0 - 8.0), 15.0),
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                           ("BUILD UP %d拍" % _bb) if not _is_preview else
+                           ("BUILD UP %d拍（点击确定）" % _bb))
 
         # ---- 3a) 能量段落带（用户 2026-10-29：「标在波形图下方」）----
         #   从"叠在波形上的半透明染色"改成**波形下方的独立条带**，因为它能多表达一层：
@@ -923,6 +1071,20 @@ class WaveformMarkWidget(QWidget):
         elif self._mode == MODE_BPM:
             sec = self._snap_to_beat(self._sec_of_x(x))
             self.bpmPicked.emit(sec)
+        elif self._mode == MODE_BUILDUP:
+            start = self._build_up_start(self._sec_of_x(x))
+            if start is None:
+                self.cancel_build_up()
+                return
+            # 一次放置只加一个；要再加就再点一次「标记 Build Up」。
+            self._build_ups.append({"start": start,
+                                    "beats": self._build_up_beats})
+            self._build_ups.sort(key=lambda z: z["start"])
+            self._buildup_preview = None
+            self._mode = MODE_SELECT
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            self.buildUpChanged.emit(self.build_ups())
         else:  # select：命中锚点 → 拖锚点；否则 → 拖播放头（并立即 emit）
             bi = self._anchor_near(x)
             if bi >= 0:
@@ -933,6 +1095,10 @@ class WaveformMarkWidget(QWidget):
 
     def mouseMoveEvent(self, ev):
         x = ev.position().x()
+        if self._mode == MODE_BUILDUP:
+            self._buildup_preview = self._build_up_start(self._sec_of_x(x))
+            self.update()
+            return
         if self._drag is not None and self._drag["type"] == "anchor":
             sec = self._snap_to_beat(self._sec_of_x(x))
             self._anchors[self._drag["index"]] = sec
@@ -971,6 +1137,15 @@ class WaveformMarkWidget(QWidget):
             t1 = self._snap_to_beat(self._sec_of_x(x1))
             if t1 - t0 > 0.05:
                 self.segmentSelected.emit(t0, t1)
+
+    def mouseDoubleClickEvent(self, ev):
+        """双击已有的某个 Build Up 段 = 只删除该段（可留下其它段）。"""
+        if ev.button() == Qt.MouseButton.LeftButton and self._build_ups:
+            sec = self._sec_of_x(ev.position().x())
+            if self._remove_build_up_at(sec):
+                ev.accept()
+                return
+        super().mouseDoubleClickEvent(ev)
 
     def leaveEvent(self, ev):
         if self._hover != -1:

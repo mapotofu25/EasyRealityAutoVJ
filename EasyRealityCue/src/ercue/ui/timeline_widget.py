@@ -64,6 +64,7 @@ from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
 
 from ercue.model import units as _units
 from . import theme
+from .thread_guard import orphan_thread
 
 log = logging.getLogger("ercue.ui.timeline")
 
@@ -629,6 +630,7 @@ class CueTimeline(QWidget):
             w.stop()
             if not w.wait(1500):                           # 在途计算最多等 1.5s
                 log.warning("波形后台线程 1.5s 未结束（计算中，完成后会自行退出）")
+            orphan_thread(w)                               # ★ running ⇒ 保活到 finished
         except Exception:                                  # noqa: BLE001
             log.exception("停止波形线程失败")
 

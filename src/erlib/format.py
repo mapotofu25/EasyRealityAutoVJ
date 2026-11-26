@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import time
 
 FORMAT_VERSION = 1          # .eravjlib 自身的结构版本
@@ -102,7 +103,9 @@ _SCHEMA = (
     " src_path TEXT,"
     # ★ 2026-11-06：导入顺序（列表按它倒序显示 ⇒ 新导入的在最上面）。
     #   老库由 `_migrate` 按 `scanned_at` 回填。
-    " import_seq INTEGER)",
+    " import_seq INTEGER,"
+    # ★ 2026-11-26：手动 Build Up（{start,beats}），从 ERLIB 1.3 起随包导出。
+    " build_up TEXT)",
     "CREATE TABLE IF NOT EXISTS fingerprints ("
     " song_id INTEGER NOT NULL, hash TEXT NOT NULL, offset INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS idx_fp_hash ON fingerprints(hash)",
@@ -162,7 +165,7 @@ def _migrate(conn):
             except Exception:                                    # noqa: BLE001
                 pass
 
-    for col in ("manual", "sections", "sections_raw", "src_path"):
+    for col in ("manual", "sections", "sections_raw", "src_path", "build_up"):
         if col in cols:
             continue
         try:
@@ -180,6 +183,24 @@ def _migrate(conn):
 # ==========================================================================
 # 写入端（DJ 端的 erlib 用）
 # ==========================================================================
+def _make_db_writable(path):
+    """Clear a stale Windows read-only flag on the DB and its WAL sidecars.
+
+    Why: a .eravjlib copied from a zip/backup/CD often keeps the read-only
+    attribute. SQLite then opens it read-only and every UPDATE raises
+    "attempt to write a readonly database" (the Build Up save failure).  This
+    only touches the writable work/export file we are about to open; LibReader
+    (used for user packages) stays strictly read-only.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        p = path + suffix
+        try:
+            if os.path.isfile(p) and not (os.stat(p).st_mode & stat.S_IWRITE):
+                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+
+
 class LibWriter:
     """写入 `.eravjlib`。
 
@@ -194,6 +215,9 @@ class LibWriter:
         d = os.path.dirname(os.path.abspath(path))
         if d and not os.path.isdir(d):
             os.makedirs(d, exist_ok=True)
+        # A stale read-only attribute on the work DB or its -wal/-shm sidecars
+        # makes SQLite reject every write. Clear it before opening a writer.
+        _make_db_writable(path)
         fresh = not os.path.isfile(path)
         if fresh:
             resume = False
@@ -341,8 +365,8 @@ class LibWriter:
             " song_id, rel_path, file_name, file_size, duration, artist, title,"
             " genre_raw, genres, styles, source, level, ai_zh, grid, fp_count,"
             " cover_size, scanned_at, manual, sections, sections_raw, src_path,"
-            " import_seq)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " import_seq, build_up)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, m.get("rel_path", ""), m.get("file_name", ""),
              int(m.get("file_size") or 0), float(m.get("duration") or 0.0),
              m.get("artist", ""), m.get("title", ""), m.get("genre_raw", ""),
@@ -350,7 +374,8 @@ class LibWriter:
              m.get("level", ""), _j(m.get("ai_zh")), _j(m.get("grid")),
              len(list(fps or ())), len(cover_bytes or b""),
              time.time(), _j(manual_val), _j(m.get("sections")),
-             _j(m.get("sections_raw")), m.get("src_path", ""), _seq))
+             _j(m.get("sections_raw")), m.get("src_path", ""), _seq,
+             _j(m.get("build_up"))))
         rows = [(sid, h, int(o)) for h, o in (fps or ())]
         if rows:
             self.conn.executemany(
@@ -646,7 +671,7 @@ class LibReader:
         for row in rows:
             d = dict(zip(cols, row))
             for k in ("genres", "styles", "ai_zh", "grid", "manual",
-                       "sections", "sections_raw"):
+                       "sections", "sections_raw", "build_up"):
                 v = d.get(k)
                 if isinstance(v, str) and v:
                     try:

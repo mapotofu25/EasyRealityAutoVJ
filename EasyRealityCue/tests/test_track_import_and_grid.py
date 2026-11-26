@@ -110,6 +110,8 @@ def main():
         check(abs(float(idt.duration_sec) - 1.2) < 0.15,
               "(b4) 时长读出来了（≈1.2s）", idt.duration_sec)
         check(bool(idt.title), "(b5) 曲名有值（标签或文件名兜底）", idt.title)
+        check(idt.title == os.path.splitext(os.path.basename(wav))[0],
+              "(b5b) 没有标签 ⇒ 曲名就是文件名", idt.title)
         check(len(tr[-1].composition.layers) >= 1,
               "(b6) 自动给了一层（能直接开始编排）", len(tr[-1].composition.layers))
     # 再导一次 ⇒ 再加一首（不是改旧的）
@@ -159,6 +161,37 @@ def main():
         check(gw - iw <= 10, "(d5) 第 %d 档横向留白 ≤10px（原来 16）" % lvl, gw - iw)
         check(gh - ih >= 14, "(d6) 第 %d 档仍留得下文件名（格高−图标高）" % lvl, gh - ih)
         check(sp <= 2, "(d7) 第 %d 档 spacing ≤2（原来最多 12，和格子留白叠加）" % lvl, sp)
+
+    print()
+    print("=" * 78)
+    print("【E】旧工程里「新曲目」占位标题：导入无标签音频 ⇒ 改成文件名")
+    print("=" * 78)
+    w.new_sheet("占位标题")
+    pump(200)
+    w.add_track(title="新曲目")
+    pump(200)
+    wav3 = os.path.join(_TMP, "demo 版本.wav")
+    make_wav(wav3, 0.8)
+    ok3 = w.import_track_audio(wav3)
+    pump(300)
+    idt3 = w._sheet().tracks[-1].identity
+    check(ok3 and idt3.title == os.path.splitext(os.path.basename(wav3))[0],
+          "(e1) 占位「新曲目」被文件名替换", (ok3, idt3.title))
+    check(idt3.file_name == os.path.basename(wav3), "(e2) 文件名照常记下", idt3.file_name)
+
+    print()
+    print("=" * 78)
+    print("【F】存量工程：曲名还是「新曲目」但已绑音频 ⇒ 选中时自动补文件名")
+    print("=" * 78)
+    w.new_sheet("旧工程")
+    pump(200)
+    w.add_track(title="新曲目")
+    w.session.track_audio[0] = wav3
+    w._preload_audio()
+    pump(300)
+    idt4 = w._sheet().tracks[0].identity
+    check(idt4.title == os.path.splitext(os.path.basename(wav3))[0],
+          "(f1) 占位曲名被自动补成文件名", idt4.title)
 
     print()
     print("=" * 78)

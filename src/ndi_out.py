@@ -17,6 +17,11 @@ import os
 import threading
 import time
 
+try:
+    from PySide6.QtGui import QImage
+except Exception:                                              # noqa: BLE001
+    QImage = None
+
 # ⚠⚠ 日志必须**按 key 去重**，不能全局只打一次（2026-10-01 修）
 #   原来用 `_ERR_ONCE = {"shown": False}`：第一条日志之后**所有**日志永久静默。
 #   于是「还没有接收端连上」这条无害提示一旦打印过，后面真正的错误
@@ -491,9 +496,38 @@ class NDIOutput:
             _old = None
             with self._vcv:
                 _old = self._vq
-                self._vq = (snap, int(w), int(h))
+                self._vq = (snap, int(w), int(h), False)
                 self._vcv.notify()
-            if _old is not None:
+            if _old is not None and not bool(_old[3] if len(_old) > 3 else False):
+                self._vbuf_pool.release(_old[0])
+            self._ensure_vthread()
+        except Exception as e:                                     # noqa: BLE001
+            self._last_err = str(e)[:160]
+
+    def send_image(self, img):
+        """渲染线程调用：**只入队一个 QImage 引用**（不拷贝、不转格式）。
+
+        ★ 2026-11-25：与 `spout_out.SpoutOut.send_image` 同一改造。旧 `send_video`
+        在渲染线程做「ARGB32→预乘」+ 8MB 池拷贝（1080p ~2.6ms/帧）；同时开 Spout
+        时两路各做一遍，直接把帧预算顶爆。现在引擎只做一次私有快照并让两路共用，
+        NDI 提交线程直接读 `img.bits()`（只读）。
+        """
+        if getattr(self, "_vstop", False):
+            return
+        if img is None or img.isNull():
+            return
+        w, h = int(img.width()), int(img.height())
+        if w <= 0 or h <= 0:
+            return
+        if not self._ensure(w, h):
+            return
+        try:
+            _old = None
+            with self._vcv:
+                _old = self._vq
+                self._vq = (img, w, h, True)
+                self._vcv.notify()
+            if _old is not None and not bool(_old[3] if len(_old) > 3 else False):
                 self._vbuf_pool.release(_old[0])
             self._ensure_vthread()
         except Exception as e:                                     # noqa: BLE001
@@ -531,7 +565,8 @@ class NDIOutput:
                 continue
             if item is None:
                 continue
-            snap, w, h = item
+            snap, w, h = item[0], item[1], item[2]
+            is_img = bool(item[3]) if len(item) > 3 else False
             t0 = time.perf_counter()
             try:
                 with self._vlock:
@@ -548,7 +583,14 @@ class NDIOutput:
                     if hasattr(v, "get_write_available") and not v.get_write_available():
                         self._dropped += 1
                         continue
-                    v.write_data(snap)
+                    if is_img:
+                        img = snap
+                        if img.format() == QImage.Format_ARGB32:
+                            img = img.convertToFormat(
+                                QImage.Format_ARGB32_Premultiplied)
+                        v.write_data(memoryview(img.bits()))
+                    else:
+                        v.write_data(snap)
                     if hasattr(self._sender, "send_video_async"):
                         self._sender.send_video_async()
                     else:
@@ -567,7 +609,9 @@ class NDIOutput:
             finally:
                 self._vsend_block_ms = (time.perf_counter() - t0) * 1000.0
                 # ★ 归还缓冲池（本轮不再用这帧数据；write_data 已把内容拷进 SDK buffer）
-                self._vbuf_pool.release(snap)
+                #   QImage 快照不归池管，直接丢引用。
+                if not is_img:
+                    self._vbuf_pool.release(snap)
 
     def set_audio_rate(self, sr):
         """记录采集侧采样率（**仅供诊断/日志**）。
