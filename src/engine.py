@@ -8019,7 +8019,7 @@ class AutoVJEngine(QObject):
         """按 Build Up 已过拍数返回闪白间隔（拍）；0 = 不闪。
 
         1~8: 不闪 / 9~16: 每 4 拍 / 17~24: 每 2 拍 /
-        25~28: 每 1 拍 / 29~30: 每 1/2 拍 / 31~32: 抽空不闪。
+        25~28: 每 1 拍 / 29~30: 每 1/2 拍 / 31~32: 每 1/4 拍。
         """
         try:
             b = float(elapsed_beats)
@@ -8035,6 +8035,8 @@ class AutoVJEngine(QObject):
             return 1.0
         if b < 30.0:
             return 0.5
+        if b < 32.0:
+            return 0.25
         return 0.0
 
     def _paint_build_up_flash(self, canvas, alpha):
