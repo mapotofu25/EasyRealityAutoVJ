@@ -11588,64 +11588,101 @@ class MainWindow(QMainWindow):
             return
         sz = grid.iconSize()
         if not icons_only:
-            grid.clear()
             kw = (getattr(self, "lib_kw", "") or "").strip().lower()
             # 动态维度：0 全部 / 1 低 / 2 中 / 3 高 / 4 频闪 / 5 已排除 / 6 未扫描
             # （判据在 `passes_lib_filter`，纯函数、可测）
             _di = int(getattr(self, "dyn_filter", 0) or 0)
             # 角色维度：0 全部 / 1 前景 / 2 背景 / 3 已排除 / 4 未扫描
             _ri = int(self.role_filter or 0)
-            for it in self.library.values():
+            _fav = getattr(self, "lib_favorite_paths", None)
+
+            def _matches(it):
                 has_roles = any(it.roles.values())
-                # 动态/未扫描判据统一走纯函数（见 `passes_lib_filter` 的说明：
-                # 「全部」= 库里所有素材；图片不打标但算"已就绪"）
                 if not passes_lib_filter(it, _di):
-                    continue
-                # --- 角色维度（只有 全部/前景/背景；「已排除/未扫描」按用户要求只放在动态栏）---
+                    return False
                 if _ri == 1 and has_roles and not it.roles.get("fg"):
-                    continue
+                    return False
                 if _ri == 2 and has_roles and not it.roles.get("bg"):
-                    continue
-                # ★ 标签筛选（多选对话框）已删；搜索框仍可按标签文字过滤（见下面 kw 分支）
+                    return False
                 if self.kind_filter == 1 and it.kind not in ("image", "gif"):
-                    continue
+                    return False
                 if self.kind_filter == 2 and it.kind != "video":
-                    continue
-                if kw and kw not in it.name.lower() and not any(kw in t.lower() for t in it.all_tags()):
-                    continue
-                # ★ 收藏夹过滤（2026-11-08）：只在“只看收藏夹”开启时生效
-                _fav = getattr(self, "lib_favorite_paths", None)
+                    return False
+                if kw and kw not in it.name.lower() and not any(
+                        kw in t.lower() for t in it.all_tags()):
+                    return False
                 if _fav is not None and it.path not in _fav:
-                    continue
-                _ic = it.icon_cached(sz.width(), sz.height())
-                try:
-                    _pm = _ic.pixmap(sz) if (not _ic.isNull()) else QPixmap()
-                    if not _pm.isNull():
-                        _ic = QIcon(_pm.copy())
-                except Exception:                              # noqa: BLE001
-                    pass
-                li = QListWidgetItem(_ic, self._item_text(it))
-                li.setData(Qt.UserRole, it)
-                li.setToolTip("")
-                self._tint_role(li, it)
-                grid.addItem(li)
-        else:
+                    return False
+                return True
+
+            # ★ 2026-11-27：不再 grid.clear()。角色筛选下拉关闭时销毁 600+
+            #   QListWidgetItem 会触发 shiboken access violation（0xc0000005）。
+            #   改为复用已有 item，只隐藏/显示；缺失的 item 补建，不销毁任何格。
+            existing = {}
             for i in range(grid.count()):
                 li = grid.item(i)
                 it = li.data(Qt.UserRole)
-                _ic = it.icon_cached(sz.width(), sz.height())
-                try:
-                    _pm = _ic.pixmap(sz) if (not _ic.isNull()) else QPixmap()
-                    if not _pm.isNull():
-                        _ic = QIcon(_pm.copy())
-                except Exception:                              # noqa: BLE001
-                    pass
-                li.setIcon(_ic)
-                li.setText(self._item_text(it))
-                li.setToolTip("")
+                p = getattr(it, "path", None)
+                if p:
+                    existing[p] = li
+            visible = 0
+            for it in self.library.values():
+                li = existing.get(it.path)
+                if li is None:
+                    _ic = it.icon_cached(sz.width(), sz.height())
+                    try:
+                        _pm = _ic.pixmap(sz) if (not _ic.isNull()) else QPixmap()
+                        if not _pm.isNull():
+                            _ic = QIcon(_pm.copy())
+                    except Exception:                          # noqa: BLE001
+                        pass
+                    li = QListWidgetItem(_ic, self._item_text(it))
+                    li.setData(Qt.UserRole, it)
+                    li.setToolTip("")
+                    grid.addItem(li)
+                else:
+                    _ic = it.icon_cached(sz.width(), sz.height())
+                    try:
+                        _pm = _ic.pixmap(sz) if (not _ic.isNull()) else QPixmap()
+                        if not _pm.isNull():
+                            _ic = QIcon(_pm.copy())
+                    except Exception:                          # noqa: BLE001
+                        pass
+                    li.setIcon(_ic)
+                    li.setText(self._item_text(it))
+                    li.setToolTip("")
                 self._tint_role(li, it)
+                _show = bool(_matches(it))
+                li.setHidden(not _show)
+                if _show:
+                    visible += 1
+            # 已经被移出 library 的旧 item：隐藏保留，避免再次 clear 触发崩溃
+            for p, li in existing.items():
+                if p not in self.library:
+                    li.setHidden(True)
+            if count_lbl is not None:
+                count_lbl.setText(f"{visible}/{len(self.library)}")
+            return
+        # 仅刷新图标/文字（缩略图尺寸变化），同样不销毁 item
+        for i in range(grid.count()):
+            li = grid.item(i)
+            it = li.data(Qt.UserRole)
+            if it is None:
+                continue
+            _ic = it.icon_cached(sz.width(), sz.height())
+            try:
+                _pm = _ic.pixmap(sz) if (not _ic.isNull()) else QPixmap()
+                if not _pm.isNull():
+                    _ic = QIcon(_pm.copy())
+            except Exception:                                  # noqa: BLE001
+                pass
+            li.setIcon(_ic)
+            li.setText(self._item_text(it))
+            li.setToolTip("")
+            self._tint_role(li, it)
         if count_lbl is not None:
             count_lbl.setText(f"{grid.count()}/{len(self.library)}")
+
 
     def _exists_cached(self, path):
         """文件是否存在（带 30 秒缓存）：素材上万时每次刷新都 stat 一遍会拖慢界面"""
