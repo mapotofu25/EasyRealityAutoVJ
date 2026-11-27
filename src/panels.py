@@ -6087,8 +6087,8 @@ class AudioSourceDialog(I18nDialog):
         self.scan_devices()
 
     # ---- 配置载入/应用 ----
-    #                   下拉索引 → 设备类别（线路输入并入 mic；索引 3 = ASIO；索引 4 = 局域网）
-    SOURCE_KEYS = ("system", "mic", "mic", "asio", "lan")
+    #                   下拉索引 → 设备类别（线路输入有独立 source_type，但设备仍走 mic 枚举）
+    SOURCE_KEYS = ("system", "mic", "linein", "asio", "lan")
 
     def _mic_category(self):
         """当前是「麦克风」(1) 还是「线路输入/声卡」(2)？两者共用 mic 通道，列表要分开。"""
@@ -6097,6 +6097,12 @@ class AudioSourceDialog(I18nDialog):
 
     def _src_key(self):
         return self.SOURCE_KEYS[max(0, min(4, self.source.currentIndex()))]
+
+    def _dev_kind(self):
+        """设备枚举类别：线路输入使用 soundcard 的 mic 列表，但配置类型保留 linein。"""
+        key = self._src_key()
+        return "mic" if key == "linein" else key
+
 
     @staticmethod
     def _looks_like_lan_target(s):
@@ -6430,7 +6436,7 @@ class AudioSourceDialog(I18nDialog):
         # ASIO 输入通道（只有 ASIO 音源才有这一步）
         if self._src_key() == "asio" and devs is not None and "asio_ch" in devs:
             self._ensure_ch_items(devs.get("asio_ch"), devs.get("asio_ch_err") or "")
-        kind = self._src_key()
+        kind = self._dev_kind()
         items = self._devs.get(kind, [])
         # ★ 麦克风 / 线路 同为 "mic" 通道，但**列出的端点要分开**：
         #   麦克风类看名字含「麦克风 / Microphone」，其余（线路、立体声混音、采集卡）归线路。
