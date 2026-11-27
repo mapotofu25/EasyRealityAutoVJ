@@ -546,10 +546,13 @@ BLEND_QT = {
     "darken": QPainter.CompositionMode_Darken,
 }
 
-MODES = ("normal", "fast", "beat")
+SWITCH_MODES = ("normal", "fast", "slow32", "slow64")
+MODES = SWITCH_MODES + ("beat",)
 MODE_LABELS = {
     "normal": "常规切",
     "fast": "快切",
+    "slow32": "32 拍",
+    "slow64": "64 拍",
     "beat": "逐拍交替",
     # ★ 2026-11-11（用户：有段落时节奏标签还在常规/快切之间跳）：
     #   段落表接管时，HUD/状态栏显示这一项；它**不是** `self.mode` 的合法值，
@@ -558,7 +561,7 @@ MODE_LABELS = {
     # ★ 2026-10-25：**不是一种节奏**，而是「完全不自动切换」的策略值（`cfg["mode"]["manual"]`）。
     #   它**绝不能进 `MODES`**：`MODES` 同时被 `manual_mode()` / `modes_snapshot()` 当合法值校验，
     #   而且 `MODES` 里的值会落到 `self.mode`，随后被 `MODE_META[self.mode]` 取过渡时长 ——
-    #   `MODE_META` 只有三个节奏键，放进去就是 KeyError。
+    #   `MODE_META` 只有节奏键，放进去就是 KeyError。
     #   这里只是给状态栏/HUD 一个显示名（`MODE_LABELS.get(m, m)` 兜底也不会崩）。
     "manual": "手动切换",
 }
@@ -611,10 +614,13 @@ BLEND_LABELS = {
 }
 # 每模式：切换间隔（拍，固定值）、过渡时长。
 # 拍数为固定值（不再随能量在区间内插值）：素材切换时机对齐 4 拍小节线，
-# 常规切 16 拍 = 4 个 4/4 小节，快切 8 拍 = 2 个 4/4 小节（用户要求踩在乐句结构点上）。
+# 常规切 16 拍 = 4 个 4/4 小节，快切 8 拍 = 2 个 4/4 小节；
+# 32 / 64 拍是用户手动选的更慢档位（8 / 16 个 4/4 小节）。
 MODE_META = {
     "normal":  {"beats": (16, 16), "trans_ms": 600},
     "fast":    {"beats": (8, 8), "trans_ms": 250},
+    "slow32":  {"beats": (32, 32), "trans_ms": 600},
+    "slow64":  {"beats": (64, 64), "trans_ms": 600},
     "beat":    {"beats": (1, 1), "trans_ms": 30},
 }
 
@@ -4043,6 +4049,14 @@ class AutoVJEngine(QObject):
             # 满间隔重新数（用户反馈：快切数到 2 突然变慢切又跳到 30，体验割裂）。
 
     def _score_modes(self, snap):
+        """自动模式的兜底节奏打分。
+
+        ★ 2026-11-27（用户）：自动模式兜底从「快切 8 / 常规 16」改成「16 / 32」。
+          自动只会在 16 拍（normal）和 32 拍（slow32）之间选：
+            · 高能/瞬态多 → 16 拍；
+            · 低能/安静段 → 32 拍。
+          「快切 8 拍」「64 拍」仍保留为手动固定档，自动模式不会自己选。
+        """
         E = self._energy_for_switch(snap)
         OD = min(1.0, snap["onset_density"] / 4.0)          # 瞬态密度归一（每秒强拍数，drop≈4）
         BS = snap["bpm_stab"]                                # BPM 稳定性
@@ -4056,33 +4070,31 @@ class AutoVJEngine(QObject):
             return w if seg == label else 0.0
 
         sens = int(self.cfg["mode"].get("sensitivity", 1))
-        speed_bonus = (-0.5, 0.0, 0.5)[max(0, min(2, sens))]  # 灵敏度→偏向快模式
+        speed_bonus = (-0.5, 0.0, 0.5)[max(0, min(2, sens))]  # 灵敏度→偏向短间隔
 
         scores = {
-            # 已删除「慢切」：安静/尾奏段直接归到常规切（16 拍，4 小节，本身就慢）
-            "normal":  1.4 + 0.8 * (1 - abs(E - 0.5) * 2) + (1 - CX) * 0.3
-                       + seg_w("peak", 0.3) + seg_w("quiet", 1.0) + seg_w("outro", 0.5),
-            "fast":    E * 1.6 + OD * 1.0 + max(TR, 0) * 1.2 + CX * 0.3
+            # 16 拍：高能/瞬态多时优先（旧「快切」的公式，但档位是 16 拍）。
+            "normal":  E * 1.6 + OD * 1.0 + max(TR, 0) * 1.2 + CX * 0.3
                        + max(0.0, E - 0.7) * 1.5
                        + seg_w("build", 1.6) + speed_bonus,
+            # 32 拍：低能/安静段优先（旧「常规切」的公式，但档位是 32 拍）。
+            "slow32":  1.4 + 0.8 * (1 - abs(E - 0.5) * 2) + (1 - CX) * 0.3
+                       + seg_w("peak", 0.3) + seg_w("quiet", 1.0) + seg_w("outro", 0.5),
+            # 逐拍交替只能手动开启；保留评分供诊断，自动模式下面会 pop 掉。
             "beat":    BC * 1.4 + BS * 1.2 + OD * 0.8 + (0.6 if E > 0.55 else 0)
                        + seg_w("drop", 2.5) + speed_bonus,
         }
-        # 低能量段：**常规切优先、快切按能量比例压制**。
-        # 先加一个小偏置（中低能量过渡用），再对快切做**乘性**压制 —— 关键在乘性：
-        # 快切在低能量时能靠 build(+1.6) + 灵敏度「高」(+0.5) + 高瞬态密度(+1.0) +
-        # 能量趋势(+1.2) 叠到 4.5+，任何常数减项都压不住（用户 2026-09-24 反馈
-        # 「0.2 能量还在快切」，实测正是"安静的 build"和"全加成拉满"两种组合）。
-        # k 从 E=0.35 的 0 线性升到 E=0.50 的 1：E≤0.35 快切得分直接归零（低能量只用常规切），
-        # E≥0.50 完全不受影响（build/drop 该快切照样快切）。
-        # 门槛 0.35 是用户 2026-09-24 定的（原为 0.30，他看了实测表后要求再抬高一档）。
+        # 低能量段：32 拍优先、16 拍按能量比例压制。
+        # 先加一个小偏置（中低能量过渡用），再对 16 拍做**乘性**压制 —— 关键在乘性：
+        # 16 拍在低能量时能靠 build(+1.6) + 灵敏度「高」(+0.5) + 高瞬态密度(+1.0) +
+        # 能量趋势(+1.2) 叠到 4.5+，任何常数减项都压不住。
         low_bias = max(0.0, 0.55 - E)
-        scores["normal"] += low_bias * 1.4
-        scores["fast"] -= low_bias * 1.2
-        k_fast = max(0.0, min(1.0, (E - 0.35) / 0.15))
-        if k_fast < 1.0:
-            scores["fast"] *= k_fast
-            scores["normal"] += (1.0 - k_fast) * 0.9
+        scores["slow32"] += low_bias * 1.4
+        scores["normal"] -= low_bias * 1.2
+        k_short = max(0.0, min(1.0, (E - 0.35) / 0.15))
+        if k_short < 1.0:
+            scores["normal"] *= k_short
+            scores["slow32"] += (1.0 - k_short) * 0.9
         return scores
 
     def _beat_pos(self, snap):
@@ -4469,8 +4481,8 @@ class AutoVJEngine(QObject):
 
     def _current_interval(self, snap, screen=None):
         """当前生效的切换间隔（拍）；None 表示不自动切换。
-        常规切/快切为固定拍数（16 拍 / 8 拍 = 4 / 2 个 4/4 小节），保证素材始终
-        停留整数个小节、切换点踩在乐句结构线上；逐拍交替走独立的 _beat_tick 节奏。
+        常规切/快切/32 拍/64 拍为固定拍数（16 / 8 / 32 / 64 拍，都是 4 拍小节整数倍），
+        保证素材始终停留在小节/乐句结构线上；逐拍交替走独立的 _beat_tick 节奏。
         「素材最小切换间隔」选项已删除：间隔固定，不再被配置里的残留值覆盖。"""
         _mode = self._mode_for_screen(screen)
         if _mode == SWITCH_MANUAL:

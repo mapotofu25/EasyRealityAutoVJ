@@ -55,7 +55,7 @@ from preview_hover import (PreviewBuildWorker, PreviewHoverCard,
 import proxy_plan
 import proxy_convert
 from engine import (AutoVJEngine, Layer, MODE_LABELS, BLEND_MODES, BLEND_LABELS,
-                    SWITCH_MANUAL)
+                    SWITCH_MANUAL, SWITCH_MODES)
 from output_window import OutputWindow
 from hotkeys import HotkeyManager
 from arrow_combo import ArrowComboBox
@@ -323,6 +323,7 @@ class SettingsPanel(QWidget):
         #   只有你按「下一素材」快捷键/按钮或「播放此素材」才换画面。
         #   Kv 待机层、码表、自愈看门狗都不受影响（它们本来就不走"自动换素材"）。
         self.mode_combo.addItems(["自动（推荐）", "常规切", "快切",
+                                  "32 拍", "64 拍",
                                   "手动（不自动切换）"])
         # ★★★ 2026-11-06（用户：「演出行为这边的自动的悬浮的说明要改」）：
         #   旧文案还写着"自动：按能量/瞬态自己挑常规切/快切"——那已经是**没有段落表时**的
@@ -331,10 +332,11 @@ class SettingsPanel(QWidget):
             "自动（推荐）——让软件自己决定什么时候换素材：\n"
             "· 这首歌在曲库里标过「能量段落」⇒ 跟着段落边界切：进 drop 那一拍就换，\n"
             "  并提前换好符合该段动态（低/中/高）的素材池，不再等 8/16 拍排期；\n"
-            "· 没有段落表 ⇒ 按能量在「常规切（16 拍）/ 快切（8 拍）」之间自动选；\n"
+            "· 没有段落表 ⇒ 按能量在「16 拍 / 32 拍」之间自动选；\n"
             "· 一个段落再长，最多 64 拍也会换一次，不会长时间不动；\n"
             "· 段落边界只切一次（同一次边界不会连着切两个素材）。\n\n"
-            "常规切 / 快切：固定用这一种节奏（有段落表时，段落边界仍会先切一次）。\n"
+            "常规切 / 快切 / 32 拍 / 64 拍：固定用这一种节奏（有段落表时，段落边界仍会先切一次）。\n"
+            "32 拍 / 64 拍是更慢的固定档：128 BPM 下约 15 秒 / 30 秒换一次。\n"
             "逐拍交替已独立成下方同名分区（只接管前景层 · 只在 drop 段生效）。\n"
             "手动（不自动切换）：永远不自动换素材，只在「下一素材」按钮/快捷键、"
             "「播放此素材」时换。Kv 待机层与码表不受影响。")
@@ -8057,7 +8059,8 @@ class MainWindow(QMainWindow):
                 st.sync_beat_section()
             except Exception:                                  # noqa: BLE001
                 pass
-            # ★ BUG-D：素材切换节奏（mode 段）——auto→0 / normal→1 / fast→2 / manual→3
+            # ★ BUG-D：素材切换节奏（mode 段）——auto→0 / normal→1 / fast→2 /
+            #   slow32→3 / slow64→4 / manual→5
             md_ = eff.get("mode") or {}
             try:
                 from config import SWITCH_MANUAL as _SM
@@ -8066,12 +8069,12 @@ class MainWindow(QMainWindow):
             if bool(md_.get("auto", True)):
                 _mi = 0
             elif str(md_.get("manual") or "") == str(_SM):
-                _mi = 3
+                _mi = 5
             else:
-                _mi = {"normal": 1, "fast": 2}.get(
+                _mi = {"normal": 1, "fast": 2, "slow32": 3, "slow64": 4}.get(
                     str(md_.get("manual") or "normal"), 1)
             _blocked(getattr(st, "mode_combo", None),
-                     lambda w: w.setCurrentIndex(max(0, min(3, _mi))))
+                     lambda w: w.setCurrentIndex(max(0, min(5, _mi))))
             _blocked(getattr(st, "sens", None),
                      lambda w: w.setCurrentIndex(
                          {"low": 0, "mid": 1, "high": 2}.get(
@@ -8530,15 +8533,16 @@ class MainWindow(QMainWindow):
         if i == 0:
             self.engine_cfg("mode", "auto", True)
             self.engine_cfg("mode", "manual", "auto")
-        elif i == 3:
-            # 手动切换：不走自动打分，三个节奏档也不生效。
-            # `mode.auto=False` 与三档一致（都表示"不自动挑节奏"）；
+        elif i == 5:
+            # 手动切换：不走自动打分，所有节奏档也不生效。
+            # `mode.auto=False` 与固定档一致（都表示"不自动挑节奏"）；
             # `manual` 存 SWITCH_MANUAL，引擎侧由 manual_switch_mode() 统一判定。
             self.engine_cfg("mode", "auto", False)
             self.engine_cfg("mode", "manual", SWITCH_MANUAL)
         else:
             self.engine_cfg("mode", "auto", False)
-            self.engine_cfg("mode", "manual", ["normal", "fast"][i - 1])
+            mode = SWITCH_MODES[i - 1] if 1 <= i <= len(SWITCH_MODES) else "normal"
+            self.engine_cfg("mode", "manual", mode)
         self.engine.mode = self.engine.manual_mode() or self.engine.mode
         self.settings.sync_beat_section()
 
@@ -9671,15 +9675,13 @@ class MainWindow(QMainWindow):
         m = self.cfg["mode"]
         manual = m.get("manual", "auto")
         if str(manual) == SWITCH_MANUAL:
-            self.settings.mode_combo.setCurrentIndex(3)
+            self.settings.mode_combo.setCurrentIndex(5)
         elif m.get("auto", True) or manual in (None, "auto"):
             self.settings.mode_combo.setCurrentIndex(0)
+        elif manual in SWITCH_MODES:
+            self.settings.mode_combo.setCurrentIndex(SWITCH_MODES.index(manual) + 1)
         else:
-            try:
-                self.settings.mode_combo.setCurrentIndex(
-                    ["normal", "fast"].index(manual) + 1)
-            except ValueError:
-                self.settings.mode_combo.setCurrentIndex(0)
+            self.settings.mode_combo.setCurrentIndex(0)
         self.settings.sens.setCurrentIndex(int(m.get("sensitivity", 1)))
         b = self.cfg["beat"]
         self.settings.chk_beat_alt.setChecked(bool(b.get("enabled", False)))

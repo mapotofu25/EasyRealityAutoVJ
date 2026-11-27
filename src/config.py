@@ -181,7 +181,7 @@ DEFAULTS = {
     },
     "mode": {
         "auto": True,                 # 自动模式：软件自动判断切换节奏
-        "manual": "auto",             # auto / normal / fast / beat（slow 已删除，旧值自动回退 auto）
+        "manual": "auto",             # auto / normal / fast / slow32 / slow64 / beat
         "freq_beats": 0,              # 【已废弃】「切换频率」覆盖选项已删除，引擎不再读取
         "transition": "",             # 过渡方式覆盖：""=跟随模式，fade/cut/slide/zoom/glitch
         "sensitivity": 1,             # 0 低 / 1 中 / 2 高

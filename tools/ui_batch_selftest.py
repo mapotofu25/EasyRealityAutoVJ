@@ -127,23 +127,24 @@ def main():
           vf is not None and 0.50 < vf < 0.60,
           "vocal_f=%.3f" % (vf if vf is not None else -1))
 
-    # ---------- 3) 低能量偏好常规切 ----------
+    # ---------- 3) 低能量偏好 32 拍；高能量偏好 16 拍 ----------
     w("")
-    w("[3] 低能量段模式打分偏好「常规切」")
+    w("[3] 自动兜底：低能量偏 32 拍、高能量偏 16 拍")
     snap = dict(audio.snapshot())
     for E in (0.0, 0.2, 0.45, 0.8):
         snap.update({"energy": E, "onset_density": 1.0, "bpm_stab": 0.5, "beat_clarity": 0.5,
                      "spec_complex": 0.5, "energy_trend": 0.0, "vocalness": 0.2, "segment": "none"})
         sc = eng._score_modes(snap)
-        w("      E=%.2f → normal %.2f / fast %.2f%s" % (E, sc["normal"], sc["fast"],
-                                                         "   ← 常规切胜" if sc["normal"] > sc["fast"] else ""))
+        w("      E=%.2f → normal(16) %.2f / slow32(32) %.2f%s"
+          % (E, sc["normal"], sc["slow32"],
+             "   ← 32 拍胜" if sc["slow32"] > sc["normal"] else ""))
         if E <= 0.45:
-            check("E=%.2f 时 normal > fast" % E, sc["normal"] > sc["fast"])
-    check("E=0.8 时仍允许 fast 胜出（不锁死模式）",
+            check("E=%.2f 时 slow32 > normal" % E, sc["slow32"] > sc["normal"])
+    check("E=0.8 build 时 normal(16) 胜出（自动仍会加速）",
           eng._score_modes(dict(snap, energy=0.8, onset_density=4.0, energy_trend=0.5,
-                                segment="build"))["fast"] >
+                                segment="build"))["normal"] >
           eng._score_modes(dict(snap, energy=0.8, onset_density=4.0, energy_trend=0.5,
-                                segment="build"))["normal"])
+                                segment="build"))["slow32"])
 
     # ---------- 4) 下一素材重置倒计时 ----------
     w("")
