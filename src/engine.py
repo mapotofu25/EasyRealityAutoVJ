@@ -3687,11 +3687,15 @@ class AutoVJEngine(QObject):
             self._latest_output_frame = None
 
     def latest_output_frame(self):
-        """单屏输出窗口用的原生分辨率帧；没有时退回预览帧。"""
+        """单屏输出窗口用的原生分辨率帧；没有时返回 None。
+
+        绝不能退回 `_latest_frame`（那是 preview.res 缩略图，480×270 放大到
+        1080p 就是用户看到的“糊”）。没有原生帧时宁可保持上一帧。
+        """
         f = getattr(self, "_latest_output_frame", None)
         if f is not None and not f.isNull():
             return f
-        return self._latest_frame
+        return None
 
     # ⚠⚠ 这里也**故意不加 @_locked**（与 `latest_frame` / `modes_snapshot` 同类，已在
     #   `tools/_scan_locks.py` 白名单登记）：它是 GUI 高频读取的只读快照，加锁就等于让 GUI
@@ -9066,6 +9070,7 @@ class AutoVJEngine(QObject):
                                     if job["main"] else "")),
                     "spout": str(sp_names.get(sid) or "") if sid in sp_sids else "",
                     "ndi": bool(sid in nd_sids),
+                    "capture": bool(job.get("capture")),
                     "layers": desc, "lut": lut,
                     "blackout": bool(getattr(self, "blackout", False))})
             # 一屏一进程：每屏独立队列/GL 上下文/读回，主屏不被 dj 读回拖慢。

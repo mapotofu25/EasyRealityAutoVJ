@@ -13679,7 +13679,10 @@ class MainWindow(QMainWindow):
                     _full = self.engine.latest_output_frame()
                 except Exception:                              # noqa: BLE001
                     _full = None
-                ow.set_frame(_full or img)
+                # 只喂原生帧；拿不到就保持上一帧，绝不把 480×270 预览图
+                # 送进 1080p 输出窗（那就是“糊”的来源）。
+                if _full is not None:
+                    ow.set_frame(_full)
             except Exception:
                 pass
         _t1 = time.perf_counter()
