@@ -11732,7 +11732,15 @@ class MainWindow(QMainWindow):
     def set_role_filter(self, i):
         self.role_filter = i
         self._sync_lib_controls()
-        self.refresh_grid()
+        # ★ 2026-11-27：不要在 QComboBox 的 currentIndexChanged 回调里同步
+        #   grid.clear()。Windows 上组合框弹层还在关闭时清空 600+ 项的网格，
+        #   会出现 shiboken access violation（0xc0000005，坛友实测闪退）。
+        #   延到当前事件处理完再重建；重复选择由 Qt 合并成一次重绘。
+        try:
+            from PySide6.QtCore import QTimer as _QT
+            _QT.singleShot(0, self.refresh_grid)
+        except Exception:                                      # noqa: BLE001
+            self.refresh_grid()
 
     def toggle_role(self, key, items):
         for m in items:
