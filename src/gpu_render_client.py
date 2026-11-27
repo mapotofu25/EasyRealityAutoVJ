@@ -278,15 +278,26 @@ class GpuRenderClient:
         for sid, st in list(self._thumbs.items()):
             try:
                 shm = st["shm"]
-                seq, idx = struct.unpack_from("<qq", shm.buf, 0)
-                if seq == st.get("seq"):
+                _ok = False
+                for _try in range(2):
+                    seq, idx = struct.unpack_from("<qq", shm.buf, 0)
+                    if seq == st.get("seq"):
+                        _ok = True
+                        break
+                    w, h = int(st["w"]), int(st["h"])
+                    off = _SINK_HDR + (0 if int(idx) == 0 else w * h * 4)
+                    raw = bytes(shm.buf[off:off + w * h * 4])
+                    seq2, idx2 = struct.unpack_from("<qq", shm.buf, 0)
+                    if seq2 != seq or idx2 != idx:
+                        continue
+                    img = QImage(raw, w, h, w * 4,
+                                 QImage.Format_ARGB32_Premultiplied).copy()
+                    st["seq"] = seq
+                    out[sid] = img
+                    _ok = True
+                    break
+                if not _ok:
                     continue
-                st["seq"] = seq
-                w, h = int(st["w"]), int(st["h"])
-                off = _SINK_HDR + (0 if int(idx) == 0 else w * h * 4)
-                raw = bytes(shm.buf[off:off + w * h * 4])
-                out[sid] = QImage(raw, w, h, w * 4,
-                                  QImage.Format_ARGB32_Premultiplied).copy()
             except Exception:                                  # noqa: BLE001
                 continue
         return out
@@ -297,15 +308,26 @@ class GpuRenderClient:
         for sid, st in list(self._sinks.items()):
             try:
                 shm = st["shm"]
-                seq, idx = struct.unpack_from("<qq", shm.buf, 0)
-                if seq == st.get("seq"):
+                _ok = False
+                for _try in range(2):
+                    seq, idx = struct.unpack_from("<qq", shm.buf, 0)
+                    if seq == st.get("seq"):
+                        _ok = True
+                        break
+                    w, h = int(st["w"]), int(st["h"])
+                    off = _SINK_HDR + (0 if int(idx) == 0 else w * h * 4)
+                    raw = bytes(shm.buf[off:off + w * h * 4])
+                    seq2, idx2 = struct.unpack_from("<qq", shm.buf, 0)
+                    if seq2 != seq or idx2 != idx:
+                        continue
+                    img = QImage(raw, w, h, w * 4,
+                                 QImage.Format_ARGB32_Premultiplied).copy()
+                    st["seq"] = seq
+                    out[sid] = img
+                    _ok = True
+                    break
+                if not _ok:
                     continue
-                st["seq"] = seq
-                w, h = int(st["w"]), int(st["h"])
-                off = _SINK_HDR + (0 if int(idx) == 0 else w * h * 4)
-                raw = bytes(shm.buf[off:off + w * h * 4])
-                out[sid] = QImage(raw, w, h, w * 4,
-                                  QImage.Format_ARGB32_Premultiplied).copy()
             except Exception:                                  # noqa: BLE001
                 continue
         return out
